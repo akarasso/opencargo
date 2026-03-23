@@ -1,0 +1,74 @@
+stages:
+  - test
+  - build
+  - release
+
+variables:
+  CARGO_HOME: ${CI_PROJECT_DIR}/.cargo
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .cargo/
+    - target/
+    - frontend/node_modules/
+
+test:
+  stage: test
+  image: rust:1.87
+  before_script:
+    - apt-get update && apt-get install -y nodejs npm
+    - npm install -g pnpm@10
+    - cd frontend && pnpm install && pnpm build && cd ..
+  script:
+    - cargo build
+    - cargo test
+
+build:
+  stage: build
+  image: rust:1.87
+  before_script:
+    - apt-get update && apt-get install -y nodejs npm
+    - npm install -g pnpm@10
+    - cd frontend && pnpm install && pnpm build && cd ..
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/opencargo
+    expire_in: 1 week
+  only:
+    - main
+    - master
+    - tags
+
+docker:
+  stage: build
+  image: docker:24
+  services:
+    - docker:24-dind
+  before_script:
+    - apk add --no-cache nodejs npm
+    - npm install -g pnpm@10
+    - cd frontend && pnpm install && pnpm build && cd ..
+  script:
+    - docker build -t opencargo:latest .
+  only:
+    - main
+    - master
+    - tags
+
+release:
+  stage: release
+  image: rust:1.87
+  before_script:
+    - apt-get update && apt-get install -y nodejs npm
+    - npm install -g pnpm@10
+    - cd frontend && pnpm install && pnpm build && cd ..
+  script:
+    - cargo build --release
+  artifacts:
+    paths:
+      - target/release/opencargo
+  only:
+    - tags

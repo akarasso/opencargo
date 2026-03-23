@@ -1,0 +1,47 @@
+# Example GitHub Actions workflow using opencargo as a service container
+# for caching npm downloads during CI builds.
+#
+# The opencargo service starts automatically and proxies requests to npmjs.org,
+# caching packages locally for faster subsequent installs.
+
+name: CI with opencargo cache
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    services:
+      registry:
+        image: opencargo:latest
+        ports:
+          - 6789:6789
+        options: >-
+          --health-cmd "curl -f http://localhost:6789/health/live || exit 1"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Configure npm to use opencargo proxy
+        run: echo "registry=http://localhost:6789/npm-all/" > .npmrc
+
+      - name: Install dependencies
+        run: pnpm install
+
+      - name: Run tests
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build

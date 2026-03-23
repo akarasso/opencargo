@@ -1,0 +1,48 @@
+# Example GitLab CI configuration using opencargo as a service container
+# for caching npm downloads during CI builds.
+#
+# The opencargo service is started alongside the CI job and proxies requests
+# to npmjs.org, caching packages locally for faster installs.
+
+stages:
+  - build
+  - test
+
+variables:
+  npm_config_registry: "http://opencargo:6789/npm-all/"
+
+build:
+  stage: build
+  image: node:22-alpine
+  services:
+    - name: opencargo:latest
+      alias: opencargo
+      variables:
+        OPENCARGO_CONFIG: ""
+  before_script:
+    - echo "registry=http://opencargo:6789/npm-all/" > .npmrc
+    # Wait for opencargo to be ready
+    - |
+      for i in $(seq 1 30); do
+        if wget -q -O /dev/null http://opencargo:6789/health/live 2>/dev/null; then
+          echo "opencargo is ready"
+          break
+        fi
+        echo "Waiting for opencargo..."
+        sleep 1
+      done
+  script:
+    - pnpm install
+    - pnpm build
+
+test:
+  stage: test
+  image: node:22-alpine
+  services:
+    - name: opencargo:latest
+      alias: opencargo
+  before_script:
+    - echo "registry=http://opencargo:6789/npm-all/" > .npmrc
+  script:
+    - pnpm install
+    - pnpm test

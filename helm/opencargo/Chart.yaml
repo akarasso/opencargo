@@ -1,0 +1,14 @@
+apiVersion: v2
+name: opencargo
+description: A lightweight, self-hosted universal package registry
+type: application
+version: 0.1.0
+appVersion: "0.1.0"
+keywords:
+  - package-registry
+  - npm
+  - cargo
+  - oci
+home: https://github.com/trace/opencargo
+maintainers:
+  - name: opencargo

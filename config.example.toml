@@ -1,0 +1,27 @@
+[server]
+bind = "127.0.0.1:6789"
+base_url = "http://localhost:6789"
+storage_path = "./data/storage"
+
+[database]
+url = "sqlite:./data/db/opencargo.db"
+
+[auth]
+anonymous_read = true
+token_prefix = "trg_"
+static_tokens = ["test-token"]
+
+[auth.admin]
+username = "admin"
+password = "admin"
+
+[proxy]
+default_ttl = "24h"
+negative_cache_ttl = "1h"
+connect_timeout = "10s"
+
+[[repositories]]
+name = "npm-private"
+type = "hosted"
+format = "npm"
+visibility = "private"
