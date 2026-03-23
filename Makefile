@@ -3,9 +3,14 @@
 
 .PHONY: help build dev test clean frontend release docker deploy undeploy logs publish lint fmt
 
+# Load .env if it exists
+-include .env
+export
+
 # Config
 NAMESPACE ?= opencargo
-REGISTRY ?= opencargo
+GHCR_REGISTRY ?= ghcr.io/akarasso
+REGISTRY ?= $(GHCR_REGISTRY)/opencargo
 TAG ?= latest
 CONFIG ?= config.toml
 
@@ -78,7 +83,10 @@ docker-run: ## Lancer via Docker
 		-v opencargo-data:/data \
 		$(REGISTRY):$(TAG) --config /config/config.toml
 
-docker-push: ## Push l'image Docker
+docker-login: ## Login au registry GHCR
+	@echo $(GITHUB_TOKEN) | docker login ghcr.io -u akarasso --password-stdin
+
+docker-push: docker-login ## Push l'image Docker sur GHCR
 	docker push $(REGISTRY):$(TAG)
 
 # ---------------------------------------------------------------------------
