@@ -2,14 +2,21 @@
 
 Registry de packages universel, leger et auto-heberge, ecrit en Rust.
 
-- **Multi-format** : npm, Cargo (crates Rust), OCI / Docker
+- **Multi-format** : npm, Cargo, OCI/Docker, Go modules
 - **Binaire unique**, ~10 Mo, ~10-30 Mo RAM
 - **Zero JVM**, zero GC — SQLite embarque
 - **Proxy + cache** : cache transparent vers npmjs.org, crates.io
 - **Repos group** : un seul endpoint pour packages prives + publics
 - **Promotion de packages** : workflow dev → prod avec audit trail
+- **Permissions granulaires** : par utilisateur × par repository
+- **Dependency graph** : suivi des deps + analyse d'impact
+- **Vulnerability scanning** : scan automatique via OSV.dev
+- **Webhooks** : notifications sur evenements (publish, promote)
 - **UI web** SolidJS embarquee dans le binaire
 - **Metriques Prometheus** integrees
+- **Recherche full-text** (SQLite FTS5)
+- **Rate limiting** sur les endpoints sensibles
+- **TLS natif** (rustls)
 
 ---
 
@@ -34,7 +41,7 @@ cp config.example.toml config.toml
 ./target/release/opencargo --config config.toml
 ```
 
-Au premier lancement, un mot de passe admin aleatoire est genere et ecrit dans `data/admin.password`. Consultez les logs ou le fichier pour le recuperer.
+Au premier lancement, un mot de passe admin aleatoire est genere et ecrit dans `data/admin.password`.
 
 ```bash
 cat data/admin.password
@@ -62,13 +69,9 @@ anonymous_read = true
 
 [auth.admin]
 username = "admin"
-
-[[repositories]]
-name = "npm-private"
-type = "hosted"
-format = "npm"
-visibility = "private"
 ```
+
+Les repositories, webhooks et permissions se gerent via l'API admin ou l'UI web — pas besoin de les definir dans le fichier de config.
 
 ### Config complete
 
@@ -78,19 +81,23 @@ bind = "127.0.0.1:6789"
 base_url = "http://localhost:6789"
 storage_path = "./data/storage"
 
+[server.tls]
+cert_path = "/path/to/cert.pem"
+key_path = "/path/to/key.pem"
+
 [database]
 url = "sqlite:./data/db/opencargo.db"
 
 [auth]
-anonymous_read = true           # GET sans token autorise
-token_prefix = "trg_"           # Prefixe des tokens generes
-static_tokens = []              # Tokens fixes (dev/CI)
+anonymous_read = true
+token_prefix = "trg_"
+static_tokens = []
 
 [auth.admin]
 username = "admin"
-# password est genere automatiquement au premier lancement
-# Pour forcer un mot de passe : password = "mon-mdp"
-# En k8s, utiliser la variable d'env OPENCARGO_ADMIN_PASSWORD
+# password genere automatiquement au premier lancement
+# Pour forcer : password = "mon-mdp"
+# En k8s : variable d'env OPENCARGO_ADMIN_PASSWORD
 
 [proxy]
 default_ttl = "24h"
@@ -102,8 +109,11 @@ enabled = true
 prerelease_older_than_days = 90
 proxy_cache_older_than_days = 180
 
-# --- Repositories ---
+[vuln_scan]
+enabled = true
+block_on_critical = false
 
+# Repositories (optionnel — seed au premier lancement, ensuite gerable via API)
 [[repositories]]
 name = "npm-private"
 type = "hosted"
@@ -124,11 +134,11 @@ format = "npm"
 visibility = "public"
 members = ["npm-private", "npm-proxy"]
 
-[[repositories]]
-name = "cargo-private"
-type = "hosted"
-format = "cargo"
-visibility = "private"
+# Webhooks (optionnel — seed, ensuite gerable via API)
+[[webhooks]]
+url = "https://ci.company.com/hooks"
+events = ["package.published", "package.promoted"]
+secret = "mon-secret"
 ```
 
 ### Variables d'environnement
@@ -148,13 +158,30 @@ visibility = "private"
 | **proxy** | Cache transparent vers un registry upstream. Les packages sont telecharges a la demande puis caches. |
 | **group** | Agregation de plusieurs repos derriere une URL unique. Resolution dans l'ordre configure. |
 
+### Gestion dynamique des repositories
+
+Les repos peuvent etre crees, modifies et supprimes via l'API sans redemarrer le serveur :
+
+```bash
+# Creer un repo
+curl -X POST http://localhost:6789/api/v1/repositories \
+  -H "Authorization: Bearer admin-token" \
+  -d '{"name": "npm-dev", "type": "hosted", "format": "npm", "visibility": "private"}'
+
+# Lister les repos
+curl http://localhost:6789/api/v1/repositories \
+  -H "Authorization: Bearer admin-token"
+
+# Supprimer un repo
+curl -X DELETE http://localhost:6789/api/v1/repositories/npm-dev \
+  -H "Authorization: Bearer admin-token"
+```
+
 ---
 
 ## Architectures type
 
 ### Setup simple (equipe unique)
-
-Un seul repo hosted pour les packages prives, un proxy pour le cache, un group pour tout combiner.
 
 ```toml
 [[repositories]]
@@ -176,25 +203,21 @@ members = ["npm-private", "npm-proxy"]
 ```
 
 ```ini
-# .npmrc — tout le monde utilise le group
+# .npmrc
 @monscope:registry=http://registry:6789/npm-all/
 //registry:6789/npm-all/:_authToken=mon-token
 ```
 
-Pas de promotion, pas de complexite. Les devs publient dans `npm-private`, tout le monde installe depuis `npm-all`.
-
 ### Setup avec promotion (dev → prod)
-
-Deux repos hosted : un pour le developpement, un pour la production. Les packages sont promus de l'un a l'autre apres validation.
 
 ```toml
 [[repositories]]
-name = "npm-dev"        # les devs publient ici
+name = "npm-dev"
 type = "hosted"
 format = "npm"
 
 [[repositories]]
-name = "npm-prod"       # packages valides/promus
+name = "npm-prod"
 type = "hosted"
 format = "npm"
 
@@ -211,33 +234,16 @@ format = "npm"
 members = ["npm-prod", "npm-dev", "npm-proxy"]
 ```
 
-**Important** : l'ordre des `members` compte. `npm-prod` est resolu en premier — si un package existe en prod ET en dev, c'est la version prod qui est servie.
-
-```ini
-# .npmrc — identique pour les devs et la CI
-@monscope:registry=http://registry:6789/npm-all/
-//registry:6789/npm-all/:_authToken=mon-token
-```
-
-Tout le monde utilise le meme group `npm-all` et le meme `.npmrc`. Le lockfile reste identique entre dev et CI — la promotion ne change pas les URLs.
-
-**Workflow :**
+L'ordre des `members` compte : `npm-prod` est resolu en premier.
 
 ```bash
-# 1. Le dev publie dans npm-dev
-pnpm publish  # → @monscope/auth-sdk@1.0.0-dev.28 dans npm-dev
-
-# 2. QA valide
-
-# 3. L'admin promeut vers npm-prod
-curl -X POST http://registry:6789/api/v1/packages/@monscope/auth-sdk/versions/1.0.0-dev.28/promote \
+# Promouvoir un package
+curl -X POST http://registry:6789/api/v1/promote/@monscope/auth-sdk/1.0.0-dev.28 \
   -H "Authorization: Bearer admin-token" \
-  -H "Content-Type: application/json" \
   -d '{"from": "npm-dev", "to": "npm-prod"}'
-
-# Le tarball n'est pas copie — les deux repos pointent vers le meme fichier.
-# Le lockfile ne change pas car tout le monde utilise npm-all.
 ```
+
+Le tarball n'est pas copie — les deux repos pointent vers le meme fichier. Le lockfile ne change pas car tout le monde utilise `npm-all`.
 
 ---
 
@@ -309,21 +315,11 @@ curl -X PUT http://localhost:6789/cargo-private/api/v1/crates/ma-crate/0.1.0/uny
 
 ## Utilisation Docker / OCI
 
-opencargo supporte le protocole OCI Distribution Spec v2 pour les images Docker.
+opencargo supporte le protocole OCI Distribution Spec v2.
 
 ### Configurer un repository OCI
 
-Dans `config.toml` ou via l'API admin :
-
-```toml
-[[repositories]]
-name = "oci-private"
-type = "hosted"
-format = "oci"
-visibility = "private"
-```
-
-Ou via l'API :
+Via l'API :
 ```bash
 curl -X POST http://localhost:6789/api/v1/repositories \
   -H "Authorization: Bearer admin-token" \
@@ -335,6 +331,8 @@ curl -X POST http://localhost:6789/api/v1/repositories \
 ```bash
 docker login localhost:6789 -u mon-user -p mon-password
 ```
+
+Docker utilise Basic Auth — opencargo le supporte nativement avec les memes users/passwords que le reste.
 
 ### Push une image
 
@@ -355,17 +353,51 @@ docker pull localhost:6789/oci-private/myapp:latest
 curl http://localhost:6789/v2/oci-private/myapp/tags/list
 ```
 
+> Note : pour utiliser Docker en HTTP (sans TLS), ajoutez `"insecure-registries": ["localhost:6789"]` dans `/etc/docker/daemon.json` et redemarrez Docker. En production, utilisez TLS ou un reverse proxy HTTPS.
+
 ---
 
-## Authentification
+## Utilisation Go modules
+
+### Configurer un repository Go
+
+```bash
+curl -X POST http://localhost:6789/api/v1/repositories \
+  -H "Authorization: Bearer admin-token" \
+  -d '{"name": "go-private", "type": "hosted", "format": "go", "visibility": "private"}'
+```
+
+### Configurer GOPROXY
+
+```bash
+export GOPROXY=http://localhost:6789/go-private,direct
+export GONOSUMCHECK=mycompany.com/*
+```
+
+### Publier un module
+
+```bash
+curl -X PUT http://localhost:6789/go-private/mymodule/@v/v1.0.0 \
+  -H "Authorization: Bearer mon-token" \
+  --data-binary @module.zip
+```
+
+### Installer un module
+
+```bash
+go get mymodule@v1.0.0
+```
+
+---
+
+## Authentification et autorisation
 
 ### Mot de passe admin initial
 
-Au premier lancement :
-- **Standalone** : un mot de passe aleatoire est genere et ecrit dans `data/admin.password`. Il doit etre change au premier login.
-- **Kubernetes** : passer le mot de passe via `OPENCARGO_ADMIN_PASSWORD` (depuis un Secret k8s). Pas de fichier, pas de changement force.
+- **Standalone** : mot de passe aleatoire genere → `data/admin.password` → doit etre change au premier login
+- **Kubernetes** : `OPENCARGO_ADMIN_PASSWORD` env var depuis un Secret k8s → pas de fichier, pas de changement force
 
-### Utilisateurs et roles
+### Roles par defaut
 
 | Role | Lecture | Publication | Promotion | Administration |
 |------|---------|-------------|-----------|----------------|
@@ -373,17 +405,39 @@ Au premier lancement :
 | `publisher` | oui | oui | non | non |
 | `reader` | oui | non | non | non |
 
+### Permissions granulaires
+
+Les permissions peuvent etre definies par utilisateur et par repository, overridant les roles par defaut :
+
+```bash
+# Donner le droit de write sur npm-dev mais pas npm-prod
+curl -X PUT http://localhost:6789/api/v1/users/dev1/permissions/npm-dev \
+  -H "Authorization: Bearer admin-token" \
+  -d '{"can_read": true, "can_write": true, "can_delete": false, "can_admin": false}'
+
+# Lister les permissions d'un user
+curl http://localhost:6789/api/v1/users/dev1/permissions \
+  -H "Authorization: Bearer admin-token"
+
+# Supprimer une permission specifique (retour au role par defaut)
+curl -X DELETE http://localhost:6789/api/v1/users/dev1/permissions/npm-dev \
+  -H "Authorization: Bearer admin-token"
+```
+
+Resolution des permissions :
+1. Role `admin` → acces total, toujours
+2. Permission specifique dans `user_permissions` → appliquee si presente
+3. Sinon, role par defaut (publisher = read+write, reader = read)
+
 ### Creer un utilisateur
 
 ```bash
 curl -X POST http://localhost:6789/api/v1/users \
   -H "Authorization: Bearer admin-token" \
-  -H "Content-Type: application/json" \
   -d '{"username": "dev1", "email": "dev1@company.com", "role": "publisher"}'
 
 # Reponse : {"username": "dev1", "password": "aB3kX9...", "role": "publisher"}
 # Le mot de passe est genere aleatoirement et retourne UNE SEULE FOIS.
-# L'admin ne choisit pas le mot de passe — il le transmet au dev.
 ```
 
 ### Changer son mot de passe
@@ -391,8 +445,7 @@ curl -X POST http://localhost:6789/api/v1/users \
 ```bash
 curl -X PUT http://localhost:6789/api/v1/users/dev1/password \
   -H "Authorization: Bearer dev1-token" \
-  -H "Content-Type: application/json" \
-  -d '{"current_password": "aB3kX9...", "new_password": "mon-nouveau-mdp"}'
+  -d '{"current_password": "ancien-mdp", "new_password": "nouveau-mdp"}'
 ```
 
 ### Creer un token API
@@ -400,7 +453,6 @@ curl -X PUT http://localhost:6789/api/v1/users/dev1/password \
 ```bash
 curl -X POST http://localhost:6789/api/v1/users/dev1/tokens \
   -H "Authorization: Bearer admin-token" \
-  -H "Content-Type: application/json" \
   -d '{"name": "laptop", "expires_in_days": 365}'
 
 # Reponse : {"id": "...", "token": "trg_a1b2c3...", ...}
@@ -409,24 +461,112 @@ curl -X POST http://localhost:6789/api/v1/users/dev1/tokens \
 
 ---
 
+## Dependency graph
+
+opencargo suit les dependances entre packages et permet l'analyse d'impact.
+
+```bash
+# Dependances d'un package
+curl http://localhost:6789/api/v1/deps/@trace/httpservice/dependencies
+
+# Qui depend de ce package ?
+curl http://localhost:6789/api/v1/deps/@trace/context/dependents
+
+# Analyse d'impact : que se passe-t-il si on supprime cette version ?
+curl http://localhost:6789/api/v1/deps/@trace/context/versions/1.0.0/impact \
+  -H "Authorization: Bearer admin-token"
+```
+
+Les dependances sont extraites automatiquement au moment de la publication (npm: dependencies/devDependencies, Cargo: deps, Go: go.mod).
+
+---
+
+## Webhooks
+
+Les webhooks notifient des systemes externes quand des evenements se produisent.
+
+### Gestion via API
+
+```bash
+# Creer un webhook
+curl -X POST http://localhost:6789/api/v1/webhooks \
+  -H "Authorization: Bearer admin-token" \
+  -d '{"url": "https://ci.company.com/hooks", "events": "package.published,package.promoted", "secret": "mon-secret"}'
+
+# Lister les webhooks
+curl http://localhost:6789/api/v1/webhooks \
+  -H "Authorization: Bearer admin-token"
+
+# Tester un webhook
+curl -X POST http://localhost:6789/api/v1/webhooks/1/test \
+  -H "Authorization: Bearer admin-token"
+
+# Supprimer
+curl -X DELETE http://localhost:6789/api/v1/webhooks/1 \
+  -H "Authorization: Bearer admin-token"
+```
+
+### Evenements disponibles
+
+| Evenement | Declencheur |
+|-----------|-------------|
+| `package.published` | Publication d'une nouvelle version |
+| `package.promoted` | Promotion d'un package entre repos |
+| `*` | Tous les evenements |
+
+### Signature
+
+Si un `secret` est configure, chaque requete webhook inclut un header `X-Webhook-Signature` contenant le HMAC-SHA256 du body.
+
+---
+
+## Vulnerability scanning (OSV.dev)
+
+opencargo scanne les dependances de chaque package publie via l'API gratuite [OSV.dev](https://osv.dev/).
+
+### Configuration
+
+```toml
+[vuln_scan]
+enabled = true
+block_on_critical = false  # true = bloquer la publication si CVE critique
+```
+
+### API
+
+```bash
+# Resultats du scan
+curl http://localhost:6789/api/v1/vulns/@trace/httpclient/1.0.0 \
+  -H "Authorization: Bearer mon-token"
+
+# Re-scanner une version
+curl -X POST http://localhost:6789/api/v1/vulns/@trace/httpclient/1.0.0/rescan \
+  -H "Authorization: Bearer mon-token"
+```
+
+---
+
 ## Interface Web
 
-L'UI est une SPA SolidJS embarquee dans le binaire. Ouvrir `http://localhost:6789/`.
+SPA SolidJS embarquee dans le binaire. Ouvrir `http://localhost:6789/`.
 
-**Public (sans authentification) :**
-- Dashboard : stats, packages recents
-- Packages : liste avec recherche et filtre par repo
-- Detail package : README, versions, commande d'install
-- Recherche
+**Public :**
+- Dashboard (stats, packages recents)
+- Packages (liste, recherche, filtre par repo)
+- Detail package (README, versions, dependances, securite, install command)
+- Recherche full-text
+- Containers (guide OCI/Docker)
+- Go Modules (guide GOPROXY)
 
 **Admin (apres login) :**
-- Vue d'ensemble admin
-- Gestion des repositories
-- Gestion des utilisateurs (creer, modifier, supprimer)
-- Gestion des tokens
-- Gestion des packages (supprimer, yank)
-- Journal d'audit
-- Status systeme et metriques
+- Vue d'ensemble
+- Repositories (CRUD)
+- Users (CRUD, permissions)
+- Packages (promote, yank, delete)
+- Webhooks (CRUD)
+- Audit log
+- System (health, metrics)
+- Password change
 
 ---
 
@@ -435,13 +575,13 @@ L'UI est une SPA SolidJS embarquee dans le binaire. Ouvrir `http://localhost:678
 ### Protocole npm
 
 ```
-GET    /{repo}/@{scope}/{name}                    Metadata du package
-GET    /{repo}/@{scope}/{name}/-/{file}.tgz       Telecharger le tarball
-PUT    /{repo}/@{scope}/{name}                    Publier une version
+GET    /{repo}/@{scope}/{name}                    Metadata
+GET    /{repo}/@{scope}/{name}/-/{file}.tgz       Tarball
+PUT    /{repo}/@{scope}/{name}                    Publier
 GET    /{repo}/-/v1/search?text=query             Recherche
 GET    /{repo}/-/package/@{scope}/{name}/dist-tags  Dist-tags
 PUT    /{repo}/-/package/@{scope}/{name}/dist-tags/{tag}  Set dist-tag
-DELETE /{repo}/-/package/@{scope}/{name}/dist-tags/{tag}  Supprimer dist-tag
+DELETE /{repo}/-/package/@{scope}/{name}/dist-tags/{tag}  Delete dist-tag
 PUT    /-/user/org.couchdb.user:{username}        npm login
 GET    /-/whoami                                  Utilisateur courant
 ```
@@ -449,9 +589,9 @@ GET    /-/whoami                                  Utilisateur courant
 ### Protocole Cargo (sparse)
 
 ```
-GET    /{repo}/index/config.json                  Config du registry
-GET    /{repo}/index/{prefix}/{name}              Index d'une crate
-PUT    /{repo}/api/v1/crates/new                  Publier une crate
+GET    /{repo}/index/config.json                  Config
+GET    /{repo}/index/{prefix}/{name}              Index
+PUT    /{repo}/api/v1/crates/new                  Publier
 GET    /{repo}/api/v1/crates/{name}/{ver}/download  Telecharger
 DELETE /{repo}/api/v1/crates/{name}/{ver}/yank      Yank
 PUT    /{repo}/api/v1/crates/{name}/{ver}/unyank    Unyank
@@ -460,23 +600,40 @@ PUT    /{repo}/api/v1/crates/{name}/{ver}/unyank    Unyank
 ### Protocole OCI (Docker)
 
 ```
-GET    /v2/                                         API version check
-HEAD   /v2/{repo}/{name}/blobs/{digest}              Verifier si un blob existe
-GET    /v2/{repo}/{name}/blobs/{digest}              Telecharger un blob
-DELETE /v2/{repo}/{name}/blobs/{digest}              Supprimer un blob
-POST   /v2/{repo}/{name}/blobs/uploads/              Initier un upload de blob
-PATCH  /v2/{repo}/{name}/blobs/uploads/{uuid}        Upload de chunk
-PUT    /v2/{repo}/{name}/blobs/uploads/{uuid}?digest= Completer un upload
-GET    /v2/{repo}/{name}/manifests/{reference}       Telecharger un manifest
-HEAD   /v2/{repo}/{name}/manifests/{reference}       Verifier un manifest
-PUT    /v2/{repo}/{name}/manifests/{reference}       Push un manifest
-DELETE /v2/{repo}/{name}/manifests/{reference}       Supprimer un manifest
-GET    /v2/{repo}/{name}/tags/list                   Lister les tags
+GET    /v2/                                         Version check
+HEAD   /v2/{repo}/{name}/blobs/{digest}              Head blob
+GET    /v2/{repo}/{name}/blobs/{digest}              Get blob
+DELETE /v2/{repo}/{name}/blobs/{digest}              Delete blob
+POST   /v2/{repo}/{name}/blobs/uploads/              Start upload
+PATCH  /v2/{repo}/{name}/blobs/uploads/{uuid}        Upload chunk
+PUT    /v2/{repo}/{name}/blobs/uploads/{uuid}?digest= Complete upload
+GET    /v2/{repo}/{name}/manifests/{reference}       Get manifest
+HEAD   /v2/{repo}/{name}/manifests/{reference}       Head manifest
+PUT    /v2/{repo}/{name}/manifests/{reference}       Push manifest
+DELETE /v2/{repo}/{name}/manifests/{reference}       Delete manifest
+GET    /v2/{repo}/{name}/tags/list                   List tags
+```
+
+### Protocole Go (GOPROXY)
+
+```
+GET    /{repo}/{module}/@v/list                   Lister les versions
+GET    /{repo}/{module}/@v/{version}.info          Info version
+GET    /{repo}/{module}/@v/{version}.mod           go.mod
+GET    /{repo}/{module}/@v/{version}.zip           Module zip
+PUT    /{repo}/{module}/@v/{version}               Publier
 ```
 
 ### Administration
 
 ```
+POST   /api/v1/repositories                       Creer un repo
+GET    /api/v1/repositories                        Lister les repos
+GET    /api/v1/repositories/{name}                 Detail repo
+PUT    /api/v1/repositories/{name}                 Modifier repo
+DELETE /api/v1/repositories/{name}                 Supprimer repo
+POST   /api/v1/repositories/{name}/purge-cache     Purger le cache proxy
+
 POST   /api/v1/users                              Creer un utilisateur
 GET    /api/v1/users                              Lister les utilisateurs
 GET    /api/v1/users/{username}                    Detail utilisateur
@@ -485,22 +642,53 @@ DELETE /api/v1/users/{username}                    Supprimer utilisateur
 PUT    /api/v1/users/{username}/password           Changer le mot de passe
 GET    /api/v1/users/{username}/tokens             Lister les tokens
 POST   /api/v1/users/{username}/tokens             Creer un token
-DELETE /api/v1/users/{username}/tokens/{id}         Revoquer un token
+DELETE /api/v1/users/{username}/tokens/{id}        Revoquer un token
+GET    /api/v1/users/{username}/permissions         Lister les permissions
+PUT    /api/v1/users/{username}/permissions/{repo}  Set permissions
+DELETE /api/v1/users/{username}/permissions/{repo}  Supprimer permissions
+
+GET    /api/v1/webhooks                            Lister les webhooks
+POST   /api/v1/webhooks                            Creer un webhook
+PUT    /api/v1/webhooks/{id}                       Modifier un webhook
+DELETE /api/v1/webhooks/{id}                       Supprimer un webhook
+POST   /api/v1/webhooks/{id}/test                  Tester un webhook
+
 GET    /api/v1/system/audit?page=1&size=50         Journal d'audit
 ```
 
 ### Promotion
 
 ```
-POST   /api/v1/packages/{name}/versions/{ver}/promote     Promouvoir une version
-GET    /api/v1/packages/{name}/versions/{ver}/promotions   Historique de promotion
+POST   /api/v1/promote/@{scope}/{name}/{version}              Promouvoir (scoped)
+POST   /api/v1/promote/{name}/{version}                       Promouvoir (unscoped)
+GET    /api/v1/promotions/@{scope}/{name}/{version}            Historique (scoped)
+GET    /api/v1/promotions/{name}/{version}                     Historique (unscoped)
+```
+
+### Dependency graph
+
+```
+GET    /api/v1/deps/@{scope}/{name}/dependencies               Dependances
+GET    /api/v1/deps/{name}/dependencies                        Dependances (unscoped)
+GET    /api/v1/deps/@{scope}/{name}/dependents                 Dependants
+GET    /api/v1/deps/{name}/dependents                          Dependants (unscoped)
+GET    /api/v1/deps/@{scope}/{name}/versions/{ver}/impact      Impact analysis
+GET    /api/v1/deps/{name}/versions/{ver}/impact               Impact analysis (unscoped)
+```
+
+### Vulnerability scanning
+
+```
+GET    /api/v1/vulns/@{scope}/{name}/{version}                 Resultats scan
+POST   /api/v1/vulns/@{scope}/{name}/{version}/rescan          Re-scanner
+GET    /api/v1/vulns/{name}/{version}                          Resultats (unscoped)
+POST   /api/v1/vulns/{name}/{version}/rescan                   Re-scanner (unscoped)
 ```
 
 ### Frontend API
 
 ```
 GET    /api/v1/dashboard                           Stats globales
-GET    /api/v1/repositories                        Liste des repos
 GET    /api/v1/packages?q=&repo=&page=             Liste paginee
 GET    /api/v1/packages/{name}                     Detail package
 GET    /api/v1/search?q=                           Recherche
@@ -542,7 +730,7 @@ docker run -p 6789:6789 \
   opencargo --config /config/config.toml
 ```
 
-### Kubernetes (manifests)
+### Kubernetes
 
 ```bash
 kubectl apply -k k8s/
@@ -557,6 +745,16 @@ helm install opencargo helm/opencargo/ \
   --set ingress.host=registry.company.com
 ```
 
+### TLS natif
+
+```toml
+[server.tls]
+cert_path = "/path/to/cert.pem"
+key_path = "/path/to/key.pem"
+```
+
+Si configure, opencargo sert en HTTPS directement via rustls. En k8s, il est plus courant de terminer le TLS a l'Ingress.
+
 ### Tilt (dev loop)
 
 ```bash
@@ -565,48 +763,7 @@ tilt up
 
 ### Mode sidecar CI
 
-opencargo peut etre utilise comme sidecar dans vos pods CI pour cacher les telechargements npm/cargo. Le sidecar fonctionne comme un proxy-cache local : les packages sont telecharges depuis le registry upstream au premier build, puis servis depuis le cache local pour les builds suivants.
-
-Avantages :
-- Premier build : temps normal
-- Builds suivants : `pnpm install` en ~5-10s au lieu de ~45s
-- Zero configuration cote developpeur
-
-Voir le repertoire `k8s/sidecar/` pour les manifests Kubernetes, ainsi que des exemples pour GitHub Actions et GitLab CI.
-
-```bash
-# Deployer le sidecar dans k8s
-kubectl apply -f k8s/sidecar/configmap.yaml
-kubectl apply -f k8s/sidecar/sidecar-deployment.yaml
-```
-
----
-
-## Vulnerability Scanning (OSV.dev)
-
-opencargo peut scanner les dependances de chaque package publie pour detecter les vulnerabilites connues via l'API gratuite [OSV.dev](https://osv.dev/).
-
-### Configuration
-
-```toml
-[vuln_scan]
-enabled = true
-block_on_critical = false  # true = bloquer la publication si une CVE critique est trouvee
-```
-
-### Fonctionnement
-
-- Au moment de la publication, les dependances sont extraites du metadata et envoyees a OSV.dev
-- Le scan est asynchrone par defaut (ne bloque pas la publication)
-- Si `block_on_critical = true`, le scan est synchrone et bloque la publication en cas de CVE critique (score >= 9.0)
-- Les resultats sont stockes en base et consultables via l'API
-
-### API
-
-```
-GET    /api/v1/packages/{name}/versions/{version}/vulns    Resultats du scan
-POST   /api/v1/packages/{name}/versions/{version}/rescan   Re-scanner une version
-```
+opencargo peut tourner comme sidecar dans les pods CI pour cacher les telechargements. Voir `k8s/sidecar/` pour les manifests et exemples GitHub Actions / GitLab CI.
 
 ---
 
@@ -617,15 +774,21 @@ POST   /api/v1/packages/{name}/versions/{version}/rescan   Re-scanner une versio
 cargo test
 
 # Par suite
-cargo test --test npm_test           # Integration HTTP npm
-cargo test --test pnpm_e2e_test      # E2E avec pnpm 10
-cargo test --test proxy_test         # Proxy + group (reseau requis)
-cargo test --test auth_test          # Auth, users, tokens, promotion
+cargo test --test npm_test           # Integration npm
+cargo test --test pnpm_e2e_test      # E2E pnpm 10
+cargo test --test proxy_test         # Proxy + group (reseau)
+cargo test --test auth_test          # Auth, users, tokens, rate limit
 cargo test --test features_test      # UI, metrics, Cargo
 cargo test --test promote_test       # Promotion de packages
-cargo test --test vuln_test          # Vulnerability scanning (reseau requis)
-cargo test --test docker_e2e_test    # Docker/OCI Basic Auth E2E
 cargo test --test oci_test           # OCI push/pull/tags
+cargo test --test docker_e2e_test    # Docker Basic Auth E2E
+cargo test --test go_test            # Go modules
+cargo test --test deps_test          # Dependency graph
+cargo test --test webhook_test       # Webhooks
+cargo test --test vuln_test          # Vulnerability scanning (reseau)
+cargo test --test tls_test           # TLS natif
+cargo test --test e2e_scoped_test    # E2E packages scoped
+cargo test --test permissions_test   # Permissions granulaires
 ```
 
 ---
