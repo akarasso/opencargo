@@ -53,12 +53,23 @@ function createAuthStore() {
         setUsername(user);
         localStorage.setItem('opencargo_token', data.token);
         localStorage.setItem('opencargo_username', user);
+        if (data.must_change_password) {
+          localStorage.setItem('opencargo_must_change_password', '1');
+        }
         return null;
       }
       return data.error || 'Login failed';
     } catch (e) {
       return 'Network error';
     }
+  }
+
+  function mustChangePassword(): boolean {
+    return localStorage.getItem('opencargo_must_change_password') === '1';
+  }
+
+  function clearMustChangePassword() {
+    localStorage.removeItem('opencargo_must_change_password');
   }
 
   function logout() {
@@ -75,7 +86,7 @@ function createAuthStore() {
   // Check auth on startup
   checkAuth();
 
-  return { token, username, checking, login, logout, isAuthenticated };
+  return { token, username, checking, login, logout, isAuthenticated, mustChangePassword, clearMustChangePassword };
 }
 
 const auth = createRoot(createAuthStore);

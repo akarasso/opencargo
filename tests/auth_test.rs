@@ -774,7 +774,7 @@ async fn test_must_change_password_blocks_npm_login() {
     let admin_password = std::fs::read_to_string(&password_file)
         .expect("admin.password file should exist");
 
-    // Try npm login with the initial admin password — should get 403
+    // Try npm login with the initial admin password — should succeed but flag must_change_password
     let resp = client
         .put(format!("{}/-/user/org.couchdb.user:admin", base_url))
         .json(&json!({
@@ -787,20 +787,19 @@ async fn test_must_change_password_blocks_npm_login() {
 
     assert_eq!(
         resp.status(),
-        StatusCode::FORBIDDEN,
-        "npm login should be blocked when must_change_password is set"
+        StatusCode::CREATED,
+        "npm login should succeed even with must_change_password"
     );
     let body: Value = resp.json().await.expect("invalid json");
-    assert!(
-        body["error"].as_str().unwrap().contains("Password change required"),
-        "error should mention password change requirement"
+    assert_eq!(body["must_change_password"], true,
+        "login response should flag must_change_password"
     );
 
     // Change the password via the password change endpoint (using static admin token)
     let new_password = "changed-admin-password";
     change_password_as_admin(&client, &base_url, "test-token", "admin", new_password).await;
 
-    // Now npm login should work
+    // Now npm login should return must_change_password: false
     let resp = client
         .put(format!("{}/-/user/org.couchdb.user:admin", base_url))
         .json(&json!({
@@ -815,6 +814,10 @@ async fn test_must_change_password_blocks_npm_login() {
         resp.status(),
         StatusCode::CREATED,
         "npm login should succeed after password change"
+    );
+    let body: Value = resp.json().await.expect("invalid json");
+    assert_eq!(body["must_change_password"], false,
+        "after password change, must_change_password should be false"
     );
 
     // A user created via API should NOT have must_change_password

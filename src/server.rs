@@ -575,14 +575,7 @@ async fn npm_login(
             .into_response();
     }
 
-    // Block login if password change is required
-    if user.must_change_password == 1 {
-        return (
-            StatusCode::FORBIDDEN,
-            Json(json!({"error": "Password change required. Log in to the web UI to change your password."})),
-        )
-            .into_response();
-    }
+    let must_change = user.must_change_password == 1;
 
     // Create a new API token for this login session
     let token_id = uuid::Uuid::new_v4().to_string();
@@ -613,7 +606,7 @@ async fn npm_login(
             .into_response();
     }
 
-    (StatusCode::CREATED, Json(json!({"ok": true, "token": raw_token}))).into_response()
+    (StatusCode::CREATED, Json(json!({"ok": true, "token": raw_token, "must_change_password": must_change}))).into_response()
 }
 
 /// Parse a duration string like "10s", "24h", "30m" into seconds.
