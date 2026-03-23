@@ -25,6 +25,12 @@ Registry de packages universel, leger et auto-heberge, ecrit en Rust.
 ### 1. Build
 
 ```bash
+make build       # dev
+make release     # production
+```
+
+Ou manuellement :
+```bash
 cd frontend && pnpm install && pnpm build && cd ..
 cargo build --release
 ```
@@ -37,6 +43,12 @@ cp config.example.toml config.toml
 
 ### 3. Lancer
 
+```bash
+make dev         # dev (avec logs debug)
+make serve       # production
+```
+
+Ou manuellement :
 ```bash
 ./target/release/opencargo --config config.toml
 ```
@@ -767,11 +779,35 @@ opencargo peut tourner comme sidecar dans les pods CI pour cacher les telecharge
 
 ---
 
+## Makefile
+
+```bash
+make help                # Toutes les commandes disponibles
+make build               # Build frontend + Rust (dev)
+make release             # Build en mode release
+make dev                 # Lancer en dev avec logs
+make test                # Tous les tests
+make test-quick          # Tests sans reseau
+make check               # Lint + tests (CI local)
+make docker              # Build image Docker
+make deploy              # Deployer sur k8s
+make helm-install        # Deployer avec Helm
+make sidecar-deploy      # Deployer le sidecar CI
+make publish-trace       # Publier les @trace/* pour tester
+make clean               # Nettoyer
+make reset-db            # Reset la DB
+```
+
+---
+
 ## Tests
 
 ```bash
-# Tous les tests
-cargo test
+# Via Makefile
+make test                # Tous les tests
+make test-quick          # Sans reseau
+make test-docker         # Docker/OCI
+make test-e2e            # E2E complets
 
 # Par suite
 cargo test --test npm_test           # Integration npm
