@@ -1,0 +1,103 @@
+[package]
+name = "opencargo"
+version = "0.1.0"
+edition = "2021"
+description = "A lightweight, self-hosted universal package registry"
+license = "MIT"
+
+[[bin]]
+name = "opencargo"
+path = "src/main.rs"
+
+[dependencies]
+# HTTP server
+axum = { version = "0.8", features = ["macros"] }
+tokio = { version = "1", features = ["full"] }
+tower = { version = "0.5", features = ["util"] }
+tower-http = { version = "0.6", features = ["cors", "trace"] }
+hyper = { version = "1" }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# Database
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "migrate", "chrono"] }
+
+# CLI
+clap = { version = "4", features = ["derive", "env"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Crypto
+sha2 = "0.10"
+sha1 = "0.10"
+hmac = "0.12"
+base64 = "0.22"
+rand = "0.8"
+
+# Tar/gzip
+flate2 = "1"
+tar = "0.4"
+
+# Async utilities
+async-trait = "0.1"
+bytes = "1"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# UUID
+uuid = { version = "1", features = ["v4", "serde"] }
+
+# Config
+dirs = "6"
+
+# HTTP client (proxy upstream)
+reqwest = { version = "0.12", features = ["json"] }
+
+# Auth (password hashing)
+argon2 = "0.5"
+
+# Metrics (Prometheus)
+metrics = "0.24"
+metrics-exporter-prometheus = "0.16"
+
+# Embedded frontend assets (SPA)
+rust-embed = { version = "8", features = ["interpolate-folder-path"] }
+mime_guess = "2"
+
+# Markdown rendering
+pulldown-cmark = "0.12"
+
+# HTML sanitization (XSS prevention)
+ammonia = "4"
+
+# Cron scheduler (cleanup policies)
+tokio-cron-scheduler = "0.13"
+
+# TLS
+axum-server = { version = "0.7", features = ["tls-rustls"] }
+zip = "8.3.1"
+
+[dev-dependencies]
+reqwest = { version = "0.12", features = ["json", "native-tls"] }
+tempfile = "3"
+tokio-test = "0.4"
+rcgen = "0.13"
+
+[package.metadata.opencargo]
+frontend-dir = "frontend"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
+opt-level = "z"

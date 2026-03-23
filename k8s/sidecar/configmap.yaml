@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: opencargo-sidecar-config
+data:
+  config.toml: |
+    [server]
+    bind = "0.0.0.0:6789"
+    base_url = "http://localhost:6789"
+    storage_path = "/data/storage"
+
+    [database]
+    url = "sqlite:/data/db/opencargo.db"
+
+    [auth]
+    anonymous_read = true
+
+    [auth.admin]
+    username = "admin"
+
+    [[repositories]]
+    name = "npm-all"
+    type = "proxy"
+    format = "npm"
+    upstream = "https://registry.npmjs.org"

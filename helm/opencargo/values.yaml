@@ -1,0 +1,48 @@
+replicaCount: 1
+
+image:
+  repository: ghcr.io/trace/opencargo
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+storage:
+  size: 50Gi
+  storageClass: ""
+
+config: |
+  [server]
+  bind = "0.0.0.0:6789"
+  base_url = "http://localhost:6789"
+  storage_path = "/data/storage"
+
+  [database]
+  url = "sqlite:/data/db/opencargo.db?mode=rwc"
+
+  [auth]
+  anonymous_read = true
+
+auth:
+  adminPassword: "admin"
+
+ingress:
+  enabled: false
+  className: ""
+  host: opencargo.local
+  annotations: {}
+  tls: []
+
+resources:
+  requests:
+    cpu: 100m
+    memory: 128Mi
+  limits:
+    cpu: 500m
+    memory: 512Mi
+
+service:
+  type: ClusterIP
+  port: 6789
+
+nodeSelector: {}
+tolerations: []
+affinity: {}

@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: opencargo
+  labels:
+    app: opencargo
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: opencargo
+  template:
+    metadata:
+      labels:
+        app: opencargo
+    spec:
+      containers:
+        - name: opencargo
+          image: ghcr.io/trace/opencargo:latest
+          args:
+            - serve
+            - --config
+            - /etc/opencargo/config.toml
+          ports:
+            - name: http
+              containerPort: 6789
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /health/ready
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          resources:
+            requests:
+              cpu: 100m
+              memory: 128Mi
+            limits:
+              cpu: 500m
+              memory: 512Mi
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/opencargo
+              readOnly: true
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: opencargo-data
+        - name: config
+          configMap:
+            name: opencargo-config
