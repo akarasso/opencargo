@@ -1,0 +1,34 @@
+# Rust
+/target
+
+# Data (storage + database)
+/data
+*.db
+*.db-wal
+*.db-shm
+
+# Config locale (peut contenir des tokens)
+config.toml
+!config.example.toml
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Tilt
+.tilt-dev/
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+node_modules
+
+# CI
+.cargo/
