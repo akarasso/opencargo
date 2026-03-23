@@ -23,6 +23,8 @@ export default function Login() {
 
     if (err) {
       setError(err);
+    } else if (auth.mustChangePassword()) {
+      navigate('/admin/password', { replace: true });
     } else {
       navigate('/admin', { replace: true });
     }
