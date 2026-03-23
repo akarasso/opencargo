@@ -32,3 +32,11 @@ node_modules
 
 # CI
 .cargo/
+
+# Secrets
+.env
+kubeconfig*
+*.kubeconfig
+
+# Stitch design artefacts
+frontend/stitch-*.html
