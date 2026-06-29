@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use axum::{
     body::Bytes,
-    extract::Path,
+    extract::{DefaultBodyLimit, Path},
     http::StatusCode,
     response::IntoResponse,
     routing::{delete, get, head, post, put},
@@ -23,6 +23,17 @@ use crate::storage::FilesystemStorage;
 use crate::telemetry;
 use crate::telemetry::vulns::VulnScanner;
 use crate::telemetry::webhooks::WebhookDispatcher;
+
+/// Maximum request body size accepted by the server (1 GiB).
+///
+/// cargo crates and OCI blobs/layers routinely exceed axum's 2 MiB default,
+/// which previously made cargo publish and OCI pushes fail with 413. The
+/// cargo/OCI handlers use the `Bytes` extractor (subject to this limit);
+/// npm/go read their body via `to_bytes(..)` with their own explicit caps and
+/// are unaffected. Bodies are still buffered fully in memory today, so this is
+/// a deliberate hard cap rather than `DefaultBodyLimit::disable()` — switching
+/// storage to streaming (P1) is the follow-up that lets this grow safely.
+const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -449,6 +460,10 @@ pub fn build_router(state: AppState) -> Router {
         .merge(web_routes)
         // Metrics endpoint (outside auth middleware)
         .merge(metrics_routes)
+        // Raise the body-size limit for the whole app so cargo crates and OCI
+        // blobs/layers (which use the `Bytes` extractor) are not rejected at
+        // axum's 2 MiB default. See MAX_BODY_BYTES.
+        .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
         // HTTP metrics middleware (outermost layer, records all requests)
         .layer(axum::middleware::from_fn(
             telemetry::http_metrics_middleware,
@@ -633,9 +648,9 @@ fn parse_duration_secs(s: &str) -> u64 {
 /// Must be applied as a `tower` `map_request` layer **outside** the
 /// axum `Router` — using `Router::layer()` would run _after_ route
 /// matching and therefore have no effect on 404s.
-pub fn decode_percent_encoded_slashes(
-    mut req: axum::http::Request<axum::body::Body>,
-) -> axum::http::Request<axum::body::Body> {
+pub fn decode_percent_encoded_slashes<B>(
+    mut req: axum::http::Request<B>,
+) -> axum::http::Request<B> {
     let path = req.uri().path();
     if path.contains("%2f") || path.contains("%2F") {
         let decoded = path.replace("%2f", "/").replace("%2F", "/");
