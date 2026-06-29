@@ -172,21 +172,44 @@ async fn count_scalar(pool: &SqlitePool, query: &str) -> i64 {
 // Handlers
 // ---------------------------------------------------------------------------
 
-pub async fn dashboard_stats(State(state): State<AppState>) -> impl IntoResponse {
-    let pool = &state.db;
+/// SQL fragments restricting `packages` rows to publicly-visible repositories
+/// for non-admin/anonymous callers (both empty for admins). `.0` is an ` AND …`
+/// fragment for queries that already have a WHERE; `.1` is a ` WHERE …` fragment
+/// for those that don't. `repository_id` is unambiguous — only `packages` has it.
+fn visibility_sql(
+    auth: &Option<axum::Extension<crate::auth::middleware::AuthUser>>,
+) -> (&'static str, &'static str) {
+    let is_admin = auth.as_ref().map(|e| e.0.role == "admin").unwrap_or(false);
+    if is_admin {
+        ("", "")
+    } else {
+        (
+            " AND repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')",
+            " WHERE repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')",
+        )
+    }
+}
 
-    let total_packages = count_scalar(pool, "SELECT COUNT(*) FROM packages").await;
+pub async fn dashboard_stats(
+    State(state): State<AppState>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
+) -> impl IntoResponse {
+    let pool = &state.db;
+    let (_, where_vis) = visibility_sql(&auth);
+
+    let total_packages =
+        count_scalar(pool, &format!("SELECT COUNT(*) FROM packages{where_vis}")).await;
     let total_versions = count_scalar(pool, "SELECT COUNT(*) FROM versions").await;
     let total_downloads = count_scalar(pool, "SELECT COUNT(*) FROM downloads").await;
     let total_repos = count_scalar(pool, "SELECT COUNT(*) FROM repositories").await;
 
-    let recent = sqlx::query_as::<_, (String, String, String)>(
+    let recent = sqlx::query_as::<_, (String, String, String)>(&format!(
         "SELECT p.name, v.version, v.published_at
          FROM versions v
-         JOIN packages p ON p.id = v.package_id
+         JOIN packages p ON p.id = v.package_id{where_vis}
          ORDER BY v.published_at DESC
          LIMIT 10",
-    )
+    ))
     .fetch_all(pool)
     .await
     .unwrap_or_default();
@@ -228,21 +251,23 @@ pub async fn list_repositories(State(state): State<AppState>) -> impl IntoRespon
 pub async fn list_packages(
     State(state): State<AppState>,
     Query(params): Query<PackagesQuery>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> impl IntoResponse {
     let pool = &state.db;
+    let (and_vis, where_vis) = visibility_sql(&auth);
     let page = if params.page < 1 { 1 } else { params.page };
     let offset = (page - 1) * PAGE_SIZE;
 
     let (pkg_rows, count) = if !params.repo.is_empty() && !params.q.is_empty() {
         let search = format!("%{}%", params.q);
-        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(
+        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(&format!(
             "SELECT p.id, p.name, p.description, p.updated_at
              FROM packages p
              JOIN repositories r ON r.id = p.repository_id
-             WHERE r.name = ?1 AND p.name LIKE ?2
+             WHERE r.name = ?1 AND p.name LIKE ?2{and_vis}
              ORDER BY p.updated_at DESC
              LIMIT ?3 OFFSET ?4",
-        )
+        ))
         .bind(&params.repo)
         .bind(&search)
         .bind(PAGE_SIZE)
@@ -251,11 +276,11 @@ pub async fn list_packages(
         .await
         .unwrap_or_default();
 
-        let cnt = sqlx::query_scalar::<_, i64>(
+        let cnt = sqlx::query_scalar::<_, i64>(&format!(
             "SELECT COUNT(*) FROM packages p
              JOIN repositories r ON r.id = p.repository_id
-             WHERE r.name = ?1 AND p.name LIKE ?2",
-        )
+             WHERE r.name = ?1 AND p.name LIKE ?2{and_vis}",
+        ))
         .bind(&params.repo)
         .bind(&search)
         .fetch_one(pool)
@@ -264,14 +289,14 @@ pub async fn list_packages(
 
         (rows, cnt)
     } else if !params.repo.is_empty() {
-        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(
+        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(&format!(
             "SELECT p.id, p.name, p.description, p.updated_at
              FROM packages p
              JOIN repositories r ON r.id = p.repository_id
-             WHERE r.name = ?1
+             WHERE r.name = ?1{and_vis}
              ORDER BY p.updated_at DESC
              LIMIT ?2 OFFSET ?3",
-        )
+        ))
         .bind(&params.repo)
         .bind(PAGE_SIZE)
         .bind(offset)
@@ -279,11 +304,11 @@ pub async fn list_packages(
         .await
         .unwrap_or_default();
 
-        let cnt = sqlx::query_scalar::<_, i64>(
+        let cnt = sqlx::query_scalar::<_, i64>(&format!(
             "SELECT COUNT(*) FROM packages p
              JOIN repositories r ON r.id = p.repository_id
-             WHERE r.name = ?1",
-        )
+             WHERE r.name = ?1{and_vis}",
+        ))
         .bind(&params.repo)
         .fetch_one(pool)
         .await
@@ -292,13 +317,13 @@ pub async fn list_packages(
         (rows, cnt)
     } else if !params.q.is_empty() {
         let search = format!("%{}%", params.q);
-        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(
+        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(&format!(
             "SELECT p.id, p.name, p.description, p.updated_at
              FROM packages p
-             WHERE p.name LIKE ?1
+             WHERE p.name LIKE ?1{and_vis}
              ORDER BY p.updated_at DESC
              LIMIT ?2 OFFSET ?3",
-        )
+        ))
         .bind(&search)
         .bind(PAGE_SIZE)
         .bind(offset)
@@ -306,9 +331,9 @@ pub async fn list_packages(
         .await
         .unwrap_or_default();
 
-        let cnt = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM packages p WHERE p.name LIKE ?1",
-        )
+        let cnt = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM packages p WHERE p.name LIKE ?1{and_vis}",
+        ))
         .bind(&search)
         .fetch_one(pool)
         .await
@@ -316,22 +341,24 @@ pub async fn list_packages(
 
         (rows, cnt)
     } else {
-        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(
+        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(&format!(
             "SELECT p.id, p.name, p.description, p.updated_at
-             FROM packages p
+             FROM packages p{where_vis}
              ORDER BY p.updated_at DESC
              LIMIT ?1 OFFSET ?2",
-        )
+        ))
         .bind(PAGE_SIZE)
         .bind(offset)
         .fetch_all(pool)
         .await
         .unwrap_or_default();
 
-        let cnt = sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM packages")
-            .fetch_one(pool)
-            .await
-            .unwrap_or(0);
+        let cnt = sqlx::query_scalar::<_, i64>(&format!(
+            "SELECT COUNT(*) FROM packages{where_vis}"
+        ))
+        .fetch_one(pool)
+        .await
+        .unwrap_or(0);
 
         (rows, cnt)
     };
@@ -380,12 +407,14 @@ pub async fn list_packages(
 pub async fn package_detail(
     State(state): State<AppState>,
     axum::extract::Path(path): axum::extract::Path<String>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> impl IntoResponse {
     let pool = &state.db;
     let pkg_name = path.as_str();
+    let (and_vis, _) = visibility_sql(&auth);
 
     let pkg = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, Option<String>)>(
-        "SELECT id, name, description, readme, license FROM packages WHERE name = ?1 LIMIT 1",
+        &format!("SELECT id, name, description, readme, license FROM packages WHERE name = ?1{and_vis} LIMIT 1"),
     )
     .bind(pkg_name)
     .fetch_optional(pool)
@@ -472,8 +501,10 @@ pub async fn package_detail(
 pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> impl IntoResponse {
     let pool = &state.db;
+    let (and_vis, _) = visibility_sql(&auth);
 
     let results = if !params.q.is_empty() {
         // Try FTS5 first, fallback to LIKE
@@ -483,14 +514,14 @@ pub async fn search(
             .collect::<Vec<_>>()
             .join(" ");
 
-        let fts_result = sqlx::query_as::<_, (i64, String, Option<String>)>(
+        let fts_result = sqlx::query_as::<_, (i64, String, Option<String>)>(&format!(
             "SELECT p.id, p.name, p.description
              FROM packages p
              JOIN packages_fts fts ON p.id = fts.rowid
-             WHERE packages_fts MATCH ?1
+             WHERE packages_fts MATCH ?1{and_vis}
              ORDER BY rank
              LIMIT 50",
-        )
+        ))
         .bind(&fts_query)
         .fetch_all(pool)
         .await;
@@ -500,13 +531,13 @@ pub async fn search(
             Err(_) => {
                 // Fallback to LIKE
                 let search = format!("%{}%", params.q);
-                sqlx::query_as::<_, (i64, String, Option<String>)>(
+                sqlx::query_as::<_, (i64, String, Option<String>)>(&format!(
                     "SELECT p.id, p.name, p.description
                      FROM packages p
-                     WHERE p.name LIKE ?1 OR p.description LIKE ?1
+                     WHERE (p.name LIKE ?1 OR p.description LIKE ?1){and_vis}
                      ORDER BY p.name
                      LIMIT 50",
-                )
+                ))
                 .bind(&search)
                 .fetch_all(pool)
                 .await
