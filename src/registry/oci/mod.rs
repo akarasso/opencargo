@@ -262,6 +262,7 @@ pub async fn start_upload(
             "can only push to hosted repositories".to_string(),
         ));
     }
+    crate::registry::ensure_format(&repo, "oci")?;
 
     // Create upload record
     let upload_id = uuid::Uuid::new_v4().to_string();

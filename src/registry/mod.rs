@@ -64,3 +64,18 @@ pub async fn ensure_can_write(
         )))
     }
 }
+
+/// Ensure the repository's declared format matches the protocol being used.
+/// Without this guard a payload of one format could be published into a repo of
+/// another (e.g. an npm tarball into a `cargo` repo), silently corrupting it
+/// since the underlying tables are shared.
+pub fn ensure_format(repo: &Repository, expected: &str) -> AppResult<()> {
+    if repo.format == expected {
+        Ok(())
+    } else {
+        Err(AppError::BadRequest(format!(
+            "repository '{}' is a '{}' repository, not '{}'",
+            repo.name, repo.format, expected
+        )))
+    }
+}
