@@ -347,6 +347,53 @@ async fn test_package_detail_page() {
     );
 }
 
+/// A9 + S17: a README sent at publish time is persisted (the `packages.readme`
+/// column used to stay empty) and surfaced by the dashboard API as rendered
+/// HTML, with embedded markup sanitized — no live <script> survives ammonia.
+#[tokio::test]
+async fn test_npm_readme_persisted_and_sanitized() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let name = "@test/readmepkg";
+    let tarball = build_tarball(
+        r#"{"name":"@test/readmepkg","version":"1.0.0","description":"readme test","main":"index.js"}"#,
+    );
+    let mut body = build_npm_publish_body(name, "1.0.0", "readme test", &tarball);
+    body["readme"] =
+        json!("# Title Heading\n\nSome **bold** text.\n\n<script>alert('xss')</script>\n");
+
+    let resp = client
+        .put(format!("{}/test-npm/{}", base_url, name))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "publish should succeed");
+
+    let resp = client
+        .get(format!("{}/api/v1/packages/{}", base_url, name))
+        .send()
+        .await
+        .expect("package detail API request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let data: Value = resp.json().await.expect("invalid JSON");
+    let readme_html = data["readme_html"].as_str().unwrap_or("");
+
+    // A9: the README content is now present (the column was never populated).
+    assert!(
+        readme_html.contains("Title Heading"),
+        "rendered README should contain the heading text, got: {readme_html}"
+    );
+    // S17: the embedded <script> must be stripped by ammonia.
+    assert!(
+        !readme_html.contains("<script"),
+        "rendered README must not contain a live <script> tag, got: {readme_html}"
+    );
+}
+
 #[tokio::test]
 async fn test_search_page() {
     let (base_url, _handle, _tmp) = setup().await;
