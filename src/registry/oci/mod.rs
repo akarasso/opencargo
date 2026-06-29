@@ -14,6 +14,7 @@ use tracing::info;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
+use crate::db::oci::{OciBlob, OciManifest, OciTag, OciUpload};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::storage::StorageBackend;
@@ -1041,58 +1042,5 @@ pub async fn list_tags(
 // Row types for OCI tables
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, sqlx::FromRow)]
-struct OciBlob {
-    #[allow(dead_code)]
-    id: i64,
-    #[allow(dead_code)]
-    repository_id: i64,
-    #[allow(dead_code)]
-    digest: String,
-    size: i64,
-    content_type: Option<String>,
-    #[allow(dead_code)]
-    created_at: String,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct OciManifest {
-    #[allow(dead_code)]
-    id: i64,
-    #[allow(dead_code)]
-    repository_id: i64,
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    digest: String,
-    content_type: String,
-    size: i64,
-    #[allow(dead_code)]
-    created_at: String,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct OciTag {
-    #[allow(dead_code)]
-    id: i64,
-    #[allow(dead_code)]
-    repository_id: i64,
-    #[allow(dead_code)]
-    name: String,
-    tag: String,
-    manifest_digest: String,
-    #[allow(dead_code)]
-    created_at: String,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-struct OciUpload {
-    #[allow(dead_code)]
-    id: String,
-    #[allow(dead_code)]
-    repository_id: i64,
-    #[allow(dead_code)]
-    name: String,
-    #[allow(dead_code)]
-    started_at: String,
-}
+// OCI row types (OciBlob/OciManifest/OciTag/OciUpload) moved to the DAL:
+// crate::db::oci (imported at the top of this file).
