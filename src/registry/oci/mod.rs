@@ -207,6 +207,21 @@ pub async fn delete_blob(
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
+    // Refuse to delete a blob still referenced by a manifest — that would break
+    // a live image. (Only manifests pushed since migration 012 are tracked.)
+    let refs: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM oci_manifest_blobs WHERE repository_id = ?1 AND blob_digest = ?2",
+    )
+    .bind(repo.id)
+    .bind(digest)
+    .fetch_one(&state.db)
+    .await?;
+    if refs > 0 {
+        return Err(AppError::Conflict(format!(
+            "blob {digest} is still referenced by {refs} manifest(s); delete those manifests first"
+        )));
+    }
+
     // Delete from DB
     let result = sqlx::query(
         "DELETE FROM oci_blobs WHERE repository_id = ?1 AND digest = ?2",
@@ -672,6 +687,29 @@ pub async fn head_manifest(
 // PUT /v2/{repo}/{name}/manifests/{reference} — Push manifest
 // ---------------------------------------------------------------------------
 
+/// Extract the blob digests an image manifest references: its config blob and
+/// every layer. Best-effort — a manifest list / unknown shape yields none.
+fn extract_blob_digests(manifest_json: &[u8]) -> Vec<String> {
+    let mut digests = Vec::new();
+    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(manifest_json) {
+        if let Some(d) = v
+            .get("config")
+            .and_then(|c| c.get("digest"))
+            .and_then(|d| d.as_str())
+        {
+            digests.push(d.to_string());
+        }
+        if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
+            for layer in layers {
+                if let Some(d) = layer.get("digest").and_then(|d| d.as_str()) {
+                    digests.push(d.to_string());
+                }
+            }
+        }
+    }
+    digests
+}
+
 pub async fn put_manifest(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
@@ -746,6 +784,24 @@ pub async fn put_manifest(
     .bind(body.len() as i64)
     .execute(&state.db)
     .await?;
+
+    // Record which blobs this manifest references (for refcount-based GC).
+    sqlx::query("DELETE FROM oci_manifest_blobs WHERE repository_id = ?1 AND manifest_digest = ?2")
+        .bind(repo.id)
+        .bind(&digest)
+        .execute(&state.db)
+        .await?;
+    for blob_digest in extract_blob_digests(&body) {
+        let _ = sqlx::query(
+            "INSERT OR IGNORE INTO oci_manifest_blobs (repository_id, manifest_digest, blob_digest)
+             VALUES (?1, ?2, ?3)",
+        )
+        .bind(repo.id)
+        .bind(&digest)
+        .bind(&blob_digest)
+        .execute(&state.db)
+        .await;
+    }
 
     // If reference is a tag (not a digest), create/update the tag mapping
     if !is_digest(&reference) {
@@ -864,6 +920,46 @@ pub async fn delete_manifest(
     .bind(&digest)
     .execute(&state.db)
     .await?;
+
+    // GC: drop this manifest's blob links, then delete any blob no longer
+    // referenced by any manifest in this repo (DB row + stored file).
+    let blob_digests: Vec<String> = sqlx::query_scalar(
+        "SELECT blob_digest FROM oci_manifest_blobs WHERE repository_id = ?1 AND manifest_digest = ?2",
+    )
+    .bind(repo.id)
+    .bind(&digest)
+    .fetch_all(&state.db)
+    .await
+    .unwrap_or_default();
+    let _ = sqlx::query(
+        "DELETE FROM oci_manifest_blobs WHERE repository_id = ?1 AND manifest_digest = ?2",
+    )
+    .bind(repo.id)
+    .bind(&digest)
+    .execute(&state.db)
+    .await;
+    for blob_digest in blob_digests {
+        let still: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM oci_manifest_blobs WHERE repository_id = ?1 AND blob_digest = ?2",
+        )
+        .bind(repo.id)
+        .bind(&blob_digest)
+        .fetch_one(&state.db)
+        .await
+        .unwrap_or(0);
+        if still == 0 {
+            let _ = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = ?1 AND digest = ?2")
+                .bind(repo.id)
+                .bind(&blob_digest)
+                .execute(&state.db)
+                .await;
+            let hex = blob_digest.strip_prefix("sha256:").unwrap_or(&blob_digest);
+            let _ = state
+                .storage
+                .delete(&format!("oci/{}/blobs/sha256/{}", image_name, hex))
+                .await;
+        }
+    }
 
     // Delete from storage
     let hex_digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
