@@ -615,6 +615,39 @@ async fn test_metrics_counts_requests() {
     );
 }
 
+/// Regression for the metrics-cardinality DoS: the Prometheus `path` label must
+/// be the matched route TEMPLATE, not the raw URI. Two requests to the same
+/// route with different dynamic segments must NOT leak those segments as label
+/// values (attacker-chosen paths would otherwise grow the series set without
+/// bound — memory exhaustion).
+#[tokio::test]
+async fn test_metrics_path_label_is_bounded() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for name in ["zzcardunique1", "zzcardunique2"] {
+        let _ = client
+            .get(format!("{}/test-npm/@test/{}", base_url, name))
+            .send()
+            .await
+            .expect("request failed");
+    }
+
+    let resp = client
+        .get(format!("{}/metrics", base_url))
+        .send()
+        .await
+        .expect("metrics request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("failed to read metrics body");
+
+    assert!(
+        !body.contains("zzcardunique1") && !body.contains("zzcardunique2"),
+        "raw dynamic path segments must not become Prometheus labels (cardinality DoS), metrics:\n{}",
+        body
+    );
+}
+
 // ===========================================================================
 // Phase 6 -- Cargo Registry Tests
 // ===========================================================================
