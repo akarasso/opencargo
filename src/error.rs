@@ -51,6 +51,22 @@ impl IntoResponse for AppError {
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::Database(err) => {
+                // A UNIQUE-constraint violation is a client-visible conflict, not
+                // an internal error. It happens e.g. on two concurrent publishes
+                // of the same package@version: both pass the pre-insert existence
+                // check, then the second INSERT violates UNIQUE(package_id,version).
+                // Map it to 409 instead of 500. (Full atomicity via DB
+                // transactions around publish/promote remains a follow-up — it
+                // needs threading a &mut Transaction through the DAL.)
+                if let sqlx::Error::Database(db_err) = err {
+                    if db_err.is_unique_violation() {
+                        return (
+                            StatusCode::CONFLICT,
+                            Json(json!({ "error": "resource already exists (conflict)" })),
+                        )
+                            .into_response();
+                    }
+                }
                 tracing::error!("Database error: {}", err);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
             }
