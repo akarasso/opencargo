@@ -226,6 +226,22 @@ pub async fn create_package(
     Ok(result.last_insert_rowid())
 }
 
+/// Update a package's stored README (raw markdown). The dashboard renders it
+/// through `render_markdown` -> ammonia, so the raw source is stored as-is and
+/// sanitized at display time.
+pub async fn update_package_readme(
+    pool: &SqlitePool,
+    package_id: i64,
+    readme: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE packages SET readme = ?1 WHERE id = ?2")
+        .bind(readme)
+        .bind(package_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 // Mirrors the `versions` table columns; a parameter struct is the eventual
 // cleanup but out of scope for the clippy pass.
 #[allow(clippy::too_many_arguments)]
