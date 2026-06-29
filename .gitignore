@@ -40,3 +40,6 @@ kubeconfig*
 
 # Stitch design artefacts
 frontend/stitch-*.html
+
+# MCP / tooling logs
+excalidraw.log
