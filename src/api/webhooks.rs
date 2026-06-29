@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::auth::middleware::AuthUser;
+use crate::api::{require_admin, require_auth};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 
@@ -34,21 +34,6 @@ pub struct UpdateWebhookRequest {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn require_auth(request: &axum::http::Request<axum::body::Body>) -> AppResult<AuthUser> {
-    request
-        .extensions()
-        .get::<AuthUser>()
-        .cloned()
-        .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))
-}
-
-fn require_admin(caller: &AuthUser) -> AppResult<()> {
-    if caller.role != "admin" {
-        return Err(AppError::Forbidden("admin access required".to_string()));
-    }
-    Ok(())
-}
 
 fn format_webhook(wh: &crate::db::Webhook) -> serde_json::Value {
     let events: Vec<String> = if wh.events == "*" {
