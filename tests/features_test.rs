@@ -760,3 +760,71 @@ async fn test_cargo_yank_unyank() {
         body_text
     );
 }
+
+/// Regression test for S2: the dashboard API must not expose packages of a
+/// PRIVATE repository to anonymous/non-admin callers, while admins still see
+/// them. cargo-private (in setup()) is a private repo.
+#[tokio::test]
+async fn test_dashboard_hides_private_packages() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    // Publish a crate into the PRIVATE repo as admin.
+    let crate_data = build_crate_data();
+    let metadata_json = r#"{"name":"test-crate","vers":"0.1.0","deps":[],"features":{},"authors":[],"description":"Secret","license":"MIT"}"#;
+    let body = build_cargo_publish_body(metadata_json, &crate_data);
+    let resp = client
+        .put(format!("{}/cargo-private/api/v1/crates/new", base_url))
+        .bearer_auth("test-token")
+        .header("content-type", "application/octet-stream")
+        .body(body)
+        .send()
+        .await
+        .expect("cargo publish failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    // Anonymous dashboard detail must NOT reveal the private package (404).
+    let resp = client
+        .get(format!("{}/api/v1/packages/test-crate", base_url))
+        .send()
+        .await
+        .expect("anonymous detail request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "anonymous caller must not see a private package via the dashboard"
+    );
+
+    // Admin sees it.
+    let resp = client
+        .get(format!("{}/api/v1/packages/test-crate", base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("admin detail request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "admin must see the private package"
+    );
+
+    // Anonymous package list must not contain it either.
+    let resp = client
+        .get(format!("{}/api/v1/packages", base_url))
+        .send()
+        .await
+        .expect("anonymous list request failed");
+    let data: Value = resp.json().await.expect("invalid JSON");
+    let empty = vec![];
+    let names: Vec<&str> = data["packages"]
+        .as_array()
+        .unwrap_or(&empty)
+        .iter()
+        .filter_map(|p| p["name"].as_str())
+        .collect();
+    assert!(
+        !names.contains(&"test-crate"),
+        "anonymous package list must not include the private 'test-crate', got: {:?}",
+        names
+    );
+}
