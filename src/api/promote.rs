@@ -12,6 +12,7 @@ use tracing::info;
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::can_admin;
 use crate::error::{AppError, AppResult};
+use crate::storage::StorageBackend;
 use crate::server::AppState;
 
 // ---------------------------------------------------------------------------
@@ -208,7 +209,24 @@ async fn promote_impl(
         )));
     }
 
-    // 6. Create a new version record pointing to the same tarball_path (no file copy)
+    // 6. Copy the tarball to a path OWNED by the target version. The previous
+    // code shared the source path, so the cleanup GC deleting the (older,
+    // pre-release) source file made the PROMOTED prod artifact undownloadable —
+    // silent data loss. Storage layout is "{format}/{repo}/{...}"; swap the repo
+    // segment for the target repo.
+    let target_tarball_path = {
+        let parts: Vec<&str> = from_version.tarball_path.splitn(3, '/').collect();
+        if parts.len() == 3 {
+            format!("{}/{}/{}", parts[0], to_repo.name, parts[2])
+        } else {
+            format!("{}/{}", to_repo.name, from_version.tarball_path)
+        }
+    };
+    if target_tarball_path != from_version.tarball_path {
+        let data = state.storage.get(&from_version.tarball_path).await?;
+        state.storage.put(&target_tarball_path, data).await?;
+    }
+
     // 7. Rewrite the dist.tarball URL to point to the target repo
     let metadata_json =
         rewrite_tarball_url(&from_version.metadata_json, &state.base_url, &body.from, &body.to);
@@ -222,7 +240,7 @@ async fn promote_impl(
         from_version.checksum_sha256.as_deref(),
         from_version.integrity.as_deref(),
         from_version.size,
-        &from_version.tarball_path, // same tarball path - no copy
+        &target_tarball_path,
     )
     .await?;
 

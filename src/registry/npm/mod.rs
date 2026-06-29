@@ -114,6 +114,7 @@ pub async fn publish_package(
             "can only publish to hosted repositories".to_string(),
         ));
     }
+    crate::registry::ensure_format(&repo, "npm")?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 

@@ -246,6 +246,7 @@ pub async fn publish_module(
             "can only publish to hosted repositories".to_string(),
         ));
     }
+    crate::registry::ensure_format(&repo, "go")?;
 
     // Read the zip body
     let zip_data = axum::body::to_bytes(request.into_body(), 100 * 1024 * 1024)
