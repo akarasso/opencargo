@@ -93,9 +93,13 @@ pub async fn auth_middleware(
 
     // Handle Basic Auth
     if let Some((username, password)) = basic_auth {
-        // Rate-limit Basic Auth to stop unlimited brute force and the Argon2 CPU
-        // DoS it enables (verify_password runs on every attempt).
-        if !state.login_rate_limiter.check(&format!("basic:{username}")) {
+        // Throttle Basic Auth to stop brute force and the Argon2 CPU DoS it
+        // enables — but only count FAILED attempts (recorded below), so a
+        // legitimate client making many authenticated requests in a burst
+        // (e.g. `docker push`) is never throttled. Checked before Argon2 so a
+        // username already over its failure budget can't keep burning CPU.
+        let rl_key = format!("basic:{username}");
+        if state.login_rate_limiter.is_limited(&rl_key) {
             return too_many_requests_response();
         }
         if let Ok(Some(user)) = crate::db::get_user_by_username(&state.db, &username).await {
@@ -123,7 +127,9 @@ pub async fn auth_middleware(
                 return next.run(request).await;
             }
         }
-        // Basic Auth provided but invalid
+        // Basic Auth failed (unknown user or bad password): record the failed
+        // attempt so repeated failures from this username get throttled.
+        state.login_rate_limiter.record_failure(&rl_key);
         return unauthorized_response(is_oci);
     }
 
