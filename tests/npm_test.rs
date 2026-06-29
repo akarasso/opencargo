@@ -441,3 +441,90 @@ async fn test_auth_required_for_publish() {
         "publish without token should return 401"
     );
 }
+
+/// `npm deprecate`: a PUT carrying an existing version flagged `deprecated`
+/// (and no _attachments) updates that version's metadata instead of 409-ing,
+/// and the flag is then served in the package document.
+#[tokio::test]
+async fn test_npm_deprecate() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    // Publish version 1.0.0 first.
+    let tarball = build_tarball(r#"{"name":"@test/deprecateme","version":"1.0.0"}"#);
+    let body = build_publish_body("@test/deprecateme", "1.0.0", "to deprecate", &tarball);
+    let resp = client
+        .put(format!("{}/test-npm/@test/deprecateme", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "publish should succeed");
+
+    // Deprecate it: same route, version flagged `deprecated`, NO _attachments.
+    let deprecate_body = json!({
+        "name": "@test/deprecateme",
+        "versions": {
+            "1.0.0": {
+                "name": "@test/deprecateme",
+                "version": "1.0.0",
+                "deprecated": "use @test/newpkg instead"
+            }
+        }
+    });
+    let resp = client
+        .put(format!("{}/test-npm/@test/deprecateme", base_url))
+        .bearer_auth("test-token")
+        .json(&deprecate_body)
+        .send()
+        .await
+        .expect("deprecate request failed");
+    assert!(
+        resp.status().is_success(),
+        "deprecate should succeed, got {}",
+        resp.status()
+    );
+
+    // The package document now exposes `deprecated` on the version.
+    let resp = client
+        .get(format!("{}/test-npm/@test/deprecateme", base_url))
+        .send()
+        .await
+        .expect("get metadata request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let doc: Value = resp.json().await.expect("invalid json");
+    assert_eq!(
+        doc["versions"]["1.0.0"]["deprecated"].as_str(),
+        Some("use @test/newpkg instead"),
+        "version 1.0.0 should be flagged deprecated, got: {:?}",
+        doc["versions"]["1.0.0"]
+    );
+
+    // Undeprecate (empty message) removes the flag.
+    let undeprecate_body = json!({
+        "name": "@test/deprecateme",
+        "versions": {
+            "1.0.0": { "name": "@test/deprecateme", "version": "1.0.0", "deprecated": "" }
+        }
+    });
+    let resp = client
+        .put(format!("{}/test-npm/@test/deprecateme", base_url))
+        .bearer_auth("test-token")
+        .json(&undeprecate_body)
+        .send()
+        .await
+        .expect("undeprecate request failed");
+    assert!(resp.status().is_success(), "undeprecate should succeed");
+
+    let resp = client
+        .get(format!("{}/test-npm/@test/deprecateme", base_url))
+        .send()
+        .await
+        .expect("get metadata request failed");
+    let doc: Value = resp.json().await.expect("invalid json");
+    assert!(
+        doc["versions"]["1.0.0"].get("deprecated").is_none(),
+        "deprecated flag should be removed after undeprecate"
+    );
+}

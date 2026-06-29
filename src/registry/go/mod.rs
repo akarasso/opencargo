@@ -11,7 +11,6 @@ use serde_json::json;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::auth::permissions::check_repo_permission;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::storage::StorageBackend;
@@ -240,10 +239,7 @@ pub async fn publish_module(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
 
-    // Check granular write permission on this repository
-    if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await {
-        return Err(AppError::Forbidden("insufficient permissions".to_string()));
-    }
+    crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
     if repo.repo_type != "hosted" {
         return Err(AppError::BadRequest(

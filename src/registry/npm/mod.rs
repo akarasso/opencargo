@@ -14,7 +14,6 @@ use sha1::Digest;
 use tracing::{info, warn};
 
 use crate::auth::middleware::AuthUser;
-use crate::auth::permissions::check_repo_permission;
 use crate::error::{AppError, AppResult};
 use crate::proxy;
 use crate::server::AppState;
@@ -42,6 +41,35 @@ pub struct Attachment {
     data: String,
     #[allow(dead_code)]
     length: Option<u64>,
+}
+
+/// Apply a metadata-only update to an existing version (npm deprecate /
+/// undeprecate): merge the incoming `deprecated` field into the stored
+/// metadata. An empty or absent `deprecated` removes the flag (undeprecate).
+async fn apply_metadata_update(
+    db: &sqlx::SqlitePool,
+    existing: &crate::db::Version,
+    new_meta: &Value,
+) -> AppResult<()> {
+    let mut meta: Value =
+        serde_json::from_str(&existing.metadata_json).unwrap_or_else(|_| json!({}));
+    if let Some(obj) = meta.as_object_mut() {
+        match new_meta.get("deprecated") {
+            // npm sends `deprecated: ""` to undeprecate.
+            Some(Value::String(s)) if s.is_empty() => {
+                obj.remove("deprecated");
+            }
+            Some(dep) => {
+                obj.insert("deprecated".to_string(), dep.clone());
+            }
+            None => {
+                obj.remove("deprecated");
+            }
+        }
+    }
+    let updated = serde_json::to_string(&meta)?;
+    crate::db::update_version_metadata(db, existing.id, &updated).await?;
+    Ok(())
 }
 
 pub async fn publish_package(
@@ -87,10 +115,7 @@ pub async fn publish_package(
         ));
     }
 
-    // Check granular write permission on this repository
-    if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await {
-        return Err(AppError::Forbidden("insufficient permissions".to_string()));
-    }
+    crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
     // Get or create the package
     let package = match crate::db::get_package(&state.db, repo.id, &package_name).await? {
@@ -113,25 +138,28 @@ pub async fn publish_package(
 
     // Process each version in the publish body
     for (version_str, version_meta) in &body.versions {
-        // Check if version already exists
-        if crate::db::get_version(&state.db, package.id, version_str)
-            .await?
-            .is_some()
-        {
-            return Err(AppError::Conflict(format!(
-                "version {version_str} already exists for {package_name}"
-            )));
+        // A publish carries a tarball attachment; an `npm deprecate` (or other
+        // metadata-only PUT) does not.
+        let attachment_key = find_attachment_key(&body.attachments, &package_name, version_str);
+        let attachment = attachment_key.and_then(|k| body.attachments.get(&k));
+
+        // If the version already exists, this is either a republish attempt
+        // (carries a tarball -> 409 Conflict) or a metadata-only update such as
+        // `npm deprecate` (no tarball -> merge the `deprecated` flag and skip).
+        if let Some(existing) = crate::db::get_version(&state.db, package.id, version_str).await? {
+            if attachment.is_some() {
+                return Err(AppError::Conflict(format!(
+                    "version {version_str} already exists for {package_name}"
+                )));
+            }
+            apply_metadata_update(&state.db, &existing, version_meta).await?;
+            continue;
         }
 
-        // Find the attachment for this version
-        let attachment_key = find_attachment_key(&body.attachments, &package_name, version_str);
-        let attachment = attachment_key
-            .and_then(|k| body.attachments.get(&k))
-            .ok_or_else(|| {
-                AppError::BadRequest(format!(
-                    "no attachment found for version {version_str}"
-                ))
-            })?;
+        // New version: a tarball attachment is required.
+        let attachment = attachment.ok_or_else(|| {
+            AppError::BadRequest(format!("no attachment found for version {version_str}"))
+        })?;
 
         // Decode the base64 tarball
         let tarball_data = base64::engine::general_purpose::STANDARD
@@ -987,9 +1015,7 @@ pub async fn put_dist_tag(
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
 
     // Check granular write permission on this repository
-    if !check_repo_permission(&state.db, user.user_id, &user.role, repo.id, "write").await {
-        return Err(AppError::Forbidden("insufficient permissions".to_string()));
-    }
+    crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, &package_name)
         .await?
@@ -1029,9 +1055,7 @@ pub async fn delete_dist_tag(
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
 
     // Check granular write permission on this repository
-    if !check_repo_permission(&state.db, user.user_id, &user.role, repo.id, "write").await {
-        return Err(AppError::Forbidden("insufficient permissions".to_string()));
-    }
+    crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, &package_name)
         .await?
