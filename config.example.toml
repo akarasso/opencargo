@@ -9,10 +9,17 @@ url = "sqlite:./data/db/opencargo.db"
 [auth]
 anonymous_read = true
 token_prefix = "trg_"
-static_tokens = ["test-token"]
+# Static tokens are break-glass credentials granted FULL ADMIN access
+# (see src/auth/middleware.rs). Keep this empty in real deployments and use
+# per-user tokens instead. NEVER ship a known value such as "test-token".
+static_tokens = []
 
 [auth.admin]
 username = "admin"
+# "admin" and "changeme" are rejected on purpose: if a weak value is left here,
+# opencargo generates a random password at first boot and forces a change
+# (must_change_password). Set a strong password, or supply it out-of-band via
+# the OPENCARGO_ADMIN_PASSWORD environment variable.
 password = "admin"
 
 [proxy]
