@@ -549,3 +549,69 @@ async fn test_delete_repository() {
         "deleted repo should return 404"
     );
 }
+
+/// Regression test for the read access-control fix (S1): reads of a `private`
+/// repository require authentication, while `public` repositories stay
+/// anonymously readable. `ensure_can_read` runs before the package lookup, so
+/// the access decision is observable via the status code without publishing:
+///   - private + anonymous   -> 401 (denied — this was 200/404 before the fix)
+///   - private + admin token  -> 404 (access allowed, package simply absent)
+///   - public  + anonymous   -> 404 (still readable)
+#[tokio::test]
+async fn test_private_repo_read_requires_auth() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    // Admin creates a private repo.
+    let resp = client
+        .post(format!("{}/api/v1/repositories", base_url))
+        .bearer_auth("test-token")
+        .json(&json!({
+            "name": "npm-secret",
+            "type": "hosted",
+            "format": "npm",
+            "visibility": "private"
+        }))
+        .send()
+        .await
+        .expect("create repo request failed");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Anonymous read of the private repo is denied (the critical fix).
+    let resp = client
+        .get(format!("{}/npm-secret/@test/pkg", base_url))
+        .send()
+        .await
+        .expect("anonymous read request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "anonymous read of a private repo must be denied"
+    );
+
+    // Authenticated admin passes the access check (404 because the package is
+    // absent — proving the access control let the request through, not 401).
+    let resp = client
+        .get(format!("{}/npm-secret/@test/pkg", base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("authenticated read request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "admin read should pass access control (package simply absent)"
+    );
+
+    // A seeded public repo remains anonymously readable (404, not 401).
+    let resp = client
+        .get(format!("{}/npm-dev/@test/pkg", base_url))
+        .send()
+        .await
+        .expect("public read request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "public repo must stay anonymously readable"
+    );
+}

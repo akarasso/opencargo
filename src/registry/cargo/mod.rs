@@ -105,6 +105,7 @@ pub async fn config_json(
 pub async fn get_index_entry(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let repo_name = params.get("repo").ok_or_else(|| {
         AppError::BadRequest("missing repository".to_string())
@@ -116,6 +117,8 @@ pub async fn get_index_entry(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, crate_name)
         .await?
@@ -399,10 +402,13 @@ pub async fn publish_crate(
 pub async fn download_crate(
     State(state): State<AppState>,
     Path((repo_name, crate_name, version_str)): Path<(String, String, String)>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, &crate_name)
         .await?

@@ -478,7 +478,17 @@ pub fn build_router(state: AppState) -> Router {
 async fn go_version_dispatch(
     state: axum::extract::State<AppState>,
     path: Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> crate::error::AppResult<axum::response::Response> {
+    // Enforce read access once for all three dispatch targets (.info/.mod/.zip).
+    let repo_name = path.get("repo").cloned().unwrap_or_default();
+    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
+        .await?
+        .ok_or_else(|| {
+            crate::error::AppError::NotFound(format!("repository not found: {repo_name}"))
+        })?;
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
+
     let version = path.get("version").cloned().unwrap_or_default();
     if version.ends_with(".info") {
         Ok(crate::registry::go::version_info(state, path).await?.into_response())

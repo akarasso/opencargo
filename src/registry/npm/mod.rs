@@ -300,6 +300,7 @@ pub async fn get_package(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
     headers: HeaderMap,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let repo_name = params.get("repo").ok_or_else(|| {
         AppError::BadRequest("missing repository".to_string())
@@ -309,6 +310,8 @@ pub async fn get_package(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     let abbreviated = headers
         .get("accept")
@@ -549,6 +552,7 @@ fn strip_to_abbreviated(meta: &mut Value) {
 pub async fn download_tarball(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let repo_name = params.get("repo").ok_or_else(|| {
         AppError::BadRequest("missing repository".to_string())
@@ -561,6 +565,8 @@ pub async fn download_tarball(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     match repo.repo_type.as_str() {
         "proxy" => {
@@ -756,10 +762,13 @@ pub async fn search(
     State(state): State<AppState>,
     Path(repo_name): Path<String>,
     Query(query): Query<SearchQuery>,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     let search_text = query.text.unwrap_or_default();
     let size = query.size.unwrap_or(20).min(250);
@@ -919,6 +928,7 @@ async fn search_in_repo(
 pub async fn get_dist_tags(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let repo_name = params.get("repo").ok_or_else(|| {
         AppError::BadRequest("missing repository".to_string())
@@ -928,6 +938,8 @@ pub async fn get_dist_tags(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, &package_name)
         .await?
