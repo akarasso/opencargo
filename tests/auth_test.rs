@@ -670,6 +670,19 @@ async fn test_audit_log() {
         "audit response should have a 'page' field"
     );
 
+    // The user.create action must now be recorded (the audit log only ever had
+    // promote entries before — every other mutation went unlogged).
+    let entries = audit_body["entries"]
+        .as_array()
+        .expect("entries should be an array");
+    assert!(
+        entries.iter().any(|e| {
+            e["action"].as_str() == Some("user.create")
+                && e["target"].as_str() == Some("audituser")
+        }),
+        "audit log should contain a user.create entry for 'audituser', got: {entries:?}"
+    );
+
     // Verify a non-admin cannot access the audit log
     create_user(&client, &base_url, "test-token", "nonadmin", "reader").await;
     let token_resp =
