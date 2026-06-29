@@ -103,6 +103,13 @@ pub async fn create_repository(
         )));
     }
 
+    // Validate the upstream URL (SSRF guard) when one is provided.
+    if let Some(ref upstream) = body.upstream {
+        if !upstream.is_empty() {
+            crate::proxy::validate_upstream_url(upstream)?;
+        }
+    }
+
     // Check that repo does not already exist
     if crate::db::get_repository_by_name(&state.db, &body.name)
         .await?
@@ -201,6 +208,13 @@ pub async fn update_repository(
     if let Some(ref vis) = body.visibility {
         if !matches!(vis.as_str(), "public" | "private") {
             return Err(AppError::BadRequest(format!("invalid visibility: {vis}")));
+        }
+    }
+
+    // Validate the upstream URL (SSRF guard) when one is provided.
+    if let Some(ref upstream) = body.upstream {
+        if !upstream.is_empty() {
+            crate::proxy::validate_upstream_url(upstream)?;
         }
     }
 

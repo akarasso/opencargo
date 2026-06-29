@@ -291,10 +291,10 @@ pub async fn publish_crate(
         repo_name, crate_name, crate_name, version_str
     );
 
-    // Store the .crate file
+    // Store the .crate file (zero-copy slice of the request body Bytes).
     state
         .storage
-        .put(&storage_path, Bytes::from(crate_data.to_vec()))
+        .put(&storage_path, body.slice(crate_start..crate_end))
         .await?;
 
     // Build the metadata JSON to store in the DB (the full cargo metadata)
