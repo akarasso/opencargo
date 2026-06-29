@@ -200,6 +200,10 @@ pub enum RepositoryFormat {
     Cargo,
     Oci,
     Go,
+    /// NOT IMPLEMENTED: there is no `registry/pypi` module, so a repository
+    /// created with format=pypi is inert (no publish/serve routes). Kept in the
+    /// enum and CHECK constraint for forward-compat — implement or remove before
+    /// exposing it as a usable option.
     Pypi,
 }
 

@@ -448,7 +448,7 @@ async fn get_package_proxy(
         ))
     })?;
 
-    let ttl_seconds: u64 = 86400; // default 24h
+    let ttl_seconds = state.proxy_default_ttl_secs; // from config.proxy.default_ttl
 
     let mut metadata = state
         .proxy_client
