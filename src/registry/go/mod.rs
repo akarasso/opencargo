@@ -345,8 +345,18 @@ fn extract_go_mod_from_zip(
             .map_err(|e| AppError::BadRequest(format!("failed to read zip entry: {e}")))?;
 
         if file.name().ends_with("go.mod") {
+            // Bound the decompressed read to defend against zip bombs: a go.mod
+            // entry could declare a tiny compressed size yet inflate to GiBs.
+            const MAX_GO_MOD_BYTES: u64 = 1024 * 1024; // 1 MiB is ample
+            if file.size() > MAX_GO_MOD_BYTES {
+                return Err(AppError::BadRequest(
+                    "go.mod entry too large".to_string(),
+                ));
+            }
             let mut contents = String::new();
-            file.read_to_string(&mut contents)
+            file.by_ref()
+                .take(MAX_GO_MOD_BYTES)
+                .read_to_string(&mut contents)
                 .map_err(|e| AppError::BadRequest(format!("failed to read go.mod: {e}")))?;
             return Ok(contents);
         }

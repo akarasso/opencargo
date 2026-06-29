@@ -134,21 +134,6 @@ fn format_size(bytes: i64) -> String {
     }
 }
 
-fn sanitize_html(html: &str) -> String {
-    html.replace("<script", "&lt;script")
-        .replace("<Script", "&lt;Script")
-        .replace("<SCRIPT", "&lt;SCRIPT")
-        .replace("<iframe", "&lt;iframe")
-        .replace("<IFRAME", "&lt;IFRAME")
-        .replace("<object", "&lt;object")
-        .replace("<OBJECT", "&lt;OBJECT")
-        .replace("<embed", "&lt;embed")
-        .replace("<EMBED", "&lt;EMBED")
-        .replace("javascript:", "")
-        .replace("onerror=", "")
-        .replace("onload=", "")
-}
-
 fn render_markdown(md: &str) -> String {
     use pulldown_cmark::{html, Options, Parser};
     let mut options = Options::empty();
@@ -158,7 +143,10 @@ fn render_markdown(md: &str) -> String {
     let parser = Parser::new_ext(md, options);
     let mut html_output = String::new();
     html::push_html(&mut html_output, parser);
-    sanitize_html(&html_output)
+    // Allowlist-based HTML sanitization via ammonia, replacing the previous
+    // hand-rolled blocklist which was trivially bypassable (stored XSS in
+    // package READMEs, e.g. `<img src=x onmouseover=...>`).
+    ammonia::clean(&html_output)
 }
 
 async fn count_scalar(pool: &SqlitePool, query: &str) -> i64 {
