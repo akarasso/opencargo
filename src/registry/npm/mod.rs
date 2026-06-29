@@ -824,8 +824,12 @@ pub async fn search(
                         None => continue,
                     };
 
+                // Fetch the first (from + size) results from each member,
+                // starting at offset 0 — NOT (size, from). The merged result is
+                // re-paginated below, so passing `from` here skipped it twice and
+                // dropped results for from > 0.
                 let member_objects =
-                    search_in_repo(&state, member_repo.id, &search_text, size, from).await?;
+                    search_in_repo(&state, member_repo.id, &search_text, from + size, 0).await?;
 
                 for obj in member_objects {
                     // Deduplicate by package name

@@ -33,6 +33,15 @@ impl RateLimiter {
         let cutoff = now - self.window;
 
         let mut map = self.requests.lock().unwrap();
+
+        // Opportunistic eviction: keys are attacker-controlled (usernames/IPs),
+        // so the map could grow unbounded under a spray of distinct keys. When it
+        // gets large, drop keys whose window has fully expired — bounding memory
+        // without paying an O(n) sweep on every call.
+        if map.len() > 1024 {
+            map.retain(|_, timestamps| timestamps.iter().any(|t| *t > cutoff));
+        }
+
         let timestamps = map.entry(key.to_string()).or_default();
 
         // Remove expired entries
