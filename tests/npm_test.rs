@@ -336,6 +336,58 @@ async fn test_search() {
     );
 }
 
+/// Regression for the unbounded `size` search bug: a negative `size` must be
+/// clamped, not passed straight through as `LIMIT -1` (unlimited in SQLite),
+/// which would bypass the 250 cap and amplify the per-result N+1 lookups. A
+/// normal search finds all matches; size=-1 must not return the whole repo.
+#[tokio::test]
+async fn test_npm_search_size_is_clamped() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for i in 1..=3 {
+        let name = format!("@test/clamppkg{i}");
+        let pkg_json = format!(
+            r#"{{"name":"{name}","version":"1.0.0","description":"zzclampword pkg","main":"index.js"}}"#
+        );
+        let tarball = build_tarball(&pkg_json);
+        let body = build_publish_body(&name, "1.0.0", "zzclampword pkg", &tarball);
+        let resp = client
+            .put(format!("{}/test-npm/{}", base_url, name))
+            .bearer_auth("test-token")
+            .json(&body)
+            .send()
+            .await
+            .expect("publish request failed");
+        assert_eq!(resp.status(), StatusCode::OK, "publish {name} should succeed");
+    }
+
+    // A normal search finds all three.
+    let resp = client
+        .get(format!("{}/test-npm/-/v1/search?text=zzclampword&size=250", base_url))
+        .send()
+        .await
+        .expect("search request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data: Value = resp.json().await.expect("invalid json");
+    let n_full = data["objects"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert_eq!(n_full, 3, "a normal search should find all three packages");
+
+    // A negative size must be clamped (no LIMIT -1 leak of the whole repo).
+    let resp = client
+        .get(format!("{}/test-npm/-/v1/search?text=zzclampword&size=-1", base_url))
+        .send()
+        .await
+        .expect("search request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data: Value = resp.json().await.expect("invalid json");
+    let n_neg = data["objects"].as_array().map(|a| a.len()).unwrap_or(0);
+    assert!(
+        n_neg < 3,
+        "negative size must be clamped, got {n_neg} objects (LIMIT -1 leak?)"
+    );
+}
+
 #[tokio::test]
 async fn test_abbreviated_metadata() {
     let (base_url, _handle, _tmp) = setup().await;

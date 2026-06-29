@@ -812,8 +812,11 @@ pub async fn search(
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     let search_text = query.text.unwrap_or_default();
-    let size = query.size.unwrap_or(20).min(250);
-    let from = query.from.unwrap_or(0);
+    // Clamp both bounds: a negative `size` would become `LIMIT -1` (unlimited)
+    // in SQLite, bypassing the 250 cap and amplifying the per-row N+1 lookups;
+    // a negative `from` would be an invalid OFFSET.
+    let size = query.size.unwrap_or(20).clamp(0, 250);
+    let from = query.from.unwrap_or(0).max(0);
 
     match repo.repo_type.as_str() {
         "group" => {
