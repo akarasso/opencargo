@@ -43,3 +43,24 @@ pub async fn ensure_can_read(
         )),
     }
 }
+
+/// Enforce write (publish) access on a repository, with an actionable error
+/// message when denied. The previous generic "insufficient permissions" did not
+/// tell the caller that their role — typically the default `reader` — lacks
+/// write, which made "I generated a token but can't publish" hard to diagnose.
+pub async fn ensure_can_write(
+    db: &sqlx::SqlitePool,
+    repo: &Repository,
+    auth_user: &AuthUser,
+) -> AppResult<()> {
+    if check_repo_permission(db, auth_user.user_id, &auth_user.role, repo.id, "write").await {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(format!(
+            "write access denied on repository '{}': your role is '{}'. Publishing requires \
+             the 'publisher' or 'admin' role, or an explicit write permission on this \
+             repository granted by an admin.",
+            repo.name, auth_user.role
+        )))
+    }
+}

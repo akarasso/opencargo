@@ -13,7 +13,6 @@ use sha2::Digest;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::auth::permissions::check_repo_permission;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::storage::StorageBackend;
@@ -205,10 +204,7 @@ pub async fn publish_crate(
         ));
     }
 
-    // Check granular write permission on this repository
-    if !check_repo_permission(&state.db, user.user_id, &user.role, repo.id, "write").await {
-        return Err(AppError::Forbidden("insufficient permissions".to_string()));
-    }
+    crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
     // Parse the binary publish format:
     //   4 bytes LE u32 — JSON metadata length
@@ -463,10 +459,7 @@ pub async fn yank(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
 
-    // Check granular write permission on this repository
-    if !check_repo_permission(&state.db, user.user_id, &user.role, repo.id, "write").await {
-        return Err(AppError::Forbidden("insufficient permissions".to_string()));
-    }
+    crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
     if repo.repo_type != "hosted" {
         return Err(AppError::BadRequest(
@@ -516,10 +509,7 @@ pub async fn unyank(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
 
-    // Check granular write permission on this repository
-    if !check_repo_permission(&state.db, user.user_id, &user.role, repo.id, "write").await {
-        return Err(AppError::Forbidden("insufficient permissions".to_string()));
-    }
+    crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
     if repo.repo_type != "hosted" {
         return Err(AppError::BadRequest(

@@ -274,6 +274,20 @@ pub async fn get_version(
     .await
 }
 
+/// Replace the stored metadata JSON of a version (used by `npm deprecate`).
+pub async fn update_version_metadata(
+    pool: &SqlitePool,
+    version_id: i64,
+    metadata_json: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query("UPDATE versions SET metadata_json = ?1 WHERE id = ?2")
+        .bind(metadata_json)
+        .bind(version_id)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 pub async fn set_dist_tag(
     pool: &SqlitePool,
     package_id: i64,
