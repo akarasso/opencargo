@@ -10,6 +10,11 @@ use crate::error::AppError;
 use crate::storage::FilesystemStorage;
 use crate::storage::StorageBackend;
 
+/// Cap on a single upstream response body. Checked against the advertised
+/// Content-Length; chunked responses without one are not bounded here (a
+/// streaming reader would be needed for that).
+const MAX_UPSTREAM_BYTES: u64 = 100 * 1024 * 1024;
+
 /// An HTTP client that fetches from upstream registries and caches responses.
 #[derive(Clone)]
 pub struct ProxyClient {
@@ -154,6 +159,13 @@ impl ProxyClient {
                     )));
                 }
 
+                if let Some(len) = response.content_length() {
+                    if len > MAX_UPSTREAM_BYTES {
+                        return Err(AppError::BadRequest(format!(
+                            "upstream response too large: {len} bytes"
+                        )));
+                    }
+                }
                 let body = response.bytes().await.map_err(|e| {
                     AppError::Internal(format!("failed to read upstream response: {e}"))
                 })?;
@@ -248,6 +260,13 @@ impl ProxyClient {
             )));
         }
 
+        if let Some(len) = response.content_length() {
+            if len > MAX_UPSTREAM_BYTES {
+                return Err(AppError::BadRequest(format!(
+                    "upstream tarball too large: {len} bytes"
+                )));
+            }
+        }
         let data = response.bytes().await.map_err(|e| {
             AppError::Internal(format!("failed to read upstream tarball: {e}"))
         })?;

@@ -150,10 +150,15 @@ fn render_markdown(md: &str) -> String {
 }
 
 async fn count_scalar(pool: &SqlitePool, query: &str) -> i64 {
+    // Don't swallow DB errors silently (which previously returned a misleading
+    // 0). Log them so a failing dashboard query is at least diagnosable.
     sqlx::query_scalar::<_, i64>(query)
         .fetch_one(pool)
         .await
-        .unwrap_or(0)
+        .unwrap_or_else(|e| {
+            tracing::warn!(query, "dashboard count query failed: {e}");
+            0
+        })
 }
 
 // ---------------------------------------------------------------------------
