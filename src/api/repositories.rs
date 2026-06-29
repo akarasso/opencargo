@@ -304,5 +304,14 @@ pub async fn purge_cache(
         .execute(&state.db)
         .await?;
 
+    // Delete the cached files too. Previously only the metadata table was
+    // cleared, so cached tarballs kept being served from disk (purge was a
+    // no-op for them) and storage leaked.
+    crate::storage::StorageBackend::delete_prefix(
+        state.storage.as_ref(),
+        &format!("_proxy_cache/{name}"),
+    )
+    .await?;
+
     Ok(Json(json!({"ok": true, "message": format!("cache purged for repository: {name}")})))
 }

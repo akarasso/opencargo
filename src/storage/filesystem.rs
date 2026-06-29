@@ -92,6 +92,16 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
+    async fn delete_prefix(&self, prefix: &str) -> Result<(), AppError> {
+        let full_path = self.safe_path(prefix)?;
+        if full_path.is_dir() {
+            fs::remove_dir_all(&full_path).await?;
+        } else if full_path.exists() {
+            fs::remove_file(&full_path).await?;
+        }
+        Ok(())
+    }
+
     async fn exists(&self, path: &str) -> Result<bool, AppError> {
         let full_path = self.safe_path(path)?;
         Ok(full_path.exists())
