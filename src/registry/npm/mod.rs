@@ -34,6 +34,11 @@ pub struct PublishBody {
     versions: HashMap<String, Value>,
     #[serde(rename = "_attachments", default)]
     attachments: HashMap<String, Attachment>,
+    /// Full README markdown, set by `npm publish` at the document root. Absent
+    /// on metadata-only PUTs (e.g. deprecate), so persisting only when present
+    /// avoids clobbering an existing README.
+    #[serde(default)]
+    readme: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -136,6 +141,27 @@ pub async fn publish_package(
                 })?
         }
     };
+
+    // Persist the README (raw markdown) when the publish carries one. The
+    // dashboard sanitizes it through ammonia at render time, so we store the
+    // source as-is, but cap its size to keep this user-controlled DB field
+    // bounded. The cap is taken on a UTF-8 char boundary to avoid panicking on
+    // multi-byte content.
+    if let Some(readme) = body.readme.as_deref() {
+        if !readme.is_empty() {
+            const MAX_README_BYTES: usize = 256 * 1024;
+            let readme = if readme.len() > MAX_README_BYTES {
+                let mut end = MAX_README_BYTES;
+                while !readme.is_char_boundary(end) {
+                    end -= 1;
+                }
+                &readme[..end]
+            } else {
+                readme
+            };
+            crate::db::update_package_readme(&state.db, package.id, readme).await?;
+        }
+    }
 
     // Process each version in the publish body
     for (version_str, version_meta) in &body.versions {
