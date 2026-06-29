@@ -113,6 +113,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let sql10 = include_str!("migrations/010_dynamic_config.sql");
     sqlx::raw_sql(sql10).execute(pool).await?;
 
+    let sql11 = include_str!("migrations/011_download_counts.sql");
+    sqlx::raw_sql(sql11).execute(pool).await?;
+
     info!("Database migrations applied");
     Ok(())
 }
@@ -321,10 +324,14 @@ pub async fn record_download(
     pool: &SqlitePool,
     version_id: i64,
 ) -> Result<(), sqlx::Error> {
-    sqlx::query("INSERT INTO downloads (version_id) VALUES (?1)")
-        .bind(version_id)
-        .execute(pool)
-        .await?;
+    // Aggregate counter (one row per version) instead of one row per download.
+    sqlx::query(
+        "INSERT INTO download_counts (version_id, count) VALUES (?1, 1)
+         ON CONFLICT(version_id) DO UPDATE SET count = count + 1",
+    )
+    .bind(version_id)
+    .execute(pool)
+    .await?;
 
     Ok(())
 }

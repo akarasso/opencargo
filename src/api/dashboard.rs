@@ -193,7 +193,8 @@ pub async fn dashboard_stats(
     let total_packages =
         count_scalar(pool, &format!("SELECT COUNT(*) FROM packages{where_vis}")).await;
     let total_versions = count_scalar(pool, "SELECT COUNT(*) FROM versions").await;
-    let total_downloads = count_scalar(pool, "SELECT COUNT(*) FROM downloads").await;
+    let total_downloads =
+        count_scalar(pool, "SELECT COALESCE(SUM(count), 0) FROM download_counts").await;
     let total_repos = count_scalar(pool, "SELECT COUNT(*) FROM repositories").await;
 
     let recent = sqlx::query_as::<_, (String, String, String)>(&format!(
@@ -368,8 +369,8 @@ pub async fn list_packages(
         .unwrap_or_else(|| "-".to_string());
 
         let downloads = sqlx::query_scalar::<_, i64>(
-            "SELECT COUNT(*) FROM downloads d
-             JOIN versions v ON v.id = d.version_id
+            "SELECT COALESCE(SUM(dc.count), 0) FROM download_counts dc
+             JOIN versions v ON v.id = dc.version_id
              WHERE v.package_id = ?1",
         )
         .bind(pkg_id)
