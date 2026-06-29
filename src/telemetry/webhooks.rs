@@ -12,9 +12,21 @@ pub struct WebhookDispatcher {
 }
 
 impl WebhookDispatcher {
+    /// Build the delivery HTTP client with bounded timeouts so a slow or
+    /// unresponsive endpoint cannot pin a spawned delivery task (and its
+    /// connection) forever — one such task is spawned per dispatched event,
+    /// so without a timeout they accumulate without bound.
+    fn build_client() -> reqwest::Client {
+        reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .connect_timeout(std::time::Duration::from_secs(5))
+            .build()
+            .expect("failed to build webhook HTTP client")
+    }
+
     pub fn new(db: SqlitePool) -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Self::build_client(),
             db: Some(db),
         }
     }
@@ -23,7 +35,7 @@ impl WebhookDispatcher {
     /// available yet). It will not dispatch any webhooks.
     pub fn new_noop() -> Self {
         Self {
-            client: reqwest::Client::new(),
+            client: Self::build_client(),
             db: None,
         }
     }
