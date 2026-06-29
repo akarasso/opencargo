@@ -158,46 +158,26 @@ impl VulnScanner {
                 Ok(parsed) => parsed,
                 Err(e) => {
                     warn!(error = %e, "Failed to parse OSV.dev response");
-                    let result = ScanResult {
+                    // Do NOT persist a "clean" scan on failure — that would
+                    // falsely report the version as scanned-and-safe. Return the
+                    // error status without writing a misleading record.
+                    return Ok(ScanResult {
                         total_deps,
                         vulnerable_deps: 0,
                         status: "error".to_string(),
                         details: vec![],
-                    };
-                    // Store error status — we use "clean" as fallback since
-                    // the CHECK constraint only allows clean/warning/critical
-                    let results_json = serde_json::to_string(&result)?;
-                    crate::db::insert_vulnerability_scan(
-                        db,
-                        version_id,
-                        total_deps as i64,
-                        0,
-                        Some(&results_json),
-                        "clean",
-                    )
-                    .await?;
-                    return Ok(result);
+                    });
                 }
             },
             Err(e) => {
                 warn!(error = %e, "Failed to query OSV.dev");
-                let result = ScanResult {
+                // Do NOT persist a "clean" scan on failure (see above).
+                return Ok(ScanResult {
                     total_deps,
                     vulnerable_deps: 0,
                     status: "error".to_string(),
                     details: vec![],
-                };
-                let results_json = serde_json::to_string(&result)?;
-                crate::db::insert_vulnerability_scan(
-                    db,
-                    version_id,
-                    total_deps as i64,
-                    0,
-                    Some(&results_json),
-                    "clean",
-                )
-                .await?;
-                return Ok(result);
+                });
             }
         };
 
