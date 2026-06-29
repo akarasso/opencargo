@@ -7,6 +7,7 @@ use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
+use crate::server::AppState;
 
 /// Enforce read access on a repository before serving any of its content.
 ///
@@ -78,4 +79,59 @@ pub fn ensure_format(repo: &Repository, expected: &str) -> AppResult<()> {
             repo.name, repo.format, expected
         )))
     }
+}
+
+/// Shared post-publish side effects, factored out of the per-format publish
+/// handlers (npm, cargo) where they were duplicated verbatim: fire the
+/// `package.published` webhook, then run the vulnerability scan. With
+/// `block_on_critical`, a critical finding aborts the publish (returns Err);
+/// otherwise the scan runs in the background.
+#[allow(clippy::too_many_arguments)]
+pub async fn finalize_publish(
+    state: &AppState,
+    ecosystem: &str,
+    repo_name: &str,
+    package_name: &str,
+    version_str: &str,
+    version_id: i64,
+    metadata_json: &str,
+    published_by: &str,
+) -> AppResult<()> {
+    state
+        .webhook_dispatcher
+        .dispatch(
+            "package.published",
+            &serde_json::json!({
+                "package": package_name,
+                "version": version_str,
+                "repository": repo_name,
+                "published_by": published_by,
+            }),
+        )
+        .await;
+
+    if state.vuln_scan_config.block_on_critical {
+        let scan_result = state
+            .vuln_scanner
+            .scan_version(&state.db, version_id, metadata_json, ecosystem)
+            .await;
+        if let Ok(ref result) = scan_result {
+            if result.status == "critical" {
+                return Err(AppError::BadRequest(
+                    "publish blocked: critical vulnerabilities found in dependencies".to_string(),
+                ));
+            }
+        }
+    } else {
+        let scanner = state.vuln_scanner.clone();
+        let db = state.db.clone();
+        let meta_json = metadata_json.to_string();
+        let eco = ecosystem.to_string();
+        tokio::spawn(async move {
+            if let Err(e) = scanner.scan_version(&db, version_id, &meta_json, &eco).await {
+                tracing::warn!(error = %e, "Background vulnerability scan failed");
+            }
+        });
+    }
+    Ok(())
 }

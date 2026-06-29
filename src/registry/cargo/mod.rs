@@ -346,40 +346,17 @@ pub async fn publish_crate(
         }
     }
 
-    // Dispatch webhook for package.published
-    state.webhook_dispatcher.dispatch("package.published", &serde_json::json!({
-        "package": crate_name,
-        "version": version_str,
-        "repository": repo_name,
-        "published_by": user.username,
-    })).await;
-
-    // Vulnerability scan
-    if state.vuln_scan_config.block_on_critical {
-        // Blocking scan: check for critical vulns before accepting
-        let scan_result = state
-            .vuln_scanner
-            .scan_version(&state.db, _version_id, &metadata_json, "crates.io")
-            .await;
-        if let Ok(ref result) = scan_result {
-            if result.status == "critical" {
-                return Err(AppError::BadRequest(
-                    "publish blocked: critical vulnerabilities found in dependencies".to_string(),
-                ));
-            }
-        }
-    } else {
-        // Non-blocking background scan
-        let scanner = state.vuln_scanner.clone();
-        let db = state.db.clone();
-        let meta_json = metadata_json.clone();
-        let vid = _version_id;
-        tokio::spawn(async move {
-            if let Err(e) = scanner.scan_version(&db, vid, &meta_json, "crates.io").await {
-                tracing::warn!(error = %e, "Background vulnerability scan failed");
-            }
-        });
-    }
+    crate::registry::finalize_publish(
+        &state,
+        "crates.io",
+        &repo_name,
+        crate_name,
+        version_str,
+        _version_id,
+        &metadata_json,
+        &user.username,
+    )
+    .await?;
 
     info!(
         crate_name = %crate_name,
