@@ -453,6 +453,7 @@ pub async fn yank(
             "can only yank on hosted repositories".to_string(),
         ));
     }
+    crate::registry::ensure_format(&repo, "cargo")?;
 
     let package = crate::db::get_package(&state.db, repo.id, &crate_name)
         .await?
@@ -503,6 +504,7 @@ pub async fn unyank(
             "can only unyank on hosted repositories".to_string(),
         ));
     }
+    crate::registry::ensure_format(&repo, "cargo")?;
 
     let package = crate::db::get_package(&state.db, repo.id, &crate_name)
         .await?
