@@ -39,3 +39,29 @@ pub(crate) fn require_admin_or_self(caller: &AuthUser, target_username: &str) ->
     }
     Ok(())
 }
+
+/// Best-effort audit-log write for a sensitive mutation. A logging failure must
+/// never fail the underlying operation, so the error is swallowed with a warning
+/// rather than propagated.
+pub(crate) async fn record_audit(
+    db: &sqlx::SqlitePool,
+    caller: &AuthUser,
+    action: &str,
+    target: Option<&str>,
+) {
+    if let Err(e) = crate::db::create_audit_entry(
+        db,
+        caller.user_id,
+        Some(caller.username.as_str()),
+        action,
+        target,
+        None,
+        None,
+        None,
+        None,
+    )
+    .await
+    {
+        tracing::warn!(error = %e, action, "failed to write audit log entry");
+    }
+}

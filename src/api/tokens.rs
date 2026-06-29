@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{require_admin_or_self, require_auth};
+use crate::api::{record_audit, require_admin_or_self, require_auth};
 use crate::auth::tokens as auth_tokens;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
@@ -107,6 +107,8 @@ pub async fn create_token(
     )
     .await?;
 
+    record_audit(&state.db, &caller, "token.create", Some(&username)).await;
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -142,6 +144,8 @@ pub async fn delete_token(
     }
 
     crate::db::delete_token(&state.db, &token_id).await?;
+
+    record_audit(&state.db, &caller, "token.revoke", Some(&username)).await;
 
     Ok(Json(json!({"ok": true})))
 }

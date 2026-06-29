@@ -7,7 +7,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{require_admin, require_admin_or_self, require_auth};
+use crate::api::{record_audit, require_admin, require_admin_or_self, require_auth};
 use crate::auth::users as auth_users;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
@@ -116,6 +116,8 @@ pub async fn create_user(
     let user = crate::db::get_user_by_username(&state.db, &body.username)
         .await?
         .ok_or_else(|| AppError::Internal("failed to fetch created user".to_string()))?;
+
+    record_audit(&state.db, &caller, "user.create", Some(&body.username)).await;
 
     // No forced password change — the admin receives the generated password
     // and transmits it securely to the user. Only the initial admin account
@@ -240,6 +242,8 @@ pub async fn delete_user(
     }
 
     crate::db::delete_user(&state.db, &username).await?;
+
+    record_audit(&state.db, &caller, "user.delete", Some(&username)).await;
 
     Ok(Json(json!({"ok": true})))
 }
