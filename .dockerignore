@@ -1,0 +1,31 @@
+# Keep the build context small and free of secrets. The Dockerfile uses
+# targeted COPYs (no `COPY . .`), but the whole context is still sent to the
+# daemon — so exclude anything the build does not need.
+
+# Build artifacts
+target/
+
+# VCS
+.git/
+.gitignore
+
+# Local data & secrets — never needed in the image, never send to the daemon
+data/
+*.db
+*.db-wal
+*.db-shm
+.env
+config.toml
+kubeconfig*
+*.kubeconfig
+
+# Frontend: node_modules and dist are rebuilt inside the frontend stage
+frontend/node_modules/
+frontend/dist/
+frontend/stitch-*.html
+
+# Deploy/CI/docs not needed by the build
+.github/
+helm/
+k8s/
+*.md
