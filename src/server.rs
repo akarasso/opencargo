@@ -49,6 +49,8 @@ pub struct AppState {
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
     pub vuln_scanner: Arc<VulnScanner>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
+    /// Parsed from config.proxy.default_ttl; TTL for cached upstream metadata.
+    pub proxy_default_ttl_secs: u64,
 }
 
 pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
@@ -178,6 +180,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         webhook_dispatcher,
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
+        proxy_default_ttl_secs: parse_duration_secs(&config.proxy.default_ttl),
     })
 }
 

@@ -1,24 +1,5 @@
 use sqlx::SqlitePool;
 
-/// Check whether the given role is allowed to perform the given action.
-///
-/// - `admin`: can do everything
-/// - `publisher`: can read + write (publish)
-/// - `reader`: can only read
-pub fn check_permission(user_role: &str, action: &str) -> bool {
-    match user_role {
-        "admin" => true,
-        "publisher" => matches!(action, "read" | "write" | "publish"),
-        "reader" => action == "read",
-        _ => false,
-    }
-}
-
-/// Returns `true` if the role has write (publish) permissions.
-pub fn can_write(role: &str) -> bool {
-    matches!(role, "admin" | "publisher")
-}
-
 /// Returns `true` if the role has admin permissions.
 pub fn can_admin(role: &str) -> bool {
     role == "admin"
