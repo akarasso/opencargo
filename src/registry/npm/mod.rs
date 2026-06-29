@@ -282,39 +282,17 @@ pub async fn publish_package(
             }
         }
 
-        // Dispatch webhook for package.published
-        state.webhook_dispatcher.dispatch("package.published", &json!({
-            "package": package_name,
-            "version": version_str,
-            "repository": repo_name,
-            "published_by": auth_user.username,
-        })).await;
-
-        // Vulnerability scan
-        if state.vuln_scan_config.block_on_critical {
-            // Blocking scan: check for critical vulns before accepting
-            let scan_result = state
-                .vuln_scanner
-                .scan_version(&state.db, version_id, &metadata_json, "npm")
-                .await;
-            if let Ok(ref result) = scan_result {
-                if result.status == "critical" {
-                    return Err(AppError::BadRequest(
-                        "publish blocked: critical vulnerabilities found in dependencies".to_string(),
-                    ));
-                }
-            }
-        } else {
-            // Non-blocking background scan
-            let scanner = state.vuln_scanner.clone();
-            let db = state.db.clone();
-            let meta_json = metadata_json.clone();
-            tokio::spawn(async move {
-                if let Err(e) = scanner.scan_version(&db, version_id, &meta_json, "npm").await {
-                    warn!(error = %e, "Background vulnerability scan failed");
-                }
-            });
-        }
+        crate::registry::finalize_publish(
+            &state,
+            "npm",
+            repo_name,
+            &package_name,
+            version_str,
+            version_id,
+            &metadata_json,
+            &auth_user.username,
+        )
+        .await?;
 
         info!(
             package = %package_name,
