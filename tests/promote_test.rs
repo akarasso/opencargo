@@ -322,6 +322,92 @@ async fn test_promote_package() {
     );
 }
 
+/// B3 regression: a promoted artifact must live under a path OWNED by the
+/// target repo, not shared with the source. The original bug shared the source
+/// path, so once the source's (pre-release) tarball was garbage-collected the
+/// PROMOTED prod artifact became undownloadable — silent data loss. We simulate
+/// that GC by deleting the source repo's storage subtree after the promote, and
+/// assert the target download still works and is byte-identical. With the old
+/// shared-path behavior this download would 404.
+#[tokio::test]
+async fn test_promote_isolates_tarball_from_source() {
+    let (base_url, _handle, tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    // Publish @test/iso@1.0.0 to npm-dev.
+    let pkg_json = r#"{"name":"@test/iso","version":"1.0.0","description":"iso","main":"index.js"}"#;
+    let tarball = build_tarball(pkg_json);
+    let body = build_publish_body("@test/iso", "1.0.0", "iso", &tarball);
+    let resp = client
+        .put(format!("{}/npm-dev/@test/iso", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "publish should succeed");
+
+    // Promote to npm-prod.
+    let resp = client
+        .post(format!("{}/api/v1/promote/@test/iso/1.0.0", base_url))
+        .bearer_auth("test-token")
+        .json(&json!({ "from": "npm-dev", "to": "npm-prod" }))
+        .send()
+        .await
+        .expect("promote request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "promote should succeed");
+
+    // The promoted artifact downloads right after the promote.
+    let prod_url = format!("{}/npm-prod/@test/iso/-/iso-1.0.0.tgz", base_url);
+    let resp = client.get(&prod_url).send().await.expect("prod download failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "prod download should work right after promote"
+    );
+
+    // Simulate the cleanup GC removing the SOURCE repo's stored tarball(s).
+    let source_dir = tmp.path().join("storage").join("npm").join("npm-dev");
+    assert!(
+        source_dir.is_dir(),
+        "source storage subtree should exist before deletion: {source_dir:?}"
+    );
+    std::fs::remove_dir_all(&source_dir).expect("failed to delete source storage subtree");
+
+    // The source download must now fail — confirms the deletion is meaningful
+    // (otherwise the survival assertion below would be trivially true).
+    let dev_url = format!("{}/npm-dev/@test/iso/-/iso-1.0.0.tgz", base_url);
+    let resp = client
+        .get(&dev_url)
+        .send()
+        .await
+        .expect("source download request failed");
+    assert!(
+        !resp.status().is_success(),
+        "source tarball must be gone after deleting its storage subtree, got {}",
+        resp.status()
+    );
+
+    // The promoted artifact must STILL download, byte-identical: it owns its own
+    // copy. This is exactly the data-loss B3 fixed.
+    let resp = client
+        .get(&prod_url)
+        .send()
+        .await
+        .expect("prod re-download request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "promoted artifact must survive source deletion (B3 isolation)"
+    );
+    let downloaded = resp.bytes().await.expect("failed to read prod bytes");
+    assert_eq!(
+        downloaded.as_ref(),
+        tarball.as_slice(),
+        "promoted tarball must remain byte-identical after source deletion"
+    );
+}
+
 /// Promoting the same version twice should return 409 Conflict.
 #[tokio::test]
 async fn test_promote_duplicate_version() {
