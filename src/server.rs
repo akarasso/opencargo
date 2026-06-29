@@ -411,18 +411,19 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::api::vulns::rescan_unscoped),
         );
 
-    // Dashboard / frontend API routes (no auth required)
+    // Dashboard / frontend API routes. These run INSIDE the auth middleware
+    // (merged before the auth layer below) so the handlers can filter out
+    // private repositories for non-admin/anonymous callers.
     let dashboard_routes = Router::new()
         .route("/api/v1/dashboard", get(crate::api::dashboard::dashboard_stats))
         .route("/api/v1/packages", get(crate::api::dashboard::list_packages))
         .route("/api/v1/packages/{*path}", get(crate::api::dashboard::package_detail))
         .route("/api/v1/search", get(crate::api::dashboard::search))
-        // Dependency graph routes (public, no auth)
+        // Dependency graph routes
         .route("/api/v1/deps/@{scope}/{name}/dependencies", get(crate::api::deps::get_dependencies))
         .route("/api/v1/deps/@{scope}/{name}/dependents", get(crate::api::deps::get_dependents))
         .route("/api/v1/deps/{name}/dependencies", get(crate::api::deps::get_dependencies_unscoped))
-        .route("/api/v1/deps/{name}/dependents", get(crate::api::deps::get_dependents_unscoped))
-        .with_state(state.clone());
+        .route("/api/v1/deps/{name}/dependents", get(crate::api::deps::get_dependents_unscoped));
 
     // Web UI routes (no auth required)
     let web_routes = crate::web::web_routes().with_state(state.clone());
@@ -450,6 +451,9 @@ pub fn build_router(state: AppState) -> Router {
         .merge(go_routes)
         // OCI container registry routes
         .merge(oci_routes)
+        // Dashboard / frontend API + dependency graph — INSIDE the auth layer
+        // so handlers receive the optional AuthUser and filter private repos.
+        .merge(dashboard_routes)
         // Auth middleware
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -458,8 +462,6 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
         // npm login (outside auth middleware — uses password auth)
         .merge(npm_login_route)
-        // Dashboard API (outside auth middleware)
-        .merge(dashboard_routes)
         // Web UI (outside auth middleware)
         .merge(web_routes)
         // Metrics endpoint (outside auth middleware)

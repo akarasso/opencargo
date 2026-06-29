@@ -731,13 +731,19 @@ pub struct DependentInfo {
 pub async fn get_dependents(
     pool: &SqlitePool,
     dependency_name: &str,
+    public_only: bool,
 ) -> Result<Vec<DependentInfo>, sqlx::Error> {
-    sqlx::query_as::<_, DependentInfo>(
+    let vis = if public_only {
+        " AND p.repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
+    } else {
+        ""
+    };
+    sqlx::query_as::<_, DependentInfo>(&format!(
         "SELECT DISTINCT p.name, v.version FROM package_dependencies d \
          JOIN versions v ON d.version_id = v.id \
          JOIN packages p ON d.package_id = p.id \
-         WHERE d.dependency_name = ?1",
-    )
+         WHERE d.dependency_name = ?1{vis}",
+    ))
     .bind(dependency_name)
     .fetch_all(pool)
     .await

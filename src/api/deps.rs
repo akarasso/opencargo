@@ -23,13 +23,25 @@ fn extract_package_name(params: &HashMap<String, String>) -> String {
 
 /// Find a package across all repositories by name.
 /// Returns the first match found.
+/// `true` unless the caller is an admin — restricts dependency lookups to
+/// packages hosted in publicly-visible repositories.
+fn public_only(auth: &Option<axum::Extension<crate::auth::middleware::AuthUser>>) -> bool {
+    !auth.as_ref().map(|e| e.0.role == "admin").unwrap_or(false)
+}
+
 async fn find_package_by_name(
     db: &sqlx::SqlitePool,
     name: &str,
+    public_only: bool,
 ) -> Result<Option<(crate::db::Package, Vec<crate::db::Version>)>, sqlx::Error> {
-    let package: Option<crate::db::Package> = sqlx::query_as(
-        "SELECT * FROM packages WHERE name = ?1 LIMIT 1",
-    )
+    let vis = if public_only {
+        " AND repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
+    } else {
+        ""
+    };
+    let package: Option<crate::db::Package> = sqlx::query_as(&format!(
+        "SELECT * FROM packages WHERE name = ?1{vis} LIMIT 1",
+    ))
     .bind(name)
     .fetch_optional(db)
     .await?;
@@ -50,23 +62,26 @@ async fn find_package_by_name(
 pub async fn get_dependencies(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let name = extract_package_name(&params);
-    get_dependencies_impl(state, name).await
+    get_dependencies_impl(state, name, public_only(&auth)).await
 }
 
 pub async fn get_dependencies_unscoped(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    get_dependencies_impl(state, name).await
+    get_dependencies_impl(state, name, public_only(&auth)).await
 }
 
 async fn get_dependencies_impl(
     state: AppState,
     name: String,
+    public_only: bool,
 ) -> AppResult<impl IntoResponse> {
-    let (pkg, versions) = find_package_by_name(&state.db, &name)
+    let (pkg, versions) = find_package_by_name(&state.db, &name, public_only)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
 
@@ -102,23 +117,26 @@ async fn get_dependencies_impl(
 pub async fn get_dependents(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let name = extract_package_name(&params);
-    get_dependents_impl(state, name).await
+    get_dependents_impl(state, name, public_only(&auth)).await
 }
 
 pub async fn get_dependents_unscoped(
     State(state): State<AppState>,
     Path(name): Path<String>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    get_dependents_impl(state, name).await
+    get_dependents_impl(state, name, public_only(&auth)).await
 }
 
 async fn get_dependents_impl(
     state: AppState,
     name: String,
+    public_only: bool,
 ) -> AppResult<impl IntoResponse> {
-    let dependents = crate::db::get_dependents(&state.db, &name).await?;
+    let dependents = crate::db::get_dependents(&state.db, &name, public_only).await?;
 
     let dep_list: Vec<Value> = dependents
         .iter()
@@ -143,6 +161,7 @@ async fn get_dependents_impl(
 pub async fn impact_analysis(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let name = extract_package_name(&params);
     let version = params
@@ -150,23 +169,25 @@ pub async fn impact_analysis(
         .cloned()
         .ok_or_else(|| AppError::BadRequest("missing version".to_string()))?;
 
-    impact_analysis_impl(state, name, version).await
+    impact_analysis_impl(state, name, version, public_only(&auth)).await
 }
 
 pub async fn impact_analysis_unscoped(
     State(state): State<AppState>,
     Path((name, version)): Path<(String, String)>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    impact_analysis_impl(state, name, version).await
+    impact_analysis_impl(state, name, version, public_only(&auth)).await
 }
 
 async fn impact_analysis_impl(
     state: AppState,
     name: String,
     version: String,
+    public_only: bool,
 ) -> AppResult<impl IntoResponse> {
     // Find all packages that depend on this package
-    let dependents = crate::db::get_dependents(&state.db, &name).await?;
+    let dependents = crate::db::get_dependents(&state.db, &name, public_only).await?;
 
     let affected: Vec<String> = dependents
         .iter()
