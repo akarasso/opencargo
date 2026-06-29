@@ -34,7 +34,7 @@ fn build_go_module_zip(module_name: &str, version: &str) -> Vec<u8> {
         zip_writer.start_file(&go_file_path, options).unwrap();
         let go_content = format!(
             "package {}\n\nfunc Hello() string {{ return \"hello\" }}\n",
-            module_name.split('/').last().unwrap_or("main")
+            module_name.split('/').next_back().unwrap_or("main")
         );
         zip_writer.write_all(go_content.as_bytes()).unwrap();
 

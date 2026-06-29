@@ -43,7 +43,7 @@ fn build_publish_body(
     let b64 = base64::engine::general_purpose::STANDARD.encode(tarball_data);
     let attachment_key = format!(
         "{}-{}.tgz",
-        package_name.split('/').last().unwrap_or(package_name),
+        package_name.split('/').next_back().unwrap_or(package_name),
         version
     );
 
