@@ -200,6 +200,41 @@ async fn test_oci_chunked_upload() {
 }
 
 #[tokio::test]
+async fn test_oci_blob_shared_across_images_in_repo() {
+    // R2-2: blobs are content-addressed and deduplicated per repository, so a
+    // blob pushed under one image must be downloadable under another image in
+    // the same repo. Before the storage path was scoped to the repo, the blob
+    // lived under the first image's path and this cross-image read 404'd —
+    // exactly what breaks a docker pull of a second image sharing a layer.
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let blob_data = b"shared layer content";
+    let digest = push_blob(&client, &base_url, blob_data).await; // pushed via image "myapp"
+
+    let resp = client
+        .get(format!(
+            "{}/v2/oci-private/otherapp/blobs/{}",
+            base_url, digest
+        ))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("cross-image blob get failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a blob pushed under one image must be readable under another image in the same repo"
+    );
+    let body = resp.bytes().await.expect("read blob failed");
+    assert_eq!(
+        body.as_ref(),
+        blob_data,
+        "cross-image blob content must match"
+    );
+}
+
+#[tokio::test]
 async fn test_oci_blob_refcount_and_gc() {
     // B8: a blob referenced by a manifest can't be deleted (409); deleting the
     // manifest GCs its now-orphaned blobs.

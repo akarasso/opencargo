@@ -146,7 +146,13 @@ pub async fn get_blob(
     let hex_digest = digest
         .strip_prefix("sha256:")
         .unwrap_or(digest);
-    let storage_path = format!("oci/{}/blobs/sha256/{}", image_name, hex_digest);
+    // Blobs are content-addressed and shared at the REPOSITORY level (dedup is
+    // UNIQUE(repository_id, digest)), so the storage path must be scoped to the
+    // repo, not the image name. Scoping by image name made two images in the
+    // same repo that share a layer collide: the HEAD dedup would report the
+    // layer present (so the client skipped the upload) while the blob was never
+    // written under the second image's path — breaking the pull.
+    let storage_path = format!("oci/{}/_blobs/sha256/{}", repo.name, hex_digest);
 
     let data = state.storage.get(&storage_path).await?;
     let content_type = blob
@@ -229,7 +235,13 @@ pub async fn delete_blob(
 
     // Delete from storage
     let hex_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-    let storage_path = format!("oci/{}/blobs/sha256/{}", image_name, hex_digest);
+    // Blobs are content-addressed and shared at the REPOSITORY level (dedup is
+    // UNIQUE(repository_id, digest)), so the storage path must be scoped to the
+    // repo, not the image name. Scoping by image name made two images in the
+    // same repo that share a layer collide: the HEAD dedup would report the
+    // layer present (so the client skipped the upload) while the blob was never
+    // written under the second image's path — breaking the pull.
+    let storage_path = format!("oci/{}/_blobs/sha256/{}", repo.name, hex_digest);
     let _ = state.storage.delete(&storage_path).await;
 
     Ok(StatusCode::ACCEPTED.into_response())
@@ -451,7 +463,13 @@ pub async fn complete_upload(
         .digest
         .strip_prefix("sha256:")
         .unwrap_or(&query.digest);
-    let storage_path = format!("oci/{}/blobs/sha256/{}", image_name, hex_digest);
+    // Blobs are content-addressed and shared at the REPOSITORY level (dedup is
+    // UNIQUE(repository_id, digest)), so the storage path must be scoped to the
+    // repo, not the image name. Scoping by image name made two images in the
+    // same repo that share a layer collide: the HEAD dedup would report the
+    // layer present (so the client skipped the upload) while the blob was never
+    // written under the second image's path — breaking the pull.
+    let storage_path = format!("oci/{}/_blobs/sha256/{}", repo.name, hex_digest);
     state
         .storage
         .put(&storage_path, blob_data.clone())
@@ -913,7 +931,7 @@ pub async fn delete_manifest(
             let hex = blob_digest.strip_prefix("sha256:").unwrap_or(&blob_digest);
             let _ = state
                 .storage
-                .delete(&format!("oci/{}/blobs/sha256/{}", image_name, hex))
+                .delete(&format!("oci/{}/_blobs/sha256/{}", repo.name, hex))
                 .await;
         }
     }
