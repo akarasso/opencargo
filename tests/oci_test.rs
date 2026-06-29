@@ -137,6 +137,79 @@ async fn push_blob(client: &reqwest::Client, base_url: &str, blob_data: &[u8]) -
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn test_oci_blob_refcount_and_gc() {
+    // B8: a blob referenced by a manifest can't be deleted (409); deleting the
+    // manifest GCs its now-orphaned blobs.
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let config_data = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}";
+    let layer_data = b"refcount-test-layer";
+    let config_digest = push_blob(&client, &base_url, config_data).await;
+    let layer_digest = push_blob(&client, &base_url, layer_data).await;
+
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": config_digest,
+            "size": config_data.len()
+        },
+        "layers": [{
+            "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+            "digest": layer_digest,
+            "size": layer_data.len()
+        }]
+    });
+    let manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+    let resp = client
+        .put(format!("{}/v2/oci-private/myapp/manifests/rc", base_url))
+        .bearer_auth("test-token")
+        .header("Content-Type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest_bytes)
+        .send()
+        .await
+        .expect("put manifest failed");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    // Deleting a still-referenced blob is refused.
+    let resp = client
+        .delete(format!("{}/v2/oci-private/myapp/blobs/{}", base_url, layer_digest))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("delete blob request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "a blob referenced by a manifest must not be deletable"
+    );
+
+    // Deleting the manifest GCs its now-orphaned blobs.
+    let resp = client
+        .delete(format!("{}/v2/oci-private/myapp/manifests/rc", base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("delete manifest request failed");
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+
+    // The layer blob is gone (GC'd) -> HEAD now 404s.
+    let resp = client
+        .head(format!("{}/v2/oci-private/myapp/blobs/{}", base_url, layer_digest))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("head blob request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "an orphaned blob should be garbage-collected on manifest deletion"
+    );
+}
+
+#[tokio::test]
 async fn test_oci_version_check() {
     let (base_url, _handle, _tmp) = setup().await;
 
