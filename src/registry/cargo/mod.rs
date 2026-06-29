@@ -421,10 +421,7 @@ pub async fn download_crate(
 
     // Read from storage
     let data = state.storage.get(&version.tarball_path).await?;
-    let filename = format!("{}-{}.crate", crate_name, version_str)
-        .replace('"', "")
-        .replace('\n', "")
-        .replace('\r', "");
+    let filename = format!("{}-{}.crate", crate_name, version_str).replace(['"', '\n', '\r'], "");
 
     Ok((
         StatusCode::OK,

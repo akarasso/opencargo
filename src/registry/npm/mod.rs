@@ -114,8 +114,9 @@ pub async fn publish_package(
     // Process each version in the publish body
     for (version_str, version_meta) in &body.versions {
         // Check if version already exists
-        if let Some(_) =
-            crate::db::get_version(&state.db, package.id, version_str).await?
+        if crate::db::get_version(&state.db, package.id, version_str)
+            .await?
+            .is_some()
         {
             return Err(AppError::Conflict(format!(
                 "version {version_str} already exists for {package_name}"
@@ -161,9 +162,7 @@ pub async fn publish_package(
         let tarball_filename = build_tarball_filename(&package_name, version_str);
         let storage_path = format!(
             "npm/{}/{}/{}",
-            repo_name,
-            package_name.replace('/', "/"),
-            tarball_filename
+            repo_name, package_name, tarball_filename
         );
 
         // Store the tarball
@@ -187,17 +186,15 @@ pub async fn publish_package(
                     Value::String(integrity.clone()),
                 );
             }
-        } else {
-            meta.as_object_mut().map(|obj| {
-                obj.insert(
-                    "dist".to_string(),
-                    json!({
-                        "tarball": tarball_url,
-                        "shasum": sha1_hex.clone(),
-                        "integrity": integrity.clone(),
-                    }),
-                );
-            });
+        } else if let Some(obj) = meta.as_object_mut() {
+            obj.insert(
+                "dist".to_string(),
+                json!({
+                    "tarball": tarball_url,
+                    "shasum": sha1_hex.clone(),
+                    "integrity": integrity.clone(),
+                }),
+            );
         }
 
         let metadata_json = serde_json::to_string(&meta)?;
@@ -602,7 +599,7 @@ async fn download_tarball_hosted(
 
     // Read from storage
     let data = state.storage.get(&version.tarball_path).await?;
-    let safe_filename = filename.replace('"', "").replace('\n', "").replace('\r', "");
+    let safe_filename = filename.replace(['"', '\n', '\r'], "");
     let disposition = format!("attachment; filename=\"{safe_filename}\"");
 
     Ok((
@@ -642,7 +639,7 @@ async fn download_tarball_proxy(
         .fetch_tarball(repo_name, upstream_url, package_name, filename, repo.id)
         .await?;
 
-    let safe_filename = filename.replace('"', "").replace('\n', "").replace('\r', "");
+    let safe_filename = filename.replace(['"', '\n', '\r'], "");
     let disposition = format!("attachment; filename=\"{safe_filename}\"");
 
     Ok((

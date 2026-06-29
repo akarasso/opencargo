@@ -13,24 +13,27 @@ cache:
     - target/
     - frontend/node_modules/
 
+# Rust pinned to 1.88 to match the Dockerfile builder image.
 test:
   stage: test
-  image: rust:1.87
+  image: rust:1.88
   before_script:
+    - rustup component add clippy
     - apt-get update && apt-get install -y nodejs npm
     - npm install -g pnpm@10
-    - cd frontend && pnpm install && pnpm build && cd ..
+    - cd frontend && pnpm install --frozen-lockfile && pnpm build && cd ..
   script:
     - cargo build
+    - cargo clippy --all-targets --all-features -- -D warnings
     - cargo test
 
 build:
   stage: build
-  image: rust:1.87
+  image: rust:1.88
   before_script:
     - apt-get update && apt-get install -y nodejs npm
     - npm install -g pnpm@10
-    - cd frontend && pnpm install && pnpm build && cd ..
+    - cd frontend && pnpm install --frozen-lockfile && pnpm build && cd ..
   script:
     - cargo build --release
   artifacts:
@@ -50,7 +53,7 @@ docker:
   before_script:
     - apk add --no-cache nodejs npm
     - npm install -g pnpm@10
-    - cd frontend && pnpm install && pnpm build && cd ..
+    - cd frontend && pnpm install --frozen-lockfile && pnpm build && cd ..
   script:
     - docker build -t opencargo:latest .
   only:
@@ -60,11 +63,11 @@ docker:
 
 release:
   stage: release
-  image: rust:1.87
+  image: rust:1.88
   before_script:
     - apt-get update && apt-get install -y nodejs npm
     - npm install -g pnpm@10
-    - cd frontend && pnpm install && pnpm build && cd ..
+    - cd frontend && pnpm install --frozen-lockfile && pnpm build && cd ..
   script:
     - cargo build --release
   artifacts:

@@ -41,7 +41,7 @@ pub async fn list_audit(
     }
 
     let page = query.page.unwrap_or(1).max(1);
-    let size = query.size.unwrap_or(50).min(200).max(1);
+    let size = query.size.unwrap_or(50).clamp(1, 200);
 
     let entries = crate::db::list_audit_entries(&state.db, page, size).await?;
 

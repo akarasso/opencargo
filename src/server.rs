@@ -576,11 +576,10 @@ async fn npm_login(
     };
 
     // Verify password
-    let password_ok = match crate::auth::users::verify_password(&login.password, &user.password_hash)
-    {
-        Ok(true) => true,
-        _ => false,
-    };
+    let password_ok = matches!(
+        crate::auth::users::verify_password(&login.password, &user.password_hash),
+        Ok(true)
+    );
 
     if !password_ok {
         return (
@@ -603,7 +602,7 @@ async fn npm_login(
         expiry.format("%Y-%m-%d %H:%M:%S").to_string()
     };
 
-    if let Err(_) = crate::db::create_api_token(
+    if crate::db::create_api_token(
         &state.db,
         &token_id,
         user.id,
@@ -613,6 +612,7 @@ async fn npm_login(
         Some(&expires_at),
     )
     .await
+    .is_err()
     {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
