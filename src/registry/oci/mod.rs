@@ -736,6 +736,15 @@ pub async fn put_manifest(
     // Compute digest
     let digest = sha256_digest(&body);
 
+    // If the client pushed by digest, the reference MUST equal the actual
+    // content digest (OCI distribution spec). Reject a mismatch rather than
+    // silently storing the manifest under its real digest.
+    if is_digest(&reference) && reference != digest {
+        return Err(AppError::BadRequest(format!(
+            "manifest digest mismatch: reference '{reference}' != computed '{digest}'"
+        )));
+    }
+
     // Store manifest
     let hex_digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
     let storage_path = format!(

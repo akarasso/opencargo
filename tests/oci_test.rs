@@ -235,6 +235,40 @@ async fn test_oci_blob_shared_across_images_in_repo() {
 }
 
 #[tokio::test]
+async fn test_oci_put_manifest_by_wrong_digest_rejected() {
+    // R2-4: pushing a manifest by digest must verify that the reference equals
+    // the real content digest (OCI spec); a mismatch must be rejected, not
+    // silently stored under the real digest.
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":0,"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"layers":[]}"#;
+    let wrong_digest =
+        "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+
+    let resp = client
+        .put(format!(
+            "{}/v2/oci-private/myapp/manifests/{}",
+            base_url, wrong_digest
+        ))
+        .bearer_auth("test-token")
+        .header(
+            "content-type",
+            "application/vnd.oci.image.manifest.v1+json",
+        )
+        .body(manifest.to_vec())
+        .send()
+        .await
+        .expect("put manifest request failed");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a manifest pushed by a mismatched digest must be rejected"
+    );
+}
+
+#[tokio::test]
 async fn test_oci_blob_refcount_and_gc() {
     // B8: a blob referenced by a manifest can't be deleted (409); deleting the
     // manifest GCs its now-orphaned blobs.
