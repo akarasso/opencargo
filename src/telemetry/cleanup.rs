@@ -24,8 +24,11 @@ pub async fn start_cleanup_task(
 
     info!("Cleanup task started (runs every 24h)");
     loop {
-        tokio::time::sleep(Duration::from_secs(86400)).await;
+        // Run first, THEN sleep: sleeping first meant the initial sweep only
+        // happened after 24h of uptime, so a service restarted more often than
+        // daily (common under k8s) would never clean up at all.
         run_cleanup(&db, &storage, &config).await;
+        tokio::time::sleep(Duration::from_secs(86400)).await;
     }
 }
 

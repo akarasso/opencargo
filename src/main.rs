@@ -53,6 +53,18 @@ async fn main() -> anyhow::Result<()> {
             info!("Starting opencargo on {}", bind);
 
             let app_state = server::build_state(&cfg).await?;
+
+            // Spawn the periodic cleanup/GC task before the router consumes
+            // app_state. It is a no-op unless cleanup.enabled and the retention
+            // thresholds are configured, so wiring it is safe by default.
+            let cleanup_storage: std::sync::Arc<dyn opencargo::storage::StorageBackend> =
+                app_state.storage.clone();
+            tokio::spawn(opencargo::telemetry::cleanup::start_cleanup_task(
+                app_state.db.clone(),
+                cleanup_storage,
+                cfg.cleanup.clone(),
+            ));
+
             let router = server::build_router(app_state);
 
             // Decode percent-encoded slashes (%2f) before routing.
