@@ -7,7 +7,7 @@ use serde::Deserialize;
 // Top-level config
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
@@ -21,21 +21,6 @@ pub struct Config {
     pub webhooks: Vec<WebhookConfig>,
     #[serde(default)]
     pub vuln_scan: VulnScanConfig,
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Self {
-            server: ServerConfig::default(),
-            database: DatabaseConfig::default(),
-            auth: AuthConfig::default(),
-            proxy: ProxyConfig::default(),
-            cleanup: CleanupConfig::default(),
-            repositories: Vec::new(),
-            webhooks: Vec::new(),
-            vuln_scan: VulnScanConfig::default(),
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -218,17 +203,12 @@ pub enum RepositoryFormat {
     Pypi,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
 pub enum Visibility {
     Public,
+    #[default]
     Private,
-}
-
-impl Default for Visibility {
-    fn default() -> Self {
-        Self::Private
-    }
 }
 
 // ---------------------------------------------------------------------------

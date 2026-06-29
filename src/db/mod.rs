@@ -218,6 +218,9 @@ pub async fn create_package(
     Ok(result.last_insert_rowid())
 }
 
+// Mirrors the `versions` table columns; a parameter struct is the eventual
+// cleanup but out of scope for the clippy pass.
+#[allow(clippy::too_many_arguments)]
 pub async fn create_version(
     pool: &SqlitePool,
     package_id: i64,
