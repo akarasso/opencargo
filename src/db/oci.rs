@@ -2,6 +2,8 @@
 //! previously defined inside the OCI handlers (and, incrementally, the typed
 //! queries that replace the inline SQL there).
 
+use sqlx::SqlitePool;
+
 #[derive(Debug, sqlx::FromRow)]
 pub struct OciBlob {
     #[allow(dead_code)]
@@ -55,4 +57,46 @@ pub struct OciUpload {
     pub name: String,
     #[allow(dead_code)]
     pub started_at: String,
+}
+
+// ---------------------------------------------------------------------------
+// Typed read queries (replace the inline SELECTs in the OCI handlers).
+// ---------------------------------------------------------------------------
+
+pub async fn get_blob(
+    pool: &SqlitePool,
+    repository_id: i64,
+    digest: &str,
+) -> Result<Option<OciBlob>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM oci_blobs WHERE repository_id = ?1 AND digest = ?2")
+        .bind(repository_id)
+        .bind(digest)
+        .fetch_optional(pool)
+        .await
+}
+
+pub async fn get_manifest(
+    pool: &SqlitePool,
+    repository_id: i64,
+    name: &str,
+    digest: &str,
+) -> Result<Option<OciManifest>, sqlx::Error> {
+    sqlx::query_as(
+        "SELECT * FROM oci_manifests WHERE repository_id = ?1 AND name = ?2 AND digest = ?3",
+    )
+    .bind(repository_id)
+    .bind(name)
+    .bind(digest)
+    .fetch_optional(pool)
+    .await
+}
+
+pub async fn get_upload(
+    pool: &SqlitePool,
+    upload_id: &str,
+) -> Result<Option<OciUpload>, sqlx::Error> {
+    sqlx::query_as("SELECT * FROM oci_uploads WHERE id = ?1")
+        .bind(upload_id)
+        .fetch_optional(pool)
+        .await
 }

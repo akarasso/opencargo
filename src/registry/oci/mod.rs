@@ -14,7 +14,7 @@ use tracing::info;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
-use crate::db::oci::{OciBlob, OciManifest, OciTag, OciUpload};
+use crate::db::oci::OciTag;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::storage::StorageBackend;
@@ -86,13 +86,7 @@ pub async fn head_blob(
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     // Check if blob exists in DB
-    let blob: Option<OciBlob> = sqlx::query_as(
-        "SELECT * FROM oci_blobs WHERE repository_id = ?1 AND digest = ?2",
-    )
-    .bind(repo.id)
-    .bind(digest)
-    .fetch_optional(&state.db)
-    .await?;
+    let blob = crate::db::oci::get_blob(&state.db, repo.id, digest).await?;
 
     match blob {
         Some(b) => {
@@ -142,13 +136,7 @@ pub async fn get_blob(
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     // Check if blob exists in DB
-    let blob: Option<OciBlob> = sqlx::query_as(
-        "SELECT * FROM oci_blobs WHERE repository_id = ?1 AND digest = ?2",
-    )
-    .bind(repo.id)
-    .bind(digest)
-    .fetch_optional(&state.db)
-    .await?;
+    let blob = crate::db::oci::get_blob(&state.db, repo.id, digest).await?;
 
     let blob = blob.ok_or_else(|| {
         AppError::NotFound(format!("blob not found: {} in {}", digest, image_name))
@@ -344,11 +332,7 @@ pub async fn upload_chunk(
     }
 
     // Verify upload exists AND belongs to this repository.
-    let upload: Option<OciUpload> =
-        sqlx::query_as("SELECT * FROM oci_uploads WHERE id = ?1")
-            .bind(upload_uuid)
-            .fetch_optional(&state.db)
-            .await?;
+    let upload = crate::db::oci::get_upload(&state.db, upload_uuid).await?;
     let upload = upload.ok_or_else(|| {
         AppError::NotFound(format!("upload not found: {upload_uuid}"))
     })?;
@@ -431,11 +415,7 @@ pub async fn complete_upload(
     }
 
     // Verify upload exists AND belongs to this repository.
-    let upload: Option<OciUpload> =
-        sqlx::query_as("SELECT * FROM oci_uploads WHERE id = ?1")
-            .bind(upload_uuid)
-            .fetch_optional(&state.db)
-            .await?;
+    let upload = crate::db::oci::get_upload(&state.db, upload_uuid).await?;
     let upload = upload.ok_or_else(|| {
         AppError::NotFound(format!("upload not found: {upload_uuid}"))
     })?;
@@ -576,14 +556,7 @@ pub async fn get_manifest(
     };
 
     // Fetch manifest from DB
-    let manifest: Option<OciManifest> = sqlx::query_as(
-        "SELECT * FROM oci_manifests WHERE repository_id = ?1 AND name = ?2 AND digest = ?3",
-    )
-    .bind(repo.id)
-    .bind(&name)
-    .bind(&digest)
-    .fetch_optional(&state.db)
-    .await?;
+    let manifest = crate::db::oci::get_manifest(&state.db, repo.id, &name, &digest).await?;
 
     let manifest = manifest.ok_or_else(|| {
         AppError::NotFound(format!(
@@ -657,14 +630,7 @@ pub async fn head_manifest(
         .manifest_digest
     };
 
-    let manifest: Option<OciManifest> = sqlx::query_as(
-        "SELECT * FROM oci_manifests WHERE repository_id = ?1 AND name = ?2 AND digest = ?3",
-    )
-    .bind(repo.id)
-    .bind(&name)
-    .bind(&digest)
-    .fetch_optional(&state.db)
-    .await?;
+    let manifest = crate::db::oci::get_manifest(&state.db, repo.id, &name, &digest).await?;
 
     let manifest = manifest.ok_or_else(|| {
         AppError::NotFound(format!(
