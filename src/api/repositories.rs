@@ -257,11 +257,21 @@ pub async fn delete_repository(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    if crate::db::get_repository_by_name(&state.db, &name)
+    let repo = crate::db::get_repository_by_name(&state.db, &name)
         .await?
-        .is_none()
-    {
-        return Err(AppError::NotFound(format!("repository not found: {name}")));
+        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))?;
+
+    // Refuse to delete a non-empty repo with a clear 409 instead of letting the
+    // foreign-key constraint blow up as an opaque 500.
+    let pkg_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = ?1")
+            .bind(repo.id)
+            .fetch_one(&state.db)
+            .await?;
+    if pkg_count > 0 {
+        return Err(AppError::Conflict(format!(
+            "repository '{name}' is not empty ({pkg_count} package(s)); delete its packages first"
+        )));
     }
 
     crate::db::delete_repository(&state.db, &name).await?;
