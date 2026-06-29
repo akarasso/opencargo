@@ -19,6 +19,11 @@ RUN touch src/main.rs && cargo build --release
 
 # Stage 3: Runtime
 FROM alpine:3.21
+# Run as an unprivileged user (uid/gid 10001). Matches runAsUser/runAsGroup in
+# the k8s/Helm securityContext. Writable state lives under /data (a volume with
+# matching fsGroup), so the binary never needs to write to the image rootfs.
+RUN addgroup -S -g 10001 opencargo && adduser -S -u 10001 -G opencargo opencargo
 COPY --from=builder /app/target/release/opencargo /usr/local/bin/
+USER 10001:10001
 EXPOSE 6789
 ENTRYPOINT ["opencargo"]

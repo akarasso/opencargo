@@ -2,6 +2,8 @@ replicaCount: 1
 
 image:
   repository: ghcr.io/trace/opencargo
+  # ":latest" is mutable and not reproducible. Prefer an immutable reference
+  # (a version tag or "@sha256:<digest>") in real deployments.
   tag: "latest"
   pullPolicy: IfNotPresent
 
@@ -22,7 +24,10 @@ config: |
   anonymous_read = true
 
 auth:
-  adminPassword: "admin"
+  # REQUIRED — no default on purpose. `helm install` fails unless a strong value
+  # is provided (e.g. `--set auth.adminPassword=...` or a values override). This
+  # prevents shipping an admin/admin instance.
+  adminPassword: ""
 
 ingress:
   enabled: false
@@ -46,3 +51,23 @@ service:
 nodeSelector: {}
 tolerations: []
 affinity: {}
+
+# Pod- and container-level hardening. Defaults run as the unprivileged uid/gid
+# 10001 baked into the image, drop all Linux capabilities and forbid privilege
+# escalation. readOnlyRootFilesystem is opt-in: enable it once you have
+# confirmed every writable path the server uses lives under /data (the mounted
+# volume) or /tmp (an emptyDir).
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 10001
+  runAsGroup: 10001
+  fsGroup: 10001
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false
+  capabilities:
+    drop:
+      - ALL

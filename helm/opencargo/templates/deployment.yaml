@@ -17,10 +17,15 @@ spec:
         app: opencargo
         release: {{ .Release.Name }}
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: opencargo
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           args:
             - serve
             - --config
@@ -49,6 +54,8 @@ spec:
             - name: config
               mountPath: /etc/opencargo
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
           env:
             - name: OPENCARGO_ADMIN_PASSWORD
               valueFrom:
@@ -62,6 +69,8 @@ spec:
         - name: config
           configMap:
             name: {{ .Release.Name }}-opencargo-config
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

@@ -14,9 +14,25 @@ spec:
       labels:
         app: opencargo
     spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
       containers:
         - name: opencargo
+          # ":latest" is mutable; prefer an immutable tag/digest in production.
           image: ghcr.io/akarasso/opencargo:latest
+          imagePullPolicy: IfNotPresent
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false
+            capabilities:
+              drop:
+                - ALL
           args:
             - serve
             - --config
@@ -50,6 +66,8 @@ spec:
             - name: config
               mountPath: /etc/opencargo
               readOnly: true
+            - name: tmp
+              mountPath: /tmp
       volumes:
         - name: data
           persistentVolumeClaim:
@@ -57,3 +75,5 @@ spec:
         - name: config
           configMap:
             name: opencargo-config
+        - name: tmp
+          emptyDir: {}
