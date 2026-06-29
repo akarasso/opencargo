@@ -3,11 +3,25 @@ pub mod go;
 pub mod npm;
 pub mod oci;
 
+use std::collections::HashMap;
+
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
+
+/// Extract the full package name from path parameters.
+/// Scoped: scope="trace", name="httpclient" -> "@trace/httpclient".
+/// Unscoped: name="react" -> "react".
+/// Single source of truth for the copy that previously lived in the npm
+/// handler and in the promote/deps/vulns API modules.
+pub fn extract_package_name(params: &HashMap<String, String>) -> String {
+    match params.get("scope") {
+        Some(scope) => format!("@{}/{}", scope, params.get("name").unwrap_or(&String::new())),
+        None => params.get("name").cloned().unwrap_or_default(),
+    }
+}
 
 /// Enforce read access on a repository before serving any of its content.
 ///

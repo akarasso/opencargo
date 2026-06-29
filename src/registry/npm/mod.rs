@@ -16,6 +16,7 @@ use tracing::{info, warn};
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::proxy;
+use crate::registry::extract_package_name;
 use crate::server::AppState;
 use crate::storage::StorageBackend;
 
@@ -1088,19 +1089,6 @@ pub async fn delete_dist_tag(
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Extract the full package name from path parameters.
-/// For scoped packages: scope="trace", name="httpclient" → "@trace/httpclient"
-/// For unscoped packages: name="react" → "react"
-fn extract_package_name(params: &HashMap<String, String>) -> String {
-    match params.get("scope") {
-        Some(scope) => format!("@{}/{}", scope, params.get("name").unwrap_or(&String::new())),
-        None => params
-            .get("name")
-            .cloned()
-            .unwrap_or_default(),
-    }
-}
 
 /// Build the tarball filename from package name and version.
 /// "@trace/httpclient" + "1.0.0" → "httpclient-1.0.0.tgz"
