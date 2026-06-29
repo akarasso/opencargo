@@ -69,10 +69,14 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let storage = Arc::new(FilesystemStorage::new(&config.server.storage_path));
 
+    // Shared between AuthState (Basic Auth throttling) and AppState (npm login).
+    let login_rate_limiter = Arc::new(RateLimiter::new(5, 60));
+
     let auth = Arc::new(AuthState {
         static_tokens: config.auth.static_tokens.clone(),
         anonymous_read: config.auth.anonymous_read,
         db: db.clone(),
+        login_rate_limiter: login_rate_limiter.clone(),
     });
 
     // Create admin user from config if it doesn't exist
@@ -168,7 +172,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         proxy_client,
         base_url: config.server.base_url.clone(),
         metrics_handle,
-        login_rate_limiter: Arc::new(RateLimiter::new(5, 60)),
+        login_rate_limiter,
         publish_rate_limiter: Arc::new(RateLimiter::new(30, 60)),
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
@@ -468,6 +472,39 @@ pub fn build_router(state: AppState) -> Router {
         .layer(axum::middleware::from_fn(
             telemetry::http_metrics_middleware,
         ))
+        // Security response headers on every response (defense in depth).
+        .layer(axum::middleware::from_fn(security_headers_middleware))
+}
+
+/// Add hardening response headers to every response.
+///
+/// The CSP allows same-origin assets plus inline styles (the embedded SPA uses
+/// them); tighten it further if the frontend stops needing `'unsafe-inline'`.
+async fn security_headers_middleware(
+    request: axum::http::Request<axum::body::Body>,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    use axum::http::{header, HeaderValue};
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::X_CONTENT_TYPE_OPTIONS,
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert(header::X_FRAME_OPTIONS, HeaderValue::from_static("DENY"));
+    headers.insert(
+        header::REFERRER_POLICY,
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(
+            "default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; \
+             img-src 'self' data:; font-src 'self' data:; connect-src 'self'; \
+             object-src 'none'; base-uri 'self'; frame-ancestors 'none'",
+        ),
+    );
+    response
 }
 
 /// Dispatch Go module version requests based on file extension.
