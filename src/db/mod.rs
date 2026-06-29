@@ -815,7 +815,8 @@ pub async fn list_audit_entries(
     page: i64,
     size: i64,
 ) -> Result<Vec<AuditEntry>, sqlx::Error> {
-    let offset = (page - 1).max(0) * size;
+    // saturating_* to avoid overflowing the i64 multiplication on a huge page.
+    let offset = page.saturating_sub(1).max(0).saturating_mul(size.max(0));
     sqlx::query_as::<_, AuditEntry>(
         "SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?1 OFFSET ?2",
     )

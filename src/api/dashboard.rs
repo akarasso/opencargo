@@ -250,7 +250,9 @@ pub async fn list_packages(
     let pool = &state.db;
     let (and_vis, where_vis) = visibility_sql(&auth);
     let page = if params.page < 1 { 1 } else { params.page };
-    let offset = (page - 1) * PAGE_SIZE;
+    // saturating_* so a huge `page` cannot overflow the i64 multiplication
+    // (panics in debug, wraps to a negative OFFSET in release).
+    let offset = page.saturating_sub(1).saturating_mul(PAGE_SIZE);
 
     let (pkg_rows, count) = if !params.repo.is_empty() && !params.q.is_empty() {
         let search = format!("%{}%", params.q);
@@ -387,7 +389,7 @@ pub async fn list_packages(
         });
     }
 
-    let has_next = (offset + PAGE_SIZE) < count;
+    let has_next = offset.saturating_add(PAGE_SIZE) < count;
 
     Json(PackagesResponse {
         packages,
