@@ -648,6 +648,26 @@ async fn test_metrics_path_label_is_bounded() {
     );
 }
 
+/// Regression for the pagination overflow: a huge `page` must not overflow the
+/// i64 OFFSET computation `(page-1)*PAGE_SIZE` (which panics in debug and wraps
+/// to a negative OFFSET in release). The request must complete normally.
+#[tokio::test]
+async fn test_dashboard_pagination_huge_page_no_overflow() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/api/v1/packages?page=999999999999999999", base_url))
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "a huge page must not overflow into a 500"
+    );
+}
+
 // ===========================================================================
 // Phase 6 -- Cargo Registry Tests
 // ===========================================================================
