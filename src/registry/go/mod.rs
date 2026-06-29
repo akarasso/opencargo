@@ -23,10 +23,13 @@ use crate::storage::StorageBackend;
 pub async fn list_versions(
     State(state): State<AppState>,
     Path((repo_name, module_name)): Path<(String, String)>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     let package = match crate::db::get_package(&state.db, repo.id, &module_name).await? {
         Some(p) => p,
