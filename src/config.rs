@@ -161,7 +161,7 @@ impl Default for ProxyConfig {
 // Cleanup
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize, Default)]
 #[serde(default)]
 pub struct CleanupConfig {
     pub enabled: bool,
