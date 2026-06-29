@@ -137,6 +137,69 @@ async fn push_blob(client: &reqwest::Client, base_url: &str, blob_data: &[u8]) -
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn test_oci_chunked_upload() {
+    // Covers upload_chunk (PATCH) + complete_upload assembling from chunks.
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let chunk1 = b"first-half-of-the-blob-";
+    let chunk2 = b"second-half-of-the-blob";
+    let mut full = Vec::new();
+    full.extend_from_slice(chunk1);
+    full.extend_from_slice(chunk2);
+    let digest = sha256_digest(&full);
+
+    let resp = client
+        .post(format!("{}/v2/oci-private/myapp/blobs/uploads/", base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("start upload failed");
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    let location = resp
+        .headers()
+        .get("location")
+        .expect("missing Location")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    for chunk in [chunk1.as_slice(), chunk2.as_slice()] {
+        let resp = client
+            .patch(format!("{}{}", base_url, location))
+            .bearer_auth("test-token")
+            .body(chunk.to_vec())
+            .send()
+            .await
+            .expect("patch chunk failed");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED, "patch chunk failed");
+    }
+
+    let resp = client
+        .put(format!("{}{}?digest={}", base_url, location, digest))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("complete upload failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "complete failed: {:?}",
+        resp.text().await
+    );
+
+    let resp = client
+        .get(format!("{}/v2/oci-private/myapp/blobs/{}", base_url, digest))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("get blob failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.bytes().await.expect("read blob failed");
+    assert_eq!(body.as_ref(), full.as_slice(), "reassembled blob must match");
+}
+
+#[tokio::test]
 async fn test_oci_blob_refcount_and_gc() {
     // B8: a blob referenced by a manifest can't be deleted (409); deleting the
     // manifest GCs its now-orphaned blobs.

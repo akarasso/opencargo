@@ -342,21 +342,11 @@ pub async fn upload_chunk(
         ));
     }
 
-    // For simplicity, store the chunk data in a temporary storage location
+    // Accumulate the chunk in a temporary storage location. We append directly
+    // instead of read-modify-write so a multi-chunk upload stays O(N) overall
+    // rather than O(N²); `append` returns the new total size for the Range header.
     let chunk_path = format!("oci/_uploads/{}/{}", upload_uuid, "data");
-
-    // Append to existing data or create new
-    let existing = state.storage.get(&chunk_path).await;
-    let new_data = match existing {
-        Ok(existing_data) => {
-            let mut combined = existing_data.to_vec();
-            combined.extend_from_slice(&body);
-            Bytes::from(combined)
-        }
-        Err(_) => body,
-    };
-
-    state.storage.put(&chunk_path, new_data.clone()).await?;
+    let total_len = state.storage.append(&chunk_path, body).await?;
 
     let location = format!("/v2/{}/{}/blobs/uploads/{}", repo_name, name, upload_uuid);
 
@@ -366,7 +356,7 @@ pub async fn upload_chunk(
             ("Location", location),
             ("Docker-Upload-UUID", upload_uuid.to_string()),
             ("Content-Length", "0".to_string()),
-            ("Range", format!("0-{}", new_data.len().saturating_sub(1))),
+            ("Range", format!("0-{}", total_len.saturating_sub(1))),
         ],
     )
         .into_response())
