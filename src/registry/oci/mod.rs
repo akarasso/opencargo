@@ -302,6 +302,7 @@ pub async fn start_upload(
 pub async fn upload_chunk(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<AuthUser>>,
     body: Bytes,
 ) -> AppResult<Response> {
     let repo_name = params
@@ -312,16 +313,39 @@ pub async fn upload_chunk(
         .get("uuid")
         .ok_or_else(|| AppError::BadRequest("missing upload uuid".to_string()))?;
 
-    // Verify upload exists
+    // Authn + authz: this path was previously unauthenticated, allowing anyone
+    // with a valid upload UUID to write into any repo. Require an authenticated
+    // user with write permission on the hosted repo named in the URL.
+    let auth_user = auth
+        .map(|e| e.0)
+        .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
+    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    if repo.repo_type != "hosted" {
+        return Err(AppError::BadRequest(
+            "can only push to hosted repositories".to_string(),
+        ));
+    }
+    if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await
+    {
+        return Err(AppError::Forbidden("insufficient permissions".to_string()));
+    }
+
+    // Verify upload exists AND belongs to this repository.
     let upload: Option<OciUpload> =
         sqlx::query_as("SELECT * FROM oci_uploads WHERE id = ?1")
             .bind(upload_uuid)
             .fetch_optional(&state.db)
             .await?;
-
-    let _upload = upload.ok_or_else(|| {
+    let upload = upload.ok_or_else(|| {
         AppError::NotFound(format!("upload not found: {upload_uuid}"))
     })?;
+    if upload.repository_id != repo.id {
+        return Err(AppError::Forbidden(
+            "upload does not belong to this repository".to_string(),
+        ));
+    }
 
     // For simplicity, store the chunk data in a temporary storage location
     let chunk_path = format!("oci/_uploads/{}/{}", upload_uuid, "data");
@@ -366,6 +390,7 @@ pub async fn complete_upload(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
     Query(query): Query<CompleteUploadQuery>,
+    auth: Option<axum::Extension<AuthUser>>,
     body: Bytes,
 ) -> AppResult<Response> {
     let image_name = extract_image_name(&params);
@@ -376,20 +401,38 @@ pub async fn complete_upload(
         .get("uuid")
         .ok_or_else(|| AppError::BadRequest("missing upload uuid".to_string()))?;
 
-    // Verify upload exists
+    // Authn + authz: require an authenticated user with write permission on the
+    // hosted repo named in the URL (this path was previously unauthenticated).
+    let auth_user = auth
+        .map(|e| e.0)
+        .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
+    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    if repo.repo_type != "hosted" {
+        return Err(AppError::BadRequest(
+            "can only push to hosted repositories".to_string(),
+        ));
+    }
+    if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await
+    {
+        return Err(AppError::Forbidden("insufficient permissions".to_string()));
+    }
+
+    // Verify upload exists AND belongs to this repository.
     let upload: Option<OciUpload> =
         sqlx::query_as("SELECT * FROM oci_uploads WHERE id = ?1")
             .bind(upload_uuid)
             .fetch_optional(&state.db)
             .await?;
-
-    let _upload = upload.ok_or_else(|| {
+    let upload = upload.ok_or_else(|| {
         AppError::NotFound(format!("upload not found: {upload_uuid}"))
     })?;
-
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    if upload.repository_id != repo.id {
+        return Err(AppError::Forbidden(
+            "upload does not belong to this repository".to_string(),
+        ));
+    }
 
     // Get the blob data: either from the PUT body (monolithic) or from chunked upload data
     let chunk_path = format!("oci/_uploads/{}/{}", upload_uuid, "data");

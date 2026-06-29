@@ -207,7 +207,11 @@ impl VulnScanner {
 
         for (i, osv_result) in response.results.iter().enumerate() {
             if !osv_result.vulns.is_empty() {
-                let (dep_name, dep_version) = &deps[i];
+                // The OSV response is attacker/3rd-party controlled; never index
+                // `deps` with its length (would panic if results.len() > deps.len()).
+                let Some((dep_name, dep_version)) = deps.get(i) else {
+                    continue;
+                };
                 for vuln in &osv_result.vulns {
                     let severity = vuln
                         .severity
