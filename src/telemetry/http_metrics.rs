@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use axum::{body::Body, http::Request, middleware::Next, response::Response};
+use axum::{body::Body, extract::MatchedPath, http::Request, middleware::Next, response::Response};
 
 use super::metrics::record_http_request;
 
@@ -11,7 +11,16 @@ pub async fn http_metrics_middleware(
     next: Next,
 ) -> Response {
     let method = request.method().to_string();
-    let path = request.uri().path().to_string();
+    // Label on the matched route TEMPLATE (e.g. "/{repo}/-/v1/search"), never
+    // the raw URI path. The raw path is attacker-controlled and unbounded:
+    // hammering random URLs (404s included) would spawn an unbounded number of
+    // Prometheus series that are never reclaimed — a memory-exhaustion DoS
+    // reachable anonymously. Unmatched requests collapse to one series.
+    let path = request
+        .extensions()
+        .get::<MatchedPath>()
+        .map(|mp| mp.as_str().to_string())
+        .unwrap_or_else(|| "<unmatched>".to_string());
     let start = Instant::now();
 
     let response = next.run(request).await;
