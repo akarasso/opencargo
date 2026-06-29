@@ -54,6 +54,36 @@ impl RateLimiter {
             true
         }
     }
+
+    /// Whether `key` has already reached the limit within the window, WITHOUT
+    /// recording a new attempt. Use this to reject before doing expensive work
+    /// (e.g. Argon2) while only counting *failures* via `record_failure`, so a
+    /// legitimate burst of successful auths (e.g. a `docker push`, which makes
+    /// many authenticated requests in a row) is never throttled.
+    pub fn is_limited(&self, key: &str) -> bool {
+        let cutoff = Instant::now() - self.window;
+        let mut map = self.requests.lock().unwrap();
+        match map.get_mut(key) {
+            Some(timestamps) => {
+                timestamps.retain(|t| *t > cutoff);
+                timestamps.len() >= self.max_requests
+            }
+            None => false,
+        }
+    }
+
+    /// Record one attempt (a failed one) for `key`, evicting expired entries.
+    pub fn record_failure(&self, key: &str) {
+        let now = Instant::now();
+        let cutoff = now - self.window;
+        let mut map = self.requests.lock().unwrap();
+        if map.len() > 1024 {
+            map.retain(|_, timestamps| timestamps.iter().any(|t| *t > cutoff));
+        }
+        let timestamps = map.entry(key.to_string()).or_default();
+        timestamps.retain(|t| *t > cutoff);
+        timestamps.push(now);
+    }
 }
 
 #[cfg(test)]
@@ -80,5 +110,18 @@ mod tests {
         assert!(limiter.check("user2"));
         assert!(limiter.check("user2"));
         assert!(!limiter.check("user2"));
+    }
+
+    #[test]
+    fn test_is_limited_only_after_recorded_failures() {
+        let limiter = RateLimiter::new(3, 60);
+        // is_limited never records, so it can be polled freely.
+        assert!(!limiter.is_limited("u"));
+        assert!(!limiter.is_limited("u"));
+        limiter.record_failure("u");
+        limiter.record_failure("u");
+        assert!(!limiter.is_limited("u"), "2 failures < limit of 3");
+        limiter.record_failure("u");
+        assert!(limiter.is_limited("u"), "3 failures reaches the limit");
     }
 }
