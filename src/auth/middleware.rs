@@ -99,8 +99,10 @@ pub async fn auth_middleware(
             return too_many_requests_response();
         }
         if let Ok(Some(user)) = crate::db::get_user_by_username(&state.db, &username).await {
-            let password_ok = super::users::verify_password(&password, &user.password_hash)
-                .unwrap_or(false);
+            let password_ok =
+                super::users::verify_password_async(password, user.password_hash.clone())
+                    .await
+                    .unwrap_or(false);
             if password_ok {
                 let auth_user = AuthUser {
                     token: String::new(),

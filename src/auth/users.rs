@@ -40,3 +40,18 @@ pub fn verify_password(password: &str, hash: &str) -> Result<bool> {
         .verify_password(password.as_bytes(), &parsed_hash)
         .is_ok())
 }
+
+/// Async wrapper running the Argon2id hash on a blocking thread so the
+/// (deliberately CPU-heavy) computation does not stall a tokio worker.
+pub async fn hash_password_async(password: String) -> Result<String> {
+    tokio::task::spawn_blocking(move || hash_password(&password))
+        .await
+        .map_err(|e| anyhow::anyhow!("password hash task failed: {e}"))?
+}
+
+/// Async wrapper running Argon2id verification on a blocking thread.
+pub async fn verify_password_async(password: String, hash: String) -> Result<bool> {
+    tokio::task::spawn_blocking(move || verify_password(&password, &hash))
+        .await
+        .map_err(|e| anyhow::anyhow!("password verify task failed: {e}"))?
+}

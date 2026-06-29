@@ -126,7 +126,8 @@ pub async fn create_user(
 
     // Always generate a random password (ignore any password in the request)
     let raw_password = auth_users::generate_random_password();
-    let password_hash = auth_users::hash_password(&raw_password)
+    let password_hash = auth_users::hash_password_async(raw_password.clone())
+        .await
         .map_err(|e| AppError::Internal(format!("failed to hash password: {e}")))?;
 
     crate::db::create_user(
@@ -219,7 +220,8 @@ pub async fn update_user(
 
     let password_hash = match &body.password {
         Some(pw) => Some(
-            auth_users::hash_password(pw)
+            auth_users::hash_password_async(pw.clone())
+                .await
                 .map_err(|e| AppError::Internal(format!("failed to hash password: {e}")))?,
         ),
         None => None,
@@ -293,14 +295,16 @@ pub async fn change_password(
         let current = body.current_password.as_deref().ok_or_else(|| {
             AppError::BadRequest("current_password is required".to_string())
         })?;
-        let ok = auth_users::verify_password(current, &user.password_hash)
+        let ok = auth_users::verify_password_async(current.to_string(), user.password_hash.clone())
+            .await
             .map_err(|e| AppError::Internal(format!("failed to verify password: {e}")))?;
         if !ok {
             return Err(AppError::Unauthorized("invalid current password".to_string()));
         }
     }
 
-    let new_hash = auth_users::hash_password(&body.new_password)
+    let new_hash = auth_users::hash_password_async(body.new_password.clone())
+        .await
         .map_err(|e| AppError::Internal(format!("failed to hash password: {e}")))?;
 
     crate::db::update_user(&state.db, &username, None, Some(&new_hash), None).await?;
