@@ -10,6 +10,7 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
+use super::rate_limit::RateLimiter;
 use super::tokens;
 
 // ---------------------------------------------------------------------------
@@ -21,6 +22,8 @@ pub struct AuthState {
     pub static_tokens: Vec<String>,
     pub anonymous_read: bool,
     pub db: SqlitePool,
+    /// Shared with `AppState.login_rate_limiter`; throttles Basic Auth attempts.
+    pub login_rate_limiter: Arc<RateLimiter>,
 }
 
 // ---------------------------------------------------------------------------
@@ -33,6 +36,9 @@ pub struct AuthUser {
     pub user_id: Option<i64>,
     pub username: String,
     pub role: String,
+    /// When true, the user must change their password before doing anything
+    /// other than changing it (enforced in `auth_middleware`).
+    pub must_change_password: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -87,17 +93,31 @@ pub async fn auth_middleware(
 
     // Handle Basic Auth
     if let Some((username, password)) = basic_auth {
+        // Rate-limit Basic Auth to stop unlimited brute force and the Argon2 CPU
+        // DoS it enables (verify_password runs on every attempt).
+        if !state.login_rate_limiter.check(&format!("basic:{username}")) {
+            return too_many_requests_response();
+        }
         if let Ok(Some(user)) = crate::db::get_user_by_username(&state.db, &username).await {
             let password_ok = super::users::verify_password(&password, &user.password_hash)
                 .unwrap_or(false);
             if password_ok {
-                let mut request = request;
-                request.extensions_mut().insert(AuthUser {
+                let auth_user = AuthUser {
                     token: String::new(),
                     user_id: Some(user.id),
                     username: user.username,
                     role: user.role,
-                });
+                    must_change_password: user.must_change_password == 1,
+                };
+                if let Some(resp) = password_change_pending_block(
+                    &auth_user,
+                    request.method(),
+                    request.uri().path(),
+                ) {
+                    return resp;
+                }
+                let mut request = request;
+                request.extensions_mut().insert(auth_user);
                 return next.run(request).await;
             }
         }
@@ -124,6 +144,7 @@ pub async fn auth_middleware(
                     user_id: None,
                     username: "static-token".to_string(),
                     role: "admin".to_string(),
+                    must_change_password: false,
                 });
                 return next.run(request).await;
             }
@@ -133,6 +154,13 @@ pub async fn auth_middleware(
             //    including the first underscore + the first 4 hex chars.
             //    Actually, the prefix stored is the first 8 chars of the raw token.
             if let Some(auth_user) = try_db_token_auth(&state.db, &t).await {
+                if let Some(resp) = password_change_pending_block(
+                    &auth_user,
+                    request.method(),
+                    request.uri().path(),
+                ) {
+                    return resp;
+                }
                 let mut request = request;
                 request.extensions_mut().insert(auth_user);
                 return next.run(request).await;
@@ -179,6 +207,42 @@ fn unauthorized_response(is_oci: bool) -> Response {
     }
 }
 
+/// 429 response for throttled authentication attempts.
+fn too_many_requests_response() -> Response {
+    (
+        StatusCode::TOO_MANY_REQUESTS,
+        Json(json!({"error": "too many authentication attempts, try again later"})),
+    )
+        .into_response()
+}
+
+/// While `must_change_password` is set, allow only the password-change endpoint
+/// (`PUT .../password`) and `/-/whoami`; block everything else with 403. This
+/// makes the forced rotation real instead of cosmetic — a long-lived token can
+/// no longer be used indefinitely without changing the password.
+fn password_change_pending_block(
+    auth_user: &AuthUser,
+    method: &axum::http::Method,
+    path: &str,
+) -> Option<Response> {
+    if !auth_user.must_change_password {
+        return None;
+    }
+    let allowed =
+        (method == axum::http::Method::PUT && path.ends_with("/password")) || path == "/-/whoami";
+    if allowed {
+        None
+    } else {
+        Some(
+            (
+                StatusCode::FORBIDDEN,
+                Json(json!({"error": "password change required before using the API"})),
+            )
+                .into_response(),
+        )
+    }
+}
+
 /// Attempt to authenticate via a DB API token.
 ///
 /// Looks up the token by its prefix, verifies the hash, checks expiration,
@@ -221,5 +285,6 @@ async fn try_db_token_auth(db: &SqlitePool, raw_token: &str) -> Option<AuthUser>
         user_id: Some(user.id),
         username: user.username,
         role: user.role,
+        must_change_password: user.must_change_password == 1,
     })
 }
