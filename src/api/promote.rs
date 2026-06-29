@@ -12,6 +12,7 @@ use tracing::info;
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::can_admin;
 use crate::error::{AppError, AppResult};
+use crate::registry::extract_package_name;
 use crate::storage::StorageBackend;
 use crate::server::AppState;
 
@@ -28,16 +29,6 @@ pub struct PromoteRequest {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Extract the full package name from path parameters.
-/// For scoped packages: scope="trace", name="httpclient" -> "@trace/httpclient"
-/// For unscoped packages: name="react" -> "react"
-fn extract_package_name(params: &HashMap<String, String>) -> String {
-    match params.get("scope") {
-        Some(scope) => format!("@{}/{}", scope, params.get("name").unwrap_or(&String::new())),
-        None => params.get("name").cloned().unwrap_or_default(),
-    }
-}
 
 /// Rewrite the dist.tarball URL in version metadata to point to the target repo.
 fn rewrite_tarball_url(

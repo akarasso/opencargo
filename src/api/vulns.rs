@@ -8,18 +8,12 @@ use axum::{
 use serde_json::json;
 
 use crate::error::{AppError, AppResult};
+use crate::registry::extract_package_name;
 use crate::server::AppState;
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-fn extract_package_name(params: &HashMap<String, String>) -> String {
-    match params.get("scope") {
-        Some(scope) => format!("@{}/{}", scope, params.get("name").unwrap_or(&String::new())),
-        None => params.get("name").cloned().unwrap_or_default(),
-    }
-}
 
 /// Find a package across all repositories by name.
 async fn find_package_by_name(
