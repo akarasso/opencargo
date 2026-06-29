@@ -262,7 +262,7 @@ pub async fn publish_package(
             if let Some(deps_obj) = version_meta.get(*field).and_then(|v| v.as_object()) {
                 for (dep_name, dep_version) in deps_obj {
                     let version_req = dep_version.as_str().unwrap_or("*");
-                    let _ = crate::db::insert_dependency(
+                    if let Err(e) = crate::db::insert_dependency(
                         &state.db,
                         package.id,
                         version_id,
@@ -270,7 +270,13 @@ pub async fn publish_package(
                         version_req,
                         dep_type,
                     )
-                    .await;
+                    .await
+                    {
+                        tracing::warn!(
+                            dependency = %dep_name,
+                            "failed to record dependency (graph may be incomplete): {e}"
+                        );
+                    }
                 }
             }
         }

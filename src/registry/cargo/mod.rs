@@ -28,12 +28,15 @@ use crate::storage::StorageBackend;
 /// - 3 chars → `3/{first_char}`
 /// - 4+ chars → `{first_two}/{next_two}`
 pub fn compute_prefix(name: &str) -> String {
+    // Operate on chars, not bytes: byte slicing (&lower[..2]) would panic on a
+    // multi-byte UTF-8 name. Crate names are ASCII in practice, but be robust.
     let lower = name.to_lowercase();
-    match lower.len() {
+    let chars: Vec<char> = lower.chars().collect();
+    match chars.len() {
         1 => "1".to_string(),
         2 => "2".to_string(),
-        3 => format!("3/{}", &lower[..1]),
-        _ => format!("{}/{}", &lower[..2], &lower[2..4]),
+        3 => format!("3/{}", chars[0]),
+        _ => format!("{}{}/{}{}", chars[0], chars[1], chars[2], chars[3]),
     }
 }
 
@@ -323,7 +326,7 @@ pub async fn publish_crate(
                 _ => "normal",
             };
             if !dep_name.is_empty() {
-                let _ = crate::db::insert_dependency(
+                if let Err(e) = crate::db::insert_dependency(
                     &state.db,
                     package.id,
                     _version_id,
@@ -331,7 +334,13 @@ pub async fn publish_crate(
                     dep_version_req,
                     dep_type,
                 )
-                .await;
+                .await
+                {
+                    tracing::warn!(
+                        dependency = %dep_name,
+                        "failed to record dependency (graph may be incomplete): {e}"
+                    );
+                }
             }
         }
     }
