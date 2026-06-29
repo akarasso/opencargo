@@ -625,10 +625,12 @@ async fn npm_login(
     };
 
     // Verify password
-    let password_ok = matches!(
-        crate::auth::users::verify_password(&login.password, &user.password_hash),
-        Ok(true)
-    );
+    let password_ok = crate::auth::users::verify_password_async(
+        login.password.clone(),
+        user.password_hash.clone(),
+    )
+    .await
+    .unwrap_or(false);
 
     if !password_ok {
         return (
