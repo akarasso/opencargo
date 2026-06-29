@@ -263,12 +263,13 @@ async fn try_db_token_auth(db: &SqlitePool, raw_token: &str) -> Option<AuthUser>
         return None;
     }
 
-    // Check expiration
+    // Check expiration. Fail CLOSED: an unparseable timestamp rejects the token
+    // rather than silently treating it as non-expiring (the previous behaviour).
     if let Some(ref expires_at) = db_token.expires_at {
-        if let Ok(exp) = chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S") {
-            if exp < chrono::Utc::now().naive_utc() {
-                return None;
-            }
+        match chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S") {
+            Ok(exp) if exp < chrono::Utc::now().naive_utc() => return None, // expired
+            Ok(_) => {}                                                     // still valid
+            Err(_) => return None, // corrupt/unexpected format -> reject
         }
     }
 
