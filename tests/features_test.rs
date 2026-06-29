@@ -394,6 +394,53 @@ async fn test_npm_readme_persisted_and_sanitized() {
     );
 }
 
+/// T5 hardening: a README larger than the 256 KiB cap whose truncation point
+/// lands inside a multi-byte UTF-8 character must not panic the publish handler
+/// (a naive `&s[..cap]` slice would). The cap recedes to a char boundary, so the
+/// publish succeeds and the truncated README still renders.
+#[tokio::test]
+async fn test_npm_oversized_readme_truncates_without_panic() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let name = "@test/bigreadme";
+    let tarball = build_tarball(
+        r#"{"name":"@test/bigreadme","version":"1.0.0","description":"big readme","main":"index.js"}"#,
+    );
+    // 256 KiB - 1 ASCII bytes, then multi-byte chars so the cap lands mid-emoji,
+    // exercising the char-boundary rewind.
+    let mut readme = "a".repeat(256 * 1024 - 1);
+    readme.push_str(&"😀".repeat(8));
+    let mut body = build_npm_publish_body(name, "1.0.0", "big readme", &tarball);
+    body["readme"] = json!(readme);
+
+    let resp = client
+        .put(format!("{}/test-npm/{}", base_url, name))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "oversized multi-byte README must not panic the publish"
+    );
+
+    // The truncated README is still served (rendered).
+    let resp = client
+        .get(format!("{}/api/v1/packages/{}", base_url, name))
+        .send()
+        .await
+        .expect("package detail API request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data: Value = resp.json().await.expect("invalid JSON");
+    assert!(
+        data["readme_html"].as_str().unwrap_or("").contains("aaaa"),
+        "truncated README should still render its ASCII content"
+    );
+}
+
 #[tokio::test]
 async fn test_search_page() {
     let (base_url, _handle, _tmp) = setup().await;
