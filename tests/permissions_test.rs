@@ -550,6 +550,109 @@ async fn test_delete_repository() {
     );
 }
 
+/// B13 regression: deleting a repository that still contains packages must be
+/// refused with 409 Conflict (previously a 500 from a foreign-key violation),
+/// the repo must survive the refused delete, and the body must tell the
+/// operator to remove the packages first.
+#[tokio::test]
+async fn test_delete_non_empty_repository_conflicts() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .post(format!("{}/api/v1/repositories", base_url))
+        .bearer_auth("test-token")
+        .json(&json!({
+            "name": "npm-nonempty",
+            "type": "hosted",
+            "format": "npm",
+            "visibility": "public"
+        }))
+        .send()
+        .await
+        .expect("create repo request failed");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+
+    let tarball = build_tarball(r#"{"name":"@test/keep","version":"1.0.0"}"#);
+    let body = build_publish_body("@test/keep", "1.0.0", "keep me", &tarball);
+    let resp = client
+        .put(format!("{}/npm-nonempty/@test/keep", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert!(
+        resp.status().is_success(),
+        "publish should succeed, got {}",
+        resp.status()
+    );
+
+    let resp = client
+        .delete(format!("{}/api/v1/repositories/npm-nonempty", base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("delete repo request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "deleting a non-empty repo must return 409"
+    );
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        text.contains("not empty"),
+        "409 body should explain the repo is not empty, got: {text}"
+    );
+
+    let resp = client
+        .get(format!("{}/api/v1/repositories/npm-nonempty", base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("get repo request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "repo must survive a refused delete"
+    );
+}
+
+/// S18 regression: creating a proxy repo with an upstream URL whose scheme is
+/// not http(s), or that is malformed, is rejected at the API boundary (400)
+/// instead of being stored and later used for outbound requests. Private and
+/// loopback hosts are intentionally allowed here (admin-only; the redirect
+/// policy handles the real SSRF vector), so we only assert on scheme/parse.
+#[tokio::test]
+async fn test_create_repository_rejects_bad_upstream() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for (i, bad) in ["file:///etc/passwd", "ftp://example.com/x", "not-a-url"]
+        .iter()
+        .enumerate()
+    {
+        let resp = client
+            .post(format!("{}/api/v1/repositories", base_url))
+            .bearer_auth("test-token")
+            .json(&json!({
+                "name": format!("proxy-bad-{i}"),
+                "type": "proxy",
+                "format": "npm",
+                "visibility": "public",
+                "upstream": bad
+            }))
+            .send()
+            .await
+            .expect("create repo request failed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "upstream '{bad}' must be rejected with 400"
+        );
+    }
+}
+
 /// Regression test for the read access-control fix (S1): reads of a `private`
 /// repository require authentication, while `public` repositories stay
 /// anonymously readable. `ensure_can_read` runs before the package lookup, so
