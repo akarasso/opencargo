@@ -66,6 +66,7 @@ pub async fn api_version_check() -> impl IntoResponse {
 pub async fn head_blob(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
     let image_name = extract_image_name(&params);
     let digest = params
@@ -80,6 +81,8 @@ pub async fn head_blob(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     // Check if blob exists in DB
     let blob: Option<OciBlob> = sqlx::query_as(
@@ -120,6 +123,7 @@ pub async fn head_blob(
 pub async fn get_blob(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
     let image_name = extract_image_name(&params);
     let digest = params
@@ -133,6 +137,8 @@ pub async fn get_blob(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     // Check if blob exists in DB
     let blob: Option<OciBlob> = sqlx::query_as(
@@ -474,6 +480,7 @@ pub async fn complete_upload(
 pub async fn get_manifest(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
     let image_name = extract_image_name(&params);
     let reference = params
@@ -488,6 +495,8 @@ pub async fn get_manifest(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     // Resolve the digest: if reference is a tag, look up the digest
     let digest = if is_digest(reference) {
@@ -556,6 +565,7 @@ pub async fn get_manifest(
 pub async fn head_manifest(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
     let repo_name = params
         .get("repo")
@@ -568,6 +578,8 @@ pub async fn head_manifest(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     // Resolve digest
     let digest = if is_digest(reference) {
@@ -848,6 +860,7 @@ pub async fn list_tags(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
     Query(query): Query<ListTagsQuery>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
     let repo_name = params
         .get("repo")
@@ -857,6 +870,8 @@ pub async fn list_tags(
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     let limit = query.n.unwrap_or(100).min(10000);
 
