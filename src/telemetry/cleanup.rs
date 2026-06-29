@@ -93,8 +93,13 @@ async fn cleanup_old_prereleases(
             .execute(db)
             .await?;
 
-        // Delete associated downloads
+        // Delete associated download records: the legacy per-row table (still
+        // needed so the versions FK can be removed) AND the aggregate counter.
         sqlx::query("DELETE FROM downloads WHERE version_id = ?1")
+            .bind(row.id)
+            .execute(db)
+            .await?;
+        sqlx::query("DELETE FROM download_counts WHERE version_id = ?1")
             .bind(row.id)
             .execute(db)
             .await?;
