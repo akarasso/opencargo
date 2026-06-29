@@ -116,6 +116,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let sql11 = include_str!("migrations/011_download_counts.sql");
     sqlx::raw_sql(sql11).execute(pool).await?;
 
+    let sql12 = include_str!("migrations/012_oci_manifest_blobs.sql");
+    sqlx::raw_sql(sql12).execute(pool).await?;
+
     info!("Database migrations applied");
     Ok(())
 }
