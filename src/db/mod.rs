@@ -4,6 +4,8 @@ use tracing::info;
 // Re-export serde_json for convenience in this module
 use serde_json;
 
+pub mod oci;
+
 // ---------------------------------------------------------------------------
 // Row types
 // ---------------------------------------------------------------------------
