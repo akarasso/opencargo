@@ -165,10 +165,12 @@ pub async fn publish_package(
             repo_name, package_name, tarball_filename
         );
 
-        // Store the tarball
+        // Store the tarball. Compute size first, then move the buffer into
+        // Bytes (no 100 MB clone). tarball_data is not used afterwards.
+        let size = tarball_data.len() as i64;
         state
             .storage
-            .put(&storage_path, Bytes::from(tarball_data.clone()))
+            .put(&storage_path, Bytes::from(tarball_data))
             .await?;
 
         // Rewrite dist in version metadata to point to our server
@@ -198,7 +200,6 @@ pub async fn publish_package(
         }
 
         let metadata_json = serde_json::to_string(&meta)?;
-        let size = tarball_data.len() as i64;
 
         // Insert version in DB
         let version_id = crate::db::create_version(

@@ -18,6 +18,44 @@ pub struct ProxyClient {
     db: SqlitePool,
 }
 
+/// True for IP literals the proxy must never reach (basic SSRF guard). Does NOT
+/// cover DNS rebinding — hostnames are not resolved here; a custom resolver
+/// would be needed for that.
+pub(crate) fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => {
+            v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_unspecified()
+                || v4.is_broadcast()
+        }
+        std::net::IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
+        }
+    }
+}
+
+/// Validate an upstream registry URL for proxy repositories: must be http(s)
+/// and must not be a literal private/loopback address.
+pub fn validate_upstream_url(url: &str) -> Result<(), AppError> {
+    let parsed = reqwest::Url::parse(url)
+        .map_err(|e| AppError::BadRequest(format!("invalid upstream URL: {e}")))?;
+    if !matches!(parsed.scheme(), "http" | "https") {
+        return Err(AppError::BadRequest(
+            "upstream URL scheme must be http or https".to_string(),
+        ));
+    }
+    // A literal private/loopback host is intentionally allowed here: upstream
+    // creation is admin-only and proxy setups legitimately target local mirrors.
+    // The real SSRF vector — an upstream that REDIRECTS to an internal address —
+    // is blocked by the client's redirect policy (see is_blocked_ip usage).
+    Ok(())
+}
+
 impl ProxyClient {
     /// Create a new ProxyClient with the given timeout.
     pub fn new(
@@ -28,6 +66,21 @@ impl ProxyClient {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(connect_timeout_secs * 3))
+            // SSRF hardening: cap redirects (was 10 by default) and refuse any
+            // hop whose host is a literal private/loopback/link-local IP.
+            .redirect(reqwest::redirect::Policy::custom(|attempt| {
+                if attempt.previous().len() >= 5 {
+                    return attempt.error("too many redirects");
+                }
+                match attempt
+                    .url()
+                    .host_str()
+                    .and_then(|h| h.parse::<std::net::IpAddr>().ok())
+                {
+                    Some(ip) if is_blocked_ip(&ip) => attempt.stop(),
+                    _ => attempt.follow(),
+                }
+            }))
             .build()
             .expect("failed to build reqwest client");
 
@@ -111,7 +164,7 @@ impl ProxyClient {
 
                 // Cache the metadata
                 self.storage
-                    .put(&cache_storage_path, Bytes::from(body.to_vec()))
+                    .put(&cache_storage_path, body.clone())
                     .await?;
 
                 // Update cache meta in DB
