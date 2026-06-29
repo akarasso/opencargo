@@ -3,6 +3,7 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::fs;
+use tokio::io::AsyncWriteExt;
 
 use crate::error::AppError;
 
@@ -82,6 +83,22 @@ impl StorageBackend for FilesystemStorage {
         }
         fs::write(&full_path, &data).await?;
         Ok(())
+    }
+
+    async fn append(&self, path: &str, data: Bytes) -> Result<u64, AppError> {
+        let full_path = self.safe_path(path)?;
+        if let Some(parent) = full_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&full_path)
+            .await?;
+        file.write_all(&data).await?;
+        file.flush().await?;
+        let len = file.metadata().await?.len();
+        Ok(len)
     }
 
     async fn delete(&self, path: &str) -> Result<(), AppError> {
