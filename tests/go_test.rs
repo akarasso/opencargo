@@ -254,3 +254,57 @@ async fn test_go_version_info() {
         "version info should contain a Time field"
     );
 }
+
+/// 4. B19 regression: a Go module whose go.mod exceeds the 1 MiB cap is
+/// rejected at publish (400 "go.mod entry too large") rather than read fully
+/// into memory — the zip-bomb defense in extract_go_mod_from_zip. We assert on
+/// the declared-size guard (file.size() > MAX), which fires deterministically.
+#[tokio::test]
+async fn test_go_oversized_gomod_rejected() {
+    use std::io::Write;
+
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let module_name = "bigmod";
+    let version = "v1.0.0";
+
+    // Build a zip whose go.mod is larger than the 1 MiB cap.
+    let mut buf = Vec::new();
+    {
+        let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+        let go_mod_path = format!("{}@{}/go.mod", module_name, version);
+        zip_writer.start_file(&go_mod_path, options).unwrap();
+        let mut content = format!("module {}\n\ngo 1.21\n", module_name);
+        while content.len() <= 1024 * 1024 {
+            content.push_str("// padding to exceed the 1 MiB go.mod cap\n");
+        }
+        zip_writer.write_all(content.as_bytes()).unwrap();
+        zip_writer.finish().unwrap();
+    }
+
+    let resp = client
+        .put(format!(
+            "{}/go-hosted/{}/@v/{}",
+            base_url, module_name, version
+        ))
+        .bearer_auth("test-token")
+        .header("content-type", "application/zip")
+        .body(buf)
+        .send()
+        .await
+        .expect("publish request failed");
+
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an oversized go.mod must be rejected with 400"
+    );
+    let text = resp.text().await.unwrap_or_default();
+    assert!(
+        text.contains("too large"),
+        "400 body should mention the go.mod is too large, got: {text}"
+    );
+}
