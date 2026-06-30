@@ -4,9 +4,17 @@ kind: Kustomization
 resources:
   - deployment.yaml
   - service.yaml
-  - pvc.yaml
   - configmap.yaml
+  # pvc.yaml is intentionally NOT managed here: the PVC already exists and its
+  # spec is immutable, so re-applying it aborts the whole apply. Apply it once
+  # by hand if recreating from scratch (kubectl apply -f k8s/pvc.yaml).
 
-commonLabels:
-  app.kubernetes.io/name: opencargo
-  app.kubernetes.io/managed-by: kustomize
+# `labels` with includeSelectors:false adds these to resource metadata WITHOUT
+# touching the Deployment selector (which is immutable). `commonLabels` used to
+# inject them into the selector, which made `apply` fail against an existing
+# Deployment created with a plain `app: opencargo` selector.
+labels:
+  - pairs:
+      app.kubernetes.io/name: opencargo
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false
