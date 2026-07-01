@@ -13,9 +13,20 @@ permissions:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    # Self-hosted ARC runner pool (actions-runner-controller, host k3s, privileged
+    # docker:dind sidecar). The pod image is minimal — install what we compile
+    # against explicitly, and isolate per-job caches: the runners share $HOME, so
+    # the default pnpm/cargo dirs would race between concurrent jobs.
+    runs-on: arc-linux
+    env:
+      CARGO_HOME: ${{ runner.temp }}/cargo
     steps:
       - uses: actions/checkout@v4
+
+      # sqlx-sqlite bundles sqlite (compiles C) and reqwest uses native-tls, so
+      # cargo needs a C toolchain + OpenSSL headers that the minimal image lacks.
+      - name: Install build toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev perl
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -29,6 +40,9 @@ jobs:
         uses: pnpm/action-setup@v4
         with:
           version: 10
+          # Per-job install dir — the shared $HOME makes the default `~/setup-pnpm`
+          # race (ENOTEMPTY) between concurrent runners.
+          dest: ${{ runner.temp }}/setup-pnpm
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -48,9 +62,13 @@ jobs:
         run: cargo test
 
   audit:
-    runs-on: ubuntu-latest
+    runs-on: arc-linux
+    env:
+      CARGO_HOME: ${{ runner.temp }}/cargo
     steps:
       - uses: actions/checkout@v4
+      - name: Install build toolchain
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
@@ -60,30 +78,48 @@ jobs:
         run: cargo audit
 
   docker:
-    runs-on: ubuntu-latest
+    runs-on: arc-linux
     needs: test
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    # Publish the image to GHCR. GITHUB_TOKEN needs packages:write for the push.
+    permissions:
+      contents: read
+      packages: write
     steps:
       - uses: actions/checkout@v4
-
-      - name: Install pnpm
-        uses: pnpm/action-setup@v4
-        with:
-          version: 10
-
-      - name: Build frontend
-        run: cd frontend && pnpm install --frozen-lockfile && pnpm build
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
 
-      - name: Build Docker image
-        run: docker build -t opencargo:ci-${{ github.sha }} -t opencargo:latest .
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Build the image (the Dockerfile builds the frontend + Rust release itself)
+      # and PUSH it — previously the job built `:latest` locally and threw it away,
+      # so GHCR `:latest` never tracked main and every deploy needed a manual build.
+      # `platforms: linux/amd64` + `provenance: false` publish a single clean
+      # manifest: `:latest` resolves to ONE digest instead of an attestation index
+      # whose "unknown/unknown" child breaks digest pinning. `:sha-<commit>` is the
+      # immutable tag deployments pin to.
+      - name: Build and push image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64
+          provenance: false
+          tags: |
+            ghcr.io/akarasso/opencargo:latest
+            ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
 
       - name: Scan image for vulnerabilities (Trivy)
         uses: aquasecurity/trivy-action@0.28.0
         with:
-          image-ref: opencargo:ci-${{ github.sha }}
+          image-ref: ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
           format: table
           # Report HIGH/CRITICAL but do not fail the build on unfixed CVEs yet.
           # Flip exit-code to '1' once the base image is reliably clean.
