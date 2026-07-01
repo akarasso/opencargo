@@ -18,8 +18,6 @@ jobs:
     # against explicitly, and isolate per-job caches: the runners share $HOME, so
     # the default pnpm/cargo dirs would race between concurrent jobs.
     runs-on: arc-linux
-    env:
-      CARGO_HOME: ${{ runner.temp }}/cargo
     steps:
       - uses: actions/checkout@v4
 
@@ -63,8 +61,6 @@ jobs:
 
   audit:
     runs-on: arc-linux
-    env:
-      CARGO_HOME: ${{ runner.temp }}/cargo
     steps:
       - uses: actions/checkout@v4
       - name: Install build toolchain
