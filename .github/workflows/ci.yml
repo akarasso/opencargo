@@ -104,7 +104,7 @@ jobs:
             ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
 
       - name: Scan image for vulnerabilities (Trivy)
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.35.0
         with:
           image-ref: ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
           format: table
