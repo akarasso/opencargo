@@ -86,7 +86,11 @@ async fn setup() -> (String, u16, tokio::task::JoinHandle<()>, TempDir) {
     (base_url, port, handle, tmp)
 }
 
-const PNPM: &str = "/home/alexandre/.local/share/pnpm/pnpm";
+// Resolve pnpm from PATH (portable across dev machines + CI). Override with
+// `PNPM_BIN` if a specific binary is needed. Previously hardcoded to a single
+// dev's absolute home path, which broke every other environment (incl. CI).
+static PNPM: std::sync::LazyLock<String> =
+    std::sync::LazyLock::new(|| std::env::var("PNPM_BIN").unwrap_or_else(|_| "pnpm".to_string()));
 
 /// Helper: run a command, returning (exit_success, stdout, stderr).
 async fn run_cmd(
@@ -164,7 +168,7 @@ async fn pnpm_publish_and_install_inner() {
 
     // ---- Publish ----
     let (ok, stdout, stderr) = run_cmd(
-        PNPM,
+        &PNPM,
         &["publish", "--no-git-checks"],
         &pkg_dir,
         &fake_home,
@@ -201,7 +205,7 @@ async fn pnpm_publish_and_install_inner() {
 
     // ---- Install ----
     let (ok, stdout, stderr) = run_cmd(
-        PNPM,
+        &PNPM,
         &["install", "--no-lockfile"],
         &consumer_dir,
         &fake_home,
@@ -288,7 +292,7 @@ async fn pnpm_publish_multiple_versions_inner() {
     .unwrap();
 
     let (ok, stdout, stderr) = run_cmd(
-        PNPM,
+        &PNPM,
         &["publish", "--no-git-checks"],
         &pkg_dir,
         &fake_home,
@@ -319,7 +323,7 @@ async fn pnpm_publish_multiple_versions_inner() {
     .unwrap();
 
     let (ok, stdout, stderr) = run_cmd(
-        PNPM,
+        &PNPM,
         &["publish", "--no-git-checks"],
         &pkg_dir,
         &fake_home,
@@ -355,7 +359,7 @@ async fn pnpm_publish_multiple_versions_inner() {
     std::fs::write(consumer_dir.join(".npmrc"), &consumer_npmrc).unwrap();
 
     let (ok, stdout, stderr) = run_cmd(
-        PNPM,
+        &PNPM,
         &["install", "--no-lockfile"],
         &consumer_dir,
         &fake_home,
@@ -432,7 +436,7 @@ async fn pnpm_publish_without_auth_fails_inner() {
 
     // ---- Attempt publish without auth ----
     let (ok, stdout, stderr) = run_cmd(
-        PNPM,
+        &PNPM,
         &["publish", "--no-git-checks"],
         &pkg_dir,
         &fake_home,
