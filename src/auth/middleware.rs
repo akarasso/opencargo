@@ -157,12 +157,28 @@ pub async fn auth_middleware(
                 return next.run(request).await;
             }
 
-            // 2. Try DB token lookup: extract the prefix (first 8 chars of the token)
-            //    Token format: {prefix_str}{32_hex} — prefix is everything up to and
-            //    including the first underscore + the first 4 hex chars.
-            //    Actually, the prefix stored is the first 8 chars of the raw token.
+            // 2. Positive auth cache: a burst of requests carrying the same token
+            //    (e.g. `pnpm install` pulling ~1000 tarballs, or several parallel
+            //    image builds at once) then does ONE DB lookup instead of one per
+            //    request — keeping the SQLite auth path off the hot path under
+            //    concurrency, which is what produced the intermittent 401s.
+            if let Some(auth_user) = auth_cache_get(&t) {
+                if let Some(resp) = password_change_pending_block(
+                    &auth_user,
+                    request.method(),
+                    request.uri().path(),
+                ) {
+                    return resp;
+                }
+                let mut request = request;
+                request.extensions_mut().insert(auth_user);
+                return next.run(request).await;
+            }
+
+            // 3. DB token lookup (prefix -> verify hash -> load user), then cache it.
             match try_db_token_auth(&state.db, &t).await {
                 Ok(Some(auth_user)) => {
+                    auth_cache_put(&t, &auth_user);
                     if let Some(resp) = password_change_pending_block(
                         &auth_user,
                         request.method(),
@@ -361,4 +377,50 @@ fn should_write_last_used(token_id: &str) -> bool {
             true
         }
     }
+}
+
+/// Positive auth cache: raw token -> (resolved user, cached-at). A verified token
+/// is trusted for up to `AUTH_CACHE_TTL` so a burst of requests carrying it does a
+/// single DB lookup rather than one per request. Trade-off: a revoked/expired
+/// token stays honoured for at most the TTL — acceptable for long-lived registry
+/// tokens, and the fix for the concurrency-induced 401 storms.
+static AUTH_CACHE: std::sync::LazyLock<
+    std::sync::Mutex<std::collections::HashMap<String, (AuthUser, std::time::Instant)>>,
+> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
+
+const AUTH_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Returns a cached `AuthUser` for `raw_token` if verified within the TTL.
+fn auth_cache_get(raw_token: &str) -> Option<AuthUser> {
+    let mut cache = AUTH_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    match cache.get(raw_token) {
+        Some((user, at)) if at.elapsed() < AUTH_CACHE_TTL => Some(user.clone()),
+        Some(_) => {
+            cache.remove(raw_token);
+            None
+        }
+        None => None,
+    }
+}
+
+/// Records a freshly-verified token so subsequent requests skip the DB.
+fn auth_cache_put(raw_token: &str, user: &AuthUser) {
+    let mut cache = AUTH_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cache.insert(raw_token.to_string(), (user.clone(), std::time::Instant::now()));
+}
+
+/// Drops every cached auth entry. Called whenever a token is revoked so the
+/// positive cache can never keep a revoked credential alive — revocation stays
+/// effective immediately, not after the TTL. The cache is keyed by raw token
+/// (which revocation, working by id, does not have), so a full clear is the
+/// correct coarse invalidation; revocations are rare.
+pub fn clear_auth_cache() {
+    AUTH_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
 }

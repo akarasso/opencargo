@@ -76,10 +76,14 @@ pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
         // requests (e.g. `pnpm install` pulling ~1000 tarballs, each doing a
         // per-request `last_used` write) collides on the lock and surfaces
         // spurious auth failures.
-        .busy_timeout(Duration::from_secs(5));
+        .busy_timeout(Duration::from_secs(10));
 
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
-        .max_connections(5)
+        // WAL allows many concurrent readers; a small pool needlessly serialises
+        // them and, under a parallel-build burst (several `pnpm install` at once),
+        // starves the auth read path. 25 leaves ample headroom over SQLite's own
+        // single-writer limit.
+        .max_connections(25)
         .connect_with(opts)
         .await?;
 
