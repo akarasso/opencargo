@@ -161,28 +161,17 @@ pub async fn auth_middleware(
             //    Token format: {prefix_str}{32_hex} — prefix is everything up to and
             //    including the first underscore + the first 4 hex chars.
             //    Actually, the prefix stored is the first 8 chars of the raw token.
-            match try_db_token_auth(&state.db, &t).await {
-                Ok(Some(auth_user)) => {
-                    if let Some(resp) = password_change_pending_block(
-                        &auth_user,
-                        request.method(),
-                        request.uri().path(),
-                    ) {
-                        return resp;
-                    }
-                    let mut request = request;
-                    request.extensions_mut().insert(auth_user);
-                    return next.run(request).await;
+            if let Some(auth_user) = try_db_token_auth(&state.db, &t).await {
+                if let Some(resp) = password_change_pending_block(
+                    &auth_user,
+                    request.method(),
+                    request.uri().path(),
+                ) {
+                    return resp;
                 }
-                // Genuine "no such token" — fall through to anonymous/401 below.
-                Ok(None) => {}
-                // Transient DB error (e.g. SQLITE_BUSY under load): a valid token
-                // must NOT be reported as invalid. Return 503 so the client
-                // retries instead of aborting on a fatal 401.
-                Err(e) => {
-                    tracing::warn!("token auth DB error (returning 503): {e}");
-                    return service_unavailable_response();
-                }
+                let mut request = request;
+                request.extensions_mut().insert(auth_user);
+                return next.run(request).await;
             }
 
             // Token not valid
@@ -235,18 +224,6 @@ fn too_many_requests_response() -> Response {
         .into_response()
 }
 
-/// 503 response for a transient auth-path DB error (e.g. SQLITE_BUSY under load).
-/// A retryable status — never surface a lock contention as a 401, which npm/pnmp
-/// treat as a fatal auth failure and abort the whole install.
-fn service_unavailable_response() -> Response {
-    (
-        StatusCode::SERVICE_UNAVAILABLE,
-        [(axum::http::header::RETRY_AFTER, "1")],
-        Json(json!({"error": "temporary error, please retry"})),
-    )
-        .into_response()
-}
-
 /// While `must_change_password` is set, allow only the password-change endpoint
 /// (`PUT .../password`) and `/-/whoami`; block everything else with 403. This
 /// makes the forced rotation real instead of cosmetic — a long-lived token can
@@ -278,87 +255,45 @@ fn password_change_pending_block(
 ///
 /// Looks up the token by its prefix, verifies the hash, checks expiration,
 /// loads the user, and updates `last_used_at`.
-async fn try_db_token_auth(
-    db: &SqlitePool,
-    raw_token: &str,
-) -> Result<Option<AuthUser>, sqlx::Error> {
+async fn try_db_token_auth(db: &SqlitePool, raw_token: &str) -> Option<AuthUser> {
     // The prefix stored in DB is the first 16 characters of the raw token.
     if raw_token.len() < 16 {
-        return Ok(None);
+        return None;
     }
     let prefix = &raw_token[..16];
 
-    // A DB error here (e.g. SQLITE_BUSY under a concurrent burst) is propagated
-    // as `Err` — the caller maps it to a 503 (retryable), NOT a 401. Only a
-    // genuine "no such token" resolves to `Ok(None)`. Previously the `.ok()??`
-    // swallowed both into `None`, so a transient lock made a valid token look
-    // invalid and pnpm aborted the whole install on the fatal 401.
-    let db_token = match crate::db::get_token_by_prefix(db, prefix).await? {
-        Some(t) => t,
-        None => return Ok(None),
-    };
+    let db_token = crate::db::get_token_by_prefix(db, prefix).await.ok()??;
 
     // Verify the token hash
     if !tokens::verify_token(raw_token, &db_token.token_hash) {
-        return Ok(None);
+        return None;
     }
 
     // Check expiration. Fail CLOSED: an unparseable timestamp rejects the token
     // rather than silently treating it as non-expiring (the previous behaviour).
     if let Some(ref expires_at) = db_token.expires_at {
         match chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S") {
-            Ok(exp) if exp < chrono::Utc::now().naive_utc() => return Ok(None), // expired
-            Ok(_) => {}                                                         // still valid
-            Err(_) => return Ok(None), // corrupt/unexpected format -> reject
+            Ok(exp) if exp < chrono::Utc::now().naive_utc() => return None, // expired
+            Ok(_) => {}                                                     // still valid
+            Err(_) => return None, // corrupt/unexpected format -> reject
         }
     }
 
     // Load the user
-    let user = match sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
+    let user = sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
         .bind(db_token.user_id)
         .fetch_optional(db)
-        .await?
-    {
-        Some(u) => u,
-        None => return Ok(None),
-    };
+        .await
+        .ok()??;
 
-    // Update last_used_at, throttled to at most once per minute per token. The
-    // previous unconditional write ran on EVERY authenticated request, turning a
-    // tarball-download burst into a write storm that starved concurrent auth
-    // reads. Best-effort — a failed update never blocks the request.
-    if should_write_last_used(&db_token.id) {
-        let _ = crate::db::update_token_last_used(db, &db_token.id).await;
-    }
+    // Update last_used_at (fire-and-forget)
+    let _ = crate::db::update_token_last_used(db, &db_token.id).await;
 
-    Ok(Some(AuthUser {
+    Some(AuthUser {
         token: raw_token.to_string(),
         user_id: Some(user.id),
         username: user.username,
         role: user.role,
         must_change_password: user.must_change_password == 1,
-    }))
-}
-
-/// Per-token throttle for `last_used_at` writes: token id -> last write instant.
-static LAST_USED_WRITES: std::sync::LazyLock<
-    std::sync::Mutex<std::collections::HashMap<String, std::time::Instant>>,
-> = std::sync::LazyLock::new(|| std::sync::Mutex::new(std::collections::HashMap::new()));
-
-/// Returns true at most once per minute per token id (recording the write time),
-/// so the per-request `last_used_at` update can't become a write storm under a
-/// concurrent download burst.
-fn should_write_last_used(token_id: &str) -> bool {
-    use std::time::{Duration, Instant};
-    let mut map = LAST_USED_WRITES
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let now = Instant::now();
-    match map.get(token_id) {
-        Some(&last) if now.duration_since(last) < Duration::from_secs(60) => false,
-        _ => {
-            map.insert(token_id.to_string(), now);
-            true
-        }
-    }
+    })
 }

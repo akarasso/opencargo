@@ -66,17 +66,10 @@ pub struct DistTag {
 pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
     use std::str::FromStr;
-    use std::time::Duration;
 
     let opts = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal)
-        // Wait for a held write lock instead of failing a concurrent query
-        // instantly with SQLITE_BUSY. Without this, a burst of authenticated
-        // requests (e.g. `pnpm install` pulling ~1000 tarballs, each doing a
-        // per-request `last_used` write) collides on the lock and surfaces
-        // spurious auth failures.
-        .busy_timeout(Duration::from_secs(5));
+        .journal_mode(SqliteJournalMode::Wal);
 
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(5)
