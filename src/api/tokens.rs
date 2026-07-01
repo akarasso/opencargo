@@ -145,6 +145,10 @@ pub async fn delete_token(
 
     crate::db::delete_token(&state.db, &token_id).await?;
 
+    // Drop the positive auth cache so the revoked token stops working immediately
+    // rather than lingering for the cache TTL.
+    crate::auth::middleware::clear_auth_cache();
+
     record_audit(&state.db, &caller, "token.revoke", Some(&username)).await;
 
     Ok(Json(json!({"ok": true})))
