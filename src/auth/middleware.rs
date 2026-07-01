@@ -304,14 +304,35 @@ async fn try_db_token_auth(
     }
     let prefix = &raw_token[..16];
 
-    // A DB error here (e.g. SQLITE_BUSY under a concurrent burst) is propagated
-    // as `Err` — the caller maps it to a 503 (retryable), NOT a 401. Only a
-    // genuine "no such token" resolves to `Ok(None)`. Previously the `.ok()??`
-    // swallowed both into `None`, so a transient lock made a valid token look
-    // invalid and pnpm aborted the whole install on the fatal 401.
-    let db_token = match crate::db::get_token_by_prefix(db, prefix).await? {
-        Some(t) => t,
-        None => return Ok(None),
+    // Under a heavy concurrent read burst (several parallel `pnpm install`) the
+    // SQLite read can transiently yield an EMPTY result — or a busy error — for a
+    // token row that provably exists, which used to surface as a spurious 401 that
+    // aborts the whole install. Retry a few times with a short backoff. A
+    // genuinely-absent token returns None on every attempt (then a real 401); a
+    // persistent DB error still bubbles up as Err -> 503 (retryable).
+    let db_token = {
+        let mut found = None;
+        for attempt in 0..4u32 {
+            match crate::db::get_token_by_prefix(db, prefix).await {
+                Ok(Some(t)) => {
+                    found = Some(t);
+                    break;
+                }
+                Ok(None) => {} // possibly transient under load — retry below
+                Err(e) if attempt == 3 => return Err(e),
+                Err(e) => tracing::warn!("token prefix lookup error (attempt {attempt}): {e}"),
+            }
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        match found {
+            Some(t) => t,
+            None => {
+                tracing::warn!("AUTH-DIAG: token prefix {prefix} unresolved after 4 attempts");
+                return Ok(None);
+            }
+        }
     };
 
     // Verify the token hash
@@ -329,14 +350,34 @@ async fn try_db_token_auth(
         }
     }
 
-    // Load the user
-    let user = match sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
-        .bind(db_token.user_id)
-        .fetch_optional(db)
-        .await?
-    {
-        Some(u) => u,
-        None => return Ok(None),
+    // Load the user (same transient-empty-read resilience as the token lookup).
+    let user = {
+        let mut found = None;
+        for attempt in 0..4u32 {
+            match sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
+                .bind(db_token.user_id)
+                .fetch_optional(db)
+                .await
+            {
+                Ok(Some(u)) => {
+                    found = Some(u);
+                    break;
+                }
+                Ok(None) => {}
+                Err(e) if attempt == 3 => return Err(e),
+                Err(e) => tracing::warn!("user lookup error (attempt {attempt}): {e}"),
+            }
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        }
+        match found {
+            Some(u) => u,
+            None => {
+                tracing::warn!("AUTH-DIAG: user {} unresolved after 4 attempts", db_token.user_id);
+                return Ok(None);
+            }
+        }
     };
 
     // Update last_used_at, throttled to at most once per minute per token. The
