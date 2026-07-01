@@ -13,18 +13,9 @@ permissions:
 
 jobs:
   test:
-    # Self-hosted ARC runner pool (actions-runner-controller, host k3s, privileged
-    # docker:dind sidecar). The pod image is minimal — install what we compile
-    # against explicitly, and isolate per-job caches: the runners share $HOME, so
-    # the default pnpm/cargo dirs would race between concurrent jobs.
-    runs-on: arc-linux
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      # sqlx-sqlite bundles sqlite (compiles C) and reqwest uses native-tls, so
-      # cargo needs a C toolchain + OpenSSL headers that the minimal image lacks.
-      - name: Install build toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev perl
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -38,9 +29,6 @@ jobs:
         uses: pnpm/action-setup@v4
         with:
           version: 10
-          # Per-job install dir — the shared $HOME makes the default `~/setup-pnpm`
-          # race (ENOTEMPTY) between concurrent runners.
-          dest: ${{ runner.temp }}/setup-pnpm
 
       - name: Install Node.js
         uses: actions/setup-node@v4
@@ -56,28 +44,31 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
+      # The pnpm e2e tests shell out to `pnpm`, resolved from PATH (installed above).
       - name: Run tests
         run: cargo test
 
   audit:
-    runs-on: arc-linux
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install build toolchain
-        run: sudo apt-get update -qq && sudo apt-get install -y -qq build-essential pkg-config libssl-dev
       - uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
+      # RUSTSEC-2023-0071 (rsa "Marvin" timing side-channel) has NO fixed upstream
+      # release and reaches us only transitively — ignore it explicitly rather than
+      # letting an un-actionable advisory permanently red the pipeline. Everything
+      # else must still pass; revisit when `rsa` ships a fix.
       - name: Security audit (RustSec advisory DB)
-        run: cargo audit
+        run: cargo audit --ignore RUSTSEC-2023-0071
 
   docker:
-    runs-on: arc-linux
+    runs-on: ubuntu-latest
     needs: test
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    # Publish the image to GHCR. GITHUB_TOKEN needs packages:write for the push.
+    # GITHUB_TOKEN needs packages:write to push the image to GHCR.
     permissions:
       contents: read
       packages: write
@@ -94,11 +85,11 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build the image (the Dockerfile builds the frontend + Rust release itself)
-      # and PUSH it — previously the job built `:latest` locally and threw it away,
-      # so GHCR `:latest` never tracked main and every deploy needed a manual build.
+      # Build (the Dockerfile builds the frontend + Rust release itself) and PUSH:
+      # previously the job built `:latest` locally and discarded it, so GHCR
+      # `:latest` never tracked main and every deploy needed a manual build.
       # `platforms: linux/amd64` + `provenance: false` publish a single clean
-      # manifest: `:latest` resolves to ONE digest instead of an attestation index
+      # manifest — `:latest` resolves to ONE digest instead of an attestation index
       # whose "unknown/unknown" child breaks digest pinning. `:sha-<commit>` is the
       # immutable tag deployments pin to.
       - name: Build and push image
