@@ -37,6 +37,11 @@ struct RepositoriesResponse {
 #[derive(Serialize)]
 struct RepoResponse {
     name: String,
+    #[serde(rename = "type")]
+    repo_type: String,
+    format: String,
+    visibility: String,
+    upstream: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -226,17 +231,36 @@ pub async fn dashboard_stats(
     })
 }
 
-pub async fn list_repositories(State(state): State<AppState>) -> impl IntoResponse {
+pub async fn list_repositories(
+    State(state): State<AppState>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
+) -> impl IntoResponse {
     let pool = &state.db;
 
-    let repos = sqlx::query_as::<_, (String,)>("SELECT name FROM repositories ORDER BY name")
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    // Anonymous callers only see public repositories; before this filter the
+    // endpoint leaked private repo names to anyone when anonymous_read was on.
+    let sql = if auth.is_some() {
+        "SELECT name, repo_type, format, visibility, upstream_url FROM repositories ORDER BY name"
+    } else {
+        "SELECT name, repo_type, format, visibility, upstream_url FROM repositories
+         WHERE visibility = 'public' ORDER BY name"
+    };
+
+    let repos =
+        sqlx::query_as::<_, (String, String, String, String, Option<String>)>(sql)
+            .fetch_all(pool)
+            .await
+            .unwrap_or_default();
 
     let repositories: Vec<RepoResponse> = repos
         .into_iter()
-        .map(|(name,)| RepoResponse { name })
+        .map(|(name, repo_type, format, visibility, upstream)| RepoResponse {
+            name,
+            repo_type,
+            format,
+            visibility,
+            upstream,
+        })
         .collect();
 
     Json(RepositoriesResponse { repositories })

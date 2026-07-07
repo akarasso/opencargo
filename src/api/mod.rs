@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod dashboard;
 pub mod deps;
+pub mod me;
 pub mod permissions;
 pub mod promote;
 pub mod repositories;
@@ -8,6 +9,7 @@ pub mod tokens;
 pub mod users;
 pub mod vulns;
 pub mod webhooks;
+pub mod ws;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
@@ -43,14 +45,18 @@ pub(crate) fn require_admin_or_self(caller: &AuthUser, target_username: &str) ->
 /// Best-effort audit-log write for a sensitive mutation. A logging failure must
 /// never fail the underlying operation, so the error is swallowed with a warning
 /// rather than propagated.
+///
+/// Every audited mutation is also broadcast on the real-time event bus as an
+/// admin-visibility `audit.entry` event, so admin UIs (audit log, users,
+/// repositories, webhooks) update live without polling.
 pub(crate) async fn record_audit(
-    db: &sqlx::SqlitePool,
+    state: &crate::server::AppState,
     caller: &AuthUser,
     action: &str,
     target: Option<&str>,
 ) {
     if let Err(e) = crate::db::create_audit_entry(
-        db,
+        &state.db,
         caller.user_id,
         Some(caller.username.as_str()),
         action,
@@ -64,4 +70,14 @@ pub(crate) async fn record_audit(
     {
         tracing::warn!(error = %e, action, "failed to write audit log entry");
     }
+
+    state.events.emit(
+        "audit.entry",
+        crate::events::Visibility::Admin,
+        serde_json::json!({
+            "username": caller.username,
+            "action": action,
+            "target": target,
+        }),
+    );
 }
