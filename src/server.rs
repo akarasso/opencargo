@@ -51,6 +51,8 @@ pub struct AppState {
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Parsed from config.proxy.default_ttl; TTL for cached upstream metadata.
     pub proxy_default_ttl_secs: u64,
+    /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
+    pub events: Arc<crate::events::EventBus>,
 }
 
 pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
@@ -181,6 +183,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         proxy_default_ttl_secs: parse_duration_secs(&config.proxy.default_ttl),
+        events: Arc::new(crate::events::EventBus::new()),
     })
 }
 
@@ -419,6 +422,7 @@ pub fn build_router(state: AppState) -> Router {
     // private repositories for non-admin/anonymous callers.
     let dashboard_routes = Router::new()
         .route("/api/v1/dashboard", get(crate::api::dashboard::dashboard_stats))
+        .route("/api/v1/me/permissions", get(crate::api::me::my_permissions))
         .route("/api/v1/packages", get(crate::api::dashboard::list_packages))
         .route("/api/v1/packages/{*path}", get(crate::api::dashboard::package_detail))
         .route("/api/v1/search", get(crate::api::dashboard::search))
@@ -436,6 +440,13 @@ pub fn build_router(state: AppState) -> Router {
     // with a Bearer token.
     let npm_login_route = Router::new()
         .route("/-/user/org.couchdb.user:{username}", put(npm_login))
+        .with_state(state.clone());
+
+    // Real-time WebSocket — outside the auth middleware because browsers
+    // cannot set an Authorization header on WebSocket handshakes; the client
+    // authenticates with its first frame instead (see api::ws).
+    let ws_route = Router::new()
+        .route("/api/v1/events/ws", get(crate::api::ws::ws_handler))
         .with_state(state.clone());
 
     Router::new()
@@ -465,6 +476,8 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
         // npm login (outside auth middleware — uses password auth)
         .merge(npm_login_route)
+        // Real-time WebSocket (outside auth middleware — first-frame auth)
+        .merge(ws_route)
         // Web UI (outside auth middleware)
         .merge(web_routes)
         // Metrics endpoint (outside auth middleware)
@@ -569,9 +582,13 @@ async fn whoami(
         .extensions()
         .get::<crate::auth::middleware::AuthUser>()
     {
-        Json(json!({"username": user.username}))
+        Json(json!({
+            "username": user.username,
+            "role": user.role,
+            "must_change_password": user.must_change_password,
+        }))
     } else {
-        Json(json!({"username": "anonymous"}))
+        Json(json!({"username": "anonymous", "role": "anonymous", "must_change_password": false}))
     }
 }
 

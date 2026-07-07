@@ -135,33 +135,9 @@ pub async fn auth_middleware(
 
     match bearer_token {
         Some(t) => {
-            // 1. Check static tokens first (backwards compatibility)
-            // Use constant-time comparison to prevent timing attacks
-            let is_static = state.static_tokens.iter().any(|st| {
-                st.len() == t.len()
-                    && st
-                        .bytes()
-                        .zip(t.bytes())
-                        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                        == 0
-            });
-            if is_static {
-                let mut request = request;
-                request.extensions_mut().insert(AuthUser {
-                    token: t,
-                    user_id: None,
-                    username: "static-token".to_string(),
-                    role: "admin".to_string(),
-                    must_change_password: false,
-                });
-                return next.run(request).await;
-            }
-
-            // 2. Try DB token lookup: extract the prefix (first 8 chars of the token)
-            //    Token format: {prefix_str}{32_hex} — prefix is everything up to and
-            //    including the first underscore + the first 4 hex chars.
-            //    Actually, the prefix stored is the first 8 chars of the raw token.
-            if let Some(auth_user) = try_db_token_auth(&state.db, &t).await {
+            // Static config tokens (constant-time compare), then DB-backed
+            // API tokens — shared with the WebSocket first-frame auth.
+            if let Some(auth_user) = authenticate_bearer(&state, &t).await {
                 if let Some(resp) = password_change_pending_block(
                     &auth_user,
                     request.method(),
@@ -249,6 +225,33 @@ fn password_change_pending_block(
                 .into_response(),
         )
     }
+}
+
+/// Resolve a Bearer token to an [`AuthUser`].
+///
+/// Static config tokens are checked first with a constant-time comparison
+/// (they map to a synthetic admin user, backwards compat), then DB-backed
+/// API tokens. Shared by the HTTP auth middleware and the WebSocket
+/// first-frame authentication (`api::ws`).
+pub(crate) async fn authenticate_bearer(state: &AuthState, token: &str) -> Option<AuthUser> {
+    let is_static = state.static_tokens.iter().any(|st| {
+        st.len() == token.len()
+            && st
+                .bytes()
+                .zip(token.bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+                == 0
+    });
+    if is_static {
+        return Some(AuthUser {
+            token: token.to_string(),
+            user_id: None,
+            username: "static-token".to_string(),
+            role: "admin".to_string(),
+            must_change_password: false,
+        });
+    }
+    try_db_token_auth(&state.db, token).await
 }
 
 /// Attempt to authenticate via a DB API token.

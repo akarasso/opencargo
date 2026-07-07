@@ -101,6 +101,10 @@ pub async fn set_permission(
     )
     .await?;
 
+    let audit_target = format!("{username} on {repo_name}");
+    crate::api::record_audit(&state, &caller, "permission.set", Some(&audit_target)).await;
+    emit_permissions_changed(&state, &username);
+
     Ok(Json(json!({
         "ok": true,
         "username": username,
@@ -131,5 +135,20 @@ pub async fn delete_permission(
 
     crate::db::delete_user_permission(&state.db, user.id, repo.id).await?;
 
+    let audit_target = format!("{username} on {repo_name}");
+    crate::api::record_audit(&state, &caller, "permission.remove", Some(&audit_target)).await;
+    emit_permissions_changed(&state, &username);
+
     Ok(Json(json!({"ok": true})))
+}
+
+/// Notify open sessions that a user's effective rights changed so they can
+/// refetch `/api/v1/me/permissions` (and admins their permission editors).
+/// Carries only the username — the actual rights stay behind the REST API.
+fn emit_permissions_changed(state: &AppState, username: &str) {
+    state.events.emit(
+        "permissions.changed",
+        crate::events::Visibility::Authenticated,
+        json!({ "username": username }),
+    );
 }

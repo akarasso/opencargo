@@ -117,7 +117,7 @@ pub async fn create_user(
         .await?
         .ok_or_else(|| AppError::Internal("failed to fetch created user".to_string()))?;
 
-    record_audit(&state.db, &caller, "user.create", Some(&body.username)).await;
+    record_audit(&state, &caller, "user.create", Some(&body.username)).await;
 
     // No forced password change — the admin receives the generated password
     // and transmits it securely to the user. Only the initial admin account
@@ -216,6 +216,17 @@ pub async fn update_user(
         .await?
         .ok_or_else(|| AppError::Internal("failed to fetch updated user".to_string()))?;
 
+    record_audit(&state, &caller, "user.update", Some(&username)).await;
+    if body.role.is_some() {
+        // A role change alters the user's effective rights everywhere; let
+        // their open sessions refresh what they can see and do.
+        state.events.emit(
+            "permissions.changed",
+            crate::events::Visibility::Authenticated,
+            json!({ "username": username }),
+        );
+    }
+
     Ok(Json(json!({
         "username": user.username,
         "email": user.email,
@@ -243,7 +254,7 @@ pub async fn delete_user(
 
     crate::db::delete_user(&state.db, &username).await?;
 
-    record_audit(&state.db, &caller, "user.delete", Some(&username)).await;
+    record_audit(&state, &caller, "user.delete", Some(&username)).await;
 
     Ok(Json(json!({"ok": true})))
 }

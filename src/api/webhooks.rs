@@ -107,6 +107,8 @@ pub async fn create_webhook(
         .await?
         .ok_or_else(|| AppError::Internal("failed to fetch created webhook".to_string()))?;
 
+    crate::api::record_audit(&state, &caller, "webhook.create", Some(&wh.url)).await;
+
     Ok((StatusCode::CREATED, Json(format_webhook(&wh))))
 }
 
@@ -162,6 +164,8 @@ pub async fn update_webhook(
         .await?
         .ok_or_else(|| AppError::Internal("failed to fetch updated webhook".to_string()))?;
 
+    crate::api::record_audit(&state, &caller, "webhook.update", Some(&updated.url)).await;
+
     Ok(Json(format_webhook(&updated)))
 }
 
@@ -182,6 +186,8 @@ pub async fn delete_webhook(
     }
 
     crate::db::delete_webhook(&state.db, id).await?;
+
+    crate::api::record_audit(&state, &caller, "webhook.delete", Some(&id.to_string())).await;
 
     Ok(Json(json!({"ok": true})))
 }

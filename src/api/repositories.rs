@@ -125,6 +125,9 @@ pub async fn create_repository(
         .await?
         .ok_or_else(|| AppError::Internal("failed to fetch created repository".to_string()))?;
 
+    crate::api::record_audit(&state, &caller, "repo.create", Some(&repo.name)).await;
+    emit_repositories_changed(&state);
+
     Ok((
         StatusCode::CREATED,
         Json(json!({
@@ -216,6 +219,9 @@ pub async fn update_repository(
         .await?
         .ok_or_else(|| AppError::Internal("failed to fetch updated repository".to_string()))?;
 
+    crate::api::record_audit(&state, &caller, "repo.update", Some(&name)).await;
+    emit_repositories_changed(&state);
+
     Ok(Json(json!({
         "id": updated.id,
         "name": updated.name,
@@ -257,7 +263,21 @@ pub async fn delete_repository(
 
     crate::db::delete_repository(&state.db, &name).await?;
 
+    crate::api::record_audit(&state, &caller, "repo.delete", Some(&name)).await;
+    emit_repositories_changed(&state);
+
     Ok(Json(json!({"ok": true})))
+}
+
+/// Public hint that the repository list changed. Payload-free on purpose: the
+/// anonymous-visible repo list is already public, and every client refetches
+/// through the REST API which enforces per-caller filtering.
+fn emit_repositories_changed(state: &AppState) {
+    state.events.emit(
+        "repositories.changed",
+        crate::events::Visibility::Public,
+        serde_json::json!({}),
+    );
 }
 
 /// POST /api/v1/repositories/{name}/purge-cache -- Purge proxy cache (admin only)
@@ -293,6 +313,8 @@ pub async fn purge_cache(
         &format!("_proxy_cache/{name}"),
     )
     .await?;
+
+    crate::api::record_audit(&state, &caller, "repo.purge_cache", Some(&name)).await;
 
     Ok(Json(json!({"ok": true, "message": format!("cache purged for repository: {name}")})))
 }

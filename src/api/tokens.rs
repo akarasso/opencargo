@@ -107,7 +107,7 @@ pub async fn create_token(
     )
     .await?;
 
-    record_audit(&state.db, &caller, "token.create", Some(&username)).await;
+    record_audit(&state, &caller, "token.create", Some(&username)).await;
 
     Ok((
         StatusCode::CREATED,
@@ -145,7 +145,7 @@ pub async fn delete_token(
 
     crate::db::delete_token(&state.db, &token_id).await?;
 
-    record_audit(&state.db, &caller, "token.revoke", Some(&username)).await;
+    record_audit(&state, &caller, "token.revoke", Some(&username)).await;
 
     Ok(Json(json!({"ok": true})))
 }
