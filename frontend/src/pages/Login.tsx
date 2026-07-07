@@ -1,156 +1,134 @@
-import { createSignal, Show } from 'solid-js';
-import { useNavigate } from '@solidjs/router';
-import auth from '../lib/auth.ts';
+import { Show, createEffect, createSignal } from 'solid-js';
+import { A, useNavigate } from '@solidjs/router';
+import Icon from '../components/Icon.tsx';
+import { session } from '../core/stores/session.ts';
+import { toasts } from '../core/stores/toasts.ts';
 
 export default function Login() {
   const navigate = useNavigate();
   const [username, setUsername] = createSignal('');
   const [password, setPassword] = createSignal('');
+  const [showPassword, setShowPassword] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(false);
 
-  if (auth.isAuthenticated()) {
-    navigate('/admin', { replace: true });
-  }
+  // Already signed in (or becomes signed in): leave the login page.
+  createEffect(() => {
+    if (!session.checking() && session.isAuthenticated() && !loading()) {
+      const u = session.user();
+      navigate(u?.mustChangePassword ? '/admin/password' : '/', { replace: true });
+    }
+  });
 
   async function handleSubmit(e: Event) {
     e.preventDefault();
+    if (loading()) return;
     setError(null);
     setLoading(true);
 
-    const err = await auth.login(username(), password());
+    const err = await session.login(username().trim(), password());
     setLoading(false);
 
     if (err) {
       setError(err);
-    } else if (auth.mustChangePassword()) {
+      return;
+    }
+
+    const u = session.user();
+    if (u?.mustChangePassword) {
+      toasts.info('Welcome back', 'Set a new password to continue.');
       navigate('/admin/password', { replace: true });
     } else {
-      navigate('/admin', { replace: true });
+      toasts.success(`Signed in as ${u?.username}`);
+      navigate('/', { replace: true });
     }
   }
 
   return (
     <div class="login-page">
-      {/* Top Navigation Anchor (from Stitch) */}
-      <header class="login-top-header">
-        <div class="login-top-brand">OPENCARGO</div>
-        <div class="login-top-meta">
-          <span class="material-symbols-outlined" style={{ "font-size": "16px" }}>terminal</span>
-          <span style={{ opacity: 0.4, "letter-spacing": "0.3em" }}>SECURE_NODE: 0x44F</span>
-        </div>
-      </header>
+      <div class="login-grid-decor" aria-hidden="true" />
 
-      {/* Main Content Canvas */}
-      <main class="login-container">
-        {/* Brand Header */}
-        <div class="login-header">
-          <div class="login-icon">
-            <span class="material-symbols-outlined">terminal</span>
+      <div class="login-box">
+        <div class="login-brand">
+          <div class="brand-mark">
+            <Icon name="anchor" size={22} strokeWidth={2} />
           </div>
-          <h1 class="login-title">
-            <span>OPEN</span><span class="login-title-accent">CARGO</span>
-          </h1>
-          <p class="login-subtitle">Kinetic Terminal Access</p>
+          <div>
+            <div class="login-title">OpenCargo</div>
+            <div class="login-sub">sign in to your registry</div>
+          </div>
         </div>
 
-        {/* Login Card */}
-        <div class="login-card">
+        <form class="login-card" onSubmit={handleSubmit}>
           <Show when={error()}>
-            <div class="login-error">{error()}</div>
+            <div class="alert alert-error" role="alert">
+              <Icon name="alert-circle" size={15} />
+              <span>{error()}</span>
+            </div>
           </Show>
 
-          <form onSubmit={handleSubmit} style={{ display: 'flex', "flex-direction": 'column', gap: '1.5rem' }}>
-            {/* Username Field */}
-            <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.5rem' }}>
-              <div class="login-field-header">
-                <label class="login-label" for="username">Username</label>
-                <span class="login-label-hint">REQ_AUTH_ID</span>
-              </div>
-              <div class="login-input-wrap">
-                <input
-                  id="username"
-                  class="login-input"
-                  type="text"
-                  value={username()}
-                  onInput={(e) => setUsername(e.currentTarget.value)}
-                  placeholder="terminal_user_01"
-                  autocomplete="username"
-                  required
-                />
-                <div class="login-input-accent" />
-              </div>
-            </div>
-
-            {/* Password Field */}
-            <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.5rem' }}>
-              <div class="login-field-header">
-                <label class="login-label" for="password">Password</label>
-                <span class="login-label-link">Recovery Protocol?</span>
-              </div>
-              <div class="login-input-wrap">
-                <input
-                  id="password"
-                  class="login-input"
-                  type="password"
-                  value={password()}
-                  onInput={(e) => setPassword(e.currentTarget.value)}
-                  placeholder="••••••••"
-                  autocomplete="current-password"
-                  required
-                />
-                <div class="login-input-accent" />
-              </div>
-            </div>
-
-            {/* Session Options */}
-            <div class="login-persist">
-              <input id="persist" type="checkbox" class="login-checkbox" />
-              <label for="persist" class="login-persist-label">Persist Session State</label>
-            </div>
-
-            {/* Action */}
-            <button
-              type="submit"
-              class="login-submit"
-              disabled={loading()}
-            >
-              {loading() ? 'Initializing...' : 'Initialize Connection'}
-            </button>
-          </form>
-
-          {/* Card Footer Metadata */}
-          <div class="login-footer">
-            <div class="login-status">
-              <span class="login-status-led" />
-              <span>System Ready</span>
-            </div>
-            <span>v0.1.0-KINETIC</span>
+          <div class="field">
+            <label class="field-label" for="login-username">
+              Username
+            </label>
+            <input
+              id="login-username"
+              class="input"
+              value={username()}
+              onInput={(e) => setUsername(e.currentTarget.value)}
+              autocomplete="username"
+              spellcheck={false}
+              required
+              autofocus
+            />
           </div>
-        </div>
 
-        {/* Security Notice */}
-        <p class="login-legal">
-          Unauthorized access is logged.
-        </p>
-      </main>
+          <div class="field">
+            <label class="field-label" for="login-password">
+              Password
+            </label>
+            <div class="search-box">
+              <input
+                id="login-password"
+                class="input"
+                style={{ 'padding-left': '11px', 'padding-right': '38px' }}
+                type={showPassword() ? 'text' : 'password'}
+                value={password()}
+                onInput={(e) => setPassword(e.currentTarget.value)}
+                autocomplete="current-password"
+                required
+              />
+              <button
+                type="button"
+                class="btn btn-quiet btn-icon"
+                style={{ position: 'absolute', right: '4px' }}
+                onClick={() => setShowPassword((v) => !v)}
+                aria-label={showPassword() ? 'Hide password' : 'Show password'}
+                tabindex={-1}
+              >
+                <Icon name={showPassword() ? 'eye-off' : 'eye'} size={15} />
+              </button>
+            </div>
+          </div>
 
-      {/* Global Footer Bar */}
-      <footer class="login-bottom-footer">
-        <div>
-          &copy; 2024 OPENCARGO REGISTRY
-        </div>
-        <div class="login-bottom-footer-links">
-          <a href="#">Privacy Policy</a>
-          <a href="#">Terms of Service</a>
-          <a href="#">Legal</a>
-        </div>
-      </footer>
+          <button class="btn btn-primary" style={{ width: '100%', 'margin-top': '6px' }} disabled={loading()}>
+            <Show when={loading()} fallback={<Icon name="log-in" size={15} />}>
+              <span class="spinner" style={{ 'border-top-color': 'var(--accent-ink)' }} />
+            </Show>
+            {loading() ? 'Signing in…' : 'Sign in'}
+          </button>
 
-      {/* Background Decoration */}
-      <div class="login-bg-decor">
-        <div class="login-bg-orb-1" />
-        <div class="login-bg-orb-2" />
+          <div class="field-hint" style={{ 'margin-top': '12px', 'text-align': 'center' }}>
+            First run? The admin password is in <span class="mono">data/admin.password</span>.
+          </div>
+        </form>
+
+        <div class="login-foot">
+          <A href="/" style={{ color: 'inherit' }}>
+            ← back to registry
+          </A>
+          <span>npm · cargo · oci · go</span>
+        </div>
       </div>
     </div>
   );
