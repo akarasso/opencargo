@@ -1,143 +1,381 @@
-import { createResource, For, Show } from 'solid-js';
-import { fetchRepositories } from '../../lib/api.ts';
-import LoadingSpinner from '../../components/LoadingSpinner.tsx';
+import { For, Show, createSignal } from 'solid-js';
+import Icon from '../../components/Icon.tsx';
+import Modal, { ConfirmModal } from '../../components/Modal.tsx';
 import EmptyState from '../../components/EmptyState.tsx';
+import { RequireAdmin } from '../../components/guards.tsx';
+import { FormatTag, LoadError, RepoTypeChip, TableSkeleton, VisibilityChip } from '../../components/bits.tsx';
+import {
+  createRepository,
+  deleteRepository,
+  fetchRepositories,
+  purgeRepositoryCache,
+  updateRepository,
+} from '../../core/api.ts';
+import { createLiveResource } from '../../core/stores/live.ts';
+import { toasts } from '../../core/stores/toasts.ts';
+import type { Repository } from '../../core/types.ts';
 
 export default function Repositories() {
-  const [repos] = createResource(fetchRepositories);
+  return (
+    <RequireAdmin>
+      <RepositoriesInner />
+    </RequireAdmin>
+  );
+}
+
+function RepositoriesInner() {
+  const [repos, refetch] = createLiveResource(fetchRepositories, ['repositories.changed']);
+
+  const [showCreate, setShowCreate] = createSignal(false);
+  const [editing, setEditing] = createSignal<Repository | null>(null);
+  const [deleting, setDeleting] = createSignal<string | null>(null);
+  const [busy, setBusy] = createSignal(false);
+
+  // Create form
+  const [name, setName] = createSignal('');
+  const [type, setType] = createSignal('hosted');
+  const [format, setFormat] = createSignal('npm');
+  const [visibility, setVisibility] = createSignal('private');
+  const [upstream, setUpstream] = createSignal('');
+  const [members, setMembers] = createSignal('');
+
+  // Edit form
+  const [editVisibility, setEditVisibility] = createSignal('private');
+  const [editUpstream, setEditUpstream] = createSignal('');
+  const [editMembers, setEditMembers] = createSignal('');
+
+  async function handleCreate(e: Event) {
+    e.preventDefault();
+    if (!name()) return;
+    setBusy(true);
+    try {
+      await createRepository({
+        name: name(),
+        type: type(),
+        format: format(),
+        visibility: visibility(),
+        upstream: type() === 'proxy' ? upstream() || undefined : undefined,
+        members:
+          type() === 'group'
+            ? members()
+                .split(',')
+                .map((m) => m.trim())
+                .filter(Boolean)
+            : undefined,
+      });
+      toasts.success(`Repository ${name()} created`);
+      setShowCreate(false);
+      setName('');
+      setUpstream('');
+      setMembers('');
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not create repository', err instanceof Error ? err.message : undefined);
+    }
+    setBusy(false);
+  }
+
+  function openEdit(repo: Repository) {
+    setEditing(repo);
+    setEditVisibility(repo.visibility);
+    setEditUpstream(repo.upstream ?? '');
+    setEditMembers('');
+  }
+
+  async function handleEdit(e: Event) {
+    e.preventDefault();
+    const repo = editing();
+    if (!repo) return;
+    setBusy(true);
+    try {
+      await updateRepository(repo.name, {
+        visibility: editVisibility(),
+        upstream: repo.type === 'proxy' ? editUpstream() || undefined : undefined,
+        members:
+          repo.type === 'group' && editMembers()
+            ? editMembers()
+                .split(',')
+                .map((m) => m.trim())
+                .filter(Boolean)
+            : undefined,
+      });
+      toasts.success(`Repository ${repo.name} updated`);
+      setEditing(null);
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not update repository', err instanceof Error ? err.message : undefined);
+    }
+    setBusy(false);
+  }
+
+  async function handleDelete() {
+    const target = deleting();
+    if (!target) return;
+    try {
+      await deleteRepository(target);
+      toasts.success(`Repository ${target} deleted`);
+      setDeleting(null);
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not delete repository', err instanceof Error ? err.message : undefined);
+      setDeleting(null);
+    }
+  }
+
+  async function handlePurge(repoName: string) {
+    try {
+      const res = await purgeRepositoryCache(repoName);
+      toasts.success('Cache purged', res.message);
+    } catch (err: unknown) {
+      toasts.error('Could not purge cache', err instanceof Error ? err.message : undefined);
+    }
+  }
 
   return (
-    <>
-      <Show when={repos.loading}>
-        <LoadingSpinner />
-      </Show>
+    <div class="page-enter">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Repositories</h1>
+          <p class="page-sub">
+            Hosted repos store what you publish, proxies cache upstream registries, groups combine
+            both behind one endpoint.
+          </p>
+        </div>
+        <div class="page-actions">
+          <button class="btn btn-primary" onClick={() => setShowCreate(true)}>
+            <Icon name="plus" size={14} />
+            New repository
+          </button>
+        </div>
+      </div>
 
       <Show when={repos.error}>
-        <div class="alert alert-error">Failed to load repositories.</div>
+        <LoadError what="repositories" />
       </Show>
 
-      <Show when={repos()}>
+      <Show when={repos()} fallback={<TableSkeleton rows={5} cols={5} />}>
         {(r) => (
           <Show
             when={r().repositories.length > 0}
             fallback={
-              <EmptyState
-                title="No repositories"
-                text="No repositories have been configured yet."
-              />
+              <div class="card">
+                <EmptyState
+                  icon="database"
+                  title="No repositories yet"
+                  text="Create a hosted repository to publish into, or a proxy to cache an upstream registry."
+                >
+                  <button class="btn btn-primary" onClick={() => setShowCreate(true)}>
+                    <Icon name="plus" size={14} />
+                    New repository
+                  </button>
+                </EmptyState>
+              </div>
             }
           >
-            <div style={{ display: 'flex', "flex-direction": 'column', gap: '2.5rem' }}>
-              {/* Stat Grid -- matches Stitch repos page: 3 stat cards */}
-              <div style={{ display: 'grid', "grid-template-columns": 'repeat(3, 1fr)', gap: '1.5rem' }}>
-                {/* Total */}
-                <div class="repo-stat-card">
-                  <div style={{ position: 'absolute', top: 0, right: 0, padding: '1rem', opacity: 0.05 }}>
-                    <span class="material-symbols-outlined" style={{ "font-size": '4rem' }}>inventory_2</span>
-                  </div>
-                  <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.5rem' }}>
-                    <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-outline)' }}>Registry.Total</span>
-                    <div style={{ display: 'flex', "align-items": 'baseline', gap: '0.5rem' }}>
-                      <span style={{ "font-size": '2.5rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-primary)' }}>{r().repositories.length}</span>
-                      <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-label)', color: 'var(--clr-outline)' }}>Modules</span>
-                    </div>
-                  </div>
-                  <div style={{ "margin-top": '1rem', height: '4px', width: '100%', background: 'var(--clr-surface-container-high)', "border-radius": '9999px', overflow: 'hidden' }}>
-                    <div style={{ height: '100%', width: '100%', background: 'var(--clr-primary)', "box-shadow": '0 0 8px rgba(123, 231, 249, 0.5)' }} />
-                  </div>
-                </div>
-
-                {/* Hosted */}
-                <div class="repo-stat-card">
-                  <div style={{ position: 'absolute', top: 0, right: 0, padding: '1rem', opacity: 0.05 }}>
-                    <span class="material-symbols-outlined" style={{ "font-size": '4rem' }}>cloud_done</span>
-                  </div>
-                  <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.5rem' }}>
-                    <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-outline)' }}>Registry.Active</span>
-                    <div style={{ display: 'flex', "align-items": 'baseline', gap: '0.5rem' }}>
-                      <span style={{ "font-size": '2.5rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-secondary)' }}>{r().repositories.length}</span>
-                      <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-label)', color: 'var(--clr-outline)' }}>Internal</span>
-                    </div>
-                  </div>
-                  <div style={{ "margin-top": '1rem', height: '4px', width: '100%', background: 'var(--clr-surface-container-high)', "border-radius": '9999px', overflow: 'hidden' }}>
-                    <div style={{ height: '100%', width: '100%', background: 'var(--clr-secondary)', "box-shadow": '0 0 8px rgba(16, 213, 255, 0.5)' }} />
-                  </div>
-                </div>
-
-                {/* Format */}
-                <div class="repo-stat-card">
-                  <div style={{ position: 'absolute', top: 0, right: 0, padding: '1rem', opacity: 0.05 }}>
-                    <span class="material-symbols-outlined" style={{ "font-size": '4rem' }}>hub</span>
-                  </div>
-                  <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.5rem' }}>
-                    <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-outline)' }}>Registry.Format</span>
-                    <div style={{ display: 'flex', "align-items": 'baseline', gap: '0.5rem' }}>
-                      <span style={{ "font-size": '2.5rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-tertiary)' }}>npm</span>
-                    </div>
-                  </div>
-                  <div style={{ "margin-top": '1rem', height: '4px', width: '100%', background: 'var(--clr-surface-container-high)', "border-radius": '9999px', overflow: 'hidden' }}>
-                    <div style={{ height: '100%', width: '40%', background: 'var(--clr-tertiary)', "box-shadow": '0 0 8px rgba(138, 184, 255, 0.5)' }} />
-                  </div>
-                </div>
-              </div>
-
-              {/* Table Container -- matches Stitch repos page */}
-              <div class="data-table-wrapper">
-                <div style={{ padding: '1.5rem 2rem', display: 'flex', "justify-content": 'space-between', "align-items": 'center', "border-bottom": '1px solid rgba(255, 255, 255, 0.05)', background: 'rgba(26, 32, 39, 0.3)' }}>
-                  <div style={{ display: 'flex', "align-items": 'center', gap: '0.75rem' }}>
-                    <div style={{ width: '6px', height: '24px', background: 'var(--clr-primary)', "border-radius": '9999px' }} />
-                    <h3 style={{ "font-family": 'var(--font-headline)', "font-weight": '700', "letter-spacing": '-0.025em', color: 'var(--clr-on-surface)', "margin-bottom": '0' }}>ACTIVE REPOSITORIES</h3>
-                  </div>
-                </div>
-                <div style={{ "overflow-x": 'auto' }}>
-                  <table class="data-table">
-                    <thead>
-                      <tr>
-                        <th>Name</th>
-                        <th>Status</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <For each={r().repositories}>
-                        {(repo) => (
-                          <tr>
-                            <td>
-                              <div style={{ display: 'flex', "align-items": 'center', gap: '0.75rem' }}>
-                                <span class="material-symbols-outlined" style={{ color: 'var(--clr-primary-dim)', "font-size": '18px' }}>folder</span>
-                                <span style={{ "font-weight": '500', color: 'var(--clr-on-surface)' }}>{repo.name}</span>
-                              </div>
-                            </td>
-                            <td>
-                              <div style={{ display: 'flex', "align-items": 'center', gap: '0.5rem' }}>
-                                <div style={{ width: '8px', height: '8px', "border-radius": '50%', background: 'var(--clr-primary)', "box-shadow": '0 0 8px rgba(123, 231, 249, 0.8)' }} class="status-led-animated" />
-                                <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', color: 'var(--clr-primary)' }}>Live</span>
-                              </div>
-                            </td>
-                          </tr>
-                        )}
-                      </For>
-                    </tbody>
-                  </table>
-                </div>
-                <div style={{ padding: '1rem 2rem', "border-top": '1px solid rgba(255, 255, 255, 0.05)', display: 'flex', "justify-content": 'space-between', "align-items": 'center', background: 'rgba(26, 32, 39, 0.1)' }}>
-                  <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-outline)' }}>Showing {r().repositories.length} repositories</span>
-                </div>
-              </div>
-
-              {/* Info banner */}
-              <div class="info-banner">
-                <span class="material-symbols-outlined">info</span>
-                <div>
-                  <h4 class="info-banner-title">System Maintenance</h4>
-                  <p class="info-banner-text">
-                    Repository configuration is managed via the server configuration file. Edit the config and restart the server to add or modify repositories.
-                  </p>
-                </div>
+            <div class="table-card page-enter">
+              <div class="table-scroll">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Name</th>
+                      <th>Type</th>
+                      <th>Format</th>
+                      <th>Visibility</th>
+                      <th class="cell-hide-sm">Upstream</th>
+                      <th style={{ 'text-align': 'right' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={r().repositories}>
+                      {(repo) => (
+                        <tr>
+                          <td>
+                            <span class="mono" style={{ color: 'var(--ink)', 'font-weight': 500 }}>
+                              {repo.name}
+                            </span>
+                          </td>
+                          <td>
+                            <RepoTypeChip type={repo.type} />
+                          </td>
+                          <td>
+                            <FormatTag format={repo.format} />
+                          </td>
+                          <td>
+                            <VisibilityChip visibility={repo.visibility} />
+                          </td>
+                          <td class="cell-dim cell-mono cell-hide-sm truncate" style={{ 'max-width': '220px' }}>
+                            {repo.upstream || '—'}
+                          </td>
+                          <td>
+                            <div class="cell-actions">
+                              <Show when={repo.type === 'proxy'}>
+                                <button
+                                  class="btn btn-quiet btn-icon"
+                                  title="Purge cached upstream artifacts"
+                                  onClick={() => handlePurge(repo.name)}
+                                >
+                                  <Icon name="refresh" size={14} />
+                                </button>
+                              </Show>
+                              <button class="btn btn-quiet btn-icon" title="Edit repository" onClick={() => openEdit(repo)}>
+                                <Icon name="pencil" size={14} />
+                              </button>
+                              <button
+                                class="btn btn-quiet btn-icon"
+                                title="Delete repository (must be empty)"
+                                onClick={() => setDeleting(repo.name)}
+                              >
+                                <Icon name="trash" size={14} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
               </div>
             </div>
           </Show>
         )}
       </Show>
-    </>
+
+      {/* Create */}
+      <Modal
+        open={showCreate()}
+        title="New repository"
+        onClose={() => setShowCreate(false)}
+        actions={
+          <>
+            <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
+              Cancel
+            </button>
+            <button class="btn btn-primary" onClick={handleCreate} disabled={busy() || !name()}>
+              {busy() ? 'Creating…' : 'Create repository'}
+            </button>
+          </>
+        }
+      >
+        <form onSubmit={handleCreate}>
+          <div class="field">
+            <label class="field-label">Name</label>
+            <input
+              class="input"
+              value={name()}
+              onInput={(e) => setName(e.currentTarget.value)}
+              placeholder="npm-private"
+              spellcheck={false}
+              required
+            />
+          </div>
+          <div class="form-row">
+            <div class="field">
+              <label class="field-label">Type</label>
+              <select class="select" value={type()} onChange={(e) => setType(e.currentTarget.value)}>
+                <option value="hosted">hosted — you publish into it</option>
+                <option value="proxy">proxy — caches an upstream</option>
+                <option value="group">group — one endpoint over several</option>
+              </select>
+            </div>
+            <div class="field">
+              <label class="field-label">Format</label>
+              <select class="select" value={format()} onChange={(e) => setFormat(e.currentTarget.value)}>
+                <option value="npm">npm</option>
+                <option value="cargo">cargo</option>
+                <option value="oci">oci</option>
+                <option value="go">go</option>
+              </select>
+            </div>
+          </div>
+          <div class="field">
+            <label class="field-label">Visibility</label>
+            <select class="select" value={visibility()} onChange={(e) => setVisibility(e.currentTarget.value)}>
+              <option value="private">private — read requires permission</option>
+              <option value="public">public — anyone can read</option>
+            </select>
+          </div>
+          <Show when={type() === 'proxy'}>
+            <div class="field">
+              <label class="field-label">Upstream URL</label>
+              <input
+                class="input"
+                value={upstream()}
+                onInput={(e) => setUpstream(e.currentTarget.value)}
+                placeholder="https://registry.npmjs.org"
+                spellcheck={false}
+              />
+            </div>
+          </Show>
+          <Show when={type() === 'group'}>
+            <div class="field">
+              <label class="field-label">Members (resolution order)</label>
+              <input
+                class="input"
+                value={members()}
+                onInput={(e) => setMembers(e.currentTarget.value)}
+                placeholder="npm-private, npm-proxy"
+                spellcheck={false}
+              />
+              <div class="field-hint">Comma-separated; the first match wins.</div>
+            </div>
+          </Show>
+        </form>
+      </Modal>
+
+      {/* Edit */}
+      <Modal
+        open={editing() !== null}
+        title={`Edit ${editing()?.name ?? ''}`}
+        onClose={() => setEditing(null)}
+        actions={
+          <>
+            <button class="btn btn-ghost" onClick={() => setEditing(null)}>
+              Cancel
+            </button>
+            <button class="btn btn-primary" onClick={handleEdit} disabled={busy()}>
+              {busy() ? 'Saving…' : 'Save changes'}
+            </button>
+          </>
+        }
+      >
+        <form onSubmit={handleEdit}>
+          <div class="field">
+            <label class="field-label">Visibility</label>
+            <select class="select" value={editVisibility()} onChange={(e) => setEditVisibility(e.currentTarget.value)}>
+              <option value="private">private</option>
+              <option value="public">public</option>
+            </select>
+          </div>
+          <Show when={editing()?.type === 'proxy'}>
+            <div class="field">
+              <label class="field-label">Upstream URL</label>
+              <input class="input" value={editUpstream()} onInput={(e) => setEditUpstream(e.currentTarget.value)} spellcheck={false} />
+            </div>
+          </Show>
+          <Show when={editing()?.type === 'group'}>
+            <div class="field">
+              <label class="field-label">Members (resolution order)</label>
+              <input
+                class="input"
+                value={editMembers()}
+                onInput={(e) => setEditMembers(e.currentTarget.value)}
+                placeholder="leave blank to keep current"
+                spellcheck={false}
+              />
+            </div>
+          </Show>
+        </form>
+      </Modal>
+
+      <ConfirmModal
+        open={deleting() !== null}
+        title={`Delete ${deleting()}?`}
+        message="Only empty repositories can be deleted; the API refuses otherwise. Clients using this endpoint will start failing."
+        confirmLabel="Delete repository"
+        danger
+        onConfirm={handleDelete}
+        onCancel={() => setDeleting(null)}
+      />
+    </div>
   );
 }

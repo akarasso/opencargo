@@ -1,138 +1,188 @@
-import { createSignal, createResource, For, Show } from 'solid-js';
-import { fetchAudit } from '../../lib/api.ts';
-import LoadingSpinner from '../../components/LoadingSpinner.tsx';
+import { For, Show, createResource, createSignal, onCleanup, onMount } from 'solid-js';
+import Icon from '../../components/Icon.tsx';
 import EmptyState from '../../components/EmptyState.tsx';
+import { RequireAdmin } from '../../components/guards.tsx';
+import { LoadError, TableSkeleton } from '../../components/bits.tsx';
+import { fetchAudit } from '../../core/api.ts';
+import { useLive } from '../../core/stores/live.ts';
+import { onEvent, wsStatus } from '../../core/ws.ts';
+import { initials, timeAgo } from '../../core/format.ts';
 
-function actionBadgeClass(action: string): string {
-  if (action.includes('publish')) return 'badge badge-action-publish';
-  if (action.includes('create')) return 'badge badge-action-create';
-  if (action.includes('login')) return 'badge badge-action-login';
-  if (action.includes('delete') || action.includes('yank') || action.includes('revoke')) return 'badge badge-action-revoke';
-  return 'badge badge-default';
-}
-
-function getInitials(username: string): string {
-  const parts = username.split(/[@._-]/);
-  if (parts.length >= 2) {
-    return (parts[0][0] + (parts[1][0] || '')).toUpperCase();
-  }
-  return username.slice(0, 2).toUpperCase();
+function actionChip(action: string): string {
+  if (action.includes('delete') || action.includes('revoke') || action.includes('remove'))
+    return 'chip chip-danger';
+  if (action.includes('create') || action.includes('publish')) return 'chip chip-ok';
+  if (action.includes('permission') || action.includes('password')) return 'chip chip-warn';
+  if (action.includes('promote')) return 'chip chip-accent';
+  return 'chip chip-neutral';
 }
 
 export default function AuditLog() {
+  return (
+    <RequireAdmin>
+      <AuditLogInner />
+    </RequireAdmin>
+  );
+}
+
+interface LiveEntry {
+  key: string;
+  username: string;
+  action: string;
+  target: string | null;
+  ts: string;
+}
+
+function AuditLogInner() {
   const [page, setPage] = createSignal(1);
   const pageSize = 50;
 
-  const [data] = createResource(
-    () => page(),
-    (p) => fetchAudit(p, pageSize),
-  );
+  const [data, { refetch }] = createResource(page, (p) => fetchAudit(p, pageSize));
+  useLive(refetch, [], { debounce: 800 }); // reconnect/resync only — live rows come via WS below
+
+  // Entries arriving over the WebSocket while we watch (page 1 view).
+  const [liveEntries, setLiveEntries] = createSignal<LiveEntry[]>([]);
+  onMount(() => {
+    const unsub = onEvent('audit.entry', (ev) => {
+      const d = ev.data ?? {};
+      setLiveEntries((rows) =>
+        [
+          {
+            key: `${ev.ts}-${d.action}-${d.target ?? ''}`,
+            username: String(d.username ?? '—'),
+            action: String(d.action ?? 'unknown'),
+            target: d.target == null ? null : String(d.target),
+            ts: ev.ts ?? '',
+          },
+          ...rows,
+        ].slice(0, 30),
+      );
+    });
+    onCleanup(unsub);
+  });
 
   return (
-    <>
-      {/* Header Section -- matches Stitch audit page */}
-      <div style={{ "margin-bottom": '2.5rem', display: 'flex', "justify-content": 'space-between', "align-items": 'flex-end' }}>
+    <div class="page-enter">
+      <div class="page-head">
         <div>
-          <h1 style={{ "font-size": '2.5rem', "font-family": 'var(--font-headline)', "font-weight": '700', "letter-spacing": '-0.05em', color: 'var(--clr-on-surface)', "margin-bottom": '0.5rem', "text-transform": 'uppercase' }}>Audit Log</h1>
-          <div style={{ display: 'flex', "align-items": 'center', gap: '1rem' }}>
-            <div style={{ display: 'flex', "align-items": 'center', gap: '0.5rem', "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'rgba(123, 231, 249, 0.6)' }}>
-              <span style={{ width: '8px', height: '8px', background: 'var(--clr-primary)', "border-radius": '50%' }} class="status-led-animated" />
-              LIVE STREAM ACTIVE
-            </div>
-          </div>
+          <h1 class="page-title">Audit log</h1>
+          <p class="page-sub">
+            Every sensitive action — publishes, permission changes, user and repository
+            administration — with who did it and when.
+          </p>
         </div>
+        <span class={`feed-live ${wsStatus() === 'online' ? 'online' : ''}`}>
+          <span class="conn-dot" />
+          {wsStatus() === 'online' ? 'streaming' : 'paused'}
+        </span>
       </div>
 
-      <Show when={data.loading}><LoadingSpinner /></Show>
-      <Show when={data.error}><div class="alert alert-error">Failed to load audit log. Make sure you are logged in as an admin.</div></Show>
+      <Show when={liveEntries().length > 0}>
+        <div class="feed-card section">
+          <div class="feed-head">
+            <span class="section-title">Just happened</span>
+            <span class="dim small">{liveEntries().length} since you opened this page</span>
+          </div>
+          <ul class="feed">
+            <For each={liveEntries()}>
+              {(e) => (
+                <li class="feed-row fresh">
+                  <span class="feed-time" title={e.ts}>
+                    {timeAgo(e.ts)}
+                  </span>
+                  <div class="feed-main">
+                    <span class="mono small" style={{ color: 'var(--ink)' }}>
+                      {e.username}
+                    </span>
+                    <span class={actionChip(e.action)}>{e.action}</span>
+                    <Show when={e.target}>
+                      <span class="dim small mono truncate">{e.target}</span>
+                    </Show>
+                  </div>
+                </li>
+              )}
+            </For>
+          </ul>
+        </div>
+      </Show>
 
-      <Show when={data()}>
+      <Show when={data.error}>
+        <LoadError what="the audit log" />
+      </Show>
+
+      <Show when={data()} fallback={<TableSkeleton rows={8} cols={5} />}>
         {(d) => (
-          <Show when={d().entries.length > 0} fallback={<EmptyState title="No audit entries" text="No actions have been recorded yet." />}>
-            {/* Audit Table -- matches Stitch audit page exactly */}
-            <div class="data-table-wrapper" style={{ position: 'relative' }}>
-              <div style={{ "overflow-x": 'auto' }}>
-                <table class="data-table">
+          <Show
+            when={d().entries.length > 0}
+            fallback={
+              <div class="card">
+                <EmptyState icon="history" title="Nothing recorded yet" text="Sensitive actions will be listed here as they happen." />
+              </div>
+            }
+          >
+            <div class="table-card page-enter">
+              <div class="table-scroll">
+                <table class="table">
                   <thead>
                     <tr>
-                      <th>Timestamp</th>
-                      <th>User Identity</th>
-                      <th>Event Action</th>
-                      <th>Target Object</th>
-                      <th>Repository</th>
-                      <th style={{ "text-align": 'right' }}>Source IP</th>
+                      <th>When</th>
+                      <th>User</th>
+                      <th>Action</th>
+                      <th>Target</th>
+                      <th class="cell-hide-sm">Repository</th>
                     </tr>
                   </thead>
                   <tbody>
                     <For each={d().entries}>
                       {(entry) => (
                         <tr>
-                          <td style={{ "font-family": 'var(--font-label)', "font-size": '0.75rem', color: 'rgb(148, 163, 184)' }}>{entry.created_at}</td>
+                          <td class="cell-dim nowrap" title={entry.created_at}>
+                            {timeAgo(entry.created_at)}
+                          </td>
                           <td>
-                            <div style={{ display: 'flex', "align-items": 'center', gap: '0.5rem' }}>
-                              <div style={{ width: '24px', height: '24px', "border-radius": '0.125rem', background: 'var(--clr-surface-variant)', display: 'flex', "align-items": 'center', "justify-content": 'center', "font-size": '0.625rem', "font-weight": '700', color: 'var(--clr-primary)' }}>
-                                {entry.username ? getInitials(entry.username) : '??'}
+                            <div class="row">
+                              <div class="avatar" style={{ width: '24px', height: '24px', 'font-size': '0.56rem' }}>
+                                {initials(entry.username ?? '?')}
                               </div>
-                              <span style={{ "font-size": '0.75rem', "font-weight": '500', color: 'var(--clr-on-surface)' }}>{entry.username || '--'}</span>
+                              <span class="small" style={{ color: 'var(--ink)' }}>
+                                {entry.username ?? '—'}
+                              </span>
                             </div>
                           </td>
-                          <td><span class={actionBadgeClass(entry.action)}>{entry.action}</span></td>
-                          <td style={{ "font-family": 'var(--font-mono)', "font-size": '0.625rem', color: 'rgb(100, 116, 139)' }}>{entry.target || '--'}</td>
-                          <td style={{ "font-size": '0.75rem', color: 'rgb(203, 213, 225)' }}>{entry.repository || '--'}</td>
-                          <td style={{ "text-align": 'right', "font-family": 'var(--font-mono)', "font-size": '0.625rem', color: 'rgb(100, 116, 139)' }}>{entry.ip || '--'}</td>
+                          <td>
+                            <span class={actionChip(entry.action)}>{entry.action}</span>
+                          </td>
+                          <td class="cell-mono cell-muted truncate" style={{ 'max-width': '260px' }}>
+                            {entry.target || '—'}
+                          </td>
+                          <td class="cell-mono cell-dim cell-hide-sm">{entry.repository || '—'}</td>
                         </tr>
                       )}
                     </For>
                   </tbody>
                 </table>
               </div>
-
-              {/* Pagination -- matches Stitch audit page */}
-              <div style={{ background: 'rgba(26, 32, 39, 0.5)', "border-top": '1px solid rgba(255, 255, 255, 0.05)', padding: '1rem 1.5rem', display: 'flex', "align-items": 'center', "justify-content": 'space-between' }}>
-                <div style={{ "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'rgb(100, 116, 139)' }}>
-                  Showing <span style={{ color: 'var(--clr-on-surface)' }}>1 - {d().entries.length}</span> entries
+              <div class="pagination">
+                <span class="pagination-info">Page {d().page}</span>
+                <div class="pagination-nav">
+                  <button class="btn btn-ghost btn-sm" disabled={page() <= 1} onClick={() => setPage((p) => p - 1)}>
+                    <Icon name="chevron-left" size={14} />
+                    Newer
+                  </button>
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    disabled={d().entries.length < pageSize}
+                    onClick={() => setPage((p) => p + 1)}
+                  >
+                    Older
+                    <Icon name="chevron-right" size={14} />
+                  </button>
                 </div>
-                <div style={{ display: 'flex', "align-items": 'center', gap: '0.5rem' }}>
-                  <Show when={page() > 1}>
-                    <button class="pagination-btn" onClick={() => setPage((p) => Math.max(1, p - 1))}>
-                      <span class="material-symbols-outlined" style={{ "font-size": '14px' }}>chevron_left</span>
-                      Previous
-                    </button>
-                  </Show>
-                  <button class="pagination-page pagination-page-active">{page()}</button>
-                  <Show when={d().entries.length >= pageSize}>
-                    <button class="pagination-page" onClick={() => setPage((p) => p + 1)}>{page() + 1}</button>
-                    <button class="pagination-btn" onClick={() => setPage((p) => p + 1)}>
-                      Next
-                      <span class="material-symbols-outlined" style={{ "font-size": '14px' }}>chevron_right</span>
-                    </button>
-                  </Show>
-                </div>
-              </div>
-            </div>
-
-            {/* Bottom Stats -- matches Stitch audit page */}
-            <div class="audit-stats-grid">
-              <div class="audit-stat-card" style={{ "border-left": '2px solid rgba(129, 236, 255, 0.3)' }}>
-                <div style={{ "font-size": '0.5rem', "font-family": 'var(--font-label)', color: 'rgb(100, 116, 139)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "margin-bottom": '0.25rem' }}>Storage_Integrity</div>
-                <div style={{ "font-size": '1.25rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: '#81ecff' }}>99.998%</div>
-              </div>
-              <div class="audit-stat-card" style={{ "border-left": '2px solid rgba(16, 213, 255, 0.3)' }}>
-                <div style={{ "font-size": '0.5rem', "font-family": 'var(--font-label)', color: 'rgb(100, 116, 139)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "margin-bottom": '0.25rem' }}>Active_Sessions</div>
-                <div style={{ "font-size": '1.25rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-secondary-fixed-dim)' }}>{d().entries.length}</div>
-              </div>
-              <div class="audit-stat-card" style={{ "border-left": '2px solid rgba(255, 113, 108, 0.3)' }}>
-                <div style={{ "font-size": '0.5rem', "font-family": 'var(--font-label)', color: 'rgb(100, 116, 139)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "margin-bottom": '0.25rem' }}>Latent_Anomalies</div>
-                <div style={{ "font-size": '1.25rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-error)' }}>0</div>
-              </div>
-              <div class="audit-stat-card" style={{ "border-left": '2px solid rgba(148, 163, 184, 0.3)' }}>
-                <div style={{ "font-size": '0.5rem', "font-family": 'var(--font-label)', color: 'rgb(100, 116, 139)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "margin-bottom": '0.25rem' }}>Log_Retention</div>
-                <div style={{ "font-size": '1.25rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'rgb(148, 163, 184)' }}>90D</div>
               </div>
             </div>
           </Show>
         )}
       </Show>
-    </>
+    </div>
   );
 }

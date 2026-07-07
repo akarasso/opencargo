@@ -1,32 +1,33 @@
-import { createSignal, createResource, For, Show } from 'solid-js';
+import { For, Show, createSignal } from 'solid-js';
 import { A } from '@solidjs/router';
-import { fetchUsers, createUser, updateUser, deleteUser, type User } from '../../lib/api.ts';
-import { ConfirmModal } from '../../components/Modal.tsx';
-import Modal from '../../components/Modal.tsx';
-import LoadingSpinner from '../../components/LoadingSpinner.tsx';
+import Icon from '../../components/Icon.tsx';
+import RoleBadge from '../../components/RoleBadge.tsx';
+import Modal, { ConfirmModal } from '../../components/Modal.tsx';
 import EmptyState from '../../components/EmptyState.tsx';
-import { toast } from '../../components/Toast.tsx';
-
-function getRoleBadgeClass(role: string): string {
-  switch (role) {
-    case 'admin': return 'badge badge-role-admin';
-    case 'publisher': return 'badge badge-role-publisher';
-    default: return 'badge badge-role-reader';
-  }
-}
-
-function getInitials(username: string): string {
-  const parts = username.split(/[._-]/);
-  if (parts.length >= 2) {
-    return (parts[0][0] + parts[1][0]).toUpperCase();
-  }
-  return username.slice(0, 2).toUpperCase();
-}
+import PermissionMatrix from '../../components/PermissionMatrix.tsx';
+import { RequireAdmin } from '../../components/guards.tsx';
+import { LoadError, TableSkeleton } from '../../components/bits.tsx';
+import { createUser, deleteUser, fetchUsers, updateUser } from '../../core/api.ts';
+import { createLiveResource } from '../../core/stores/live.ts';
+import { session } from '../../core/stores/session.ts';
+import { toasts } from '../../core/stores/toasts.ts';
+import { initials, timeAgo } from '../../core/format.ts';
+import type { User } from '../../core/types.ts';
 
 export default function Users() {
-  const [users, { refetch }] = createResource(fetchUsers);
+  return (
+    <RequireAdmin>
+      <UsersInner />
+    </RequireAdmin>
+  );
+}
+
+function UsersInner() {
+  const [users, refetch] = createLiveResource(fetchUsers, ['audit.entry', 'permissions.changed']);
+
   const [showCreate, setShowCreate] = createSignal(false);
   const [editingUser, setEditingUser] = createSignal<User | null>(null);
+  const [accessUser, setAccessUser] = createSignal<User | null>(null);
   const [deletingUser, setDeletingUser] = createSignal<string | null>(null);
 
   const [newUsername, setNewUsername] = createSignal('');
@@ -42,14 +43,25 @@ export default function Users() {
 
   async function handleCreate(e: Event) {
     e.preventDefault();
+    if (!newUsername() || !newPassword()) return;
     setCreateLoading(true);
     try {
-      await createUser({ username: newUsername(), email: newEmail() || undefined, password: newPassword(), role: newRole() });
-      toast.success(`User "${newUsername()}" created.`);
+      await createUser({
+        username: newUsername(),
+        email: newEmail() || undefined,
+        password: newPassword(),
+        role: newRole(),
+      });
+      toasts.success(`User ${newUsername()} created`, `role: ${newRole()}`);
       setShowCreate(false);
-      setNewUsername(''); setNewEmail(''); setNewPassword(''); setNewRole('reader');
-      refetch();
-    } catch (err: any) { toast.error(err.message || 'Failed to create user.'); }
+      setNewUsername('');
+      setNewEmail('');
+      setNewPassword('');
+      setNewRole('reader');
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not create user', err instanceof Error ? err.message : undefined);
+    }
     setCreateLoading(false);
   }
 
@@ -71,10 +83,12 @@ export default function Users() {
       if (editRole() !== user.role) data.role = editRole();
       if (editPassword()) data.password = editPassword();
       await updateUser(user.username, data);
-      toast.success(`User "${user.username}" updated.`);
+      toasts.success(`User ${user.username} updated`);
       setEditingUser(null);
-      refetch();
-    } catch (err: any) { toast.error(err.message || 'Failed to update user.'); }
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not update user', err instanceof Error ? err.message : undefined);
+    }
     setEditLoading(false);
   }
 
@@ -83,66 +97,63 @@ export default function Users() {
     if (!username) return;
     try {
       await deleteUser(username);
-      toast.success(`User "${username}" deleted.`);
+      toasts.success(`User ${username} deleted`);
       setDeletingUser(null);
-      refetch();
-    } catch (err: any) { toast.error(err.message || 'Failed to delete user.'); }
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not delete user', err instanceof Error ? err.message : undefined);
+    }
   }
 
+  const roleCount = (role: string) => users()?.filter((u) => u.role === role).length ?? 0;
+
   return (
-    <>
-      {/* Page Header -- matches Stitch users page */}
-      <div style={{ display: 'flex', "align-items": 'flex-end', "justify-content": 'space-between', "margin-bottom": '2rem' }}>
-        <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.5rem' }}>
-          <div style={{ display: 'flex', "align-items": 'center', gap: '0.5rem', "font-size": '0.625rem', "font-family": 'var(--font-label)', "letter-spacing": '0.3em', color: 'rgba(123, 231, 249, 0.6)', "text-transform": 'uppercase' }}>
-            <span style={{ width: '8px', height: '8px', "border-radius": '50%', background: 'var(--clr-primary)' }} class="status-led-animated" />
-            LIVE_SYSTEM_RESOURCES
-          </div>
-          <h1 class="page-title">User Management</h1>
+    <div class="page-enter">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Users & access</h1>
+          <p class="page-sub">
+            Accounts, roles, and per-repository rights. Changes apply to open sessions instantly.
+          </p>
         </div>
-        <button class="btn btn-primary" onClick={() => setShowCreate(true)}>
-          <span class="material-symbols-outlined" style={{ "font-size": '14px' }}>person_add</span>
-          Create User
-        </button>
+        <div class="page-actions">
+          <button class="btn btn-primary" onClick={() => setShowCreate(true)}>
+            <Icon name="plus" size={14} />
+            Add user
+          </button>
+        </div>
       </div>
 
-      <Show when={users.loading}><LoadingSpinner /></Show>
-      <Show when={users.error}><div class="alert alert-error">Failed to load users. Make sure you are logged in as an admin.</div></Show>
+      <Show when={users.error}>
+        <LoadError what="users" />
+      </Show>
 
-      <Show when={users()}>
+      <Show when={users()} fallback={<TableSkeleton rows={5} cols={5} />}>
         {(list) => (
-          <Show when={list().length > 0} fallback={<EmptyState title="No users" text="No users found." />}>
-            {/* Stats Grid -- matches Stitch users page */}
-            <div style={{ display: 'grid', "grid-template-columns": 'repeat(4, 1fr)', gap: '1rem', "margin-bottom": '2rem' }}>
-              <div style={{ background: 'var(--clr-surface-container)', padding: '1rem', display: 'flex', "flex-direction": 'column', gap: '0.25rem', "border-left": '2px solid rgba(123, 231, 249, 0.4)' }}>
-                <span style={{ "font-size": '0.625rem', "font-weight": '700', color: 'rgb(100, 116, 139)', "letter-spacing": '0.2em', "text-transform": 'uppercase' }}>Total Identities</span>
-                <span style={{ "font-family": 'var(--font-headline)', "font-size": '1.5rem', "font-weight": '700' }}>{list().length.toLocaleString()}</span>
+          <Show
+            when={list().length > 0}
+            fallback={
+              <div class="card">
+                <EmptyState icon="users" title="No users yet" text="Add the first account to hand out access." />
               </div>
-              <div style={{ background: 'var(--clr-surface-container)', padding: '1rem', display: 'flex', "flex-direction": 'column', gap: '0.25rem', "border-left": '2px solid rgba(123, 231, 249, 0.2)' }}>
-                <span style={{ "font-size": '0.625rem', "font-weight": '700', color: 'rgb(100, 116, 139)', "letter-spacing": '0.2em', "text-transform": 'uppercase' }}>Admin Users</span>
-                <span style={{ "font-family": 'var(--font-headline)', "font-size": '1.5rem', "font-weight": '700', color: 'var(--clr-primary)' }}>{list().filter(u => u.role === 'admin').length}</span>
-              </div>
-              <div style={{ background: 'var(--clr-surface-container)', padding: '1rem', display: 'flex', "flex-direction": 'column', gap: '0.25rem', "border-left": '2px solid rgba(16, 213, 255, 0.2)' }}>
-                <span style={{ "font-size": '0.625rem', "font-weight": '700', color: 'rgb(100, 116, 139)', "letter-spacing": '0.2em', "text-transform": 'uppercase' }}>Publishers</span>
-                <span style={{ "font-family": 'var(--font-headline)', "font-size": '1.5rem', "font-weight": '700' }}>{list().filter(u => u.role === 'publisher').length}</span>
-              </div>
-              <div style={{ background: 'var(--clr-surface-container)', padding: '1rem', display: 'flex', "flex-direction": 'column', gap: '0.25rem', "border-left": '2px solid rgba(255, 113, 108, 0.2)' }}>
-                <span style={{ "font-size": '0.625rem', "font-weight": '700', color: 'rgb(100, 116, 139)', "letter-spacing": '0.2em', "text-transform": 'uppercase' }}>Readers</span>
-                <span style={{ "font-family": 'var(--font-headline)', "font-size": '1.5rem', "font-weight": '700' }}>{list().filter(u => u.role === 'reader').length}</span>
-              </div>
+            }
+          >
+            <div class="row-wrap" style={{ 'margin-bottom': '14px' }}>
+              <span class="chip chip-accent">{roleCount('admin')} admin</span>
+              <span class="chip chip-info">{roleCount('publisher')} publisher</span>
+              <span class="chip chip-neutral">{roleCount('reader')} reader</span>
             </div>
 
-            {/* User Registry Table -- matches Stitch users page */}
-            <div class="data-table-wrapper">
-              <div style={{ "overflow-x": 'auto' }}>
-                <table class="data-table">
+            <div class="table-card page-enter">
+              <div class="table-scroll">
+                <table class="table">
                   <thead>
                     <tr>
-                      <th>Username</th>
-                      <th>Email Path</th>
-                      <th>Privilege Level</th>
-                      <th>Created_TS</th>
-                      <th style={{ "text-align": 'right' }}>Interaction</th>
+                      <th>User</th>
+                      <th class="cell-hide-sm">Email</th>
+                      <th>Role</th>
+                      <th class="cell-hide-sm">Created</th>
+                      <th style={{ 'text-align': 'right' }}>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -150,26 +161,54 @@ export default function Users() {
                       {(user) => (
                         <tr>
                           <td>
-                            <div style={{ display: 'flex', "align-items": 'center', gap: '0.75rem' }}>
-                              <div style={{ width: '8px', height: '8px', "border-radius": '50%', background: user.role === 'admin' ? 'var(--clr-primary)' : user.role === 'publisher' ? 'rgba(138, 184, 255, 0.4)' : 'rgb(75, 85, 99)' }} />
-                              <span style={{ "font-family": 'var(--font-headline)', "font-weight": '700', "font-size": '0.875rem', "letter-spacing": '-0.025em', color: 'var(--clr-on-surface)' }}>{user.username}</span>
+                            <div class="row">
+                              <div class="avatar" style={{ width: '28px', height: '28px', 'font-size': '0.62rem' }}>
+                                {initials(user.username)}
+                              </div>
+                              <span style={{ 'font-weight': 600, color: 'var(--ink)' }}>{user.username}</span>
+                              <Show when={user.username === session.user()?.username}>
+                                <span class="chip chip-neutral">you</span>
+                              </Show>
                             </div>
                           </td>
-                          <td style={{ "font-family": 'var(--font-label)', "font-size": '0.75rem', color: 'rgb(148, 163, 184)', "letter-spacing": '-0.025em' }}>{user.email || 'none'}</td>
+                          <td class="cell-muted cell-hide-sm">{user.email || '—'}</td>
                           <td>
-                            <span class={getRoleBadgeClass(user.role)}>{user.role}</span>
+                            <RoleBadge role={user.role} />
                           </td>
-                          <td style={{ "font-family": 'var(--font-label)', "font-size": '0.6875rem', color: 'rgb(100, 116, 139)', "text-transform": 'uppercase', "letter-spacing": '0.2em' }}>{user.created_at}</td>
-                          <td style={{ "text-align": 'right' }}>
-                            <div style={{ display: 'flex', "align-items": 'center', "justify-content": 'flex-end', gap: '0.75rem' }}>
-                              <button style={{ padding: '0.25rem', background: 'none', border: 'none', color: 'rgb(100, 116, 139)', cursor: 'pointer' }} onClick={() => openEdit(user)}>
-                                <span class="material-symbols-outlined" style={{ "font-size": '14px' }}>edit</span>
+                          <td class="cell-dim cell-hide-sm" title={user.created_at}>
+                            {timeAgo(user.created_at)}
+                          </td>
+                          <td>
+                            <div class="cell-actions">
+                              <button
+                                class="btn btn-ghost btn-sm"
+                                title={`Per-repository rights for ${user.username}`}
+                                onClick={() => setAccessUser(user)}
+                              >
+                                <Icon name="shield" size={13} />
+                                Access
                               </button>
-                              <A href={`/admin/users/${user.username}/tokens`} style={{ padding: '0.25rem', color: 'rgb(100, 116, 139)', "text-decoration": 'none' }}>
-                                <span class="material-symbols-outlined" style={{ "font-size": '14px' }}>key</span>
+                              <A
+                                class="btn btn-quiet btn-icon"
+                                href={`/admin/users/${user.username}/tokens`}
+                                title="API tokens"
+                              >
+                                <Icon name="key" size={14} />
                               </A>
-                              <button style={{ padding: '0.25rem', background: 'none', border: 'none', color: 'rgb(100, 116, 139)', cursor: 'pointer' }} onClick={() => setDeletingUser(user.username)}>
-                                <span class="material-symbols-outlined" style={{ "font-size": '14px' }}>delete</span>
+                              <button class="btn btn-quiet btn-icon" title="Edit user" onClick={() => openEdit(user)}>
+                                <Icon name="pencil" size={14} />
+                              </button>
+                              <button
+                                class="btn btn-quiet btn-icon"
+                                title={
+                                  user.username === session.user()?.username
+                                    ? "You can't delete your own account"
+                                    : 'Delete user'
+                                }
+                                disabled={user.username === session.user()?.username}
+                                onClick={() => setDeletingUser(user.username)}
+                              >
+                                <Icon name="trash" size={14} />
                               </button>
                             </div>
                           </td>
@@ -179,36 +218,118 @@ export default function Users() {
                   </tbody>
                 </table>
               </div>
-              <div style={{ "margin-top": 'auto', "border-top": '1px solid rgba(67, 72, 78, 0.1)', padding: '1rem', display: 'flex', "align-items": 'center', "justify-content": 'space-between' }}>
-                <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'rgb(75, 85, 99)', "letter-spacing": '0.2em', "text-transform": 'uppercase' }}>Registry Page 1</span>
-              </div>
             </div>
           </Show>
         )}
       </Show>
 
-      {/* Create user modal */}
-      <Modal open={showCreate()} title="Create User" onClose={() => setShowCreate(false)}
-        actions={<><button class="btn btn-secondary" onClick={() => setShowCreate(false)}>Cancel</button><button class="btn btn-primary" onClick={handleCreate} disabled={createLoading()}>{createLoading() ? 'Creating...' : 'Create'}</button></>}>
+      {/* Create */}
+      <Modal
+        open={showCreate()}
+        title="Add user"
+        subtitle="They can sign in on the web and with npm/docker/cargo clients right away."
+        onClose={() => setShowCreate(false)}
+        actions={
+          <>
+            <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
+              Cancel
+            </button>
+            <button class="btn btn-primary" onClick={handleCreate} disabled={createLoading()}>
+              {createLoading() ? 'Creating…' : 'Create user'}
+            </button>
+          </>
+        }
+      >
         <form onSubmit={handleCreate}>
-          <div class="form-group"><label class="form-label">Username</label><input class="form-input" type="text" value={newUsername()} onInput={(e) => setNewUsername(e.currentTarget.value)} required /></div>
-          <div class="form-group"><label class="form-label">Email</label><input class="form-input" type="email" value={newEmail()} onInput={(e) => setNewEmail(e.currentTarget.value)} /></div>
-          <div class="form-group"><label class="form-label">Password</label><input class="form-input" type="password" value={newPassword()} onInput={(e) => setNewPassword(e.currentTarget.value)} required /></div>
-          <div class="form-group"><label class="form-label">Role</label><select class="form-select" value={newRole()} onChange={(e) => setNewRole(e.currentTarget.value)}><option value="reader">reader</option><option value="publisher">publisher</option><option value="admin">admin</option></select></div>
+          <div class="field">
+            <label class="field-label">Username</label>
+            <input class="input" value={newUsername()} onInput={(e) => setNewUsername(e.currentTarget.value)} required spellcheck={false} />
+          </div>
+          <div class="field">
+            <label class="field-label">Email (optional)</label>
+            <input class="input" type="email" value={newEmail()} onInput={(e) => setNewEmail(e.currentTarget.value)} />
+          </div>
+          <div class="field">
+            <label class="field-label">Password</label>
+            <input class="input" type="password" value={newPassword()} onInput={(e) => setNewPassword(e.currentTarget.value)} required />
+          </div>
+          <div class="field">
+            <label class="field-label">Role</label>
+            <select class="select" value={newRole()} onChange={(e) => setNewRole(e.currentTarget.value)}>
+              <option value="reader">reader — install only</option>
+              <option value="publisher">publisher — install & publish</option>
+              <option value="admin">admin — everything, everywhere</option>
+            </select>
+            <div class="field-hint">Fine-grained per-repository rights can be set after creation via “Access”.</div>
+          </div>
         </form>
       </Modal>
 
-      {/* Edit user modal */}
-      <Modal open={editingUser() !== null} title={`Edit User: ${editingUser()?.username || ''}`} onClose={() => setEditingUser(null)}
-        actions={<><button class="btn btn-secondary" onClick={() => setEditingUser(null)}>Cancel</button><button class="btn btn-primary" onClick={handleEdit} disabled={editLoading()}>{editLoading() ? 'Saving...' : 'Save'}</button></>}>
+      {/* Edit */}
+      <Modal
+        open={editingUser() !== null}
+        title={`Edit ${editingUser()?.username ?? ''}`}
+        onClose={() => setEditingUser(null)}
+        actions={
+          <>
+            <button class="btn btn-ghost" onClick={() => setEditingUser(null)}>
+              Cancel
+            </button>
+            <button class="btn btn-primary" onClick={handleEdit} disabled={editLoading()}>
+              {editLoading() ? 'Saving…' : 'Save changes'}
+            </button>
+          </>
+        }
+      >
         <form onSubmit={handleEdit}>
-          <div class="form-group"><label class="form-label">Email</label><input class="form-input" type="email" value={editEmail()} onInput={(e) => setEditEmail(e.currentTarget.value)} /></div>
-          <div class="form-group"><label class="form-label">Role</label><select class="form-select" value={editRole()} onChange={(e) => setEditRole(e.currentTarget.value)}><option value="reader">reader</option><option value="publisher">publisher</option><option value="admin">admin</option></select></div>
-          <div class="form-group"><label class="form-label">New Password</label><input class="form-input" type="password" value={editPassword()} onInput={(e) => setEditPassword(e.currentTarget.value)} placeholder="Leave blank to keep current" /><div class="form-hint">Leave empty to keep current password.</div></div>
+          <div class="field">
+            <label class="field-label">Email</label>
+            <input class="input" type="email" value={editEmail()} onInput={(e) => setEditEmail(e.currentTarget.value)} />
+          </div>
+          <div class="field">
+            <label class="field-label">Role</label>
+            <select class="select" value={editRole()} onChange={(e) => setEditRole(e.currentTarget.value)}>
+              <option value="reader">reader</option>
+              <option value="publisher">publisher</option>
+              <option value="admin">admin</option>
+            </select>
+            <div class="field-hint">Role changes reach the user's open sessions immediately.</div>
+          </div>
+          <div class="field">
+            <label class="field-label">New password</label>
+            <input
+              class="input"
+              type="password"
+              value={editPassword()}
+              onInput={(e) => setEditPassword(e.currentTarget.value)}
+              placeholder="Leave blank to keep the current one"
+            />
+          </div>
         </form>
       </Modal>
 
-      <ConfirmModal open={deletingUser() !== null} title="Delete User" message={`Are you sure you want to delete the user "${deletingUser()}"? This action cannot be undone.`} confirmLabel="Delete User" danger onConfirm={handleDelete} onCancel={() => setDeletingUser(null)} />
-    </>
+      {/* Access matrix */}
+      <Modal
+        open={accessUser() !== null}
+        wide
+        title={`Access — ${accessUser()?.username ?? ''}`}
+        subtitle="Effective rights per repository. Explicit grants replace the role default entirely."
+        onClose={() => setAccessUser(null)}
+      >
+        <Show when={accessUser()}>
+          {(u) => <PermissionMatrix username={u().username} role={u().role} />}
+        </Show>
+      </Modal>
+
+      <ConfirmModal
+        open={deletingUser() !== null}
+        title={`Delete ${deletingUser()}?`}
+        message="Their tokens stop working immediately and their per-repository grants are removed. Published packages stay."
+        confirmLabel="Delete user"
+        danger
+        onConfirm={handleDelete}
+        onCancel={() => setDeletingUser(null)}
+      />
+    </div>
   );
 }
