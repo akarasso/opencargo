@@ -2064,6 +2064,10 @@ input[type='checkbox'] {
   gap: 16px;
   align-items: start;
 }
+.dashboard-cols > *,
+.detail-grid > * {
+  min-width: 0;
+}
 
 /* Reveal-on-create for token values */
 .token-reveal {
@@ -2099,7 +2103,7 @@ input[type='checkbox'] {
   }
   .detail-grid,
   .dashboard-cols {
-    grid-template-columns: 1fr;
+    grid-template-columns: minmax(0, 1fr);
   }
   .side-stack {
     position: static;
