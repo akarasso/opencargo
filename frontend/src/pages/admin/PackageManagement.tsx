@@ -1,279 +1,244 @@
-import { createSignal, createResource, For, Show } from 'solid-js';
+import { For, Show, createResource, createSignal } from 'solid-js';
 import { A, useSearchParams } from '@solidjs/router';
-import { fetchPackages, fetchRepositories, promotePackage } from '../../lib/api.ts';
-import LoadingSpinner from '../../components/LoadingSpinner.tsx';
+import Icon from '../../components/Icon.tsx';
+import Modal from '../../components/Modal.tsx';
 import EmptyState from '../../components/EmptyState.tsx';
+import { RequireAdmin } from '../../components/guards.tsx';
+import { LoadError, TableSkeleton } from '../../components/bits.tsx';
+import { fetchPackages, fetchRepositories, promotePackage } from '../../core/api.ts';
+import { useLive } from '../../core/stores/live.ts';
+import { toasts } from '../../core/stores/toasts.ts';
+import { formatNumber, timeAgo } from '../../core/format.ts';
 
 function paramStr(val: string | string[] | undefined): string {
   if (Array.isArray(val)) return val[0] ?? '';
   return val ?? '';
 }
 
-/** Guess format from package name or repo name. */
-function guessFormat(name: string): string {
-  if (name.startsWith('@') || name.includes('/')) return 'npm';
-  if (name.includes('github.com/') || name.includes('golang.org/')) return 'go';
-  if (name.includes(':') || name.includes('sha256')) return 'oci';
-  return 'cargo';
-}
-
-/** Return badge class for format. */
-function formatBadgeClass(fmt: string): string {
-  switch (fmt) {
-    case 'npm': return 'format-badge-npm';
-    case 'cargo': return 'format-badge-cargo';
-    case 'oci': return 'format-badge-oci';
-    case 'go': return 'format-badge-go';
-    default: return 'format-badge-npm';
-  }
-}
-
 export default function PackageManagement() {
-  const [searchParams, setSearchParams] = useSearchParams();
+  return (
+    <RequireAdmin>
+      <PackageManagementInner />
+    </RequireAdmin>
+  );
+}
 
+function PackageManagementInner() {
+  const [searchParams, setSearchParams] = useSearchParams();
   const query = () => paramStr(searchParams.q);
   const repoFilter = () => paramStr(searchParams.repo);
   const page = () => parseInt(paramStr(searchParams.page) || '1', 10) || 1;
 
   const [inputValue, setInputValue] = createSignal(query());
-
   const [repos] = createResource(fetchRepositories);
   const [data, { refetch }] = createResource(
     () => ({ q: query(), repo: repoFilter(), page: page() }),
     fetchPackages,
   );
+  useLive(refetch, ['package.published', 'package.promoted', 'registry.changed']);
 
-  // Promote modal state
   const [promoteTarget, setPromoteTarget] = createSignal<{ name: string; version: string } | null>(null);
   const [promoteFrom, setPromoteFrom] = createSignal('');
   const [promoteTo, setPromoteTo] = createSignal('');
   const [promoteLoading, setPromoteLoading] = createSignal(false);
-  const [promoteMsg, setPromoteMsg] = createSignal<string | null>(null);
+
+  const hostedRepos = () => (repos()?.repositories ?? []).filter((r) => r.type === 'hosted');
 
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
-
   function handleInput(value: string) {
     setInputValue(value);
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       setSearchParams({ q: value || undefined, page: '1' });
-    }, 300);
-  }
-
-  function handleRepoChange(value: string) {
-    setSearchParams({ repo: value || undefined, page: '1' });
-  }
-
-  function goToPage(p: number) {
-    setSearchParams({ page: String(p) });
-  }
-
-  function openPromote(name: string, version: string) {
-    setPromoteTarget({ name, version });
-    setPromoteFrom('');
-    setPromoteTo('');
-    setPromoteMsg(null);
+    }, 280);
   }
 
   async function handlePromote() {
     const target = promoteTarget();
     if (!target) return;
     setPromoteLoading(true);
-    setPromoteMsg(null);
     try {
-      const result = await promotePackage(target.name, target.version, promoteFrom(), promoteTo());
-      setPromoteMsg(result.message || 'Promoted successfully');
-    } catch (e: any) {
-      setPromoteMsg(e.message || 'Promotion failed');
+      await promotePackage(target.name, target.version, promoteFrom(), promoteTo());
+      toasts.success(`${target.name} ${target.version} promoted`, `${promoteFrom()} → ${promoteTo()}`);
+      setPromoteTarget(null);
+      void refetch();
+    } catch (e: unknown) {
+      toasts.error('Promotion failed', e instanceof Error ? e.message : undefined);
     }
     setPromoteLoading(false);
   }
 
-  return (
-    <>
-      {/* Header -- matches Stitch admin-packages page */}
-      <header style={{ "margin-bottom": '2rem' }}>
-        <div style={{ display: 'flex', "align-items": 'center', "justify-content": 'space-between', "margin-bottom": '0.5rem' }}>
-          <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-headline)', "font-weight": '500', color: 'var(--clr-primary)', "letter-spacing": '0.3em', "text-transform": 'uppercase' }}>Registry / Admin</span>
-        </div>
-        <h2 style={{ "font-size": '1.875rem', "font-family": 'var(--font-headline)', "font-weight": '700', "letter-spacing": '-0.025em', color: 'var(--clr-on-surface)', "margin-bottom": '0' }}>Package Management</h2>
-      </header>
+  const totalPages = () => {
+    const d = data();
+    return d ? Math.max(1, Math.ceil(d.total / d.page_size)) : 1;
+  };
 
-      {/* Search Bar -- matches Stitch admin-packages */}
-      <section style={{ "margin-bottom": '2rem' }}>
-        <div style={{ position: 'relative', background: '#000', border: '1px solid rgba(67, 72, 78, 0.2)', "border-radius": '0.75rem', overflow: 'hidden' }}>
-          <div style={{ position: 'absolute', left: '1rem', top: '50%', transform: 'translateY(-50%)', color: 'var(--clr-primary)' }}>
-            <span class="material-symbols-outlined" style={{ "font-size": '20px' }}>terminal</span>
-          </div>
+  return (
+    <div class="page-enter">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Promotion</h1>
+          <p class="page-sub">
+            Move versions between hosted repositories (dev → prod). The tarball is shared, so
+            lockfiles keep resolving.
+          </p>
+        </div>
+      </div>
+
+      <div class="filter-bar">
+        <div class="search-box">
+          <Icon name="search" size={15} />
           <input
-            type="text"
+            class="input"
             value={inputValue()}
             onInput={(e) => handleInput(e.currentTarget.value)}
-            placeholder="Query Registry..."
-            style={{ width: '100%', background: 'transparent', border: 'none', color: 'var(--clr-on-surface)', padding: '1rem 1rem 1rem 3rem', "font-family": 'var(--font-headline)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "font-size": '0.875rem', outline: 'none' }}
+            placeholder="Filter packages…"
+            spellcheck={false}
           />
         </div>
-      </section>
+        <Show when={(repos()?.repositories.length ?? 0) > 0}>
+          <select
+            class="select"
+            value={repoFilter()}
+            onChange={(e) => setSearchParams({ repo: e.currentTarget.value || undefined, page: '1' })}
+          >
+            <option value="">All repositories</option>
+            <For each={repos()?.repositories}>{(r) => <option value={r.name}>{r.name}</option>}</For>
+          </select>
+        </Show>
+      </div>
 
-      <Show when={data.loading}><LoadingSpinner /></Show>
-      <Show when={data.error}><div class="alert alert-error">Failed to load packages.</div></Show>
+      <Show when={data.error}>
+        <LoadError what="packages" />
+      </Show>
 
-      <Show when={data()}>
+      <Show when={data()} fallback={<TableSkeleton rows={8} cols={4} />}>
         {(d) => (
-          <>
-            <Show when={d().packages.length > 0} fallback={<EmptyState title="No packages" text="No packages found." />}>
-              {/* Table layout -- matches Stitch admin-packages-full.html */}
-              <div class="data-table-wrapper">
-                <div class="table-header-bar">
-                  <div style={{ display: 'flex', "align-items": 'center', gap: '1rem' }}>
-                    <div style={{ display: 'flex', "align-items": 'center', gap: '0.5rem', padding: '0.25rem 0.75rem', background: 'var(--clr-surface-container-lowest)', "border-radius": '0.375rem', border: '1px solid rgba(255, 255, 255, 0.05)' }}>
-                      <span class="material-symbols-outlined" style={{ "font-size": '12px', color: 'var(--clr-primary)' }}>filter_list</span>
-                      <span style={{ "font-size": '0.625rem', "font-weight": '700', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)' }}>Filter By Format</span>
-                    </div>
-                  </div>
-                  <div style={{ "font-size": '0.625rem', "font-family": 'var(--font-mono)', color: 'var(--clr-on-surface-variant)', "letter-spacing": '-0.025em', "text-transform": 'uppercase' }}>
-                    {d().total} results
-                  </div>
-                </div>
-                <table class="data-table">
+          <Show
+            when={d().packages.length > 0}
+            fallback={
+              <div class="card">
+                <EmptyState icon="layers" title="Nothing to promote" text="No packages match the current filter." />
+              </div>
+            }
+          >
+            <div class="table-card page-enter">
+              <div class="table-scroll">
+                <table class="table">
                   <thead>
                     <tr>
                       <th>Package</th>
-                      <th>Repository</th>
-                      <th style={{ "text-align": 'center' }}>Format</th>
-                      <th style={{ "text-align": 'center' }}>Versions</th>
-                      <th style={{ "text-align": 'center' }}>Security</th>
-                      <th style={{ "text-align": 'right' }}>Actions</th>
+                      <th>Latest</th>
+                      <th style={{ 'text-align': 'right' }}>Downloads</th>
+                      <th class="cell-hide-sm" style={{ 'text-align': 'right' }}>
+                        Updated
+                      </th>
+                      <th style={{ 'text-align': 'right' }}>Actions</th>
                     </tr>
                   </thead>
                   <tbody>
                     <For each={d().packages}>
-                      {(p) => {
-                        const fmt = guessFormat(p.name);
-                        return (
-                          <tr class="admin-pkg-row">
-                            <td>
-                              <div style={{ display: 'flex', "align-items": 'center', gap: '0.75rem' }}>
-                                <div style={{ width: '32px', height: '32px', "border-radius": '0.25rem', background: 'var(--clr-surface-container-highest)', display: 'flex', "align-items": 'center', "justify-content": 'center' }}>
-                                  <span class="material-symbols-outlined" style={{ color: 'var(--clr-primary)', "font-size": '14px' }}>package_2</span>
-                                </div>
-                                <div>
-                                  <div style={{ "font-size": '0.875rem', "font-weight": '700', color: 'var(--clr-on-surface)' }}>{p.name}</div>
-                                  <div style={{ "font-size": '0.625rem', color: 'var(--clr-on-surface-variant)', "font-family": 'var(--font-mono)' }}>
-                                    {p.latest_version} &bull; {p.downloads.toLocaleString()} DLS
-                                  </div>
-                                </div>
-                              </div>
-                            </td>
-                            <td style={{ "font-family": 'var(--font-mono)', "font-size": '0.6875rem', color: 'var(--clr-on-surface-variant)' }}>
-                              --
-                            </td>
-                            <td style={{ "text-align": 'center' }}>
-                              <span class={`format-badge ${formatBadgeClass(fmt)}`}>{fmt}</span>
-                            </td>
-                            <td style={{ "text-align": 'center', "font-family": 'var(--font-mono)', "font-size": '0.75rem', color: 'var(--clr-on-surface-variant)' }}>
-                              --
-                            </td>
-                            <td style={{ "text-align": 'center' }}>
-                              {/* Vuln badge -- matches Stitch: green verified_user or red report */}
-                              <span class="material-symbols-outlined vuln-icon-clean" style={{ "font-variation-settings": "'FILL' 1" }}>verified_user</span>
-                            </td>
-                            <td style={{ "text-align": 'right' }}>
-                              <div class="admin-pkg-actions">
-                                <button
-                                  class="promote-btn"
-                                  onClick={() => openPromote(p.name, p.latest_version)}
-                                >
-                                  Promote
-                                </button>
-                                <A href={`/packages/${p.name}`} style={{ "font-size": '0.5625rem', "font-family": 'var(--font-headline)', color: 'var(--clr-primary-dim)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "text-decoration": 'none' }}>
-                                  View
-                                </A>
-                              </div>
-                            </td>
-                          </tr>
-                        );
-                      }}
+                      {(p) => (
+                        <tr>
+                          <td>
+                            <A class="row-link" href={`/packages/${p.name}`}>
+                              {p.name}
+                            </A>
+                          </td>
+                          <td>
+                            <span class="version">{p.latest_version}</span>
+                          </td>
+                          <td class="cell-mono cell-num" style={{ 'text-align': 'right' }}>
+                            {formatNumber(p.downloads)}
+                          </td>
+                          <td class="cell-dim cell-hide-sm nowrap" style={{ 'text-align': 'right' }} title={p.published_at}>
+                            {timeAgo(p.published_at)}
+                          </td>
+                          <td>
+                            <div class="cell-actions">
+                              <button
+                                class="btn btn-ghost btn-sm"
+                                onClick={() => {
+                                  setPromoteTarget({ name: p.name, version: p.latest_version });
+                                  setPromoteFrom('');
+                                  setPromoteTo('');
+                                }}
+                              >
+                                <Icon name="arrow-up-right" size={13} />
+                                Promote
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
                     </For>
                   </tbody>
                 </table>
-
-                {/* Pagination */}
-                <div class="pagination">
-                  <span class="pagination-info">Page {d().page} of {Math.ceil(d().total / d().page_size) || 1}</span>
-                  <div style={{ display: 'flex', "align-items": 'center', gap: '0.25rem' }}>
-                    <Show when={d().page > 1}>
-                      <button class="pagination-btn" onClick={() => goToPage(d().page - 1)}>Previous</button>
-                    </Show>
-                    <Show when={d().has_next}>
-                      <button class="pagination-btn" onClick={() => goToPage(d().page + 1)}>Next</button>
-                    </Show>
-                  </div>
-                </div>
               </div>
-            </Show>
-          </>
-        )}
-      </Show>
-
-      {/* Promote Modal */}
-      <Show when={promoteTarget()}>
-        {(target) => (
-          <div class="modal-overlay" onClick={() => setPromoteTarget(null)}>
-            <div class="modal" onClick={(e) => e.stopPropagation()}>
-              <h3 class="modal-title">Promote Package</h3>
-              <div class="modal-body">
-                <p style={{ "margin-bottom": '1rem' }}>
-                  Promote <strong style={{ color: 'var(--clr-primary)' }}>{target().name}@{target().version}</strong> between repositories.
-                </p>
-                <div class="form-group">
-                  <label class="form-label">Source Repository</label>
-                  <select
-                    class="form-select"
-                    value={promoteFrom()}
-                    onChange={(e) => setPromoteFrom(e.currentTarget.value)}
+              <div class="pagination">
+                <span class="pagination-info">
+                  Page {d().page} / {totalPages()} · {formatNumber(d().total)} packages
+                </span>
+                <div class="pagination-nav">
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    disabled={d().page <= 1}
+                    onClick={() => setSearchParams({ page: String(d().page - 1) })}
                   >
-                    <option value="">Select source...</option>
-                    <Show when={repos()}>
-                      <For each={repos()!.repositories}>
-                        {(r) => <option value={r.name}>{r.name}</option>}
-                      </For>
-                    </Show>
-                  </select>
-                </div>
-                <div class="form-group">
-                  <label class="form-label">Target Repository</label>
-                  <select
-                    class="form-select"
-                    value={promoteTo()}
-                    onChange={(e) => setPromoteTo(e.currentTarget.value)}
+                    <Icon name="chevron-left" size={14} />
+                    Prev
+                  </button>
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    disabled={!d().has_next}
+                    onClick={() => setSearchParams({ page: String(d().page + 1) })}
                   >
-                    <option value="">Select target...</option>
-                    <Show when={repos()}>
-                      <For each={repos()!.repositories}>
-                        {(r) => <option value={r.name}>{r.name}</option>}
-                      </For>
-                    </Show>
-                  </select>
+                    Next
+                    <Icon name="chevron-right" size={14} />
+                  </button>
                 </div>
-                <Show when={promoteMsg()}>
-                  <div class="alert alert-info" style={{ "margin-top": '0.5rem' }}>{promoteMsg()}</div>
-                </Show>
-              </div>
-              <div class="modal-actions">
-                <button class="btn btn-secondary" onClick={() => setPromoteTarget(null)}>Cancel</button>
-                <button
-                  class="btn btn-primary"
-                  onClick={handlePromote}
-                  disabled={promoteLoading() || !promoteFrom() || !promoteTo()}
-                >
-                  {promoteLoading() ? 'Promoting...' : 'Promote'}
-                </button>
               </div>
             </div>
-          </div>
+          </Show>
         )}
       </Show>
-    </>
+
+      <Modal
+        open={promoteTarget() !== null}
+        title="Promote a version"
+        subtitle={`${promoteTarget()?.name}@${promoteTarget()?.version}`}
+        onClose={() => setPromoteTarget(null)}
+        actions={
+          <>
+            <button class="btn btn-ghost" onClick={() => setPromoteTarget(null)}>
+              Cancel
+            </button>
+            <button
+              class="btn btn-primary"
+              onClick={handlePromote}
+              disabled={promoteLoading() || !promoteFrom() || !promoteTo() || promoteFrom() === promoteTo()}
+            >
+              {promoteLoading() ? 'Promoting…' : 'Promote'}
+            </button>
+          </>
+        }
+      >
+        <div class="field">
+          <label class="field-label">From repository</label>
+          <select class="select" value={promoteFrom()} onChange={(e) => setPromoteFrom(e.currentTarget.value)}>
+            <option value="">Select source…</option>
+            <For each={hostedRepos()}>{(r) => <option value={r.name}>{r.name}</option>}</For>
+          </select>
+        </div>
+        <div class="field">
+          <label class="field-label">To repository</label>
+          <select class="select" value={promoteTo()} onChange={(e) => setPromoteTo(e.currentTarget.value)}>
+            <option value="">Select target…</option>
+            <For each={hostedRepos()}>{(r) => <option value={r.name}>{r.name}</option>}</For>
+          </select>
+          <div class="field-hint">Both must be hosted repositories of the same format.</div>
+        </div>
+      </Modal>
+    </div>
   );
 }
