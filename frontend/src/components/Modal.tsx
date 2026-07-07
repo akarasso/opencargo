@@ -1,5 +1,6 @@
 import type { JSX } from 'solid-js';
 import { Show, onMount, onCleanup } from 'solid-js';
+import { Portal } from 'solid-js/web';
 import Icon from './Icon.tsx';
 
 interface ModalProps {
@@ -26,31 +27,35 @@ export default function Modal(props: ModalProps) {
 
   return (
     <Show when={props.open}>
-      <div class="modal-overlay" onClick={props.onClose}>
-        <div
-          class={`modal ${props.wide ? 'modal-wide' : ''}`}
-          role="dialog"
-          aria-modal="true"
-          aria-label={props.title}
-          onClick={(e) => e.stopPropagation()}
-        >
-          <div class="row" style={{ 'align-items': 'flex-start' }}>
-            <div class="grow">
-              <div class="modal-title">{props.title}</div>
-              <Show when={props.subtitle}>
-                <div class="modal-sub">{props.subtitle}</div>
-              </Show>
+      {/* Portal to <body>: a transformed/animated ancestor would otherwise
+          become the containing block of this fixed overlay. */}
+      <Portal>
+        <div class="modal-overlay" onClick={props.onClose}>
+          <div
+            class={`modal ${props.wide ? 'modal-wide' : ''}`}
+            role="dialog"
+            aria-modal="true"
+            aria-label={props.title}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div class="row" style={{ 'align-items': 'flex-start' }}>
+              <div class="grow">
+                <div class="modal-title">{props.title}</div>
+                <Show when={props.subtitle}>
+                  <div class="modal-sub">{props.subtitle}</div>
+                </Show>
+              </div>
+              <button class="btn btn-quiet btn-icon" onClick={props.onClose} aria-label="Close">
+                <Icon name="x" size={15} />
+              </button>
             </div>
-            <button class="btn btn-quiet btn-icon" onClick={props.onClose} aria-label="Close">
-              <Icon name="x" size={15} />
-            </button>
+            <div style={{ 'margin-top': '10px' }}>{props.children}</div>
+            <Show when={props.actions}>
+              <div class="modal-actions">{props.actions}</div>
+            </Show>
           </div>
-          <div style={{ 'margin-top': '10px' }}>{props.children}</div>
-          <Show when={props.actions}>
-            <div class="modal-actions">{props.actions}</div>
-          </Show>
         </div>
-      </div>
+      </Portal>
     </Show>
   );
 }
