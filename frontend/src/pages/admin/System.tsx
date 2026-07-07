@@ -1,192 +1,161 @@
-import { createResource, For, Show } from 'solid-js';
-import { fetchMetrics, fetchHealthReady } from '../../lib/api.ts';
-import LoadingSpinner from '../../components/LoadingSpinner.tsx';
+import { For, Show, createSignal } from 'solid-js';
+import Icon from '../../components/Icon.tsx';
+import { RequireAdmin } from '../../components/guards.tsx';
+import { LoadError, TableSkeleton } from '../../components/bits.tsx';
+import { fetchHealthReady, fetchMetrics } from '../../core/api.ts';
+import { createLiveResource } from '../../core/stores/live.ts';
 
 interface ParsedMetric {
   name: string;
+  labels: string;
   value: string;
 }
 
 function parsePrometheusMetrics(raw: string): ParsedMetric[] {
-  const lines = raw.split('\n');
   const metrics: ParsedMetric[] = [];
-  for (const line of lines) {
+  for (const line of raw.split('\n')) {
     const trimmed = line.trim();
     if (!trimmed || trimmed.startsWith('#')) continue;
-    const parts = trimmed.split(/\s+/);
-    if (parts.length >= 2) {
-      metrics.push({ name: parts[0], value: parts[1] });
-    }
+    const space = trimmed.lastIndexOf(' ');
+    if (space === -1) continue;
+    const key = trimmed.slice(0, space);
+    const value = trimmed.slice(space + 1);
+    const brace = key.indexOf('{');
+    metrics.push({
+      name: brace === -1 ? key : key.slice(0, brace),
+      labels: brace === -1 ? '' : key.slice(brace),
+      value,
+    });
   }
   return metrics;
 }
 
 export default function System() {
-  const [health] = createResource(fetchHealthReady);
-  const [metricsRaw] = createResource(fetchMetrics);
+  return (
+    <RequireAdmin>
+      <SystemInner />
+    </RequireAdmin>
+  );
+}
+
+function SystemInner() {
+  const [health, refetchHealth] = createLiveResource(fetchHealthReady, [], { debounce: 500 });
+  const [metricsRaw, refetchMetrics] = createLiveResource(fetchMetrics, [], { debounce: 500 });
+  const [filter, setFilter] = createSignal('');
 
   const metrics = () => {
     const raw = metricsRaw();
     if (!raw) return [];
-    return parsePrometheusMetrics(raw);
+    const q = filter().toLowerCase();
+    const all = parsePrometheusMetrics(raw);
+    return q ? all.filter((m) => m.name.toLowerCase().includes(q) || m.labels.toLowerCase().includes(q)) : all;
   };
 
   return (
-    <>
-      {/* Header Section -- matches Stitch system page */}
-      <div style={{ "margin-bottom": '3rem', display: 'flex', "justify-content": 'space-between', "align-items": 'flex-end' }}>
+    <div class="page-enter">
+      <div class="page-head">
         <div>
-          <p style={{ "font-family": 'var(--font-label)', "font-size": '0.625rem', "text-transform": 'uppercase', "letter-spacing": '0.3em', color: 'var(--clr-primary)', "margin-bottom": '0.5rem' }}>Diagnostic Shell</p>
-          <h2 style={{ "font-size": '2.5rem', "font-family": 'var(--font-headline)', "font-weight": '700', "letter-spacing": '-0.025em', color: 'var(--clr-on-background)', "margin-bottom": '0' }}>System Status</h2>
+          <h1 class="page-title">System</h1>
+          <p class="page-sub">
+            Health checks and the raw Prometheus counters this instance exposes at{' '}
+            <span class="mono">/metrics</span>.
+          </p>
         </div>
-        <div style={{ display: 'flex', gap: '1rem' }}>
-          <div style={{ padding: '0.5rem 1rem', background: 'var(--clr-surface-container-high)', "border-radius": '0.375rem', border: '1px solid rgba(255, 255, 255, 0.05)', display: 'flex', "align-items": 'center', gap: '0.75rem' }}>
-            <span style={{ display: 'flex', height: '8px', width: '8px', "border-radius": '50%', background: 'var(--clr-primary)' }} class="status-led-animated" />
-            <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-mono)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)' }}>Live Telemetry</span>
-          </div>
+        <div class="page-actions">
+          <button
+            class="btn btn-ghost"
+            onClick={() => {
+              void refetchHealth();
+              void refetchMetrics();
+            }}
+          >
+            <Icon name="refresh" size={14} />
+            Refresh
+          </button>
         </div>
       </div>
 
-      {/* Health Indicators -- matches Stitch system page: 3 horizontal cards */}
-      <section class="system-health-row" style={{ "margin-bottom": '2rem' }}>
-        {/* Database */}
-        <div class="system-health-card">
-          <div style={{ display: 'flex', "flex-direction": 'column' }}>
-            <span style={{ "font-family": 'var(--font-label)', "font-size": '0.625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)', "margin-bottom": '0.25rem' }}>Database</span>
-            <span style={{ "font-family": 'var(--font-headline)', "font-size": '1.25rem', "font-weight": '600', "letter-spacing": '0.025em', color: 'var(--clr-on-background)' }}>
-              <Show when={health()} fallback="Checking...">
-                {(h) => h().status === 'ok' ? 'Healthy' : 'Degraded'}
+      <div class="stagger">
+        <section class="stats-grid section" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1fr))' }}>
+          <div class="stat" style={{ '--stat-tint': health()?.status === 'ok' ? 'var(--ok)' : 'var(--danger)' }}>
+            <div class="stat-head">
+              <span class="stat-label">Database</span>
+              <Icon name="database" size={16} />
+            </div>
+            <div class="stat-value" style={{ 'font-size': '1.3rem' }}>
+              <Show when={health()} fallback={<span class="dim">checking…</span>}>
+                {(h) => <>{h().status === 'ok' ? 'Healthy' : 'Degraded'}</>}
               </Show>
-            </span>
-          </div>
-          <div style={{ position: 'relative' }}>
-            <div style={{ height: '12px', width: '12px', "border-radius": '50%', background: 'var(--clr-primary)', "box-shadow": '0 0 10px rgba(123, 231, 249, 0.4)' }} />
-          </div>
-        </div>
-        {/* Storage */}
-        <div class="system-health-card">
-          <div style={{ display: 'flex', "flex-direction": 'column' }}>
-            <span style={{ "font-family": 'var(--font-label)', "font-size": '0.625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)', "margin-bottom": '0.25rem' }}>Storage</span>
-            <span style={{ "font-family": 'var(--font-headline)', "font-size": '1.25rem', "font-weight": '600', "letter-spacing": '0.025em', color: 'var(--clr-on-background)' }}>OK</span>
-          </div>
-          <div style={{ height: '12px', width: '12px', "border-radius": '50%', background: 'var(--clr-primary)', "box-shadow": '0 0 10px rgba(123, 231, 249, 0.4)' }} />
-        </div>
-        {/* Proxy */}
-        <div class="system-health-card">
-          <div style={{ display: 'flex', "flex-direction": 'column' }}>
-            <span style={{ "font-family": 'var(--font-label)', "font-size": '0.625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)', "margin-bottom": '0.25rem' }}>Proxy</span>
-            <span style={{ "font-family": 'var(--font-headline)', "font-size": '1.25rem', "font-weight": '600', "letter-spacing": '0.025em', color: 'var(--clr-on-background)' }}>Connected</span>
-          </div>
-          <div style={{ height: '12px', width: '12px', "border-radius": '50%', background: 'var(--clr-primary)', "box-shadow": '0 0 10px rgba(123, 231, 249, 0.4)' }} />
-        </div>
-      </section>
-
-      <Show when={metricsRaw.loading}><LoadingSpinner /></Show>
-      <Show when={metricsRaw.error}>
-        <div class="alert alert-warning">Could not fetch Prometheus metrics. The /metrics endpoint may not be available.</div>
-      </Show>
-
-      {/* Metrics Grid -- matches Stitch system page: 4 metric cards */}
-      <Show when={metrics().length > 0}>
-        <div style={{ display: 'grid', "grid-template-columns": 'repeat(4, 1fr)', gap: '1.5rem', "margin-bottom": '3rem' }}>
-          {/* HTTP Requests */}
-          <div style={{ background: 'var(--clr-surface-container)', padding: '1.5rem', "border-left": '2px solid var(--clr-primary)' }}>
-            <p style={{ "font-family": 'var(--font-label)', "font-size": '0.625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)', "margin-bottom": '1rem' }}>Total Metrics</p>
-            <div style={{ display: 'flex', "align-items": 'baseline', gap: '0.5rem' }}>
-              <span style={{ "font-size": '1.875rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-on-background)' }}>{metrics().length}</span>
-              <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'var(--clr-primary)' }}>active</span>
             </div>
-            <div style={{ "margin-top": '1rem', height: '2px', width: '100%', background: 'rgba(255, 255, 255, 0.05)', position: 'relative' }}>
-              <div style={{ position: 'absolute', inset: '0 0 0 0', background: 'var(--clr-primary)', width: '67%' }} />
+            <div class="stat-foot">SQLite · embedded</div>
+          </div>
+          <div class="stat" style={{ '--stat-tint': 'var(--steel)' }}>
+            <div class="stat-head">
+              <span class="stat-label">Metrics exported</span>
+              <Icon name="activity" size={16} />
+            </div>
+            <div class="stat-value" style={{ 'font-size': '1.3rem' }}>
+              {metricsRaw() ? parsePrometheusMetrics(metricsRaw()!).length : '—'}
+            </div>
+            <div class="stat-foot">Prometheus text format</div>
+          </div>
+        </section>
+
+        <Show when={metricsRaw.error}>
+          <LoadError what="metrics" />
+        </Show>
+
+        <section class="section">
+          <div class="filter-bar">
+            <div class="search-box">
+              <Icon name="search" size={15} />
+              <input
+                class="input"
+                placeholder="Filter metrics… (http_requests, opencargo_)"
+                value={filter()}
+                onInput={(e) => setFilter(e.currentTarget.value)}
+                spellcheck={false}
+              />
             </div>
           </div>
 
-          {/* Avg Response Time */}
-          <div style={{ background: 'var(--clr-surface-container)', padding: '1.5rem', "border-left": '2px solid rgba(123, 231, 249, 0.4)' }}>
-            <p style={{ "font-family": 'var(--font-label)', "font-size": '0.625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)', "margin-bottom": '1rem' }}>Health Status</p>
-            <div style={{ display: 'flex', "align-items": 'baseline', gap: '0.5rem' }}>
-              <span style={{ "font-size": '1.875rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-on-background)' }}>
-                <Show when={health()} fallback="...">
-                  {(h) => h().status === 'ok' ? 'OK' : 'ERR'}
-                </Show>
-              </span>
-              <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'var(--clr-primary)' }}>OPTIMAL</span>
+          <Show when={metricsRaw()} fallback={<TableSkeleton rows={8} cols={2} />}>
+            <div class="table-card">
+              <div class="table-scroll" style={{ 'max-height': '520px', 'overflow-y': 'auto' }}>
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Metric</th>
+                      <th style={{ 'text-align': 'right' }}>Value</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={metrics().slice(0, 400)}>
+                      {(m) => (
+                        <tr>
+                          <td>
+                            <span class="cell-mono" style={{ color: 'var(--ink)' }}>
+                              {m.name}
+                            </span>
+                            <Show when={m.labels}>
+                              <div class="cell-mono cell-dim truncate" style={{ 'max-width': '460px', 'font-size': '0.68rem' }}>
+                                {m.labels}
+                              </div>
+                            </Show>
+                          </td>
+                          <td class="cell-mono cell-num" style={{ 'text-align': 'right', color: 'var(--accent)' }}>
+                            {m.value}
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
             </div>
-            <div style={{ "margin-top": '1rem', height: '2px', width: '100%', background: 'rgba(255, 255, 255, 0.05)', position: 'relative' }}>
-              <div style={{ position: 'absolute', inset: '0 0 0 0', background: 'rgba(123, 231, 249, 0.4)', width: '25%' }} />
-            </div>
-          </div>
-
-          {/* Cache Hit Ratio */}
-          <div style={{ background: 'var(--clr-surface-container)', padding: '1.5rem', "border-left": '2px solid var(--clr-primary)' }}>
-            <p style={{ "font-family": 'var(--font-label)', "font-size": '0.625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)', "margin-bottom": '1rem' }}>Cache Hit Ratio</p>
-            <div style={{ display: 'flex', "align-items": 'baseline', gap: '0.5rem' }}>
-              <span style={{ "font-size": '1.875rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-on-background)' }}>87%</span>
-              <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'var(--clr-primary)' }}>WARM</span>
-            </div>
-            <div style={{ "margin-top": '1rem', height: '2px', width: '100%', background: 'rgba(255, 255, 255, 0.05)', position: 'relative' }}>
-              <div style={{ position: 'absolute', inset: '0 0 0 0', background: 'var(--clr-primary)', width: '87%' }} />
-            </div>
-          </div>
-
-          {/* Storage Used */}
-          <div style={{ background: 'var(--clr-surface-container)', padding: '1.5rem', "border-left": '2px solid rgba(123, 231, 249, 0.4)' }}>
-            <p style={{ "font-family": 'var(--font-label)', "font-size": '0.625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-on-surface-variant)', "margin-bottom": '1rem' }}>Storage Used</p>
-            <div style={{ display: 'flex', "align-items": 'baseline', gap: '0.5rem' }}>
-              <span style={{ "font-size": '1.875rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-on-background)' }}>2.3GB</span>
-              <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'rgb(100, 116, 139)' }}>OF 10GB</span>
-            </div>
-            <div style={{ "margin-top": '1rem', height: '2px', width: '100%', background: 'rgba(255, 255, 255, 0.05)', position: 'relative' }}>
-              <div style={{ position: 'absolute', inset: '0 0 0 0', background: 'rgba(123, 231, 249, 0.4)', width: '23%' }} />
-            </div>
-          </div>
-        </div>
-      </Show>
-
-      {/* Terminal Section -- Raw Prometheus Metrics (matches Stitch system page) */}
-      <Show when={metricsRaw()}>
-        {(raw) => (
-          <section style={{ "margin-bottom": '2rem' }}>
-            <div style={{ display: 'flex', "align-items": 'center', "justify-content": 'space-between', "margin-bottom": '1rem' }}>
-              <h3 style={{ "font-family": 'var(--font-headline)', "font-size": '0.875rem', "font-weight": '700', "text-transform": 'uppercase', "letter-spacing": '0.2em', display: 'flex', "align-items": 'center', gap: '0.5rem', "margin-bottom": '0' }}>
-                <span class="material-symbols-outlined" style={{ color: 'var(--clr-primary)', "font-size": '18px' }}>terminal</span>
-                Raw Prometheus Metrics
-              </h3>
-              <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-mono)', color: 'var(--clr-on-surface-variant)' }}>REF: 0xFD-719-88</span>
-            </div>
-            <div class="raw-metrics-block">
-              <pre>{raw()}</pre>
-            </div>
-          </section>
-        )}
-      </Show>
-
-      <Show when={metrics().length === 0 && !metricsRaw.loading && !metricsRaw.error}>
-        <div class="card">
-          <p style={{ color: 'var(--clr-on-surface-variant)' }}>No metrics data available.</p>
-        </div>
-      </Show>
-
-      {/* Footer Data Frame -- matches Stitch system page */}
-      <div style={{ "margin-top": '5rem', "border-top": '1px solid rgba(255, 255, 255, 0.05)', "padding-top": '1.5rem', display: 'flex', "justify-content": 'space-between', "align-items": 'center', opacity: 0.4 }}>
-        <div style={{ display: 'flex', gap: '2rem' }}>
-          <div style={{ display: 'flex', "flex-direction": 'column' }}>
-            <span style={{ "font-size": '0.5625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'rgb(100, 116, 139)', "font-weight": '700' }}>Latency</span>
-            <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-mono)', color: 'var(--clr-primary)', "letter-spacing": '-0.025em' }}>0.024ms</span>
-          </div>
-          <div style={{ display: 'flex', "flex-direction": 'column' }}>
-            <span style={{ "font-size": '0.5625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'rgb(100, 116, 139)', "font-weight": '700' }}>Uptime</span>
-            <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-mono)', color: 'var(--clr-primary)', "letter-spacing": '-0.025em' }}>14d 2h 45m</span>
-          </div>
-          <div style={{ display: 'flex', "flex-direction": 'column' }}>
-            <span style={{ "font-size": '0.5625rem', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'rgb(100, 116, 139)', "font-weight": '700' }}>Region</span>
-            <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-mono)', color: 'var(--clr-primary)', "letter-spacing": '-0.025em' }}>US-EAST-1A</span>
-          </div>
-        </div>
-        <div style={{ "font-size": '0.5625rem', "text-transform": 'uppercase', "letter-spacing": '0.4em', color: 'rgb(100, 116, 139)', "font-weight": '700' }}>
-          OpenCargo Neural Core // Secure Connection Verified
-        </div>
+          </Show>
+        </section>
       </div>
-    </>
+    </div>
   );
 }

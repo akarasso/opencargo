@@ -1,120 +1,340 @@
-import { Show } from 'solid-js';
+import { For, Show, createSignal } from 'solid-js';
+import Icon from '../../components/Icon.tsx';
+import Modal, { ConfirmModal } from '../../components/Modal.tsx';
+import EmptyState from '../../components/EmptyState.tsx';
+import { RequireAdmin } from '../../components/guards.tsx';
+import { LoadError, TableSkeleton } from '../../components/bits.tsx';
+import {
+  createWebhook,
+  deleteWebhook,
+  fetchWebhooks,
+  testWebhook,
+  updateWebhook,
+} from '../../core/api.ts';
+import { createLiveResource } from '../../core/stores/live.ts';
+import { toasts } from '../../core/stores/toasts.ts';
+import { timeAgo } from '../../core/format.ts';
+import type { Webhook } from '../../core/types.ts';
+
+const KNOWN_EVENTS = ['package.published', 'package.promoted'];
 
 export default function Webhooks() {
   return (
-    <>
-      {/* Header Section -- matches Stitch v2-webhooks.html */}
-      <header style={{ "margin-bottom": '2rem' }}>
-        <div style={{ display: 'flex', "align-items": 'center', "justify-content": 'space-between', "margin-bottom": '0.5rem' }}>
-          <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-label)', "font-weight": '500', color: 'rgba(123, 231, 249, 0.6)', "letter-spacing": '0.3em', "text-transform": 'uppercase' }}>
-            Registry Service // Events
-          </span>
+    <RequireAdmin>
+      <WebhooksInner />
+    </RequireAdmin>
+  );
+}
+
+function WebhooksInner() {
+  const [hooks, refetch] = createLiveResource(fetchWebhooks, ['audit.entry'], { debounce: 500 });
+
+  const [showCreate, setShowCreate] = createSignal(false);
+  const [editing, setEditing] = createSignal<Webhook | null>(null);
+  const [deleting, setDeleting] = createSignal<Webhook | null>(null);
+  const [busy, setBusy] = createSignal(false);
+
+  const [url, setUrl] = createSignal('');
+  const [events, setEvents] = createSignal<string[]>(['package.published']);
+  const [secret, setSecret] = createSignal('');
+
+  function toggleEvent(list: string[], ev: string): string[] {
+    return list.includes(ev) ? list.filter((e) => e !== ev) : [...list, ev];
+  }
+
+  function openCreate() {
+    setUrl('');
+    setEvents(['package.published']);
+    setSecret('');
+    setShowCreate(true);
+  }
+
+  function openEdit(hook: Webhook) {
+    setUrl(hook.url);
+    setEvents(hook.events.includes('*') ? [...KNOWN_EVENTS] : [...hook.events]);
+    setSecret('');
+    setEditing(hook);
+  }
+
+  async function handleCreate(e: Event) {
+    e.preventDefault();
+    if (!url()) return;
+    setBusy(true);
+    try {
+      await createWebhook({ url: url(), events: events(), secret: secret() || undefined });
+      toasts.success('Webhook created', url());
+      setShowCreate(false);
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not create webhook', err instanceof Error ? err.message : undefined);
+    }
+    setBusy(false);
+  }
+
+  async function handleEdit(e: Event) {
+    e.preventDefault();
+    const hook = editing();
+    if (!hook) return;
+    setBusy(true);
+    try {
+      await updateWebhook(hook.id, {
+        url: url(),
+        events: events(),
+        ...(secret() ? { secret: secret() } : {}),
+      });
+      toasts.success('Webhook updated');
+      setEditing(null);
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not update webhook', err instanceof Error ? err.message : undefined);
+    }
+    setBusy(false);
+  }
+
+  async function handleToggleActive(hook: Webhook) {
+    try {
+      await updateWebhook(hook.id, { active: !hook.active });
+      toasts.success(hook.active ? 'Webhook paused' : 'Webhook resumed', hook.url);
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not update webhook', err instanceof Error ? err.message : undefined);
+    }
+  }
+
+  async function handleTest(hook: Webhook) {
+    try {
+      await testWebhook(hook.id);
+      toasts.success('Test event sent', `Check the receiver behind ${hook.url}`);
+    } catch (err: unknown) {
+      toasts.error('Test delivery failed', err instanceof Error ? err.message : undefined);
+    }
+  }
+
+  async function handleDelete() {
+    const hook = deleting();
+    if (!hook) return;
+    try {
+      await deleteWebhook(hook.id);
+      toasts.success('Webhook deleted');
+      setDeleting(null);
+      void refetch();
+    } catch (err: unknown) {
+      toasts.error('Could not delete webhook', err instanceof Error ? err.message : undefined);
+    }
+  }
+
+  const EventPicker = () => (
+    <div class="field">
+      <label class="field-label">Events</label>
+      <div class="row-wrap">
+        <For each={KNOWN_EVENTS}>
+          {(ev) => (
+            <label class="checkbox-row">
+              <input
+                type="checkbox"
+                checked={events().includes(ev)}
+                onChange={() => setEvents((list) => toggleEvent(list, ev))}
+              />
+              <span class="mono small">{ev}</span>
+            </label>
+          )}
+        </For>
+      </div>
+      <div class="field-hint">Nothing selected means every event (*).</div>
+    </div>
+  );
+
+  return (
+    <div class="page-enter">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Webhooks</h1>
+          <p class="page-sub">
+            HTTP callbacks fired on registry events — wire them into CI, chat, or monitoring.
+            Payloads are signed with the shared secret when one is set.
+          </p>
         </div>
-        <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'flex-end' }}>
-          <div>
-            <h2 style={{ "font-size": '2.5rem', "font-family": 'var(--font-headline)', "font-weight": '700', "letter-spacing": '-0.05em', color: 'var(--clr-on-surface)', "margin-bottom": '0.25rem' }}>Webhooks</h2>
-            <p style={{ color: 'var(--clr-on-surface-variant)', "font-size": '0.875rem', "max-width": '42rem', "line-height": '1.6' }}>
-              Configure HTTP endpoints to receive real-time notifications when specific events occur within your OpenCargo registry.
-              These webhooks enable seamless integration with CI/CD pipelines and external monitoring systems.
-            </p>
-          </div>
-        </div>
-      </header>
-
-      <div style={{ display: 'grid', "grid-template-columns": '1fr 3fr', gap: '2rem' }}>
-        {/* Sidebar Stats / Info */}
-        <div style={{ display: 'flex', "flex-direction": 'column', gap: '1.5rem' }}>
-          {/* Registry Health card */}
-          <div class="card" style={{ "border-left": '2px solid rgba(123, 231, 249, 0.1)' }}>
-            <div style={{ "font-size": '0.5625rem', "font-family": 'var(--font-label)', "letter-spacing": '0.2em', color: 'var(--clr-outline-variant)', "text-transform": 'uppercase', "margin-bottom": '1rem' }}>
-              Registry Health
-            </div>
-            <div style={{ display: 'flex', "flex-direction": 'column', gap: '1rem' }}>
-              <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'center' }}>
-                <span style={{ "font-size": '0.75rem', color: 'var(--clr-on-surface-variant)' }}>Active Nodes</span>
-                <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'var(--clr-primary)' }}>0x04</span>
-              </div>
-              <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'center' }}>
-                <span style={{ "font-size": '0.75rem', color: 'var(--clr-on-surface-variant)' }}>Avg Latency</span>
-                <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'var(--clr-primary)' }}>24ms</span>
-              </div>
-              <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'center' }}>
-                <span style={{ "font-size": '0.75rem', color: 'var(--clr-on-surface-variant)' }}>Event Queue</span>
-                <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'var(--clr-secondary)' }}>Idle</span>
-              </div>
-            </div>
-          </div>
-
-          {/* Quick Manual */}
-          <div style={{ background: 'var(--clr-surface-container-high)', "border-radius": '0.75rem', padding: '1.5rem', "border-top": '1px solid rgba(67, 72, 78, 0.1)' }}>
-            <div style={{ "font-size": '0.5625rem', "font-family": 'var(--font-label)', "letter-spacing": '0.2em', color: 'var(--clr-outline-variant)', "text-transform": 'uppercase', "margin-bottom": '1rem' }}>
-              Quick Manual
-            </div>
-            <p style={{ "font-size": '0.6875rem', color: 'var(--clr-on-surface-variant)', "line-height": '1.6' }}>
-              Webhooks are configured in your <code style={{ color: 'var(--clr-primary)', "font-family": 'var(--font-mono)' }}>config.toml</code> file. Add a <code style={{ color: 'var(--clr-primary)', "font-family": 'var(--font-mono)' }}>[webhooks.name]</code> section to register endpoints.
-            </p>
-          </div>
-        </div>
-
-        {/* Main Content Area */}
-        <div style={{ display: 'flex', "flex-direction": 'column', gap: '2rem' }}>
-          {/* Empty State -- matches Stitch v2-webhooks.html */}
-          <div class="webhooks-empty-state">
-            <div style={{ position: 'absolute', inset: '0', opacity: '0.05', "pointer-events": 'none', background: 'radial-gradient(circle at center, var(--clr-primary), transparent)' }} />
-            <div class="webhooks-empty-icon">
-              <span class="material-symbols-outlined" style={{ "font-size": '2.5rem', color: 'rgba(123, 231, 249, 0.4)' }}>sensors_off</span>
-            </div>
-            <h3 style={{ "font-size": '1.25rem', "font-family": 'var(--font-headline)', "font-weight": '700', "margin-bottom": '0.5rem' }}>No webhooks configured.</h3>
-            <p style={{ "font-size": '0.875rem', color: 'var(--clr-on-surface-variant)', "max-width": '20rem', "margin-bottom": '2rem' }}>
-              Your registry is currently isolated. Connect external systems to start receiving event streams.
-            </p>
-
-            {/* Example Config Block -- matches Stitch */}
-            <div class="webhooks-config-example">
-              <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'center', "margin-bottom": '1rem', "padding-bottom": '0.5rem', "border-bottom": '1px solid rgba(67, 72, 78, 0.1)' }}>
-                <span style={{ "font-size": '0.5625rem', "font-family": 'var(--font-label)', "letter-spacing": '0.15em', "text-transform": 'uppercase', color: 'var(--clr-outline-variant)' }}>example_config.toml</span>
-                <span class="material-symbols-outlined" style={{ "font-size": '14px', color: 'var(--clr-outline-variant)', cursor: 'pointer' }}>content_copy</span>
-              </div>
-              <div style={{ "font-family": 'var(--font-mono)', "font-size": '0.75rem', display: 'flex', "flex-direction": 'column', gap: '0.25rem' }}>
-                <p><span style={{ color: 'var(--clr-secondary)' }}>[webhooks.production]</span></p>
-                <p><span style={{ color: 'var(--clr-primary)' }}>url</span> = <span style={{ color: 'var(--clr-on-tertiary-container)' }}>"https://api.internal.sys/hooks"</span></p>
-                <p><span style={{ color: 'var(--clr-primary)' }}>events</span> = [<span style={{ color: 'var(--clr-on-tertiary-container)' }}>"package.published"</span>, <span style={{ color: 'var(--clr-on-tertiary-container)' }}>"node.sync"</span>]</p>
-                <p><span style={{ color: 'var(--clr-primary)' }}>secret</span> = <span style={{ color: 'var(--clr-on-tertiary-container)' }}>"cargo_sec_0xA4..."</span></p>
-                <p><span style={{ color: 'var(--clr-primary)' }}>active</span> = <span style={{ color: 'var(--clr-secondary)' }}>true</span></p>
-              </div>
-            </div>
-          </div>
-
-          {/* Simulation table header -- matches Stitch */}
-          <div style={{ "font-size": '0.5625rem', "font-family": 'var(--font-label)', "letter-spacing": '0.2em', color: 'var(--clr-outline-variant)', "text-transform": 'uppercase' }}>
-            Registry Entries (Preview)
-          </div>
-
-          {/* Example webhook entries table -- matches Stitch v2-webhooks.html */}
-          <div class="data-table-wrapper">
-            <table class="data-table">
-              <thead>
-                <tr>
-                  <th>Status</th>
-                  <th>Endpoint URL</th>
-                  <th>Events</th>
-                  <th>Secret</th>
-                  <th>Actions</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr>
-                  <td colspan="5" style={{ "text-align": 'center', padding: '2rem', color: 'var(--clr-on-surface-variant)' }}>
-                    <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.1em' }}>
-                      No webhooks registered. Configure webhooks in config.toml to see them here.
-                    </span>
-                  </td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
+        <div class="page-actions">
+          <button class="btn btn-primary" onClick={openCreate}>
+            <Icon name="plus" size={14} />
+            New webhook
+          </button>
         </div>
       </div>
-    </>
+
+      <Show when={hooks.error}>
+        <LoadError what="webhooks" />
+      </Show>
+
+      <Show when={hooks()} fallback={<TableSkeleton rows={3} cols={4} />}>
+        {(list) => (
+          <Show
+            when={list().webhooks.length > 0}
+            fallback={
+              <div class="card">
+                <EmptyState
+                  icon="webhook"
+                  title="No webhooks yet"
+                  text="Add an endpoint and the registry will call it whenever packages are published or promoted."
+                >
+                  <button class="btn btn-primary" onClick={openCreate}>
+                    <Icon name="plus" size={14} />
+                    New webhook
+                  </button>
+                </EmptyState>
+              </div>
+            }
+          >
+            <div class="table-card page-enter">
+              <div class="table-scroll">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Status</th>
+                      <th>Endpoint</th>
+                      <th>Events</th>
+                      <th class="cell-hide-sm">Created</th>
+                      <th style={{ 'text-align': 'right' }}>Actions</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={list().webhooks}>
+                      {(hook) => (
+                        <tr>
+                          <td>
+                            <button
+                              class={`switch ${hook.active ? 'on' : ''}`}
+                              role="switch"
+                              aria-checked={hook.active}
+                              title={hook.active ? 'Active — click to pause' : 'Paused — click to resume'}
+                              onClick={() => handleToggleActive(hook)}
+                            />
+                          </td>
+                          <td class="cell-mono truncate" style={{ 'max-width': '300px', color: 'var(--ink)' }}>
+                            {hook.url}
+                          </td>
+                          <td>
+                            <div class="row-wrap">
+                              <For each={hook.events}>
+                                {(ev) => <span class="chip chip-neutral mono">{ev}</span>}
+                              </For>
+                            </div>
+                          </td>
+                          <td class="cell-dim cell-hide-sm nowrap" title={hook.created_at}>
+                            {timeAgo(hook.created_at)}
+                          </td>
+                          <td>
+                            <div class="cell-actions">
+                              <button class="btn btn-ghost btn-sm" title="Send a test event" onClick={() => handleTest(hook)}>
+                                <Icon name="send" size={13} />
+                                Test
+                              </button>
+                              <button class="btn btn-quiet btn-icon" title="Edit webhook" onClick={() => openEdit(hook)}>
+                                <Icon name="pencil" size={14} />
+                              </button>
+                              <button class="btn btn-quiet btn-icon" title="Delete webhook" onClick={() => setDeleting(hook)}>
+                                <Icon name="trash" size={14} />
+                              </button>
+                            </div>
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
+            </div>
+          </Show>
+        )}
+      </Show>
+
+      {/* Create */}
+      <Modal
+        open={showCreate()}
+        title="New webhook"
+        onClose={() => setShowCreate(false)}
+        actions={
+          <>
+            <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
+              Cancel
+            </button>
+            <button class="btn btn-primary" onClick={handleCreate} disabled={busy() || !url()}>
+              {busy() ? 'Creating…' : 'Create webhook'}
+            </button>
+          </>
+        }
+      >
+        <form onSubmit={handleCreate}>
+          <div class="field">
+            <label class="field-label">Endpoint URL</label>
+            <input
+              class="input"
+              type="url"
+              value={url()}
+              onInput={(e) => setUrl(e.currentTarget.value)}
+              placeholder="https://ci.example.com/hooks/registry"
+              spellcheck={false}
+              required
+            />
+          </div>
+          <EventPicker />
+          <div class="field">
+            <label class="field-label">Secret (optional)</label>
+            <input
+              class="input"
+              value={secret()}
+              onInput={(e) => setSecret(e.currentTarget.value)}
+              placeholder="Used to sign payloads (X-OpenCargo-Signature)"
+              spellcheck={false}
+            />
+          </div>
+        </form>
+      </Modal>
+
+      {/* Edit */}
+      <Modal
+        open={editing() !== null}
+        title="Edit webhook"
+        onClose={() => setEditing(null)}
+        actions={
+          <>
+            <button class="btn btn-ghost" onClick={() => setEditing(null)}>
+              Cancel
+            </button>
+            <button class="btn btn-primary" onClick={handleEdit} disabled={busy() || !url()}>
+              {busy() ? 'Saving…' : 'Save changes'}
+            </button>
+          </>
+        }
+      >
+        <form onSubmit={handleEdit}>
+          <div class="field">
+            <label class="field-label">Endpoint URL</label>
+            <input class="input" type="url" value={url()} onInput={(e) => setUrl(e.currentTarget.value)} required spellcheck={false} />
+          </div>
+          <EventPicker />
+          <div class="field">
+            <label class="field-label">Secret</label>
+            <input
+              class="input"
+              value={secret()}
+              onInput={(e) => setSecret(e.currentTarget.value)}
+              placeholder="Leave blank to keep the current one"
+              spellcheck={false}
+            />
+          </div>
+        </form>
+      </Modal>
+
+      <ConfirmModal
+        open={deleting() !== null}
+        title="Delete this webhook?"
+        message={`${deleting()?.url ?? ''} will stop receiving registry events immediately.`}
+        confirmLabel="Delete webhook"
+        danger
+        onConfirm={handleDelete}
+        onCancel={() => setDeleting(null)}
+      />
+    </div>
   );
 }
