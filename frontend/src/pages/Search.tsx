@@ -1,8 +1,9 @@
-import { createSignal, createResource, For, Show } from 'solid-js';
+import { For, Show, createResource, createSignal } from 'solid-js';
 import { A, useSearchParams } from '@solidjs/router';
-import { fetchSearch } from '../lib/api.ts';
-import LoadingSpinner from '../components/LoadingSpinner.tsx';
+import Icon from '../components/Icon.tsx';
 import EmptyState from '../components/EmptyState.tsx';
+import { LoadError } from '../components/bits.tsx';
+import { fetchSearch } from '../core/api.ts';
 
 function paramStr(val: string | string[] | undefined): string {
   if (Array.isArray(val)) return val[0] ?? '';
@@ -17,132 +18,96 @@ export default function Search() {
   const [data] = createResource(query, fetchSearch);
 
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
-
   function handleInput(value: string) {
     setInputValue(value);
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       setSearchParams({ q: value || undefined });
-    }, 300);
+    }, 260);
   }
 
   return (
-    <div style={{ "max-width": '64rem', margin: '0 auto', padding: '4rem 2rem' }}>
-      {/* Hero Section -- matches Stitch search page */}
-      <section style={{ "text-align": 'center', "margin-bottom": '4rem' }}>
-        <div style={{ display: 'inline-flex', "align-items": 'center', gap: '0.5rem', "margin-bottom": '1.5rem', padding: '0.25rem 0.75rem', background: 'rgba(123, 231, 249, 0.1)', "border-radius": '9999px', border: '1px solid rgba(123, 231, 249, 0.2)' }}>
-          <span style={{ display: 'flex', height: '8px', width: '8px', "border-radius": '50%', background: 'var(--clr-primary)' }} class="status-led-animated" />
-          <span style={{ "font-family": "var(--font-label)", "font-size": "0.625rem", "text-transform": "uppercase", "letter-spacing": "0.2em", color: "var(--clr-primary)", "font-weight": "700" }}>Registry Node: Live</span>
+    <div class="page-enter">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Search</h1>
+          <p class="page-sub">Full-text search across package names and descriptions.</p>
         </div>
-        <h1 style={{ "font-family": 'var(--font-headline)', "font-size": '3.5rem', "font-weight": '700', color: 'var(--clr-on-background)', "margin-bottom": '1rem', "letter-spacing": '-0.05em' }}>
-          Search Packages
-        </h1>
-        <p style={{ color: 'var(--clr-on-surface-variant)', "font-family": 'var(--font-body)', "font-size": '1.125rem', "max-width": '36rem', margin: '0 auto' }}>
-          Access the distributed global registry with high-fidelity indexing and real-time dependency mapping.
-        </p>
-      </section>
+      </div>
 
-      {/* Search Interface -- matches Stitch */}
-      <section style={{ "margin-bottom": '3rem' }}>
-        <div class="search-outer" style={{ position: 'relative' }}>
-          <div class="search-glow" />
-          <div class="search-bar-container">
-            <div style={{ "padding-left": '1.5rem', "padding-right": '1rem', color: 'var(--clr-primary)' }}>
-              <span class="material-symbols-outlined" style={{ "font-size": '24px' }}>search</span>
-            </div>
-            <input
-              type="text"
-              value={inputValue()}
-              onInput={(e) => handleInput(e.currentTarget.value)}
-              placeholder="Search packages by name or description"
-              autofocus
-              style={{ width: '100%', background: 'transparent', border: 'none', padding: '1.5rem 0', color: 'var(--clr-on-background)', "font-family": 'var(--font-body)', "font-size": '1.125rem', outline: 'none' }}
-            />
-            <div style={{ "padding-right": '1.5rem', display: 'flex', "align-items": 'center', gap: '0.75rem' }}>
-              <kbd style={{ display: 'flex', "align-items": 'center', gap: '0.25rem', padding: '0.25rem 0.5rem', background: 'var(--clr-surface-container-high)', border: '1px solid rgba(67, 72, 78, 0.5)', "border-radius": 'var(--radius-sm)', "font-size": '0.625rem', color: 'rgb(148, 163, 184)', "font-family": 'var(--font-headline)', "font-weight": '700' }}>
-                <span>CTRL</span>
-                <span>K</span>
-              </kbd>
-              <button class="btn-primary" style={{ padding: '0.5rem 1.5rem', "border-radius": '0.5rem', border: 'none', background: 'var(--gradient-kinetic)', color: 'var(--clr-on-primary-container)', "font-family": 'var(--font-headline)', "font-weight": '700', "font-size": '0.75rem', "letter-spacing": '0.2em', "text-transform": 'uppercase', cursor: 'pointer' }}>
-                Execute
-              </button>
-            </div>
-          </div>
-        </div>
-      </section>
-
-      <Show when={data.loading}>
-        <LoadingSpinner />
-      </Show>
+      <div class="search-box" style={{ 'margin-bottom': '18px' }}>
+        <Icon name="search" size={16} />
+        <input
+          class="input"
+          style={{ padding: '12px 40px 12px 38px', 'font-size': '0.95rem' }}
+          type="text"
+          value={inputValue()}
+          onInput={(e) => handleInput(e.currentTarget.value)}
+          placeholder="Search packages…"
+          spellcheck={false}
+          autofocus
+        />
+        <Show when={data.loading}>
+          <span class="spinner" style={{ position: 'absolute', right: '12px' }} />
+        </Show>
+      </div>
 
       <Show when={data.error}>
-        <div class="alert alert-error">Search failed.</div>
+        <LoadError what="search results" />
       </Show>
 
-      {/* Search Results -- matches Stitch result cards */}
-      <Show when={query()}>
+      <Show
+        when={query()}
+        fallback={
+          <div class="card">
+            <EmptyState
+              icon="search"
+              title="Type to search"
+              text="Search covers every package you're allowed to see — private repositories stay private."
+            />
+          </div>
+        }
+      >
         <Show when={data()}>
           {(d) => (
             <Show
               when={d().results.length > 0}
               fallback={
-                <EmptyState
-                  title="No results"
-                  text={`No packages found for "${query()}".`}
-                />
+                <div class="card">
+                  <EmptyState
+                    icon="search"
+                    title="No results"
+                    text={`Nothing matches “${d().query}”. Try a shorter or different term.`}
+                  />
+                </div>
               }
             >
-              <section>
-                <div style={{ display: 'flex', "align-items": 'center', "justify-content": 'space-between', "margin-bottom": '1.5rem', padding: '0 0.5rem' }}>
-                  <h2 style={{ "font-family": 'var(--font-headline)', "font-size": '0.75rem', "font-weight": '700', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'rgb(148, 163, 184)', "margin-bottom": '0' }}>
-                    Registry Matches ({d().results.length})
-                  </h2>
-                  <div style={{ display: 'flex', "align-items": 'center', gap: '1rem' }}>
-                    <span style={{ "font-family": 'var(--font-headline)', "font-size": '0.625rem', "font-weight": '700', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'rgb(100, 116, 139)' }}>Sort by: Relevance</span>
-                    <span class="material-symbols-outlined" style={{ color: 'rgb(100, 116, 139)', "font-size": '14px' }}>filter_list</span>
-                  </div>
-                </div>
-
-                <div class="search-result-list">
-                  <For each={d().results}>
-                    {(r) => (
-                      <A
-                        href={`/packages/${r.name}`}
-                        class="search-result-card"
-                        style={{ "text-decoration": 'none', color: 'inherit', display: 'block' }}
-                      >
-                        <div class="search-result-card-inner">
-                          <div style={{ flex: '1' }}>
-                            <div style={{ display: 'flex', "align-items": 'center', gap: '0.75rem', "margin-bottom": '0.5rem' }}>
-                              <span style={{ color: 'var(--clr-primary)', "font-family": 'var(--font-mono)', "font-size": '1.125rem', "font-weight": '500' }}>{r.name}</span>
-                              <span style={{ padding: '0.125rem 0.5rem', background: 'var(--clr-surface-container-highest)', border: '1px solid rgba(67, 72, 78, 0.5)', "border-radius": 'var(--radius-sm)', "font-size": '0.625rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-on-background)', "letter-spacing": '0.05em' }}>{r.latest_version}</span>
-                            </div>
-                            <p style={{ color: 'var(--clr-on-surface-variant)', "font-family": 'var(--font-body)', "font-size": '0.875rem', "line-height": '1.6', "max-width": '42rem' }}>
-                              {r.description || 'No description available.'}
-                            </p>
-                          </div>
-                          <div style={{ display: 'flex', "align-items": 'center', gap: '1rem' }}>
-                            <div style={{ display: 'flex', "flex-direction": 'column', "align-items": 'flex-end', gap: '0.25rem' }}>
-                              <span style={{ padding: '0.25rem 0.75rem', background: 'rgba(123, 231, 249, 0.1)', color: 'var(--clr-primary)', border: '1px solid rgba(123, 231, 249, 0.2)', "border-radius": '9999px', "font-size": '0.625rem', "font-family": 'var(--font-headline)', "font-weight": '700', "text-transform": 'uppercase', "letter-spacing": '0.2em' }}>npm</span>
-                            </div>
-                            <span class="material-symbols-outlined" style={{ color: 'rgb(148, 163, 184)' }}>chevron_right</span>
-                          </div>
-                        </div>
-                      </A>
-                    )}
-                  </For>
-                </div>
-              </section>
+              <p class="dim small" style={{ 'margin-bottom': '10px' }}>
+                {d().results.length} result{d().results.length === 1 ? '' : 's'} for “{d().query}”
+              </p>
+              <div class="col stagger" style={{ gap: '10px' }}>
+                <For each={d().results}>
+                  {(r) => (
+                    <A href={`/packages/${r.name}`} class="card card-pad card-hover" style={{ display: 'block' }}>
+                      <div class="row">
+                        <Icon name="package" size={15} class="icon dim" />
+                        <span class="mono grow truncate" style={{ color: 'var(--ink)', 'font-weight': 500 }}>
+                          {r.name}
+                        </span>
+                        <span class="version">{r.latest_version}</span>
+                      </div>
+                      <Show when={r.description}>
+                        <p class="muted small truncate" style={{ 'margin-top': '6px' }}>
+                          {r.description}
+                        </p>
+                      </Show>
+                    </A>
+                  )}
+                </For>
+              </div>
             </Show>
           )}
         </Show>
-      </Show>
-
-      <Show when={!query()}>
-        <EmptyState
-          title="Start searching"
-          text="Type a package name or keyword to search."
-        />
       </Show>
     </div>
   );
