@@ -197,10 +197,50 @@ pub async fn dashboard_stats(
 
     let total_packages =
         count_scalar(pool, &format!("SELECT COUNT(*) FROM packages{where_vis}")).await;
-    let total_versions = count_scalar(pool, "SELECT COUNT(*) FROM versions").await;
-    let total_downloads =
-        count_scalar(pool, "SELECT COALESCE(SUM(count), 0) FROM download_counts").await;
-    let total_repos = count_scalar(pool, "SELECT COUNT(*) FROM repositories").await;
+    // Versions/downloads respect the same visibility rule as packages: an
+    // anonymous caller must not learn how much private activity exists.
+    let total_versions = count_scalar(
+        pool,
+        &format!(
+            "SELECT COUNT(*) FROM versions v
+             JOIN packages p ON p.id = v.package_id
+             {}",
+            if where_vis.is_empty() {
+                String::new()
+            } else {
+                " WHERE p.repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
+                    .to_string()
+            }
+        ),
+    )
+    .await;
+    let total_downloads = count_scalar(
+        pool,
+        &format!(
+            "SELECT COALESCE(SUM(dc.count), 0) FROM download_counts dc
+             JOIN versions v ON v.id = dc.version_id
+             JOIN packages p ON p.id = v.package_id
+             {}",
+            if where_vis.is_empty() {
+                String::new()
+            } else {
+                " WHERE p.repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
+                    .to_string()
+            }
+        ),
+    )
+    .await;
+    // Same rule as list_repositories: anonymous callers only count public
+    // repos; any authenticated user sees the full count.
+    let total_repos = if auth.is_some() {
+        count_scalar(pool, "SELECT COUNT(*) FROM repositories").await
+    } else {
+        count_scalar(
+            pool,
+            "SELECT COUNT(*) FROM repositories WHERE visibility = 'public'",
+        )
+        .await
+    };
 
     let recent = sqlx::query_as::<_, (String, String, String)>(&format!(
         "SELECT p.name, v.version, v.published_at
