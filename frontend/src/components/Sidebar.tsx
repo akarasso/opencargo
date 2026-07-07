@@ -1,132 +1,155 @@
 import { Show } from 'solid-js';
 import { A } from '@solidjs/router';
-import auth from '../lib/auth.ts';
+import Icon from './Icon.tsx';
+import RoleBadge from './RoleBadge.tsx';
+import { session } from '../core/stores/session.ts';
+import { ui } from '../core/stores/ui.ts';
+import { initials } from '../core/format.ts';
 
-interface SidebarProps {
-  isOpen: boolean;
-  onClose: () => void;
-}
-
-export default function Sidebar(props: SidebarProps) {
-  const admin = () => auth.isAuthenticated();
+export default function Sidebar() {
+  const close = ui.closeSidebar;
 
   return (
     <>
       <div
-        class={`sidebar-overlay ${props.isOpen ? 'sidebar-overlay-visible' : ''}`}
-        onClick={props.onClose}
+        class={`drawer-overlay ${ui.sidebarOpen() ? 'visible' : ''}`}
+        onClick={close}
+        aria-hidden="true"
       />
-      <aside class={`sidebar ${props.isOpen ? 'sidebar-open' : ''}`}>
-        {/* Brand Header -- matches Stitch sidebar brand */}
-        <div class="sidebar-brand">
-          <div class="sidebar-brand-icon">
-            <span class="material-symbols-outlined" style={{ "font-variation-settings": "'FILL' 1" }}>package_2</span>
+      <aside class={`sidebar ${ui.sidebarOpen() ? 'open' : ''}`}>
+        <div class="brand">
+          <div class="brand-mark">
+            <Icon name="anchor" size={18} strokeWidth={2} />
           </div>
-          <div class="sidebar-brand-text">
-            <h1><A href="/" onClick={props.onClose}>OpenCargo</A></h1>
-            <p>v1.0.4-stable</p>
+          <div>
+            <div class="brand-name">
+              <A href="/" onClick={close}>
+                OpenCargo
+              </A>
+            </div>
+            <div class="brand-sub">package registry</div>
           </div>
         </div>
 
-        {/* Browse section label -- matches Stitch */}
-        <div class="sidebar-section">
-          <div class="sidebar-section-label">Browse</div>
-          <nav class="sidebar-nav">
-            <A class="sidebar-link" href="/" end activeClass="active" onClick={props.onClose}>
-              <span class="material-symbols-outlined">dashboard</span>
+        <div class="nav-section">
+          <div class="nav-label">Browse</div>
+          <nav class="nav">
+            <A class="nav-link" href="/" end activeClass="active" onClick={close}>
+              <Icon name="gauge" />
               <span>Dashboard</span>
             </A>
-            <A class="sidebar-link" href="/packages" activeClass="active" onClick={props.onClose}>
-              <span class="material-symbols-outlined">package_2</span>
+            <A class="nav-link" href="/packages" activeClass="active" onClick={close}>
+              <Icon name="package" />
               <span>Packages</span>
             </A>
-            <A class="sidebar-link" href="/search" activeClass="active" onClick={props.onClose}>
-              <span class="material-symbols-outlined">search</span>
+            <A class="nav-link" href="/search" activeClass="active" onClick={close}>
+              <Icon name="search" />
               <span>Search</span>
             </A>
-            <A class="sidebar-link" href="/oci" activeClass="active" onClick={props.onClose}>
-              <span class="material-symbols-outlined">deployed_code</span>
+            <A class="nav-link" href="/oci" activeClass="active" onClick={close}>
+              <Icon name="container" />
               <span>Containers</span>
             </A>
-            <A class="sidebar-link" href="/go" activeClass="active" onClick={props.onClose}>
-              <span class="material-symbols-outlined">code</span>
-              <span>Go Modules</span>
+            <A class="nav-link" href="/go" activeClass="active" onClick={close}>
+              <Icon name="code" />
+              <span>Go modules</span>
             </A>
           </nav>
         </div>
 
-        {/* Admin section (only when authenticated) -- matches Stitch admin sidebar */}
-        <Show when={admin()}>
-          <div class="sidebar-section">
-            <div class="sidebar-section-label">Admin</div>
-            <nav class="sidebar-nav">
-              <A class="sidebar-link" href="/admin" end activeClass="active" onClick={props.onClose}>
-                <span class="material-symbols-outlined">speed</span>
-                <span>Overview</span>
+        {/* Account section for any signed-in user */}
+        <Show when={session.isAuthenticated()}>
+          <div class="nav-section">
+            <div class="nav-label">Account</div>
+            <nav class="nav">
+              <A class="nav-link" href="/account/access" activeClass="active" onClick={close}>
+                <Icon name="shield-check" />
+                <span>My access</span>
               </A>
-              <A class="sidebar-link" href="/admin/repositories" activeClass="active" onClick={props.onClose}>
-                <span class="material-symbols-outlined">database</span>
-                <span>Repositories</span>
+              <A
+                class="nav-link"
+                href={`/admin/users/${session.user()?.username}/tokens`}
+                activeClass="active"
+                onClick={close}
+              >
+                <Icon name="key" />
+                <span>API tokens</span>
               </A>
-              <A class="sidebar-link" href="/admin/users" activeClass="active" onClick={props.onClose}>
-                <span class="material-symbols-outlined">group</span>
-                <span>Users</span>
-              </A>
-              <A class="sidebar-link" href="/admin/packages" activeClass="active" onClick={props.onClose}>
-                <span class="material-symbols-outlined">inventory_2</span>
-                <span>Packages</span>
-              </A>
-              <A class="sidebar-link" href="/admin/audit" activeClass="active" onClick={props.onClose}>
-                <span class="material-symbols-outlined">history_toggle_off</span>
-                <span>Audit Log</span>
-              </A>
-              <A class="sidebar-link" href="/admin/system" activeClass="active" onClick={props.onClose}>
-                <span class="material-symbols-outlined">settings</span>
-                <span>System</span>
-              </A>
-              <A class="sidebar-link" href="/admin/webhooks" activeClass="active" onClick={props.onClose}>
-                <span class="material-symbols-outlined">send</span>
-                <span>Webhooks</span>
-              </A>
-              <A class="sidebar-link" href="/admin/password" activeClass="active" onClick={props.onClose}>
-                <span class="material-symbols-outlined">lock</span>
+              <A class="nav-link" href="/admin/password" activeClass="active" onClick={close}>
+                <Icon name="lock" />
                 <span>Password</span>
               </A>
             </nav>
           </div>
         </Show>
 
-        <div class="sidebar-spacer" />
+        {/* Admin section, only for the admin role */}
+        <Show when={session.isAdmin()}>
+          <div class="nav-section">
+            <div class="nav-label">Administration</div>
+            <nav class="nav">
+              <A class="nav-link" href="/admin" end activeClass="active" onClick={close}>
+                <Icon name="activity" />
+                <span>Overview</span>
+              </A>
+              <A class="nav-link" href="/admin/repositories" activeClass="active" onClick={close}>
+                <Icon name="database" />
+                <span>Repositories</span>
+              </A>
+              <A class="nav-link" href="/admin/users" activeClass="active" onClick={close}>
+                <Icon name="users" />
+                <span>Users & access</span>
+              </A>
+              <A class="nav-link" href="/admin/packages" activeClass="active" onClick={close}>
+                <Icon name="layers" />
+                <span>Promotion</span>
+              </A>
+              <A class="nav-link" href="/admin/webhooks" activeClass="active" onClick={close}>
+                <Icon name="webhook" />
+                <span>Webhooks</span>
+              </A>
+              <A class="nav-link" href="/admin/audit" activeClass="active" onClick={close}>
+                <Icon name="history" />
+                <span>Audit log</span>
+              </A>
+              <A class="nav-link" href="/admin/system" activeClass="active" onClick={close}>
+                <Icon name="settings" />
+                <span>System</span>
+              </A>
+            </nav>
+          </div>
+        </Show>
 
-        {/* Footer: Sign In button (public) or user info + logout (admin) */}
-        <div class="sidebar-footer">
+        <div class="sidebar-foot">
           <Show
-            when={admin()}
+            when={session.isAuthenticated()}
             fallback={
-              <A class="sidebar-signin-btn" href="/login" onClick={props.onClose}>
-                Sign In
+              <A class="signin-cta" href="/login" onClick={close}>
+                <Icon name="log-in" size={15} />
+                Sign in
               </A>
             }
           >
-            <div class="sidebar-user">
-              <div class="sidebar-user-avatar">
-                {(auth.username() || '?').slice(0, 2).toUpperCase()}
+            <div class="user-chip">
+              <div class="avatar">{initials(session.user()?.username)}</div>
+              <div class="grow">
+                <div class="user-chip-name">{session.user()?.username}</div>
+                <div class="user-chip-meta">
+                  <RoleBadge role={session.user()?.role ?? 'reader'} />
+                </div>
               </div>
-              <div>
-                <div class="sidebar-user-name">{auth.username()}</div>
-                <div class="sidebar-user-role">Administrator</div>
-              </div>
+              <button
+                class="btn btn-quiet btn-icon"
+                title="Sign out"
+                aria-label="Sign out"
+                onClick={() => {
+                  session.logout();
+                  close();
+                }}
+              >
+                <Icon name="log-out" size={15} />
+              </button>
             </div>
-            <button
-              class="sidebar-logout-btn"
-              onClick={() => {
-                auth.logout();
-                props.onClose();
-              }}
-            >
-              <span class="material-symbols-outlined" style={{ "font-size": "20px" }}>logout</span>
-              <span>Logout</span>
-            </button>
           </Show>
         </div>
       </aside>

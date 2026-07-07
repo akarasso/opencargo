@@ -2,7 +2,7 @@
 import { render } from 'solid-js/web';
 import { Router, Route } from '@solidjs/router';
 import Layout from './components/Layout.tsx';
-import ToastContainer from './components/Toast.tsx';
+import Toaster from './components/Toaster.tsx';
 import Dashboard from './pages/Dashboard.tsx';
 import Packages from './pages/Packages.tsx';
 import PackageDetail from './pages/PackageDetail.tsx';
@@ -10,6 +10,7 @@ import Search from './pages/Search.tsx';
 import OciImages from './pages/OciImages.tsx';
 import GoModules from './pages/GoModules.tsx';
 import Login from './pages/Login.tsx';
+import MyAccess from './pages/MyAccess.tsx';
 import AdminDashboard from './pages/admin/AdminDashboard.tsx';
 import Repositories from './pages/admin/Repositories.tsx';
 import Users from './pages/admin/Users.tsx';
@@ -28,10 +29,10 @@ render(
   () => (
     <>
       <Router>
-        {/* Login page has its own layout (no sidebar) */}
+        {/* Login page has its own layout (no shell) */}
         <Route path="/login" component={Login} />
 
-        {/* All other routes use the sidebar layout */}
+        {/* All other routes share the shell */}
         <Route path="/" component={Layout}>
           <Route path="/" component={Dashboard} />
           <Route path="/packages" component={Packages} />
@@ -39,6 +40,7 @@ render(
           <Route path="/search" component={Search} />
           <Route path="/oci" component={OciImages} />
           <Route path="/go" component={GoModules} />
+          <Route path="/account/access" component={MyAccess} />
           <Route path="/admin" component={AdminDashboard} />
           <Route path="/admin/repositories" component={Repositories} />
           <Route path="/admin/users" component={Users} />
@@ -51,7 +53,7 @@ render(
         </Route>
       </Router>
 
-      <ToastContainer />
+      <Toaster />
     </>
   ),
   root,
