@@ -42,13 +42,16 @@ function PasswordChangeInner() {
 
     setLoading(true);
     try {
+      // Capture before clearing the flag — reading it afterwards would
+      // always be false and skip the redirect.
+      const wasForced = forced();
       await changePassword(username, currentPw(), newPw());
       session.clearMustChangePassword();
       toasts.success('Password updated');
       setCurrentPw('');
       setNewPw('');
       setConfirmPw('');
-      if (forced()) navigate('/', { replace: true });
+      if (wasForced) navigate('/', { replace: true });
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Could not update the password.');
     }

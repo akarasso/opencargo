@@ -292,6 +292,10 @@ pub async fn list_repositories(
             .await
             .unwrap_or_default();
 
+    // Upstream URLs stay behind authentication: they can carry credentials in
+    // userinfo and reveal internal mirror hosts. Anonymous callers only need
+    // the name/format/visibility to browse.
+    let authenticated = auth.is_some();
     let repositories: Vec<RepoResponse> = repos
         .into_iter()
         .map(|(name, repo_type, format, visibility, upstream)| RepoResponse {
@@ -299,7 +303,7 @@ pub async fn list_repositories(
             repo_type,
             format,
             visibility,
-            upstream,
+            upstream: if authenticated { upstream } else { None },
         })
         .collect();
 
