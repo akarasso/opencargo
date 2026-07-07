@@ -43,3 +43,4 @@ frontend/stitch-*.html
 
 # MCP / tooling logs
 excalidraw.log
+.playwright-mcp/
