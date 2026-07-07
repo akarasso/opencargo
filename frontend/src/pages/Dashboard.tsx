@@ -62,7 +62,8 @@ export default function Dashboard() {
               kind: 'promoted' as const,
               pkg: String(d.package ?? 'package'),
               version: String(d.version ?? ''),
-              detail: `${d.from ?? '?'} → ${d.to ?? '?'}`,
+              // `from` is omitted for private source repos.
+              detail: d.from ? `${d.from} → ${d.to}` : `→ ${d.to ?? '?'}`,
               at: ev.ts ?? '',
               fresh: true,
             },

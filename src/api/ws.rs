@@ -132,16 +132,34 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
                     break;
                 }
                 ticks += 1;
-                // Drop connections whose token was revoked/expired mid-stream.
+                // Re-validate mid-stream: a revoked/expired token, a forced
+                // password rotation, or a role change must not keep streaming
+                // at the visibility level captured at connect time (an
+                // ex-admin would otherwise keep the admin event feed until
+                // they closed the tab). Closing forces the client to
+                // reconnect and re-authenticate at its current level.
                 if ticks % REVALIDATE_EVERY == 0 {
                     if let Some(ref token) = identity.token {
-                        if authenticate_bearer(&state.auth, token).await.is_none() {
-                            let _ = socket
-                                .send(Message::Close(Some(CloseFrame {
-                                    code: CLOSE_UNAUTHORIZED,
-                                    reason: "token no longer valid".into(),
-                                })))
-                                .await;
+                        let violation = match authenticate_bearer(&state.auth, token).await {
+                            None => Some((CLOSE_UNAUTHORIZED, "token no longer valid")),
+                            Some(user) if user.must_change_password => {
+                                Some((CLOSE_FORBIDDEN, "password change required"))
+                            }
+                            Some(user) => {
+                                let fresh_level = if user.role == "admin" {
+                                    Visibility::Admin
+                                } else {
+                                    Visibility::Authenticated
+                                };
+                                if fresh_level != identity.level {
+                                    Some((CLOSE_UNAUTHORIZED, "access level changed — reconnect"))
+                                } else {
+                                    None
+                                }
+                            }
+                        };
+                        if let Some((code, reason)) = violation {
+                            close(&mut socket, code, reason).await;
                             break;
                         }
                     }

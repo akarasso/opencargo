@@ -272,23 +272,29 @@ async fn promote_impl(
         "promoted_by": auth_user.username,
     })).await;
 
-    // Real-time event, scoped by destination repo visibility. Also mirror the
-    // audit entry on the bus so the admin audit view updates live (the entry
-    // above is written directly, not through record_audit).
-    crate::registry::emit_package_event(
-        &state,
-        "package.promoted",
-        &body.to,
-        json!({
-            "package": name,
-            "version": version,
-            "from": body.from,
-            "to": body.to,
-            "repository": body.to,
-            "promoted_by": auth_user.username,
-        }),
-    )
-    .await;
+    // Real-time event, scoped by destination repo visibility. The source repo
+    // name is only included when that repo is itself public: promoting
+    // private → public must not disclose the private staging repo's name to
+    // anonymous/authenticated subscribers (admins get it via audit.entry).
+    let from_is_public = matches!(
+        crate::db::get_repository_by_name(&state.db, &body.from).await,
+        Ok(Some(ref r)) if r.visibility == "public"
+    );
+    let mut event_payload = json!({
+        "package": name,
+        "version": version,
+        "to": body.to,
+        "repository": body.to,
+        "promoted_by": auth_user.username,
+    });
+    if from_is_public {
+        event_payload["from"] = json!(body.from);
+    }
+    crate::registry::emit_package_event(&state, "package.promoted", &body.to, event_payload)
+        .await;
+
+    // Also mirror the audit entry on the bus so the admin audit view updates
+    // live (the entry above is written directly, not through record_audit).
     state.events.emit(
         "audit.entry",
         crate::events::Visibility::Admin,
