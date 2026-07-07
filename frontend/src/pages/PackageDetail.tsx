@@ -1,4 +1,4 @@
-import { For, Show, createResource, createSignal } from 'solid-js';
+import { For, Show, createEffect, createResource, createSignal, on } from 'solid-js';
 import { useParams } from '@solidjs/router';
 import Icon from '../components/Icon.tsx';
 import CopyButton from '../components/CopyButton.tsx';
@@ -45,6 +45,22 @@ export default function PackageDetail() {
   const [vulnData, setVulnData] = createSignal<VulnReport | null>(null);
   const [vulnLoading, setVulnLoading] = createSignal(false);
   const [vulnError, setVulnError] = createSignal<string | null>(null);
+
+  // The router reuses this component across /packages/* navigations; reset
+  // per-package state or the previous package's scan report (and tab) would
+  // be shown attributed to the new one.
+  createEffect(
+    on(
+      packageName,
+      () => {
+        setActiveTab('readme');
+        setVulnData(null);
+        setVulnError(null);
+        setVulnLoading(false);
+      },
+      { defer: true },
+    ),
+  );
 
   // Promotion
   const [showPromote, setShowPromote] = createSignal(false);

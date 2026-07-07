@@ -25,9 +25,10 @@ export default function Toaster() {
       }),
       onEvent('package.promoted', (ev) => {
         const d = ev.data ?? {};
+        // `from` is omitted when the source repo is private.
         toasts.event(
           `${d.package ?? 'package'} ${d.version ?? ''} promoted`,
-          `${d.from ?? '?'} → ${d.to ?? '?'}`,
+          d.from ? `${d.from} → ${d.to}` : `to ${d.to ?? 'repository'}`,
         );
       }),
     ];
