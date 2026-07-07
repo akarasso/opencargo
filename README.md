@@ -12,7 +12,8 @@ Registry de packages universel, leger et auto-heberge, ecrit en Rust.
 - **Dependency graph** : suivi des deps + analyse d'impact
 - **Vulnerability scanning** : scan automatique via OSV.dev
 - **Webhooks** : notifications sur evenements (publish, promote)
-- **UI web** SolidJS embarquee dans le binaire
+- **Temps reel** : WebSocket d'evenements (publications, promotions, audit) — l'UI se met a jour sans recharger
+- **UI web** SolidJS embarquee dans le binaire (dashboard live, matrice de permissions, palette Cmd+K)
 - **Metriques Prometheus** integrees
 - **Recherche full-text** (SQLite FTS5)
 - **Rate limiting** sur les endpoints sensibles
@@ -441,6 +442,27 @@ Resolution des permissions :
 2. Permission specifique dans `user_permissions` → appliquee si presente
 3. Sinon, role par defaut (publisher = read+write, reader = read)
 
+Dans l'UI web : **Admin → Users & access → Access** ouvre la matrice de permissions
+(user × repository, un toggle par droit) ; chaque utilisateur voit ses propres droits
+effectifs et leur origine sur **My access**.
+
+### Consulter ses droits effectifs
+
+```bash
+# Droits effectifs du porteur du token, repo par repo, avec la regle qui les produit
+curl http://localhost:6789/api/v1/me/permissions \
+  -H "Authorization: Bearer mon-token"
+
+# Reponse (extrait) :
+# {"username":"dev1","role":"publisher","permissions":[
+#   {"repository":"npm-dev","format":"npm","visibility":"private",
+#    "can_read":true,"can_write":true,"can_delete":false,"can_admin":false,
+#    "source":"grant"}]}
+```
+
+`source` vaut `admin` (role admin), `grant` (permission explicite), `role` (defaut du
+role) ou `anonymous` (lecture anonyme sur repo public).
+
 ### Creer un utilisateur
 
 ```bash
@@ -470,6 +492,37 @@ curl -X POST http://localhost:6789/api/v1/users/dev1/tokens \
 # Reponse : {"id": "...", "token": "trg_a1b2c3...", ...}
 # Le token brut est retourne UNIQUEMENT a la creation.
 ```
+
+---
+
+## Temps reel (WebSocket)
+
+L'UI web est alimentee par un flux d'evenements sur `GET /api/v1/events/ws`.
+Le navigateur ne pouvant pas poser de header `Authorization` sur un handshake
+WebSocket, l'authentification se fait par le **premier frame** :
+
+```
+→ {"type":"auth","token":"trg_..."}     # ou {"type":"auth"} pour anonyme
+← {"type":"hello","username":"dev1","role":"publisher","anonymous":false}
+← {"type":"package.published","data":{"package":"@scope/pkg","version":"1.2.0",
+    "repository":"npm-dev","format":"npm","published_by":"dev1"},"ts":"..."}
+```
+
+Chaque evenement porte un niveau de visibilite applique cote serveur :
+
+| Evenement | Visibilite | Contenu |
+|-----------|-----------|---------|
+| `package.published`, `package.promoted` (repo public) | tous | payload complet |
+| `package.published`, `package.promoted` (repo prive) | admin | payload complet |
+| `registry.changed` | authentifies | `{repository}` seulement (indice de refetch, sans fuite de noms de packages prives) |
+| `repositories.changed` | tous | vide (la liste refetchee est filtree par l'API REST) |
+| `permissions.changed` | authentifies | `{username}` — les sessions ouvertes rafraichissent leurs droits |
+| `audit.entry` | admin | `{username, action, target}` |
+
+Keepalive : le client peut envoyer `{"type":"ping"}` (reponse `{"type":"pong"}`) ;
+le serveur envoie des pings proto toutes les 30 s et re-valide le token toutes les
+~5 min (un token revoque ferme la connexion, code 4401). En cas de retard de
+lecture, le serveur emet `{"type":"resync"}` : le client doit refetch ce qu'il affiche.
 
 ---
 

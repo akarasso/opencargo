@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+- Real-time event WebSocket at `/api/v1/events/ws` (first-frame token auth,
+  server-side visibility scoping public/authenticated/admin, heartbeat,
+  periodic token re-validation, `resync` marker on lag)
+- `GET /api/v1/me/permissions`: effective per-repository rights for the
+  caller, with the rule that produced them (`admin`/`grant`/`role`/`anonymous`)
+- `whoami` now returns `role` and `must_change_password`
+- Audit entries for previously silent mutations: user update, repository
+  create/update/delete/purge-cache, webhook create/update/delete,
+  permission set/remove
+- Web UI: per-user × per-repository permission matrix editor, "My access"
+  page, repository CRUD, webhook CRUD + test delivery, live audit stream,
+  command palette (Cmd+K), live dashboard manifest fed by the WebSocket
+
+### Changed
+- Web UI redesigned end to end (new design system, self-hosted IBM Plex /
+  Space Grotesk, inline SVG icons, skeleton loaders, mobile drawer); frontend
+  split into a framework-agnostic `core/` layer (typed API client, WebSocket
+  client, reactive stores) and rendering components
+- `GET /api/v1/repositories` returns `type`, `format`, `visibility` and
+  `upstream`, and no longer lists private repositories to anonymous callers
+- Dashboard stats apply the same visibility rules as the package list
+  (anonymous callers no longer see private version/download/repo counts)
+
+### Fixed
+- Production CSP silently blocked Google Fonts and Material Symbols; fonts
+  are now bundled and icons inlined, so typography and iconography render
+  under the strict CSP
+
 ## [0.1.0] - 2026-03-23
 
 ### Added
