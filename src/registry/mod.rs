@@ -124,6 +124,20 @@ pub async fn finalize_publish(
         )
         .await;
 
+    emit_package_event(
+        state,
+        "package.published",
+        repo_name,
+        serde_json::json!({
+            "package": package_name,
+            "version": version_str,
+            "repository": repo_name,
+            "format": ecosystem,
+            "published_by": published_by,
+        }),
+    )
+    .await;
+
     if state.vuln_scan_config.block_on_critical {
         let scan_result = state
             .vuln_scanner
@@ -148,4 +162,36 @@ pub async fn finalize_publish(
         });
     }
     Ok(())
+}
+
+/// Broadcast a package event on the real-time bus, scoped by the repository's
+/// visibility:
+///
+/// - **public repo** — full payload, visible to everyone (incl. anonymous);
+/// - **private repo** — full payload for admins only, plus an anonymized
+///   `registry.changed` hint for authenticated users so their views refetch
+///   without leaking private package names to users lacking read access.
+pub async fn emit_package_event(
+    state: &AppState,
+    event_type: &str,
+    repo_name: &str,
+    payload: serde_json::Value,
+) {
+    use crate::events::Visibility;
+
+    let is_public = matches!(
+        crate::db::get_repository_by_name(&state.db, repo_name).await,
+        Ok(Some(ref repo)) if repo.visibility == "public"
+    );
+
+    if is_public {
+        state.events.emit(event_type, Visibility::Public, payload);
+    } else {
+        state.events.emit(event_type, Visibility::Admin, payload);
+        state.events.emit(
+            "registry.changed",
+            Visibility::Authenticated,
+            serde_json::json!({ "repository": repo_name }),
+        );
+    }
 }

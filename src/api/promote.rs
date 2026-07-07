@@ -272,6 +272,33 @@ async fn promote_impl(
         "promoted_by": auth_user.username,
     })).await;
 
+    // Real-time event, scoped by destination repo visibility. Also mirror the
+    // audit entry on the bus so the admin audit view updates live (the entry
+    // above is written directly, not through record_audit).
+    crate::registry::emit_package_event(
+        &state,
+        "package.promoted",
+        &body.to,
+        json!({
+            "package": name,
+            "version": version,
+            "from": body.from,
+            "to": body.to,
+            "repository": body.to,
+            "promoted_by": auth_user.username,
+        }),
+    )
+    .await;
+    state.events.emit(
+        "audit.entry",
+        crate::events::Visibility::Admin,
+        json!({
+            "username": auth_user.username,
+            "action": "package.promote",
+            "target": target_str,
+        }),
+    );
+
     info!(
         package = %name,
         version = %version,
