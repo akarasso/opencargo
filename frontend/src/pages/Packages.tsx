@@ -1,8 +1,11 @@
-import { createSignal, createResource, For, Show } from 'solid-js';
+import { For, Show, createResource, createSignal } from 'solid-js';
 import { A, useSearchParams } from '@solidjs/router';
-import { fetchPackages, fetchRepositories } from '../lib/api.ts';
-import LoadingSpinner from '../components/LoadingSpinner.tsx';
+import Icon from '../components/Icon.tsx';
 import EmptyState from '../components/EmptyState.tsx';
+import { FormatTag, LoadError, TableSkeleton } from '../components/bits.tsx';
+import { fetchPackages, fetchRepositories } from '../core/api.ts';
+import { useLive } from '../core/stores/live.ts';
+import { formatNumber, timeAgo } from '../core/format.ts';
 
 function paramStr(val: string | string[] | undefined): string {
   if (Array.isArray(val)) return val[0] ?? '';
@@ -19,165 +22,149 @@ export default function Packages() {
   const [inputValue, setInputValue] = createSignal(query());
 
   const [repos] = createResource(fetchRepositories);
-  const [data] = createResource(
+  const [data, { refetch }] = createResource(
     () => ({ q: query(), repo: repoFilter(), page: page() }),
     fetchPackages,
   );
+  useLive(refetch, ['package.published', 'package.promoted', 'registry.changed']);
 
   let debounceTimer: ReturnType<typeof setTimeout> | undefined;
-
   function handleInput(value: string) {
     setInputValue(value);
     clearTimeout(debounceTimer);
     debounceTimer = setTimeout(() => {
       setSearchParams({ q: value || undefined, page: '1' });
-    }, 300);
+    }, 280);
   }
 
-  function handleRepoChange(value: string) {
-    setSearchParams({ repo: value || undefined, page: '1' });
-  }
-
-  function goToPage(p: number) {
-    setSearchParams({ page: String(p) });
-  }
+  const totalPages = () => {
+    const d = data();
+    return d ? Math.max(1, Math.ceil(d.total / d.page_size)) : 1;
+  };
 
   return (
-    <>
-      {/* Header -- matches Stitch packages page */}
-      <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'center', "margin-bottom": '2rem' }}>
-        <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.25rem' }}>
-          <div style={{ display: 'flex', "align-items": 'center', gap: '0.5rem' }}>
-            <div style={{ width: '6px', height: '6px', background: 'var(--clr-primary)', "border-radius": '50%' }} class="status-led-animated" />
-            <span style={{ "font-family": "var(--font-label)", "font-size": "0.625rem", "text-transform": "uppercase", "letter-spacing": "0.2em", color: "var(--clr-primary)", "font-weight": "700" }}>Live Registry Stream</span>
-          </div>
-          <h1 style={{ "font-size": '2.5rem', "font-family": 'var(--font-headline)', "font-weight": '700', "letter-spacing": '-0.025em', color: 'var(--clr-on-surface)' }}>Package Registry</h1>
+    <div class="page-enter">
+      <div class="page-head">
+        <div>
+          <h1 class="page-title">Packages</h1>
+          <p class="page-sub">Everything published to or cached by this registry.</p>
         </div>
       </div>
 
-      {/* Filters Bar -- matches Stitch */}
-      <div style={{ display: 'flex', gap: '1rem', "margin-bottom": '2rem' }}>
-        <div style={{ flex: '1', position: 'relative' }}>
-          <span class="material-symbols-outlined" style={{ position: 'absolute', left: '1rem', top: '50%', transform: 'translateY(-50%)', color: 'rgb(100, 116, 139)' }}>search</span>
+      <div class="filter-bar">
+        <div class="search-box">
+          <Icon name="search" size={15} />
           <input
-            style={{ width: '100%', background: 'var(--clr-surface-container)', border: 'none', "border-radius": '0.5rem', padding: '1rem 1rem 1rem 3rem', color: 'var(--clr-on-surface)', "font-family": 'var(--font-body)', "font-size": '0.875rem', outline: 'none' }}
+            class="input"
             type="text"
             value={inputValue()}
             onInput={(e) => handleInput(e.currentTarget.value)}
-            placeholder="Filter packages by name or hash..."
-            onFocus={(e) => { e.currentTarget.style.boxShadow = '0 0 0 2px rgba(123, 231, 249, 0.2)'; }}
-            onBlur={(e) => { e.currentTarget.style.boxShadow = 'none'; }}
+            placeholder="Filter by package name…"
+            spellcheck={false}
           />
         </div>
-        <Show when={repos()}>
-          {(r) => (
-            <Show when={r().repositories.length > 0}>
-              <div style={{ width: '256px', position: 'relative' }}>
-                <select
-                  class="filter-select"
-                  style={{ width: '100%' }}
-                  value={repoFilter()}
-                  onChange={(e) => handleRepoChange(e.currentTarget.value)}
-                >
-                  <option value="">Repo: All</option>
-                  <For each={r().repositories}>
-                    {(repo) => <option value={repo.name}>Repo: {repo.name}</option>}
-                  </For>
-                </select>
-                <span class="material-symbols-outlined" style={{ position: 'absolute', right: '1rem', top: '50%', transform: 'translateY(-50%)', color: 'rgb(100, 116, 139)', "pointer-events": 'none' }}>expand_more</span>
-              </div>
-            </Show>
-          )}
+        <Show when={(repos()?.repositories.length ?? 0) > 0}>
+          <select
+            class="select"
+            value={repoFilter()}
+            onChange={(e) => setSearchParams({ repo: e.currentTarget.value || undefined, page: '1' })}
+          >
+            <option value="">All repositories</option>
+            <For each={repos()?.repositories}>
+              {(repo) => <option value={repo.name}>{repo.name}</option>}
+            </For>
+          </select>
         </Show>
       </div>
 
-      <Show when={data.loading}>
-        <LoadingSpinner />
-      </Show>
-
       <Show when={data.error}>
-        <div class="alert alert-error">Failed to load packages.</div>
+        <LoadError what="packages" />
       </Show>
 
-      <Show when={data()}>
+      <Show when={data()} fallback={<TableSkeleton rows={8} cols={5} />}>
         {(d) => (
-          <>
-            <Show
-              when={d().packages.length > 0}
-              fallback={
+          <Show
+            when={d().packages.length > 0}
+            fallback={
+              <div class="card">
                 <EmptyState
-                  title="No packages found"
-                  text={query() ? `No packages match "${query()}".` : 'No packages have been published yet.'}
+                  icon="package"
+                  title={query() ? 'No matches' : 'No packages yet'}
+                  text={
+                    query()
+                      ? `Nothing matches “${query()}”${repoFilter() ? ` in ${repoFilter()}` : ''}.`
+                      : 'Publish a package or install through a proxy repository and it will show up here.'
+                  }
                 />
-              }
-            >
-              {/* Registry Table -- matches Stitch */}
-              <div class="data-table-wrapper">
-                <div style={{ "overflow-x": 'auto' }}>
-                  <table class="data-table">
-                    <thead>
-                      <tr>
-                        <th>Package Entity</th>
-                        <th>Version Hash</th>
-                        <th>Description Metadata</th>
-                        <th>Sync Load</th>
-                        <th>Committed</th>
-                      </tr>
-                    </thead>
-                    <tbody>
-                      <For each={d().packages}>
-                        {(p) => (
-                          <tr>
-                            <td>
-                              <A href={`/packages/${p.name}`} style={{ "font-family": 'var(--font-mono)', "font-size": '0.875rem', color: 'var(--clr-primary)', "text-decoration": 'none' }}>
-                                {p.name}
-                              </A>
-                            </td>
-                            <td>
-                              <span style={{ background: 'rgba(123, 231, 249, 0.1)', color: 'var(--clr-primary)', padding: '0.125rem 0.5rem', "border-radius": 'var(--radius-sm)', "font-size": '0.625rem', "font-weight": '700', "letter-spacing": '0.05em', "font-family": 'var(--font-headline)' }}>{p.latest_version}</span>
-                            </td>
-                            <td style={{ "font-size": '0.875rem', color: 'rgb(148, 163, 184)' }}>{p.description || '--'}</td>
-                            <td style={{ "font-size": '0.875rem', "font-family": 'var(--font-mono)', color: 'var(--clr-secondary-fixed-dim)' }}>{p.downloads.toLocaleString()}</td>
-                            <td style={{ "font-size": '0.75rem', color: 'rgb(100, 116, 139)', "text-transform": 'uppercase', "letter-spacing": '0.2em' }}>{p.published_at}</td>
-                          </tr>
-                        )}
-                      </For>
-                    </tbody>
-                  </table>
+              </div>
+            }
+          >
+            <div class="table-card">
+              <div class="table-scroll">
+                <table class="table">
+                  <thead>
+                    <tr>
+                      <th>Package</th>
+                      <th>Latest</th>
+                      <th class="cell-hide-sm">Description</th>
+                      <th style={{ 'text-align': 'right' }}>Downloads</th>
+                      <th style={{ 'text-align': 'right' }}>Updated</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    <For each={d().packages}>
+                      {(p) => (
+                        <tr>
+                          <td>
+                            <A class="row-link" href={`/packages/${p.name}`}>
+                              {p.name}
+                            </A>
+                          </td>
+                          <td>
+                            <span class="version">{p.latest_version}</span>
+                          </td>
+                          <td class="cell-muted cell-hide-sm truncate" style={{ 'max-width': '340px' }}>
+                            {p.description || '—'}
+                          </td>
+                          <td class="cell-mono cell-num" style={{ 'text-align': 'right' }}>
+                            {formatNumber(p.downloads)}
+                          </td>
+                          <td class="cell-dim nowrap" style={{ 'text-align': 'right' }} title={p.published_at}>
+                            {timeAgo(p.published_at)}
+                          </td>
+                        </tr>
+                      )}
+                    </For>
+                  </tbody>
+                </table>
+              </div>
+              <div class="pagination">
+                <span class="pagination-info">
+                  Page {d().page} / {totalPages()} · {formatNumber(d().total)} packages
+                </span>
+                <div class="pagination-nav">
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    disabled={d().page <= 1}
+                    onClick={() => setSearchParams({ page: String(d().page - 1) })}
+                  >
+                    <Icon name="chevron-left" size={14} />
+                    Prev
+                  </button>
+                  <button
+                    class="btn btn-ghost btn-sm"
+                    disabled={!d().has_next}
+                    onClick={() => setSearchParams({ page: String(d().page + 1) })}
+                  >
+                    Next
+                    <Icon name="chevron-right" size={14} />
+                  </button>
                 </div>
               </div>
-
-              {/* Pagination -- matches Stitch */}
-              <div style={{ "margin-top": '2rem', background: 'var(--clr-surface-container-low)', padding: '1rem', "border-radius": '0.5rem', border: '1px solid rgba(255, 255, 255, 0.05)', display: 'flex', "justify-content": 'space-between', "align-items": 'center' }}>
-                <div style={{ display: 'flex', "align-items": 'center', gap: '1rem' }}>
-                  <p style={{ "font-family": 'var(--font-headline)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "font-size": '0.625rem', color: 'rgb(100, 116, 139)', "margin-bottom": '0' }}>Page {d().page} of {Math.ceil(d().total / d().page_size) || 1}</p>
-                  <div style={{ height: '4px', width: '96px', background: 'rgba(255, 255, 255, 0.05)', "border-radius": '9999px', overflow: 'hidden' }}>
-                    <div style={{ height: '100%', background: 'var(--clr-primary)', width: `${Math.min(100, (d().page / (Math.ceil(d().total / d().page_size) || 1)) * 100)}%` }} />
-                  </div>
-                </div>
-                <div style={{ display: 'flex', gap: '0.5rem' }}>
-                  <Show when={d().page > 1}>
-                    <button
-                      onClick={() => goToPage(d().page - 1)}
-                      style={{ width: '40px', height: '40px', display: 'flex', "align-items": 'center', "justify-content": 'center', "border-radius": 'var(--radius-sm)', background: 'var(--clr-surface-container-high)', border: '1px solid rgba(255, 255, 255, 0.05)', color: 'var(--clr-on-surface)', cursor: 'pointer' }}
-                    >
-                      <span class="material-symbols-outlined">chevron_left</span>
-                    </button>
-                  </Show>
-                  <Show when={d().has_next}>
-                    <button
-                      onClick={() => goToPage(d().page + 1)}
-                      style={{ width: '40px', height: '40px', display: 'flex', "align-items": 'center', "justify-content": 'center', "border-radius": 'var(--radius-sm)', background: 'var(--clr-surface-container-high)', border: '1px solid rgba(255, 255, 255, 0.05)', color: 'var(--clr-on-surface)', cursor: 'pointer' }}
-                    >
-                      <span class="material-symbols-outlined">chevron_right</span>
-                    </button>
-                  </Show>
-                </div>
-              </div>
-            </Show>
-          </>
+            </div>
+          </Show>
         )}
       </Show>
-    </>
+    </div>
   );
 }

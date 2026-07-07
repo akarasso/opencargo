@@ -1,210 +1,255 @@
-import { createResource, createSignal, For, Show } from 'solid-js';
+import { For, Show, createResource, createSignal } from 'solid-js';
 import { useParams } from '@solidjs/router';
+import Icon from '../components/Icon.tsx';
+import CopyButton from '../components/CopyButton.tsx';
+import EmptyState from '../components/EmptyState.tsx';
+import Modal from '../components/Modal.tsx';
+import { LoadError, TableSkeleton } from '../components/bits.tsx';
 import {
-  fetchPackageDetail,
   fetchDependencies,
   fetchDependents,
-  fetchVulns,
-  rescanVulns,
-  promotePackage,
+  fetchPackageDetail,
   fetchRepositories,
-} from '../lib/api.ts';
-import type { Dependency, Dependent, VulnReport } from '../lib/api.ts';
-import CopyButton from '../components/CopyButton.tsx';
-import LoadingSpinner from '../components/LoadingSpinner.tsx';
-import auth from '../lib/auth.ts';
+  fetchVulns,
+  promotePackage,
+  rescanVulns,
+} from '../core/api.ts';
+import { useLive } from '../core/stores/live.ts';
+import { session } from '../core/stores/session.ts';
+import { toasts } from '../core/stores/toasts.ts';
+import { formatNumber, timeAgo } from '../core/format.ts';
+import type { VulnReport } from '../core/types.ts';
 
 type Tab = 'readme' | 'versions' | 'dependencies' | 'security';
+
+const SEVERITY_CHIP: Record<string, string> = {
+  critical: 'chip-danger',
+  high: 'chip-danger',
+  medium: 'chip-warn',
+  moderate: 'chip-warn',
+  low: 'chip-info',
+};
 
 export default function PackageDetail() {
   const params = useParams<{ path: string }>();
   const packageName = () => params.path;
 
-  const [data] = createResource(packageName, fetchPackageDetail);
-  const [activeTab, setActiveTab] = createSignal<Tab>('readme');
+  const [data, { refetch }] = createResource(packageName, fetchPackageDetail);
+  useLive(refetch, ['package.published', 'package.promoted', 'registry.changed']);
 
-  // Dependencies data (loaded lazily when tab is activated)
+  const [activeTab, setActiveTab] = createSignal<Tab>('readme');
   const [deps] = createResource(packageName, fetchDependencies);
   const [dependents] = createResource(packageName, fetchDependents);
 
-  // Vuln data (loaded lazily when tab is activated or version is available)
+  // Vulnerabilities load on first visit to the Security tab.
   const [vulnData, setVulnData] = createSignal<VulnReport | null>(null);
   const [vulnLoading, setVulnLoading] = createSignal(false);
   const [vulnError, setVulnError] = createSignal<string | null>(null);
 
-  // Promote modal
+  // Promotion
   const [showPromote, setShowPromote] = createSignal(false);
   const [promoteFrom, setPromoteFrom] = createSignal('');
   const [promoteTo, setPromoteTo] = createSignal('');
   const [promoteLoading, setPromoteLoading] = createSignal(false);
-  const [promoteMsg, setPromoteMsg] = createSignal<string | null>(null);
   const [repos] = createResource(fetchRepositories);
 
-  async function loadVulns() {
+  const latestVersion = () => data()?.versions[0]?.version ?? '';
+  const canPromote = () => session.canWriteAnywhere();
+  const writableRepos = () =>
+    (repos()?.repositories ?? []).filter(
+      (r) => r.type === 'hosted' && (session.permissionFor(r.name)?.can_write ?? false),
+    );
+  const sourceRepos = () => (repos()?.repositories ?? []).filter((r) => r.type === 'hosted');
+
+  async function loadVulns(force = false) {
     const d = data();
     if (!d || d.versions.length === 0) return;
-    const version = d.versions[0].version;
     setVulnLoading(true);
     setVulnError(null);
     try {
-      const report = await fetchVulns(d.name, version);
-      setVulnData(report);
-    } catch (e: any) {
-      setVulnError(e.message || 'Failed to load vulnerability data');
+      const fn = force ? rescanVulns : fetchVulns;
+      setVulnData(await fn(d.name, d.versions[0].version));
+    } catch (e: unknown) {
+      setVulnError(e instanceof Error ? e.message : 'Scan unavailable');
     }
     setVulnLoading(false);
-  }
-
-  async function handleRescan() {
-    const d = data();
-    if (!d || d.versions.length === 0) return;
-    const version = d.versions[0].version;
-    setVulnLoading(true);
-    setVulnError(null);
-    try {
-      const report = await rescanVulns(d.name, version);
-      setVulnData(report);
-    } catch (e: any) {
-      setVulnError(e.message || 'Rescan failed');
-    }
-    setVulnLoading(false);
-  }
-
-  async function handlePromote() {
-    const d = data();
-    if (!d || d.versions.length === 0) return;
-    setPromoteLoading(true);
-    setPromoteMsg(null);
-    try {
-      const result = await promotePackage(d.name, d.versions[0].version, promoteFrom(), promoteTo());
-      setPromoteMsg(result.message || 'Promoted successfully');
-    } catch (e: any) {
-      setPromoteMsg(e.message || 'Promotion failed');
-    }
-    setPromoteLoading(false);
-  }
-
-  function getInstallCommand(name: string): string {
-    return `pnpm add ${name}`;
   }
 
   function onTabChange(tab: Tab) {
     setActiveTab(tab);
-    if (tab === 'security' && !vulnData() && !vulnLoading()) {
-      loadVulns();
+    if (tab === 'security' && !vulnData() && !vulnLoading()) void loadVulns();
+  }
+
+  async function handlePromote() {
+    const d = data();
+    if (!d) return;
+    setPromoteLoading(true);
+    try {
+      await promotePackage(d.name, latestVersion(), promoteFrom(), promoteTo());
+      toasts.success(`${d.name} ${latestVersion()} promoted`, `${promoteFrom()} → ${promoteTo()}`);
+      setShowPromote(false);
+      void refetch();
+    } catch (e: unknown) {
+      toasts.error('Promotion failed', e instanceof Error ? e.message : undefined);
     }
+    setPromoteLoading(false);
   }
 
   return (
-    <>
-      <Show when={data.loading}>
-        <LoadingSpinner />
-      </Show>
-
+    <div class="page-enter">
       <Show when={data.error}>
-        <div class="alert alert-error">Package not found or failed to load.</div>
+        <LoadError what="this package" detail="It may not exist, or you may not have read access to its repository." />
       </Show>
 
-      <Show when={data()}>
-        {(d) => {
-          const latestVersion = () => d().versions.length > 0 ? d().versions[0].version : '';
-
-          return (
-            <div style={{ "max-width": '80rem', margin: '0 auto', padding: '2.5rem 2rem' }}>
-              {/* Technical Scaffolding Header -- matches Stitch detail page */}
-              <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'flex-end', "margin-bottom": '2rem', "border-bottom": '1px solid rgba(255, 255, 255, 0.05)', "padding-bottom": '1.5rem' }}>
-                <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.5rem' }}>
-                  <div style={{ display: 'flex', "align-items": 'center', gap: '0.75rem', "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-outline)' }}>
-                    <span>REGISTRY_NODE: 0x44F</span>
-                    <span style={{ width: '4px', height: '4px', background: 'var(--clr-primary)', "border-radius": '50%' }} class="status-led-animated" />
-                    <span>STATUS: ACTIVE</span>
-                  </div>
-                  <h1 style={{ "font-size": '3rem', "font-weight": '700', "font-family": 'var(--font-headline)', color: 'var(--clr-on-background)', "letter-spacing": '-0.05em' }}>{d().name}</h1>
-                  <Show when={d().description}>
-                    <p style={{ color: 'var(--clr-on-surface-variant)', "font-size": '1.125rem', "max-width": '42rem', "font-family": 'var(--font-body)' }}>{d().description}</p>
-                  </Show>
-                </div>
-                <div style={{ display: 'flex', "align-items": 'center', gap: '1rem' }}>
+      <Show
+        when={data()}
+        fallback={
+          <Show when={!data.error}>
+            <div>
+              <div class="skeleton" style={{ width: '40%', height: '30px', 'margin-bottom': '10px' }} />
+              <div class="skeleton skeleton-text" style={{ width: '60%', 'margin-bottom': '24px' }} />
+              <TableSkeleton rows={6} cols={3} />
+            </div>
+          </Show>
+        }
+      >
+        {(d) => (
+          <>
+            <div class="page-head">
+              <div class="grow">
+                <div class="row" style={{ 'margin-bottom': '4px' }}>
+                  <h1 class="page-title mono" style={{ 'font-family': 'var(--font-mono)', 'font-weight': 500 }}>
+                    {d().name}
+                  </h1>
+                  <span class="version" style={{ 'font-size': '0.8rem' }}>
+                    {latestVersion()}
+                  </span>
                   <Show when={d().license}>
-                    <span style={{ padding: '0.25rem 0.75rem', background: 'var(--clr-surface-container-high)', color: 'var(--clr-primary)', border: '1px solid rgba(123, 231, 249, 0.2)', "border-radius": '0.375rem', "font-size": '0.75rem', "font-weight": '700', "font-family": 'var(--font-headline)', "letter-spacing": '0.2em', "text-transform": 'uppercase' }}>{d().license}</span>
+                    <span class="chip chip-neutral">{d().license}</span>
                   </Show>
                 </div>
+                <Show when={d().description}>
+                  <p class="page-sub">{d().description}</p>
+                </Show>
               </div>
+              <div class="page-actions">
+                <Show when={canPromote()}>
+                  <button class="btn btn-primary" onClick={() => setShowPromote(true)}>
+                    <Icon name="arrow-up-right" size={14} />
+                    Promote
+                  </button>
+                </Show>
+              </div>
+            </div>
 
-              {/* Two-Column Grid -- matches Stitch */}
-              <div class="pkg-grid">
-                {/* Left Column */}
-                <div style={{ display: 'flex', "flex-direction": 'column', gap: '2.5rem' }}>
-                  {/* Installation Block */}
-                  <section style={{ display: 'flex', "flex-direction": 'column', gap: '1rem' }}>
-                    <h3 style={{ "font-size": '0.625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-outline)', "margin-bottom": '0' }}>Quick Install</h3>
-                    <div class="code-block">
-                      <code style={{ "font-family": 'var(--font-mono)', color: 'var(--clr-secondary)', "font-size": '1.125rem' }}>{getInstallCommand(d().name)}</code>
-                      <CopyButton text={getInstallCommand(d().name)} />
-                    </div>
-                  </section>
+            <div class="detail-grid">
+              <div>
+                <div class="code-line" style={{ 'margin-bottom': '18px' }}>
+                  <code>
+                    <span class="accent">pnpm</span> add {d().name}
+                  </code>
+                  <CopyButton text={`pnpm add ${d().name}`} />
+                </div>
 
-                  {/* Content Tabs -- matches Stitch */}
-                  <section>
-                    <div class="pkg-tabs">
+                <div class="tabs" role="tablist">
+                  <For
+                    each={[
+                      ['readme', 'Readme'],
+                      ['versions', `Versions · ${d().versions.length}`],
+                      ['dependencies', 'Dependencies'],
+                      ['security', 'Security'],
+                    ] as [Tab, string][]}
+                  >
+                    {([tab, label]) => (
                       <button
-                        class={`pkg-tab ${activeTab() === 'readme' ? 'pkg-tab-active' : ''}`}
-                        onClick={() => onTabChange('readme')}
+                        class={`tab ${activeTab() === tab ? 'active' : ''}`}
+                        role="tab"
+                        aria-selected={activeTab() === tab}
+                        onClick={() => onTabChange(tab)}
                       >
-                        README
+                        {label}
                       </button>
-                      <button
-                        class={`pkg-tab ${activeTab() === 'versions' ? 'pkg-tab-active' : ''}`}
-                        onClick={() => onTabChange('versions')}
-                      >
-                        Versions
-                      </button>
-                      <button
-                        class={`pkg-tab ${activeTab() === 'dependencies' ? 'pkg-tab-active' : ''}`}
-                        onClick={() => onTabChange('dependencies')}
-                      >
-                        Dependencies
-                      </button>
-                      <button
-                        class={`pkg-tab ${activeTab() === 'security' ? 'pkg-tab-active' : ''}`}
-                        onClick={() => onTabChange('security')}
-                      >
-                        Security
-                      </button>
-                    </div>
+                    )}
+                  </For>
+                </div>
 
-                    {/* Readme tab */}
-                    <Show when={activeTab() === 'readme'}>
-                      <Show
-                        when={d().readme_html}
-                        fallback={
-                          <div class="card">
-                            <p style={{ color: 'var(--clr-on-surface-variant)' }}>No README available.</p>
-                          </div>
-                        }
-                      >
-                        <div class="readme-content" innerHTML={d().readme_html} />
-                      </Show>
-                    </Show>
+                {/* Readme */}
+                <Show when={activeTab() === 'readme'}>
+                  <Show
+                    when={d().readme_html}
+                    fallback={
+                      <div class="card">
+                        <EmptyState icon="package" title="No readme" text="This package was published without one." />
+                      </div>
+                    }
+                  >
+                    <div class="card card-pad readme" innerHTML={d().readme_html} />
+                  </Show>
+                </Show>
 
-                    {/* Versions tab */}
-                    <Show when={activeTab() === 'versions'}>
-                      <div class="data-table-wrapper">
-                        <table class="data-table">
+                {/* Versions */}
+                <Show when={activeTab() === 'versions'}>
+                  <div class="table-card">
+                    <table class="table">
+                      <thead>
+                        <tr>
+                          <th>Version</th>
+                          <th>Size</th>
+                          <th style={{ 'text-align': 'right' }}>Published</th>
+                        </tr>
+                      </thead>
+                      <tbody>
+                        <For each={d().versions}>
+                          {(v) => (
+                            <tr>
+                              <td>
+                                <span class="version">{v.version}</span>
+                              </td>
+                              <td class="cell-mono cell-muted">{v.size_display}</td>
+                              <td class="cell-dim nowrap" style={{ 'text-align': 'right' }} title={v.published_at}>
+                                {timeAgo(v.published_at)}
+                              </td>
+                            </tr>
+                          )}
+                        </For>
+                      </tbody>
+                    </table>
+                  </div>
+                </Show>
+
+                {/* Dependencies */}
+                <Show when={activeTab() === 'dependencies'}>
+                  <Show when={!deps.loading} fallback={<TableSkeleton rows={4} cols={3} />}>
+                    <Show
+                      when={(deps() ?? []).length > 0}
+                      fallback={
+                        <div class="card">
+                          <EmptyState icon="layers" title="No dependencies recorded" text="Nothing declared, or metadata hasn't been indexed yet." />
+                        </div>
+                      }
+                    >
+                      <div class="table-card">
+                        <table class="table">
                           <thead>
                             <tr>
-                              <th>Version</th>
-                              <th>Size</th>
-                              <th>Published</th>
+                              <th>Name</th>
+                              <th>Requirement</th>
+                              <th style={{ 'text-align': 'right' }}>Type</th>
                             </tr>
                           </thead>
                           <tbody>
-                            <For each={d().versions}>
-                              {(v) => (
+                            <For each={deps()}>
+                              {(dep) => (
                                 <tr>
-                                  <td><span class="badge badge-mono">{v.version}</span></td>
-                                  <td class="data-table-muted">{v.size_display}</td>
-                                  <td class="data-table-muted">{v.published_at}</td>
+                                  <td class="cell-mono" style={{ color: 'var(--ink)' }}>
+                                    {dep.name}
+                                  </td>
+                                  <td class="cell-mono cell-muted">{dep.version_req}</td>
+                                  <td style={{ 'text-align': 'right' }}>
+                                    <span class={`chip ${dep.dep_type === 'dev' ? 'chip-neutral' : 'chip-info'}`}>
+                                      {dep.dep_type}
+                                    </span>
+                                  </td>
                                 </tr>
                               )}
                             </For>
@@ -212,326 +257,201 @@ export default function PackageDetail() {
                         </table>
                       </div>
                     </Show>
+                  </Show>
 
-                    {/* Dependencies tab -- matches Stitch v2-detail-full.html Dependencies table */}
-                    <Show when={activeTab() === 'dependencies'}>
-                      <Show when={deps.loading}>
-                        <LoadingSpinner />
-                      </Show>
-                      <Show when={deps.error}>
-                        <div class="card">
-                          <p style={{ color: 'var(--clr-on-surface-variant)' }}>Could not load dependency information.</p>
-                        </div>
-                      </Show>
-                      <Show when={deps()}>
-                        {(depsData) => (
-                          <>
-                            <Show when={depsData().length === 0}>
-                              <div class="card">
-                                <p style={{ color: 'var(--clr-on-surface-variant)' }}>No dependency information available.</p>
-                              </div>
-                            </Show>
-                            <Show when={depsData().length > 0}>
-                              <div class="data-table-wrapper">
-                                <table class="data-table">
-                                  <thead>
-                                    <tr>
-                                      <th>Name</th>
-                                      <th>Version Req</th>
-                                      <th style={{ "text-align": 'right' }}>Type</th>
-                                    </tr>
-                                  </thead>
-                                  <tbody>
-                                    <For each={depsData()}>
-                                      {(dep: Dependency) => (
-                                        <tr>
-                                          <td>
-                                            <span style={{ color: dep.dep_type === 'runtime' ? 'var(--clr-primary)' : 'var(--clr-on-surface)', "font-weight": '500' }}>{dep.name}</span>
-                                          </td>
-                                          <td style={{ "font-family": 'var(--font-mono)', "font-size": '0.875rem', color: 'var(--clr-on-surface-variant)' }}>{dep.version_req}</td>
-                                          <td style={{ "text-align": 'right' }}>
-                                            <span class={`badge ${dep.dep_type === 'dev' ? 'badge-default' : 'badge-default'}`}
-                                              style={{ background: dep.dep_type === 'dev' ? 'var(--clr-surface-container-highest)' : 'rgba(123, 231, 249, 0.1)', color: dep.dep_type === 'dev' ? 'var(--clr-on-surface-variant)' : 'var(--clr-primary)' }}
-                                            >
-                                              {dep.dep_type}
-                                            </span>
-                                          </td>
-                                        </tr>
-                                      )}
-                                    </For>
-                                  </tbody>
-                                </table>
-                              </div>
-                            </Show>
+                  <Show when={(dependents() ?? []).length > 0}>
+                    <div class="section-head" style={{ 'margin-top': '20px' }}>
+                      <span class="section-title">Used by</span>
+                      <span class="dim small">{dependents()!.length} package(s) in this registry</span>
+                    </div>
+                    <div class="grid-cards">
+                      <For each={dependents()}>
+                        {(dep) => (
+                          <div class="card card-pad row">
+                            <Icon name="package" size={15} class="icon dim" />
+                            <span class="mono grow truncate" style={{ color: 'var(--ink)' }}>
+                              {dep.name}
+                            </span>
+                            <span class="version">{dep.version}</span>
+                          </div>
+                        )}
+                      </For>
+                    </div>
+                  </Show>
+                </Show>
 
-                            {/* Dependents section */}
-                            <Show when={dependents() && (dependents() as Dependent[]).length > 0}>
-                              <div style={{ "margin-top": '2rem' }}>
-                                <h3 style={{ "font-size": '0.875rem', "font-family": 'var(--font-headline)', "text-transform": 'uppercase', "letter-spacing": '0.1em', color: 'var(--clr-on-surface)', "margin-bottom": '1rem', "font-weight": '700' }}>
-                                  <span class="material-symbols-outlined" style={{ "font-size": '18px', color: 'var(--clr-primary)', "margin-right": '0.5rem', "vertical-align": 'middle' }}>hub</span>
-                                  Dependents
-                                </h3>
-                                <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.75rem' }}>
-                                  <For each={dependents() as Dependent[]}>
-                                    {(dep) => (
-                                      <div class="dep-card">
-                                        <div style={{ display: 'flex', "align-items": 'center', gap: '0.75rem' }}>
-                                          <div style={{ width: '40px', height: '40px', "border-radius": '0.5rem', background: 'var(--clr-surface-container-highest)', display: 'flex', "align-items": 'center', "justify-content": 'center', border: '1px solid rgba(67, 72, 78, 0.2)' }}>
-                                            <span class="material-symbols-outlined" style={{ color: 'var(--clr-primary)', "font-size": '20px' }}>web</span>
-                                          </div>
-                                          <div>
-                                            <div style={{ "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-on-surface)' }}>{dep.name}</div>
-                                            <div style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'var(--clr-on-surface-variant)' }}>{dep.version}</div>
-                                          </div>
-                                        </div>
-                                      </div>
-                                    )}
-                                  </For>
-                                </div>
-                              </div>
-                            </Show>
-                          </>
+                {/* Security */}
+                <Show when={activeTab() === 'security'}>
+                  <div class="section-head">
+                    <div class="row">
+                      <span class="section-title">Vulnerability scan</span>
+                      <Show when={vulnData()}>
+                        {(vd) => (
+                          <span class={`chip ${vd().vulnerabilities.length === 0 ? 'chip-ok' : 'chip-danger'}`}>
+                            {vd().vulnerabilities.length === 0
+                              ? 'clean'
+                              : `${vd().vulnerabilities.length} finding(s)`}
+                          </span>
                         )}
                       </Show>
-                    </Show>
-
-                    {/* Security tab -- matches Stitch v2-detail-full.html Security section */}
-                    <Show when={activeTab() === 'security'}>
-                      <section class="vuln-section">
-                        <div style={{ display: 'flex', "align-items": 'center', "justify-content": 'space-between', "margin-bottom": '1.5rem' }}>
-                          <h3 style={{ "font-family": 'var(--font-headline)', "text-transform": 'uppercase', "letter-spacing": '0.1em', "font-size": '0.875rem', "font-weight": '700', color: 'var(--clr-on-surface)', display: 'flex', "align-items": 'center', gap: '0.75rem', "margin-bottom": '0' }}>
-                            <span class="material-symbols-outlined" style={{ color: 'var(--clr-primary)' }}>verified_user</span>
-                            Security Status
-                          </h3>
-                          <div style={{ display: 'flex', "align-items": 'center', gap: '0.75rem' }}>
-                            <Show when={vulnData()}>
-                              {(vd) => (
-                                <>
-                                  <Show when={vd().vulnerabilities.length === 0}>
-                                    <div class="vuln-status-badge vuln-status-clean">
-                                      <span class="vuln-status-led vuln-status-led-green" />
-                                      <span>No vulnerabilities</span>
-                                    </div>
-                                  </Show>
-                                  <Show when={vd().vulnerabilities.length > 0}>
-                                    <div class="vuln-status-badge vuln-status-danger">
-                                      <span class="vuln-status-led vuln-status-led-red" />
-                                      <span>{vd().vulnerabilities.length} vulnerabilit{vd().vulnerabilities.length === 1 ? 'y' : 'ies'}</span>
-                                    </div>
-                                  </Show>
-                                  <Show when={vd().scanned_at}>
-                                    <span style={{ "font-size": '0.625rem', "font-family": 'var(--font-headline)', "text-transform": 'uppercase', "letter-spacing": '0.1em', color: 'var(--clr-on-surface-variant)' }}>
-                                      Last Scan: {vd().scanned_at}
-                                    </span>
-                                  </Show>
-                                </>
-                              )}
-                            </Show>
-                            <button class="btn btn-sm btn-secondary" onClick={handleRescan} disabled={vulnLoading()}>
-                              <span class="material-symbols-outlined" style={{ "font-size": '14px' }}>refresh</span>
-                              Rescan
-                            </button>
-                          </div>
-                        </div>
-
-                        <Show when={vulnLoading()}>
-                          <LoadingSpinner />
-                        </Show>
-
-                        <Show when={vulnError()}>
-                          <div class="alert alert-error">{vulnError()}</div>
-                        </Show>
-
-                        <Show when={vulnData()}>
-                          {(vd) => (
-                            <>
-                              <Show when={vd().vulnerabilities.length === 0}>
-                                <div class="vuln-empty-state">
-                                  <span class="material-symbols-outlined" style={{ "font-size": '3rem', color: 'var(--clr-on-surface-variant)', "margin-bottom": '1rem' }}>security_update_good</span>
-                                  <p style={{ "font-size": '0.625rem', "font-family": 'var(--font-headline)', "text-transform": 'uppercase', "letter-spacing": '0.1em', color: 'var(--clr-on-surface-variant)', "font-weight": '500' }}>
-                                    Audit complete. No CVEs identified in current version graph.
-                                  </p>
-                                </div>
-                              </Show>
-
-                              <Show when={vd().vulnerabilities.length > 0}>
-                                <div class="data-table-wrapper">
-                                  <table class="data-table">
-                                    <thead>
-                                      <tr>
-                                        <th>CVE ID</th>
-                                        <th>Severity</th>
-                                        <th>Title</th>
-                                        <th>Fixed In</th>
-                                      </tr>
-                                    </thead>
-                                    <tbody>
-                                      <For each={vd().vulnerabilities}>
-                                        {(vuln) => (
-                                          <tr>
-                                            <td><span class="badge badge-mono">{vuln.id}</span></td>
-                                            <td>
-                                              <span class={`badge ${vuln.severity === 'critical' ? 'badge-danger' : vuln.severity === 'high' ? 'badge-warning' : 'badge-default'}`}>
-                                                {vuln.severity}
-                                              </span>
-                                            </td>
-                                            <td style={{ color: 'var(--clr-on-surface)' }}>{vuln.title}</td>
-                                            <td class="data-table-muted">{vuln.fixed_in || 'N/A'}</td>
-                                          </tr>
-                                        )}
-                                      </For>
-                                    </tbody>
-                                  </table>
-                                </div>
-                              </Show>
-                            </>
-                          )}
-                        </Show>
-                      </section>
-                    </Show>
-                  </section>
-                </div>
-
-                {/* Right Column -- Metadata Sidebar */}
-                <div style={{ display: 'flex', "flex-direction": 'column', gap: '2rem' }}>
-                  {/* Metadata Card -- matches Stitch */}
-                  <div class="pkg-sidebar-card">
-                    <div style={{ display: 'flex', "flex-direction": 'column', gap: '1.5rem' }}>
-
-                      {/* Promote Button -- matches Stitch kinetic-gradient promote button */}
-                      <Show when={auth.isAuthenticated()}>
-                        <div>
-                          <button
-                            class="btn btn-primary"
-                            style={{ width: '100%', padding: '1rem', "letter-spacing": '0.2em', "box-shadow": '0 0 20px rgba(129, 236, 255, 0.2)' }}
-                            onClick={() => setShowPromote(true)}
-                          >
-                            Promote to Production
-                          </button>
-                          <p style={{ "margin-top": '0.75rem', "font-size": '0.5625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "text-align": 'center', color: 'var(--clr-on-surface-variant)' }}>
-                            Admin Privileges: Authorized
-                          </p>
-                        </div>
+                    </div>
+                    <div class="row">
+                      <Show when={vulnData()?.scanned_at}>
+                        <span class="dim small nowrap">scanned {timeAgo(vulnData()!.scanned_at)}</span>
                       </Show>
-
-                      <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'center' }}>
-                        <span class="pkg-sidebar-label">Latest Version</span>
-                        <span style={{ color: 'var(--clr-secondary)', "font-family": 'var(--font-mono)', "font-weight": '700' }}>{latestVersion()}</span>
-                      </div>
-                      <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'center' }}>
-                        <span class="pkg-sidebar-label">Downloads (Total)</span>
-                        <span style={{ color: 'var(--clr-on-surface)', "font-family": 'var(--font-mono)' }}>{d().total_downloads.toLocaleString()}</span>
-                      </div>
-                      <div style={{ display: 'flex', "justify-content": 'space-between', "align-items": 'center' }}>
-                        <span class="pkg-sidebar-label">Versions</span>
-                        <span style={{ color: 'var(--clr-on-surface)', "font-family": 'var(--font-mono)' }}>{d().versions.length}</span>
-                      </div>
-                    </div>
-
-                    {/* Distribution Tags */}
-                    <Show when={d().dist_tags.length > 0}>
-                      <div class="pkg-sidebar-divider" />
-                      <div>
-                        <h4 class="pkg-sidebar-label" style={{ "margin-bottom": '1rem' }}>Distribution Tags</h4>
-                        <div style={{ display: 'flex', "flex-direction": 'column', gap: '0.75rem' }}>
-                          <For each={d().dist_tags}>
-                            {(dt, i) => (
-                              <div style={{ display: 'flex', "align-items": 'center', "justify-content": 'space-between', padding: '0.75rem', background: i() === 0 ? 'var(--clr-surface-container-high)' : 'transparent', "border-radius": '0.375rem', border: i() === 0 ? '1px solid rgba(123, 231, 249, 0.1)' : '1px solid var(--clr-outline-variant)' }}>
-                                <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-headline)', "font-weight": '700', "text-transform": 'uppercase', "letter-spacing": '-0.025em', color: i() === 0 ? 'var(--clr-secondary)' : 'var(--clr-outline)' }}>{dt.tag}</span>
-                                <span style={{ "font-size": '0.75rem', "font-family": 'var(--font-mono)', color: 'var(--clr-on-surface)' }}>{dt.version}</span>
-                              </div>
-                            )}
-                          </For>
-                        </div>
-                      </div>
-                    </Show>
-                  </div>
-
-                  {/* Technical Stats -- matches Stitch */}
-                  <div style={{ display: 'grid', "grid-template-columns": '1fr 1fr', gap: '1rem' }}>
-                    <div style={{ background: 'var(--clr-surface-container-low)', padding: '1rem', "border-radius": '0.5rem', border: '1px solid rgba(255, 255, 255, 0.05)' }}>
-                      <span style={{ "font-size": '0.5625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-outline)', display: 'block', "margin-bottom": '0.25rem' }}>Status</span>
-                      <span style={{ "font-size": '0.875rem', "font-family": 'var(--font-mono)', color: 'var(--clr-on-surface)' }}>Active</span>
-                    </div>
-                    <div style={{ background: 'var(--clr-surface-container-low)', padding: '1rem', "border-radius": '0.5rem', border: '1px solid rgba(255, 255, 255, 0.05)' }}>
-                      <span style={{ "font-size": '0.5625rem', "font-family": 'var(--font-label)', "text-transform": 'uppercase', "letter-spacing": '0.2em', color: 'var(--clr-outline)', display: 'block', "margin-bottom": '0.25rem' }}>Total Files</span>
-                      <span style={{ "font-size": '0.875rem', "font-family": 'var(--font-mono)', color: 'var(--clr-on-surface)' }}>{d().versions.length}</span>
-                    </div>
-                  </div>
-
-                  {/* Security Audit -- matches Stitch */}
-                  <div style={{ background: 'rgba(159, 5, 25, 0.1)', border: '1px solid rgba(255, 113, 108, 0.2)', padding: '1.5rem', "border-radius": '0.75rem', position: 'relative', overflow: 'hidden' }}>
-                    <div style={{ position: 'relative', "z-index": 1, display: 'flex', gap: '1rem', "align-items": 'flex-start' }}>
-                      <span class="material-symbols-outlined" style={{ color: 'var(--clr-error)' }}>security</span>
-                      <div>
-                        <h4 style={{ "font-size": '0.75rem', "font-family": 'var(--font-headline)', "font-weight": '700', color: 'var(--clr-on-error-container)', "text-transform": 'uppercase', "letter-spacing": '0.2em', "margin-bottom": '0.25rem' }}>Audit Results</h4>
-                        <p style={{ "font-size": '0.625rem', color: 'rgba(255, 168, 163, 0.8)' }}>0 Vulnerabilities detected in the current build.</p>
-                      </div>
-                    </div>
-                  </div>
-                </div>
-              </div>
-
-              {/* Promote Modal */}
-              <Show when={showPromote()}>
-                <div class="modal-overlay" onClick={() => setShowPromote(false)}>
-                  <div class="modal" onClick={(e) => e.stopPropagation()}>
-                    <h3 class="modal-title">Promote Package</h3>
-                    <div class="modal-body">
-                      <p style={{ "margin-bottom": '1rem' }}>
-                        Promote <strong style={{ color: 'var(--clr-primary)' }}>{d().name}@{latestVersion()}</strong> between repositories.
-                      </p>
-                      <div class="form-group">
-                        <label class="form-label">Source Repository</label>
-                        <select
-                          class="form-select"
-                          value={promoteFrom()}
-                          onChange={(e) => setPromoteFrom(e.currentTarget.value)}
-                        >
-                          <option value="">Select source...</option>
-                          <Show when={repos()}>
-                            <For each={repos()!.repositories}>
-                              {(r) => <option value={r.name}>{r.name}</option>}
-                            </For>
-                          </Show>
-                        </select>
-                      </div>
-                      <div class="form-group">
-                        <label class="form-label">Target Repository</label>
-                        <select
-                          class="form-select"
-                          value={promoteTo()}
-                          onChange={(e) => setPromoteTo(e.currentTarget.value)}
-                        >
-                          <option value="">Select target...</option>
-                          <Show when={repos()}>
-                            <For each={repos()!.repositories}>
-                              {(r) => <option value={r.name}>{r.name}</option>}
-                            </For>
-                          </Show>
-                        </select>
-                      </div>
-                      <Show when={promoteMsg()}>
-                        <div class="alert alert-info" style={{ "margin-top": '0.5rem' }}>{promoteMsg()}</div>
-                      </Show>
-                    </div>
-                    <div class="modal-actions">
-                      <button class="btn btn-secondary" onClick={() => setShowPromote(false)}>Cancel</button>
-                      <button
-                        class="btn btn-primary"
-                        onClick={handlePromote}
-                        disabled={promoteLoading() || !promoteFrom() || !promoteTo()}
-                      >
-                        {promoteLoading() ? 'Promoting...' : 'Promote'}
+                      <button class="btn btn-ghost btn-sm" onClick={() => loadVulns(true)} disabled={vulnLoading()}>
+                        <Icon name="refresh" size={13} />
+                        Rescan
                       </button>
                     </div>
                   </div>
+
+                  <Show when={vulnError()}>
+                    <div class="alert alert-warn">
+                      <Icon name="alert-triangle" size={15} />
+                      <span>{vulnError()}</span>
+                    </div>
+                  </Show>
+
+                  <Show when={vulnLoading()}>
+                    <TableSkeleton rows={3} cols={4} />
+                  </Show>
+
+                  <Show when={!vulnLoading() && vulnData()}>
+                    {(vd) => (
+                      <Show
+                        when={vd().vulnerabilities.length > 0}
+                        fallback={
+                          <div class="card">
+                            <EmptyState
+                              icon="shield-check"
+                              title="No known vulnerabilities"
+                              text={`OSV.dev has no advisories for ${d().name}@${vd().version}.`}
+                            />
+                          </div>
+                        }
+                      >
+                        <div class="table-card">
+                          <div class="table-scroll">
+                            <table class="table">
+                              <thead>
+                                <tr>
+                                  <th>Advisory</th>
+                                  <th>Severity</th>
+                                  <th>Title</th>
+                                  <th>Fixed in</th>
+                                </tr>
+                              </thead>
+                              <tbody>
+                                <For each={vd().vulnerabilities}>
+                                  {(vuln) => (
+                                    <tr>
+                                      <td class="cell-mono">{vuln.id}</td>
+                                      <td>
+                                        <span class={`chip ${SEVERITY_CHIP[vuln.severity.toLowerCase()] ?? 'chip-neutral'}`}>
+                                          {vuln.severity}
+                                        </span>
+                                      </td>
+                                      <td class="cell-muted">{vuln.title}</td>
+                                      <td class="cell-mono cell-muted">{vuln.fixed_in || '—'}</td>
+                                    </tr>
+                                  )}
+                                </For>
+                              </tbody>
+                            </table>
+                          </div>
+                        </div>
+                      </Show>
+                    )}
+                  </Show>
+                </Show>
+              </div>
+
+              {/* Side column */}
+              <div class="side-stack">
+                <div class="card card-pad">
+                  <div class="side-label">Total downloads</div>
+                  <div class="side-value">{formatNumber(d().total_downloads)}</div>
+                  <div class="divider" />
+                  <div class="side-row">
+                    <span class="dim">Latest</span>
+                    <span class="version">{latestVersion()}</span>
+                  </div>
+                  <div class="side-row">
+                    <span class="dim">Versions</span>
+                    <span class="cell-mono">{d().versions.length}</span>
+                  </div>
+                  <div class="side-row">
+                    <span class="dim">License</span>
+                    <span class="cell-mono">{d().license || '—'}</span>
+                  </div>
                 </div>
-              </Show>
+
+                <Show when={d().dist_tags.length > 0}>
+                  <div class="card card-pad">
+                    <div class="side-label" style={{ 'margin-bottom': '8px' }}>
+                      Distribution tags
+                    </div>
+                    <For each={d().dist_tags}>
+                      {(dt) => (
+                        <div class="side-row">
+                          <span class="chip chip-accent">{dt.tag}</span>
+                          <span class="cell-mono">{dt.version}</span>
+                        </div>
+                      )}
+                    </For>
+                  </div>
+                </Show>
+
+                <Show when={!session.isAuthenticated()}>
+                  <div class="alert alert-info" style={{ margin: 0 }}>
+                    <Icon name="info" size={15} />
+                    <span>Sign in to promote versions or manage this package.</span>
+                  </div>
+                </Show>
+              </div>
             </div>
-          );
-        }}
+
+            {/* Promote modal */}
+            <Modal
+              open={showPromote()}
+              title="Promote a version"
+              subtitle={`${d().name}@${latestVersion()} — the tarball is shared, not copied; lockfiles stay valid.`}
+              onClose={() => setShowPromote(false)}
+              actions={
+                <>
+                  <button class="btn btn-ghost" onClick={() => setShowPromote(false)}>
+                    Cancel
+                  </button>
+                  <button
+                    class="btn btn-primary"
+                    onClick={handlePromote}
+                    disabled={promoteLoading() || !promoteFrom() || !promoteTo() || promoteFrom() === promoteTo()}
+                  >
+                    {promoteLoading() ? 'Promoting…' : 'Promote'}
+                  </button>
+                </>
+              }
+            >
+              <div class="field">
+                <label class="field-label">From repository</label>
+                <select class="select" value={promoteFrom()} onChange={(e) => setPromoteFrom(e.currentTarget.value)}>
+                  <option value="">Select source…</option>
+                  <For each={sourceRepos()}>{(r) => <option value={r.name}>{r.name}</option>}</For>
+                </select>
+              </div>
+              <div class="field">
+                <label class="field-label">To repository</label>
+                <select class="select" value={promoteTo()} onChange={(e) => setPromoteTo(e.currentTarget.value)}>
+                  <option value="">Select target…</option>
+                  <For each={writableRepos()}>{(r) => <option value={r.name}>{r.name}</option>}</For>
+                </select>
+                <div class="field-hint">Only hosted repositories where you hold write access are listed.</div>
+              </div>
+            </Modal>
+          </>
+        )}
       </Show>
-    </>
+    </div>
   );
 }
