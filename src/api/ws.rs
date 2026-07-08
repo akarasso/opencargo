@@ -111,14 +111,13 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
             msg = socket.recv() => match msg {
                 Some(Ok(Message::Text(text))) => {
                     if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                        if v.get("type").and_then(|t| t.as_str()) == Some("ping") {
-                            if socket
+                        if v.get("type").and_then(|t| t.as_str()) == Some("ping")
+                            && socket
                                 .send(Message::text(r#"{"type":"pong"}"#.to_string()))
                                 .await
                                 .is_err()
-                            {
-                                break;
-                            }
+                        {
+                            break;
                         }
                     }
                 }
@@ -138,7 +137,7 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
                 // ex-admin would otherwise keep the admin event feed until
                 // they closed the tab). Closing forces the client to
                 // reconnect and re-authenticate at its current level.
-                if ticks % REVALIDATE_EVERY == 0 {
+                if ticks.is_multiple_of(REVALIDATE_EVERY) {
                     if let Some(ref token) = identity.token {
                         let violation = match authenticate_bearer(&state.auth, token).await {
                             None => Some((CLOSE_UNAUTHORIZED, "token no longer valid")),

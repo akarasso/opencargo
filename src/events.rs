@@ -7,7 +7,7 @@
 //!
 //! - `Public`        — safe for anonymous readers (public-repo activity)
 //! - `Authenticated` — any logged-in user (private-repo *hints*, no payload
-//!                     details that could leak package names across teams)
+//!   details that could leak package names across teams)
 //! - `Admin`         — admin role only (audit trail, user/token/webhook CRUD)
 //!
 //! Emission is best-effort: a send with no subscribers is not an error, and
