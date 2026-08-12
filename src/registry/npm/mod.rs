@@ -197,19 +197,31 @@ pub async fn publish_package(
             AppError::BadRequest(format!("no attachment found for version {version_str}"))
         })?;
 
-        // Decode the base64 tarball
-        let tarball_data = base64::engine::general_purpose::STANDARD
-            .decode(&attachment.data)
-            .map_err(|e| AppError::BadRequest(format!("invalid base64 attachment: {e}")))?;
-
-        // Compute checksums
-        let sha1_hex = hex::encode(sha1::Sha1::digest(&tarball_data));
-        let sha256_hex = hex::encode(sha2::Sha256::digest(&tarball_data));
-        let integrity = format!(
-            "sha512-{}",
+        // Decode the base64 tarball, straight into `Bytes` so the checksum
+        // task below and the storage write share the buffer via cheap clones.
+        let tarball_data = Bytes::from(
             base64::engine::general_purpose::STANDARD
-                .encode(sha2::Sha512::digest(&tarball_data))
+                .decode(&attachment.data)
+                .map_err(|e| AppError::BadRequest(format!("invalid base64 attachment: {e}")))?,
         );
+
+        // Compute checksums on a blocking thread: three digest passes over a
+        // tarball that can reach 100 MiB would otherwise stall a tokio worker.
+        let (sha1_hex, sha256_hex, integrity) = {
+            let data = tarball_data.clone();
+            tokio::task::spawn_blocking(move || {
+                let sha1_hex = hex::encode(sha1::Sha1::digest(&data));
+                let sha256_hex = hex::encode(sha2::Sha256::digest(&data));
+                let integrity = format!(
+                    "sha512-{}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(sha2::Sha512::digest(&data))
+                );
+                (sha1_hex, sha256_hex, integrity)
+            })
+            .await
+            .map_err(|e| AppError::Internal(format!("checksum task failed: {e}")))?
+        };
 
         // Verify shasum if provided
         if let Some(dist) = version_meta.get("dist") {
@@ -229,12 +241,11 @@ pub async fn publish_package(
             repo_name, package_name, tarball_filename
         );
 
-        // Store the tarball. Compute size first, then move the buffer into
-        // Bytes (no 100 MB clone). tarball_data is not used afterwards.
+        // Store the tarball (moves the `Bytes` handle, no buffer copy).
         let size = tarball_data.len() as i64;
         state
             .storage
-            .put(&storage_path, Bytes::from(tarball_data))
+            .put(&storage_path, tarball_data)
             .await?;
 
         // Rewrite dist in version metadata to point to our server

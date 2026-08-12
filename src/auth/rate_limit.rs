@@ -32,7 +32,8 @@ impl RateLimiter {
         let now = Instant::now();
         let cutoff = now - self.window;
 
-        let mut map = self.requests.lock().unwrap();
+        // Recover from a poisoned lock: the state is a best-effort counter, still usable as-is.
+        let mut map = self.requests.lock().unwrap_or_else(|e| e.into_inner());
 
         // Opportunistic eviction: keys are attacker-controlled (usernames/IPs),
         // so the map could grow unbounded under a spray of distinct keys. When it
@@ -62,7 +63,8 @@ impl RateLimiter {
     /// many authenticated requests in a row) is never throttled.
     pub fn is_limited(&self, key: &str) -> bool {
         let cutoff = Instant::now() - self.window;
-        let mut map = self.requests.lock().unwrap();
+        // Recover from a poisoned lock: the state is a best-effort counter, still usable as-is.
+        let mut map = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         match map.get_mut(key) {
             Some(timestamps) => {
                 timestamps.retain(|t| *t > cutoff);
@@ -76,7 +78,8 @@ impl RateLimiter {
     pub fn record_failure(&self, key: &str) {
         let now = Instant::now();
         let cutoff = now - self.window;
-        let mut map = self.requests.lock().unwrap();
+        // Recover from a poisoned lock: the state is a best-effort counter, still usable as-is.
+        let mut map = self.requests.lock().unwrap_or_else(|e| e.into_inner());
         if map.len() > 1024 {
             map.retain(|_, timestamps| timestamps.iter().any(|t| *t > cutoff));
         }
