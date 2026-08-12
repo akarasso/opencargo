@@ -5,12 +5,13 @@ import Icon from './Icon.tsx';
 import CommandPalette from './CommandPalette.tsx';
 import { session } from '../core/stores/session.ts';
 import { ui } from '../core/stores/ui.ts';
-import { wsStatus } from '../core/ws.ts';
+import { reconnectWs, wsStatus } from '../core/ws.ts';
 
 const STATUS_LABEL = {
   online: 'Live',
   connecting: 'Connecting',
   offline: 'Offline',
+  unauthorized: 'Auth required',
 } as const;
 
 export default function Layout(props: RouteSectionProps) {
@@ -50,10 +51,26 @@ export default function Layout(props: RouteSectionProps) {
 
           <div class="topbar-spacer" />
 
-          <div class={`conn ${wsStatus()}`} title="Real-time connection">
-            <span class="conn-dot" />
-            <span class="conn-text">{STATUS_LABEL[wsStatus()]}</span>
-          </div>
+          <Show
+            when={wsStatus() === 'unauthorized'}
+            fallback={
+              <div class={`conn ${wsStatus()}`} title="Real-time connection">
+                <span class="conn-dot" />
+                <span class="conn-text">{STATUS_LABEL[wsStatus()]}</span>
+              </div>
+            }
+          >
+            {/* Server refused the socket's credentials: no automatic retry,
+                so offer one (signing in also reconnects). */}
+            <button
+              class="conn unauthorized"
+              title="Live updates rejected — sign in again or click to retry"
+              onClick={reconnectWs}
+            >
+              <span class="conn-dot" style={{ background: 'var(--danger)' }} />
+              <span class="conn-text">{STATUS_LABEL.unauthorized} · retry</span>
+            </button>
+          </Show>
         </header>
 
         <main class="content">{props.children}</main>

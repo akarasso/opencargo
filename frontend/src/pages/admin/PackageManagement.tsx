@@ -7,13 +7,10 @@ import { RequireAdmin } from '../../components/guards.tsx';
 import { LoadError, TableSkeleton } from '../../components/bits.tsx';
 import { fetchPackages, fetchRepositories, promotePackage } from '../../core/api.ts';
 import { useLive } from '../../core/stores/live.ts';
-import { toasts } from '../../core/stores/toasts.ts';
+import { reportError, toasts } from '../../core/stores/toasts.ts';
+import { createDebounced } from '../../core/debounce.ts';
 import { formatNumber, timeAgo } from '../../core/format.ts';
-
-function paramStr(val: string | string[] | undefined): string {
-  if (Array.isArray(val)) return val[0] ?? '';
-  return val ?? '';
-}
+import { paramStr } from '../../core/params.ts';
 
 export default function PackageManagement() {
   return (
@@ -46,13 +43,12 @@ function PackageManagementInner() {
 
   const hostedRepos = () => (repos()?.repositories ?? []).filter((r) => r.type === 'hosted');
 
-  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  const debouncedSearch = createDebounced((value: string) => {
+    setSearchParams({ q: value || undefined, page: '1' });
+  }, 280);
   function handleInput(value: string) {
     setInputValue(value);
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      setSearchParams({ q: value || undefined, page: '1' });
-    }, 280);
+    debouncedSearch(value);
   }
 
   async function handlePromote() {
@@ -68,7 +64,7 @@ function PackageManagementInner() {
       setPromoteTarget(null);
       void refetch();
     } catch (e: unknown) {
-      toasts.error('Promotion failed', e instanceof Error ? e.message : undefined);
+      reportError('Promotion failed', e);
     }
     setPromoteLoading(false);
   }

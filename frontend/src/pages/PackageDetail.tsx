@@ -16,7 +16,7 @@ import {
 } from '../core/api.ts';
 import { useLive } from '../core/stores/live.ts';
 import { session } from '../core/stores/session.ts';
-import { toasts } from '../core/stores/toasts.ts';
+import { reportError, toasts } from '../core/stores/toasts.ts';
 import { formatNumber, timeAgo } from '../core/format.ts';
 import type { VulnReport } from '../core/types.ts';
 
@@ -134,7 +134,7 @@ export default function PackageDetail() {
       setShowPromote(false);
       void refetch();
     } catch (e: unknown) {
-      toasts.error('Promotion failed', e instanceof Error ? e.message : undefined);
+      reportError('Promotion failed', e);
     }
     setPromoteLoading(false);
   }

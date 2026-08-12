@@ -8,7 +8,7 @@ import {
   setUserPermission,
 } from '../core/api.ts';
 import { useLive } from '../core/stores/live.ts';
-import { toasts } from '../core/stores/toasts.ts';
+import { reportError, toasts } from '../core/stores/toasts.ts';
 import type { PermissionFlags, Role } from '../core/types.ts';
 
 const ACTIONS = ['can_read', 'can_write', 'can_delete', 'can_admin'] as const;
@@ -68,7 +68,7 @@ export default function PermissionMatrix(props: { username: string; role: Role |
       await setUserPermission(props.username, repo, next);
       void refetch();
     } catch (e: unknown) {
-      toasts.error('Could not update permission', e instanceof Error ? e.message : undefined);
+      reportError('Could not update permission', e);
     }
   }
 
@@ -78,7 +78,7 @@ export default function PermissionMatrix(props: { username: string; role: Role |
       toasts.success(`${repo} back to role default for ${props.username}`);
       void refetch();
     } catch (e: unknown) {
-      toasts.error('Could not reset permission', e instanceof Error ? e.message : undefined);
+      reportError('Could not reset permission', e);
     }
   }
 

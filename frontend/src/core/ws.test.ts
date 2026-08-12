@@ -226,7 +226,7 @@ describe('connection state machine', () => {
     lastSocket().serverSend({ type: 'hello' });
 
     lastSocket().serverClose(4401);
-    expect(ws.wsStatus()).toBe('offline');
+    expect(ws.wsStatus()).toBe('unauthorized');
     vi.advanceTimersByTime(120_000);
     expect(MockWebSocket.instances).toHaveLength(1);
   });
@@ -235,6 +235,7 @@ describe('connection state machine', () => {
     const ws = await loadWs();
     ws.connectWs();
     lastSocket().serverClose(4403);
+    expect(ws.wsStatus()).toBe('unauthorized');
     vi.advanceTimersByTime(120_000);
     expect(MockWebSocket.instances).toHaveLength(1);
   });

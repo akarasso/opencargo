@@ -90,6 +90,7 @@ pub fn web_routes() -> Router<AppState> {
         .route("/favicon.svg", get(serve_favicon))
         // Explicit SPA routes to prevent conflicts with npm protocol routes
         // (e.g. /{repo}/@{scope}/{name} would match /packages/@scope/name)
+        // Mirror of the SolidJS router in frontend/src/index.tsx — keep both lists in sync.
         .route("/", get(serve_spa))
         .route("/packages", get(serve_spa))
         .route("/packages/{*path}", get(serve_spa))
@@ -97,6 +98,7 @@ pub fn web_routes() -> Router<AppState> {
         .route("/oci", get(serve_spa))
         .route("/go", get(serve_spa))
         .route("/login", get(serve_spa))
+        .route("/account/access", get(serve_spa))
         .route("/admin", get(serve_spa))
         .route("/admin/repositories", get(serve_spa))
         .route("/admin/users", get(serve_spa))

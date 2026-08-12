@@ -4,11 +4,8 @@ import Icon from '../components/Icon.tsx';
 import EmptyState from '../components/EmptyState.tsx';
 import { LoadError } from '../components/bits.tsx';
 import { fetchSearch } from '../core/api.ts';
-
-function paramStr(val: string | string[] | undefined): string {
-  if (Array.isArray(val)) return val[0] ?? '';
-  return val ?? '';
-}
+import { createDebounced } from '../core/debounce.ts';
+import { paramStr } from '../core/params.ts';
 
 export default function Search() {
   const [searchParams, setSearchParams] = useSearchParams();
@@ -17,13 +14,12 @@ export default function Search() {
 
   const [data] = createResource(query, fetchSearch);
 
-  let debounceTimer: ReturnType<typeof setTimeout> | undefined;
+  const debouncedSearch = createDebounced((value: string) => {
+    setSearchParams({ q: value || undefined });
+  }, 260);
   function handleInput(value: string) {
     setInputValue(value);
-    clearTimeout(debounceTimer);
-    debounceTimer = setTimeout(() => {
-      setSearchParams({ q: value || undefined });
-    }, 260);
+    debouncedSearch(value);
   }
 
   return (

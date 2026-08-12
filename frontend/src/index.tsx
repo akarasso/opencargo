@@ -58,6 +58,7 @@ render(
   () => (
     <ErrorBoundary fallback={(error) => <CrashScreen error={error} />}>
       <Router>
+        {/* Mirror of the explicit SPA route list in src/web/mod.rs — keep both lists in sync. */}
         {/* Login page has its own layout (no shell) */}
         <Route path="/login" component={Login} />
 
