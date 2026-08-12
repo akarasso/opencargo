@@ -336,7 +336,7 @@ pub async fn upload_chunk(
             "can only push to hosted repositories".to_string(),
         ));
     }
-    if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await
+    if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await?
     {
         return Err(AppError::Forbidden("insufficient permissions".to_string()));
     }
@@ -409,7 +409,7 @@ pub async fn complete_upload(
             "can only push to hosted repositories".to_string(),
         ));
     }
-    if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await
+    if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await?
     {
         return Err(AppError::Forbidden("insufficient permissions".to_string()));
     }

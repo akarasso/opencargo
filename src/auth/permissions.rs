@@ -1,5 +1,7 @@
 use sqlx::SqlitePool;
 
+use crate::error::{AppError, AppResult};
+
 /// Returns `true` if the role has admin permissions.
 pub fn can_admin(role: &str) -> bool {
     role == "admin"
@@ -13,37 +15,50 @@ pub fn can_admin(role: &str) -> bool {
 /// 3. Fall back to role-based defaults:
 ///    - publisher: read + write on all repos
 ///    - reader: read on all repos
+///
+/// A DB failure during the grant lookup is an error, not a fallback: silently
+/// applying the role default would stop enforcing an explicit deny (e.g.
+/// `can_read=0`) for as long as the DB is failing. The caller gets a
+/// retryable 503, consistent with the auth middleware's handling of DB errors.
 pub async fn check_repo_permission(
     db: &SqlitePool,
     user_id: Option<i64>,
     user_role: &str,
     repo_id: i64,
     action: &str, // "read", "write", "delete", "admin"
-) -> bool {
+) -> AppResult<bool> {
     // Admin role always has full access
     if user_role == "admin" {
-        return true;
+        return Ok(true);
     }
 
     // Check user_permissions table for a specific grant
     if let Some(uid) = user_id {
-        if let Ok(Some(perm)) = crate::db::get_user_permission(db, uid, repo_id).await {
-            return match action {
+        let perm = crate::db::get_user_permission(db, uid, repo_id)
+            .await
+            .map_err(|e| {
+                tracing::warn!(error = %e, "database error during permission check");
+                AppError::ServiceUnavailable(
+                    "permission check temporarily unavailable, try again".to_string(),
+                )
+            })?;
+        if let Some(perm) = perm {
+            return Ok(match action {
                 "read" => perm.can_read != 0,
                 "write" => perm.can_write != 0,
                 "delete" => perm.can_delete != 0,
                 "admin" => perm.can_admin != 0,
                 _ => false,
-            };
+            });
         }
     }
 
     // Fallback to role-based defaults
-    match user_role {
+    Ok(match user_role {
         "publisher" => action == "read" || action == "write",
         "reader" => action == "read",
         _ => false,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -116,16 +131,16 @@ mod tests {
         let (_tmp, pool) = test_pool().await;
         for action in ["read", "write", "delete", "admin", "frobnicate"] {
             assert!(
-                check_repo_permission(&pool, Some(ALICE), "admin", REPO_A, action).await,
+                check_repo_permission(&pool, Some(ALICE), "admin", REPO_A, action).await.unwrap(),
                 "admin must be allowed action {action:?}"
             );
         }
         // Even an explicit deny-all grant cannot restrict an admin: the role
         // check runs before the grant lookup.
         grant(&pool, ALICE, REPO_A, false, false, false, false).await;
-        assert!(check_repo_permission(&pool, Some(ALICE), "admin", REPO_A, "delete").await);
+        assert!(check_repo_permission(&pool, Some(ALICE), "admin", REPO_A, "delete").await.unwrap());
         // An admin without a user id (static config token) is also unrestricted.
-        assert!(check_repo_permission(&pool, None, "admin", REPO_A, "admin").await);
+        assert!(check_repo_permission(&pool, None, "admin", REPO_A, "admin").await.unwrap());
     }
 
     #[tokio::test]
@@ -134,15 +149,15 @@ mod tests {
         // alice is a reader; her grant on repo-a revokes read but adds write.
         grant(&pool, ALICE, REPO_A, false, true, false, false).await;
         assert!(
-            !check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await,
+            !check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await.unwrap(),
             "explicit can_read=0 must beat the reader role default"
         );
         assert!(
-            check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "write").await,
+            check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "write").await.unwrap(),
             "explicit can_write=1 must beat the reader role default"
         );
-        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "delete").await);
-        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "admin").await);
+        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "delete").await.unwrap());
+        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "admin").await.unwrap());
     }
 
     #[tokio::test]
@@ -150,9 +165,9 @@ mod tests {
         let (_tmp, pool) = test_pool().await;
         // Grant row present with everything allowed: unknown action → false.
         grant(&pool, ALICE, REPO_A, true, true, true, true).await;
-        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "frobnicate").await);
+        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "frobnicate").await.unwrap());
         // No grant row: unknown action is false through role defaults too.
-        assert!(!check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "frobnicate").await);
+        assert!(!check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "frobnicate").await.unwrap());
     }
 
     #[tokio::test]
@@ -160,53 +175,52 @@ mod tests {
         let (_tmp, pool) = test_pool().await;
         grant(&pool, ALICE, REPO_A, false, false, false, false).await;
         // The deny-all on repo-a does not leak onto repo-b: role default applies.
-        assert!(check_repo_permission(&pool, Some(ALICE), "reader", REPO_B, "read").await);
-        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await);
+        assert!(check_repo_permission(&pool, Some(ALICE), "reader", REPO_B, "read").await.unwrap());
+        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await.unwrap());
     }
 
     #[tokio::test]
     async fn role_defaults_apply_without_grant() {
         let (_tmp, pool) = test_pool().await;
         // publisher: read + write, nothing destructive.
-        assert!(check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "read").await);
-        assert!(check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "write").await);
-        assert!(!check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "delete").await);
-        assert!(!check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "admin").await);
+        assert!(check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "read").await.unwrap());
+        assert!(check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "write").await.unwrap());
+        assert!(!check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "delete").await.unwrap());
+        assert!(!check_repo_permission(&pool, Some(BOB), "publisher", REPO_A, "admin").await.unwrap());
         // reader: read only.
-        assert!(check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await);
-        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "write").await);
+        assert!(check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await.unwrap());
+        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "write").await.unwrap());
         // Unknown or empty role: nothing at all.
-        assert!(!check_repo_permission(&pool, Some(ALICE), "ghost", REPO_A, "read").await);
-        assert!(!check_repo_permission(&pool, Some(ALICE), "", REPO_A, "read").await);
+        assert!(!check_repo_permission(&pool, Some(ALICE), "ghost", REPO_A, "read").await.unwrap());
+        assert!(!check_repo_permission(&pool, Some(ALICE), "", REPO_A, "read").await.unwrap());
     }
 
     #[tokio::test]
     async fn anonymous_and_unknown_users_fall_back_to_role_defaults() {
         let (_tmp, pool) = test_pool().await;
         // No user id: the grant lookup is skipped entirely.
-        assert!(check_repo_permission(&pool, None, "reader", REPO_A, "read").await);
-        assert!(!check_repo_permission(&pool, None, "reader", REPO_A, "write").await);
-        assert!(!check_repo_permission(&pool, None, "anonymous", REPO_A, "read").await);
+        assert!(check_repo_permission(&pool, None, "reader", REPO_A, "read").await.unwrap());
+        assert!(!check_repo_permission(&pool, None, "reader", REPO_A, "write").await.unwrap());
+        assert!(!check_repo_permission(&pool, None, "anonymous", REPO_A, "read").await.unwrap());
         // A user id with no user_permissions row behaves the same way.
-        assert!(check_repo_permission(&pool, Some(999), "reader", REPO_A, "read").await);
+        assert!(check_repo_permission(&pool, Some(999), "reader", REPO_A, "read").await.unwrap());
     }
 
-    /// OBSERVATION (documented, deliberately not fixed by this test change):
-    /// a DB error during the grant lookup is swallowed by `if let Ok(...)`,
-    /// so the role default applies — an explicit can_read=0 revocation stops
-    /// being enforced while the DB is failing. With a closed pool, alice's
-    /// deny-all grant on repo-a becomes invisible and her reader role grants
-    /// read again. If this test starts failing, the behavior was changed —
-    /// update the assertion.
+    /// A DB error during the grant lookup is propagated instead of silently
+    /// falling back to the role default: an explicit can_read=0 revocation
+    /// stays enforced (as "temporarily unavailable") while the DB is failing.
+    /// With a closed pool, alice's deny-all grant on repo-a must surface as a
+    /// retryable ServiceUnavailable error, never as read-allowed.
     #[tokio::test]
-    async fn db_error_falls_back_to_role_defaults_ignoring_explicit_deny() {
+    async fn db_error_propagates_instead_of_falling_back_to_role_defaults() {
         let (_tmp, pool) = test_pool().await;
         grant(&pool, ALICE, REPO_A, false, false, false, false).await;
-        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await);
+        assert!(!check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await.unwrap());
         pool.close().await;
+        let res = check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await;
         assert!(
-            check_repo_permission(&pool, Some(ALICE), "reader", REPO_A, "read").await,
-            "documents current fail-open-to-role-default behavior on DB error"
+            matches!(res, Err(AppError::ServiceUnavailable(_))),
+            "DB error must propagate as ServiceUnavailable, got {res:?}"
         );
     }
 }

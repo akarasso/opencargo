@@ -61,7 +61,41 @@ impl FilesystemStorage {
                 "path escapes storage directory".to_string(),
             ));
         }
-        Ok(full_path)
+        // Component normalization alone does not see the filesystem: a symlink
+        // already planted inside the base and pointing outside would let a
+        // *new* file be created on the symlink's target side. Canonicalize the
+        // deepest existing ancestor (walking up component by component) and
+        // verify it still lives under the canonical base before re-appending
+        // the not-yet-existing suffix (already normalized, no `..` possible).
+        // `symlink_metadata` (not `exists`) so a dangling symlink counts as
+        // the existing ancestor: its failing canonicalize is then rejected
+        // instead of being silently walked past.
+        let mut ancestor = normalized.as_path();
+        let mut missing: Vec<std::ffi::OsString> = Vec::new();
+        while ancestor.symlink_metadata().is_err() {
+            match (ancestor.parent(), ancestor.file_name()) {
+                (Some(parent), Some(name)) => {
+                    missing.push(name.to_os_string());
+                    ancestor = parent;
+                }
+                _ => {
+                    return Err(AppError::BadRequest("invalid storage path".to_string()));
+                }
+            }
+        }
+        let canonical = ancestor
+            .canonicalize()
+            .map_err(|_| AppError::BadRequest("invalid storage path".to_string()))?;
+        if !canonical.starts_with(&self.base_path) {
+            return Err(AppError::BadRequest(
+                "path escapes storage directory".to_string(),
+            ));
+        }
+        let mut resolved = canonical;
+        for name in missing.iter().rev() {
+            resolved.push(name);
+        }
+        Ok(resolved)
     }
 }
 
@@ -270,17 +304,14 @@ mod tests {
         );
     }
 
-    /// KNOWN LIMITATION (documented, deliberately not fixed by this test
-    /// change): for a path that does not exist yet, `safe_path` never
-    /// canonicalizes the existing ancestors. An out-of-base symlink already
-    /// planted inside the base is therefore NOT detected when targeting a
-    /// NEW file through it — a subsequent `put` would create the file on the
-    /// symlink's target side. The API offers no way to create symlinks, so
-    /// exploiting this requires prior local filesystem access. If this test
-    /// starts failing, the gap was fixed — update the assertion.
+    /// For a path that does not exist yet, `safe_path` canonicalizes the
+    /// deepest existing ancestor: an out-of-base symlink already planted
+    /// inside the base is detected even when targeting a NEW file through
+    /// it, so a subsequent `put` can no longer create the file on the
+    /// symlink's target side.
     #[cfg(unix)]
     #[test]
-    fn new_file_behind_outward_symlink_is_currently_accepted() {
+    fn new_file_behind_outward_symlink_is_rejected() {
         let (tmp, s) = storage();
         let outside = tmp.path().join("outside");
         std::fs::create_dir_all(&outside).unwrap();
@@ -288,8 +319,8 @@ mod tests {
 
         let res = s.safe_path("evil/new-file.txt");
         assert!(
-            res.is_ok(),
-            "documents current behavior (see comment), got {res:?}"
+            is_bad_request(&res),
+            "creating a new file through an out-of-base symlink must be rejected, got {res:?}"
         );
     }
 }
