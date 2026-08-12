@@ -2,7 +2,6 @@ import { For, Show } from 'solid-js';
 import { A } from '@solidjs/router';
 import Icon from '../../components/Icon.tsx';
 import CountUp from '../../components/CountUp.tsx';
-import RoleBadge from '../../components/RoleBadge.tsx';
 import { RequireAdmin } from '../../components/guards.tsx';
 import { FormatTag, LoadError, StatsSkeleton, VisibilityChip } from '../../components/bits.tsx';
 import { fetchAudit, fetchDashboard, fetchHealthReady, fetchRepositories, fetchUsers } from '../../core/api.ts';

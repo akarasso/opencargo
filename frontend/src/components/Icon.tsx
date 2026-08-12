@@ -102,6 +102,7 @@ export default function Icon(props: IconProps) {
       stroke-linecap="round"
       stroke-linejoin="round"
       aria-hidden="true"
+      // eslint-disable-next-line solid/no-innerhtml -- static hardcoded SVG path table, no user input
       innerHTML={PATHS[props.name] ?? PATHS['package']}
     />
   );

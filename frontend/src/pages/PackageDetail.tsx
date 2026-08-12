@@ -199,6 +199,7 @@ export default function PackageDetail() {
                       </div>
                     }
                   >
+                    {/* eslint-disable-next-line solid/no-innerhtml -- readme_html is sanitized server-side before storage */}
                     <div class="card card-pad readme" innerHTML={d().readme_html} />
                   </Show>
                 </Show>

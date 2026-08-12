@@ -2,7 +2,7 @@ import { For, Show, createResource, createSignal } from 'solid-js';
 import { A, useSearchParams } from '@solidjs/router';
 import Icon from '../components/Icon.tsx';
 import EmptyState from '../components/EmptyState.tsx';
-import { FormatTag, LoadError, TableSkeleton } from '../components/bits.tsx';
+import { LoadError, TableSkeleton } from '../components/bits.tsx';
 import { fetchPackages, fetchRepositories } from '../core/api.ts';
 import { useLive } from '../core/stores/live.ts';
 import { formatNumber, timeAgo } from '../core/format.ts';

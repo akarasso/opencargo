@@ -18,7 +18,7 @@ function legacyCopy(text: string): boolean {
   textarea.style.pointerEvents = 'none';
   document.body.appendChild(textarea);
   textarea.select();
-  let ok = false;
+  let ok: boolean;
   try {
     ok = document.execCommand('copy');
   } catch {

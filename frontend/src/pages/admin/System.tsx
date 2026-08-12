@@ -4,31 +4,7 @@ import { RequireAdmin } from '../../components/guards.tsx';
 import { LoadError, TableSkeleton } from '../../components/bits.tsx';
 import { fetchHealthReady, fetchMetrics } from '../../core/api.ts';
 import { createLiveResource } from '../../core/stores/live.ts';
-
-interface ParsedMetric {
-  name: string;
-  labels: string;
-  value: string;
-}
-
-function parsePrometheusMetrics(raw: string): ParsedMetric[] {
-  const metrics: ParsedMetric[] = [];
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed || trimmed.startsWith('#')) continue;
-    const space = trimmed.lastIndexOf(' ');
-    if (space === -1) continue;
-    const key = trimmed.slice(0, space);
-    const value = trimmed.slice(space + 1);
-    const brace = key.indexOf('{');
-    metrics.push({
-      name: brace === -1 ? key : key.slice(0, brace),
-      labels: brace === -1 ? '' : key.slice(brace),
-      value,
-    });
-  }
-  return metrics;
-}
+import { parsePrometheusMetrics } from '../../core/prometheus.ts';
 
 export default function System() {
   return (
