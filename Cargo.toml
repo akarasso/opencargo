@@ -80,9 +80,6 @@ pulldown-cmark = "0.12"
 # HTML sanitization (XSS prevention)
 ammonia = "4"
 
-# Cron scheduler (cleanup policies)
-tokio-cron-scheduler = "0.13"
-
 # TLS
 axum-server = { version = "0.7", features = ["tls-rustls"] }
 zip = "8.3.1"

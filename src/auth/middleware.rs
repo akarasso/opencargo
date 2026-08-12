@@ -102,7 +102,18 @@ pub async fn auth_middleware(
         if state.login_rate_limiter.is_limited(&rl_key) {
             return too_many_requests_response();
         }
-        if let Ok(Some(user)) = crate::db::get_user_by_username(&state.db, &username).await {
+        // A DB failure (e.g. SQLITE_BUSY under load) says nothing about the
+        // credentials: answer 503 so the client retries — same treatment as
+        // the Bearer path — and do NOT record a rate-limit failure, so a DB
+        // hiccup can't push a legitimate user toward the throttle.
+        let user = match crate::db::get_user_by_username(&state.db, &username).await {
+            Ok(user) => user,
+            Err(e) => {
+                tracing::warn!(error = %e, "database error during basic authentication");
+                return service_unavailable_response();
+            }
+        };
+        if let Some(user) = user {
             let password_ok =
                 super::users::verify_password_async(password, user.password_hash.clone())
                     .await

@@ -290,8 +290,19 @@ pub async fn publish_module(
         .await
         .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
 
-    // Extract go.mod from the zip file
-    let go_mod_content = extract_go_mod_from_zip(&zip_data, module_name, version_str)?;
+    // Extract go.mod from the zip file. The synchronous zip inflation runs on
+    // a blocking thread so a large archive (body cap is 100 MiB) does not
+    // stall a tokio worker; the `Bytes` clone is a cheap refcount bump.
+    let go_mod_content = {
+        let zip_data = zip_data.clone();
+        let module_name = module_name.clone();
+        let version_str = version_str.clone();
+        tokio::task::spawn_blocking(move || {
+            extract_go_mod_from_zip(&zip_data, &module_name, &version_str)
+        })
+        .await
+        .map_err(|e| AppError::Internal(format!("go.mod extraction task failed: {e}")))??
+    };
 
     // Get or create the package
     let package = match crate::db::get_package(&state.db, repo.id, module_name).await? {

@@ -249,10 +249,19 @@ pub async fn publish_crate(
         ));
     }
 
-    let crate_data = &data[crate_start..crate_end];
+    // Zero-copy slice of the request body Bytes, shared by the checksum task
+    // and the storage write below.
+    let crate_data = body.slice(crate_start..crate_end);
 
-    // Compute SHA-256 checksum of the .crate file
-    let sha256_hex = hex::encode(sha2::Sha256::digest(crate_data));
+    // Compute the SHA-256 checksum on a blocking thread: a .crate can approach
+    // the body cap (up to 1 GiB) and hashing it inline would stall a tokio
+    // worker.
+    let sha256_hex = {
+        let data = crate_data.clone();
+        tokio::task::spawn_blocking(move || hex::encode(sha2::Sha256::digest(&data)))
+            .await
+            .map_err(|e| AppError::Internal(format!("checksum task failed: {e}")))?
+    };
 
     let crate_name = &meta.name;
     let version_str = &meta.vers;
@@ -292,10 +301,10 @@ pub async fn publish_crate(
         repo_name, crate_name, crate_name, version_str
     );
 
-    // Store the .crate file (zero-copy slice of the request body Bytes).
+    // Store the .crate file (another cheap handle onto the same buffer).
     state
         .storage
-        .put(&storage_path, body.slice(crate_start..crate_end))
+        .put(&storage_path, crate_data.clone())
         .await?;
 
     // Build the metadata JSON to store in the DB (the full cargo metadata)
