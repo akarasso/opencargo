@@ -124,3 +124,172 @@ impl StorageBackend for FilesystemStorage {
         Ok(full_path.exists())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::FilesystemStorage;
+    use crate::error::AppError;
+
+    /// Storage rooted in a fresh temp dir. The `TempDir` guard must stay
+    /// alive for the duration of the test (drop deletes the tree).
+    fn storage() -> (tempfile::TempDir, FilesystemStorage) {
+        let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
+        let storage = FilesystemStorage::new(tmp.path().join("base"));
+        (tmp, storage)
+    }
+
+    fn is_bad_request(res: &Result<std::path::PathBuf, AppError>) -> bool {
+        matches!(res, Err(AppError::BadRequest(_)))
+    }
+
+    #[test]
+    fn accepts_simple_and_nested_relative_paths() {
+        let (_tmp, s) = storage();
+
+        let p = s.safe_path("file.txt").expect("simple path must resolve");
+        assert!(p.starts_with(&s.base_path));
+        assert!(p.ends_with("file.txt"));
+
+        let p = s
+            .safe_path("npm/my-repo/pkg/pkg-1.0.0.tgz")
+            .expect("nested path must resolve");
+        assert!(p.starts_with(&s.base_path));
+        assert!(p.ends_with("npm/my-repo/pkg/pkg-1.0.0.tgz"));
+    }
+
+    #[test]
+    fn normalizes_paths_to_nonexistent_files() {
+        let (_tmp, s) = storage();
+        // Nothing under "a/" exists yet: this exercises the component-
+        // normalization branch (no canonicalize possible).
+        let p = s
+            .safe_path("a/b/new-file.bin")
+            .expect("path to a new file must resolve");
+        assert!(p.starts_with(&s.base_path));
+        // CurDir components are absorbed by Path::components().
+        let p = s
+            .safe_path("./a/./c.txt")
+            .expect("CurDir components are harmless");
+        assert!(p.starts_with(&s.base_path));
+    }
+
+    #[test]
+    fn rejects_parent_dir_components() {
+        let (_tmp, s) = storage();
+        for attempt in [
+            "..",
+            "../escape.txt",
+            "../../etc/passwd",
+            "a/../../etc/passwd",
+            "a/b/../../../etc/passwd",
+            "a/..",
+        ] {
+            let res = s.safe_path(attempt);
+            assert!(
+                is_bad_request(&res),
+                "traversal attempt {attempt:?} must be rejected, got {res:?}"
+            );
+        }
+    }
+
+    /// The guard is a plain substring check on "..": even a legitimate file
+    /// name that merely *contains* two consecutive dots is rejected. Overly
+    /// strict, but fail-safe — documented here as current behavior.
+    #[test]
+    fn rejects_double_dots_anywhere_in_a_component() {
+        let (_tmp, s) = storage();
+        for attempt in ["foo..bar.txt", "x/fo..o/y.txt", "pkg-1.0..tgz"] {
+            let res = s.safe_path(attempt);
+            assert!(
+                is_bad_request(&res),
+                "{attempt:?} contains '..' as a substring and is rejected, got {res:?}"
+            );
+        }
+    }
+
+    /// Percent-encoding is not decoded at this layer (the HTTP layer decodes
+    /// before storage paths are built): "%2e%2e" is a literal directory name
+    /// here, so it stays safely inside the base.
+    #[test]
+    fn percent_encoded_dotdot_is_treated_as_a_literal_name() {
+        let (_tmp, s) = storage();
+        let p = s
+            .safe_path("%2e%2e/escape.txt")
+            .expect("literal %2e%2e is just an odd directory name");
+        assert!(p.starts_with(&s.base_path));
+    }
+
+    #[test]
+    fn rejects_absolute_paths() {
+        let (_tmp, s) = storage();
+        // Path::join replaces the base entirely when handed an absolute path.
+        // Existing target → canonicalize branch catches the escape.
+        let res = s.safe_path("/etc/passwd");
+        assert!(
+            is_bad_request(&res),
+            "absolute path to an existing file must be rejected, got {res:?}"
+        );
+        // Nonexistent target → normalization branch catches it too.
+        let res = s.safe_path("/definitely/not/existing/xyz.txt");
+        assert!(
+            is_bad_request(&res),
+            "absolute path to a missing file must be rejected, got {res:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_inside_base_is_followed_and_accepted() {
+        let (_tmp, s) = storage();
+        let real = s.base_path.join("real");
+        std::fs::create_dir_all(&real).unwrap();
+        std::fs::write(real.join("data.txt"), b"x").unwrap();
+        std::os::unix::fs::symlink(&real, s.base_path.join("link")).unwrap();
+
+        let p = s
+            .safe_path("link/data.txt")
+            .expect("internal symlink must resolve");
+        // Canonicalized to the real location, still inside the base.
+        assert_eq!(p, real.join("data.txt"));
+        assert!(p.starts_with(&s.base_path));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn existing_file_behind_outward_symlink_is_rejected() {
+        let (tmp, s) = storage();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret.txt"), b"s").unwrap();
+        std::os::unix::fs::symlink(&outside, s.base_path.join("evil")).unwrap();
+
+        let res = s.safe_path("evil/secret.txt");
+        assert!(
+            is_bad_request(&res),
+            "reading through an out-of-base symlink must be rejected, got {res:?}"
+        );
+    }
+
+    /// KNOWN LIMITATION (documented, deliberately not fixed by this test
+    /// change): for a path that does not exist yet, `safe_path` never
+    /// canonicalizes the existing ancestors. An out-of-base symlink already
+    /// planted inside the base is therefore NOT detected when targeting a
+    /// NEW file through it — a subsequent `put` would create the file on the
+    /// symlink's target side. The API offers no way to create symlinks, so
+    /// exploiting this requires prior local filesystem access. If this test
+    /// starts failing, the gap was fixed — update the assertion.
+    #[cfg(unix)]
+    #[test]
+    fn new_file_behind_outward_symlink_is_currently_accepted() {
+        let (tmp, s) = storage();
+        let outside = tmp.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::os::unix::fs::symlink(&outside, s.base_path.join("evil")).unwrap();
+
+        let res = s.safe_path("evil/new-file.txt");
+        assert!(
+            res.is_ok(),
+            "documents current behavior (see comment), got {res:?}"
+        );
+    }
+}
