@@ -149,11 +149,16 @@ function teardownSocket(): void {
   stopHeartbeat();
 }
 
+/** Pure reconnect delay: 0.5s, 1s, 2s … capped at 30s, ±25% jitter.
+ * `random` is injectable for tests; defaults to `Math.random`. */
+export function reconnectDelayMs(attempts: number, random: () => number = Math.random): number {
+  const base = Math.min(30_000, 500 * 2 ** attempts);
+  return base * (0.75 + random() * 0.5);
+}
+
 function scheduleReconnect(): void {
   if (!started || suspended || reconnectTimer) return;
-  // 0.5s, 1s, 2s … capped at 30s, ±25% jitter.
-  const base = Math.min(30_000, 500 * 2 ** attempts);
-  const delay = base * (0.75 + Math.random() * 0.5);
+  const delay = reconnectDelayMs(attempts);
   attempts += 1;
   reconnectTimer = setTimeout(() => {
     reconnectTimer = null;

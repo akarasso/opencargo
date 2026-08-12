@@ -30,7 +30,7 @@ export default function Modal(props: ModalProps) {
       {/* Portal to <body>: a transformed/animated ancestor would otherwise
           become the containing block of this fixed overlay. */}
       <Portal>
-        <div class="modal-overlay" onClick={props.onClose}>
+        <div class="modal-overlay" onClick={() => props.onClose()}>
           <div
             class={`modal ${props.wide ? 'modal-wide' : ''}`}
             role="dialog"
@@ -45,7 +45,11 @@ export default function Modal(props: ModalProps) {
                   <div class="modal-sub">{props.subtitle}</div>
                 </Show>
               </div>
-              <button class="btn btn-quiet btn-icon" onClick={props.onClose} aria-label="Close">
+              <button
+                class="btn btn-quiet btn-icon"
+                onClick={() => props.onClose()}
+                aria-label="Close"
+              >
                 <Icon name="x" size={15} />
               </button>
             </div>

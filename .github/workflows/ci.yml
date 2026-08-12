@@ -35,8 +35,17 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install frontend dependencies
+        run: cd frontend && pnpm install --frozen-lockfile
+
+      - name: Lint frontend
+        run: cd frontend && pnpm lint
+
+      - name: Test frontend
+        run: cd frontend && pnpm test
+
       - name: Build frontend
-        run: cd frontend && pnpm install --frozen-lockfile && pnpm build
+        run: cd frontend && pnpm build
 
       - name: Build
         run: cargo build

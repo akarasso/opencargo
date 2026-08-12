@@ -141,6 +141,7 @@ function createSessionStore() {
 
   // --- Live updates ---------------------------------------------------------
   // Rights change server-side → refresh what this session can see/do.
+  // eslint-disable-next-line solid/reactivity -- event handler reads current signal values on purpose; no tracking intended
   onEvent('permissions.changed', (ev) => {
     const who = ev.data?.username as string | undefined;
     if (!who || who === user()?.username || isAdmin()) {

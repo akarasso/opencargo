@@ -18,6 +18,7 @@ export default function CommandPalette() {
   const navigate = useNavigate();
   const [query, setQuery] = createSignal('');
   const [selected, setSelected] = createSignal(0);
+  // eslint-disable-next-line no-unassigned-vars -- assigned by Solid's ref directive (JSX compiler)
   let inputRef: HTMLInputElement | undefined;
 
   // Debounced package search against the registry.
@@ -101,7 +102,8 @@ export default function CommandPalette() {
     const onKey = (e: KeyboardEvent) => {
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
-        ui.paletteOpen() ? ui.closePalette() : ui.openPalette();
+        if (ui.paletteOpen()) ui.closePalette();
+        else ui.openPalette();
       } else if (e.key === 'Escape' && ui.paletteOpen()) {
         ui.closePalette();
       }
