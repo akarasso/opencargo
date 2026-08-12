@@ -137,24 +137,34 @@ pub async fn auth_middleware(
         Some(t) => {
             // Static config tokens (constant-time compare), then DB-backed
             // API tokens — shared with the WebSocket first-frame auth.
-            if let Some(auth_user) = authenticate_bearer(&state, &t).await {
-                if let Some(resp) = password_change_pending_block(
-                    &auth_user,
-                    request.method(),
-                    request.uri().path(),
-                ) {
-                    return resp;
+            match authenticate_bearer(&state, &t).await {
+                Ok(Some(auth_user)) => {
+                    if let Some(resp) = password_change_pending_block(
+                        &auth_user,
+                        request.method(),
+                        request.uri().path(),
+                    ) {
+                        return resp;
+                    }
+                    let mut request = request;
+                    request.extensions_mut().insert(auth_user);
+                    next.run(request).await
                 }
-                let mut request = request;
-                request.extensions_mut().insert(auth_user);
-                return next.run(request).await;
-            }
-
-            // Token not valid
-            if state.anonymous_read && is_read {
-                next.run(request).await
-            } else {
-                unauthorized_response(is_oci)
+                // Token not valid
+                Ok(None) => {
+                    if state.anonymous_read && is_read {
+                        next.run(request).await
+                    } else {
+                        unauthorized_response(is_oci)
+                    }
+                }
+                // A DB failure (e.g. SQLITE_BUSY under load) says nothing
+                // about the token: answer 503 so the client retries, instead
+                // of the historical 401 that logged valid users out.
+                Err(e) => {
+                    tracing::warn!(error = %e, "database error during bearer authentication");
+                    service_unavailable_response()
+                }
             }
         }
         None => {
@@ -200,6 +210,16 @@ fn too_many_requests_response() -> Response {
         .into_response()
 }
 
+/// 503 response for transient DB failures during authentication — retryable,
+/// unlike the 401 these used to be silently collapsed into.
+fn service_unavailable_response() -> Response {
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(json!({"error": "authentication temporarily unavailable, try again"})),
+    )
+        .into_response()
+}
+
 /// While `must_change_password` is set, allow only the password-change endpoint
 /// (`PUT .../password`) and `/-/whoami`; block everything else with 403. This
 /// makes the forced rotation real instead of cosmetic — a long-lived token can
@@ -233,7 +253,14 @@ fn password_change_pending_block(
 /// (they map to a synthetic admin user, backwards compat), then DB-backed
 /// API tokens. Shared by the HTTP auth middleware and the WebSocket
 /// first-frame authentication (`api::ws`).
-pub(crate) async fn authenticate_bearer(state: &AuthState, token: &str) -> Option<AuthUser> {
+///
+/// `Ok(None)` means the token was actually rejected (unknown, bad hash,
+/// expired); `Err` means the DB could not answer and the caller must NOT
+/// treat the token as invalid.
+pub(crate) async fn authenticate_bearer(
+    state: &AuthState,
+    token: &str,
+) -> Result<Option<AuthUser>, sqlx::Error> {
     let is_static = state.static_tokens.iter().any(|st| {
         st.len() == token.len()
             && st
@@ -243,13 +270,13 @@ pub(crate) async fn authenticate_bearer(state: &AuthState, token: &str) -> Optio
                 == 0
     });
     if is_static {
-        return Some(AuthUser {
+        return Ok(Some(AuthUser {
             token: token.to_string(),
             user_id: None,
             username: "static-token".to_string(),
             role: "admin".to_string(),
             must_change_password: false,
-        });
+        }));
     }
     try_db_token_auth(&state.db, token).await
 }
@@ -257,46 +284,56 @@ pub(crate) async fn authenticate_bearer(state: &AuthState, token: &str) -> Optio
 /// Attempt to authenticate via a DB API token.
 ///
 /// Looks up the token by its prefix, verifies the hash, checks expiration,
-/// loads the user, and updates `last_used_at`.
-async fn try_db_token_auth(db: &SqlitePool, raw_token: &str) -> Option<AuthUser> {
+/// loads the user, and updates `last_used_at`. DB errors are propagated
+/// instead of being collapsed into a rejection (the historical "401 under
+/// load": SQLITE_BUSY looked like an invalid token).
+async fn try_db_token_auth(
+    db: &SqlitePool,
+    raw_token: &str,
+) -> Result<Option<AuthUser>, sqlx::Error> {
     // The prefix stored in DB is the first 16 characters of the raw token.
     if raw_token.len() < 16 {
-        return None;
+        return Ok(None);
     }
     let prefix = &raw_token[..16];
 
-    let db_token = crate::db::get_token_by_prefix(db, prefix).await.ok()??;
+    let Some(db_token) = crate::db::get_token_by_prefix(db, prefix).await? else {
+        return Ok(None);
+    };
 
     // Verify the token hash
     if !tokens::verify_token(raw_token, &db_token.token_hash) {
-        return None;
+        return Ok(None);
     }
 
     // Check expiration. Fail CLOSED: an unparseable timestamp rejects the token
     // rather than silently treating it as non-expiring (the previous behaviour).
     if let Some(ref expires_at) = db_token.expires_at {
         match chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S") {
-            Ok(exp) if exp < chrono::Utc::now().naive_utc() => return None, // expired
-            Ok(_) => {}                                                     // still valid
-            Err(_) => return None, // corrupt/unexpected format -> reject
+            Ok(exp) if exp < chrono::Utc::now().naive_utc() => return Ok(None), // expired
+            Ok(_) => {}                                                          // still valid
+            Err(_) => return Ok(None), // corrupt/unexpected format -> reject
         }
     }
 
     // Load the user
-    let user = sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
-        .bind(db_token.user_id)
-        .fetch_optional(db)
-        .await
-        .ok()??;
+    let Some(user) =
+        sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
+            .bind(db_token.user_id)
+            .fetch_optional(db)
+            .await?
+    else {
+        return Ok(None);
+    };
 
     // Update last_used_at (fire-and-forget)
     let _ = crate::db::update_token_last_used(db, &db_token.id).await;
 
-    Some(AuthUser {
+    Ok(Some(AuthUser {
         token: raw_token.to_string(),
         user_id: Some(user.id),
         username: user.username,
         role: user.role,
         must_change_password: user.must_change_password == 1,
-    })
+    }))
 }

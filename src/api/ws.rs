@@ -41,6 +41,9 @@ const REVALIDATE_EVERY: u32 = 10;
 // Application close codes (4000-4999 range is app-defined).
 const CLOSE_UNAUTHORIZED: u16 = 4401;
 const CLOSE_FORBIDDEN: u16 = 4403;
+// Standard "Try Again Later" close code — used for transient DB failures
+// during auth, which must not look like a token rejection to the client.
+const CLOSE_TRY_AGAIN: u16 = 1013;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
@@ -140,11 +143,18 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
                 if ticks.is_multiple_of(REVALIDATE_EVERY) {
                     if let Some(ref token) = identity.token {
                         let violation = match authenticate_bearer(&state.auth, token).await {
-                            None => Some((CLOSE_UNAUTHORIZED, "token no longer valid")),
-                            Some(user) if user.must_change_password => {
+                            Ok(None) => Some((CLOSE_UNAUTHORIZED, "token no longer valid")),
+                            // Transient DB failure: keep the previously
+                            // validated identity instead of dropping the
+                            // connection; the next revalidation tick retries.
+                            Err(e) => {
+                                tracing::warn!(error = %e, "ws token revalidation skipped: database error");
+                                None
+                            }
+                            Ok(Some(user)) if user.must_change_password => {
                                 Some((CLOSE_FORBIDDEN, "password change required"))
                             }
-                            Some(user) => {
+                            Ok(Some(user)) => {
                                 let fresh_level = if user.role == "admin" {
                                     Visibility::Admin
                                 } else {
@@ -201,14 +211,14 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<WsIden
 
     match token {
         Some(t) => match authenticate_bearer(&state.auth, &t).await {
-            Some(AuthUser {
+            Ok(Some(AuthUser {
                 must_change_password: true,
                 ..
-            }) => {
+            })) => {
                 close(socket, CLOSE_FORBIDDEN, "password change required").await;
                 None
             }
-            Some(user) => {
+            Ok(Some(user)) => {
                 let level = if user.role == "admin" {
                     Visibility::Admin
                 } else {
@@ -221,8 +231,15 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<WsIden
                     token: Some(t),
                 })
             }
-            None => {
+            Ok(None) => {
                 close(socket, CLOSE_UNAUTHORIZED, "invalid token").await;
+                None
+            }
+            // A DB failure says nothing about the token: tell the client to
+            // retry rather than treat it as rejected.
+            Err(e) => {
+                tracing::warn!(error = %e, "database error during ws authentication");
+                close(socket, CLOSE_TRY_AGAIN, "authentication temporarily unavailable").await;
                 None
             }
         },

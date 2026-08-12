@@ -144,17 +144,25 @@ pub async fn create_repository(
     ))
 }
 
-/// GET /api/v1/repositories/{name} -- Get repository details (any authenticated user)
+/// GET /api/v1/repositories/{name} -- Get repository details (authenticated
+/// caller with read access; the response includes `upstream_url` and
+/// `config_json`, which must not leak to callers lacking read on the repo)
 pub async fn get_repository(
     State(state): State<AppState>,
     Path(name): Path<String>,
     request: axum::http::Request<axum::body::Body>,
 ) -> AppResult<impl IntoResponse> {
-    let _caller = require_auth(&request)?;
+    let caller = require_auth(&request)?;
 
     let repo = crate::db::get_repository_by_name(&state.db, &name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))?;
+
+    // A private repo the caller cannot read must be indistinguishable from a
+    // missing one, so the permission denial maps to the same 404.
+    crate::registry::ensure_can_read(&state.db, &repo, Some(&caller))
+        .await
+        .map_err(|_| AppError::NotFound(format!("repository not found: {name}")))?;
 
     Ok(Json(json!({
         "id": repo.id,
