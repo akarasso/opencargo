@@ -201,11 +201,7 @@ pub async fn publish_crate(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
 
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only publish to hosted repositories".to_string(),
-        ));
-    }
+    crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, "cargo")?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
@@ -235,6 +231,11 @@ pub async fn publish_crate(
 
     let meta: CargoPublishMeta = serde_json::from_slice(&data[json_start..json_end])
         .map_err(|e| AppError::BadRequest(format!("invalid publish metadata JSON: {e}")))?;
+
+    // The crate name and version come from the client-controlled metadata and
+    // are interpolated into the storage path — validate them before any write.
+    crate::registry::validate_package_name("cargo", &meta.name)?;
+    crate::registry::validate_version(&meta.vers)?;
 
     let crate_len =
         u32::from_le_bytes([data[json_end], data[json_end + 1], data[json_end + 2], data[json_end + 3]])
@@ -352,7 +353,7 @@ pub async fn publish_crate(
         &repo_name,
         crate_name,
         version_str,
-        _version_id,
+        Some(_version_id),
         &metadata_json,
         &user.username,
     )

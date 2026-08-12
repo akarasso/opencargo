@@ -263,6 +263,14 @@ pub fn build_router(state: AppState) -> Router {
             put(crate::registry::cargo::unyank),
         );
 
+    // Go module routes. Real module paths span several URL segments
+    // (github.com/org/repo) while `{module}` matches exactly one; a
+    // `/{repo}/{*rest}` catch-all is rejected by axum's matchit because it
+    // conflicts with the npm/cargo routes sharing the `/{repo}/` prefix.
+    // Instead, `rewrite_go_module_path` (applied before routing, see the end
+    // of this function) percent-encodes the slashes inside multi-segment
+    // module paths so they match these single-segment routes; axum decodes
+    // path params, so the handlers receive the real module path.
     let go_routes = Router::new()
         .route(
             "/{repo}/{module}/@v/list",
@@ -271,6 +279,10 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/{repo}/{module}/@v/{version}",
             get(go_version_dispatch).put(crate::registry::go::publish_module),
+        )
+        .route(
+            "/{repo}/{module}/@latest",
+            get(crate::registry::go::latest_version),
         );
 
     // OCI / Docker container registry routes
@@ -449,7 +461,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/events/ws", get(crate::api::ws::ws_handler))
         .with_state(state.clone());
 
-    Router::new()
+    let router = Router::new()
         // Health checks (no auth)
         .route("/health/live", get(health_live))
         .route("/health/ready", get(health_ready))
@@ -491,7 +503,85 @@ pub fn build_router(state: AppState) -> Router {
             telemetry::http_metrics_middleware,
         ))
         // Security response headers on every response (defense in depth).
-        .layer(axum::middleware::from_fn(security_headers_middleware))
+        .layer(axum::middleware::from_fn(security_headers_middleware));
+
+    // Multi-segment Go module support. The rewrite must run BEFORE route
+    // matching, and `Router::layer` runs after it, so the finished router is
+    // wrapped in a `map_request` service and re-exposed as the fallback of a
+    // fresh route-less Router. This keeps the return type (`Router`) so both
+    // `main.rs` and the integration tests get the rewrite for free.
+    Router::new().fallback_service(
+        tower::Layer::layer(
+            &tower::util::MapRequestLayer::new(rewrite_go_module_path),
+            router,
+        ),
+    )
+}
+
+/// Rewrite multi-segment Go module paths so the router can match them.
+///
+/// The GOPROXY protocol addresses a module as `{base}/{module}/@v/...` or
+/// `{base}/{module}/@latest`, where the module path usually spans several URL
+/// segments (`github.com/org/repo`). axum's `{module}` param matches exactly
+/// one segment, and a `/{repo}/{*rest}` catch-all is rejected at router build
+/// time (matchit forbids a catch-all overlapping the npm/cargo param routes
+/// under `/{repo}/`). So, before routing, the slashes INSIDE the module part
+/// of GOPROXY-shaped paths are percent-encoded; the module then fits in a
+/// single segment, the existing `/{repo}/{module}/@v/...` routes match, and
+/// axum's percent-decoding of path params hands the handlers the real module
+/// path.
+///
+/// The rewrite only applies when the path has a GOPROXY marker — `/@v/`
+/// followed by a final single segment (`list`, `{version}`, `{version}.info`,
+/// ...) or an `/@latest` suffix — with at least two module segments before
+/// it, and never under `/api/` or `/v2/` (admin API and OCI namespaces; an
+/// npm scope named `@v` never has a single trailing segment after it, but the
+/// guards keep the reasoning local). Everything else passes through untouched.
+fn rewrite_go_module_path(
+    mut req: axum::http::Request<axum::body::Body>,
+) -> axum::http::Request<axum::body::Body> {
+    let path = req.uri().path();
+    if path.starts_with("/api/") || path.starts_with("/v2/") {
+        return req;
+    }
+
+    let (prefix, suffix) = if let Some(idx) = path.rfind("/@v/") {
+        // GOPROXY paths have exactly one segment after /@v/; npm/dist-tags
+        // paths that can contain "/@v/" (scope named "v") always have more.
+        if path[idx + 4..].contains('/') {
+            return req;
+        }
+        (&path[..idx], &path[idx..])
+    } else if let Some(prefix) = path.strip_suffix("/@latest") {
+        (prefix, "/@latest")
+    } else {
+        return req;
+    };
+
+    // prefix is "/{repo}/{module...}" — rewrite only when the module part
+    // spans at least two segments (single-segment modules already match).
+    let mut parts = prefix.splitn(3, '/');
+    let (Some(""), Some(repo), Some(module)) = (parts.next(), parts.next(), parts.next())
+    else {
+        return req;
+    };
+    if repo.is_empty() || module.is_empty() || !module.contains('/') {
+        return req;
+    }
+
+    let encoded_module = module.replace('/', "%2F");
+    let new_path = format!("/{repo}/{encoded_module}{suffix}");
+    let new_uri_str = match req.uri().query() {
+        Some(q) => format!("{new_path}?{q}"),
+        None => new_path,
+    };
+    match new_uri_str.parse() {
+        Ok(new_uri) => *req.uri_mut() = new_uri,
+        Err(e) => {
+            tracing::warn!(uri = %req.uri(), error = %e, "re-parse of rewritten Go module URI failed; keeping original");
+        }
+    }
+    req
 }
 
 /// Add hardening response headers to every response.
@@ -745,13 +835,71 @@ pub fn decode_percent_encoded_slashes<B>(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_percent_encoded_slashes;
+    use super::{decode_percent_encoded_slashes, rewrite_go_module_path};
 
     fn req(uri: &str) -> axum::http::Request<()> {
         axum::http::Request::builder()
             .uri(uri)
             .body(())
             .expect("test URI should build")
+    }
+
+    fn body_req(uri: &str) -> axum::http::Request<axum::body::Body> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(axum::body::Body::empty())
+            .expect("test URI should build")
+    }
+
+    /// Multi-segment module paths get their inner slashes percent-encoded so
+    /// the single-segment `/{repo}/{module}/...` routes match.
+    #[test]
+    fn rewrites_multi_segment_go_paths() {
+        for (input, expected) in [
+            (
+                "/go-hosted/github.com/org/repo/@v/list",
+                "/go-hosted/github.com%2Forg%2Frepo/@v/list",
+            ),
+            (
+                "/go-hosted/github.com/org/repo/@v/v1.0.0.info",
+                "/go-hosted/github.com%2Forg%2Frepo/@v/v1.0.0.info",
+            ),
+            (
+                "/go-hosted/example.com/mod/@latest",
+                "/go-hosted/example.com%2Fmod/@latest",
+            ),
+        ] {
+            let out = rewrite_go_module_path(body_req(input));
+            assert_eq!(out.uri().path(), expected, "for {input}");
+        }
+
+        // Query strings survive.
+        let out = rewrite_go_module_path(body_req("/go-hosted/a/b/@v/list?x=1"));
+        assert_eq!(out.uri().path(), "/go-hosted/a%2Fb/@v/list");
+        assert_eq!(out.uri().query(), Some("x=1"));
+    }
+
+    /// Paths that are not multi-segment GOPROXY calls pass through untouched:
+    /// single-segment modules, npm routes (including a scope named "@v"),
+    /// cargo, admin API, and OCI namespaces.
+    #[test]
+    fn leaves_non_go_paths_untouched() {
+        for uri in [
+            "/go-hosted/mymodule/@v/list",          // single-segment module
+            "/go-hosted/mymodule/@v/v1.0.0",        // single-segment module
+            "/go-hosted/mymodule/@latest",          // single-segment module
+            "/npm-dev/@scope/pkg",                  // npm scoped metadata
+            "/npm-dev/@v/pkg",                      // npm scope named "v"
+            "/npm-dev/@v/pkg/-/pkg-1.0.0.tgz",      // npm tarball, scope "v"
+            "/npm-dev/-/package/@v/pkg/dist-tags",  // npm dist-tags, scope "v"
+            "/cargo-repo/api/v1/crates/new",        // cargo publish
+            "/api/v1/packages",                     // admin API guard
+            "/v2/oci-repo/img/manifests/latest",    // OCI guard
+            "/health/live",
+        ] {
+            let out = rewrite_go_module_path(body_req(uri));
+            assert_eq!(out.uri().path(), uri, "{uri} must not be rewritten");
+        }
     }
 
     /// Nominal npm/pnpm case: scoped package names arrive with `%2f`-encoded

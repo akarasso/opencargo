@@ -580,3 +580,71 @@ async fn test_npm_deprecate() {
         "deprecated flag should be removed after undeprecate"
     );
 }
+
+/// Hostile or malformed package names must be rejected with 400 at publish,
+/// before anything reaches the DB or the storage tree.
+#[tokio::test]
+async fn test_npm_publish_rejects_invalid_name() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    // Uppercase scope: npm names are lowercase-only.
+    let pkg_json = r#"{"name":"@Test/hello","version":"1.0.0","description":"x","main":"index.js"}"#;
+    let tarball = build_tarball(pkg_json);
+    let body = build_publish_body("@Test/hello", "1.0.0", "x", &tarball);
+
+    let resp = client
+        .put(format!("{}/test-npm/@Test/hello", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an uppercase npm name must be rejected with 400"
+    );
+
+    // Leading dot in the name part.
+    let body = build_publish_body("@test/.hidden", "1.0.0", "x", &tarball);
+    let resp = client
+        .put(format!("{}/test-npm/@test/.hidden", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a leading-dot npm name must be rejected with 400"
+    );
+}
+
+/// The `name` in the publish body must match the package name in the URL —
+/// otherwise the tarball is stored under one name while the metadata claims
+/// another.
+#[tokio::test]
+async fn test_npm_publish_rejects_body_name_mismatch() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let pkg_json = r#"{"name":"@test/other","version":"1.0.0","description":"x","main":"index.js"}"#;
+    let tarball = build_tarball(pkg_json);
+    // Body says "@test/other" but the URL targets "@test/hello".
+    let body = build_publish_body("@test/other", "1.0.0", "x", &tarball);
+
+    let resp = client
+        .put(format!("{}/test-npm/@test/hello", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a body/URL package-name mismatch must be rejected with 400"
+    );
+}

@@ -164,6 +164,22 @@ async fn setup_with_webhooks(
                 upstream: None,
                 members: None,
             },
+            RepositoryConfig {
+                name: "go-hosted".to_string(),
+                repo_type: RepositoryType::Hosted,
+                format: RepositoryFormat::Go,
+                visibility: Visibility::Public,
+                upstream: None,
+                members: None,
+            },
+            RepositoryConfig {
+                name: "oci-hosted".to_string(),
+                repo_type: RepositoryType::Hosted,
+                format: RepositoryFormat::Oci,
+                visibility: Visibility::Public,
+                upstream: None,
+                members: None,
+            },
         ],
         webhooks,
         ..Default::default()
@@ -395,4 +411,115 @@ async fn test_webhook_event_filter() {
         assert_eq!(calls[0].body["event"], "package.promoted");
         assert_eq!(calls[0].body["data"]["package"], "@test/filter-pkg");
     }
+}
+
+/// Build a minimal Go module zip (a go.mod plus one source file).
+fn build_go_module_zip(module_name: &str, version: &str) -> Vec<u8> {
+    use std::io::Write;
+
+    let mut buf = Vec::new();
+    {
+        let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        let go_mod_path = format!("{}@{}/go.mod", module_name, version);
+        zip_writer.start_file(&go_mod_path, options).unwrap();
+        let go_mod_content = format!("module {}\n\ngo 1.21\n", module_name);
+        zip_writer.write_all(go_mod_content.as_bytes()).unwrap();
+
+        zip_writer.finish().unwrap();
+    }
+    buf
+}
+
+/// Publishing a Go module (multi-segment path) must fire the
+/// `package.published` webhook, exactly like npm/cargo.
+#[tokio::test]
+async fn test_webhook_on_go_publish() {
+    let (webhook_url, received) = setup_webhook_receiver().await;
+
+    let (base_url, _handle, _tmp) = setup_with_webhooks(vec![WebhookConfig {
+        url: webhook_url,
+        events: vec!["package.published".to_string()],
+        secret: None,
+    }])
+    .await;
+
+    let client = reqwest::Client::new();
+    let module = "example.com/org/hookmod";
+    let zip_data = build_go_module_zip(module, "v1.0.0");
+
+    let resp = client
+        .put(format!("{}/go-hosted/{}/@v/v1.0.0", base_url, module))
+        .bearer_auth("test-token")
+        .header("content-type", "application/zip")
+        .body(zip_data)
+        .send()
+        .await
+        .expect("go publish request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "go publish failed: {:?}",
+        resp.text().await
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let calls = received.lock().unwrap();
+    assert!(
+        !calls.is_empty(),
+        "webhook receiver should have been called for a Go publish"
+    );
+    let call = &calls[0];
+    assert_eq!(call.body["event"], "package.published");
+    assert_eq!(call.body["data"]["package"], module);
+    assert_eq!(call.body["data"]["version"], "v1.0.0");
+    assert_eq!(call.body["data"]["repository"], "go-hosted");
+}
+
+/// Pushing an OCI manifest by tag must fire the `package.published` webhook:
+/// package = image name, version = the pushed tag.
+#[tokio::test]
+async fn test_webhook_on_oci_manifest_push() {
+    let (webhook_url, received) = setup_webhook_receiver().await;
+
+    let (base_url, _handle, _tmp) = setup_with_webhooks(vec![WebhookConfig {
+        url: webhook_url,
+        events: vec!["package.published".to_string()],
+        secret: None,
+    }])
+    .await;
+
+    let client = reqwest::Client::new();
+    let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":0,"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"layers":[]}"#;
+
+    let resp = client
+        .put(format!("{}/v2/oci-hosted/hookapp/manifests/v1.0", base_url))
+        .bearer_auth("test-token")
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest.to_vec())
+        .send()
+        .await
+        .expect("put manifest request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "oci manifest push failed: {:?}",
+        resp.text().await
+    );
+
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+    let calls = received.lock().unwrap();
+    assert!(
+        !calls.is_empty(),
+        "webhook receiver should have been called for an OCI manifest push"
+    );
+    let call = &calls[0];
+    assert_eq!(call.body["event"], "package.published");
+    assert_eq!(call.body["data"]["package"], "hookapp");
+    assert_eq!(call.body["data"]["version"], "v1.0");
+    assert_eq!(call.body["data"]["repository"], "oci-hosted");
 }

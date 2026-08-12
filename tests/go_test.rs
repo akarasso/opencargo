@@ -255,7 +255,127 @@ async fn test_go_version_info() {
     );
 }
 
-/// 4. B19 regression: a Go module whose go.mod exceeds the 1 MiB cap is
+/// 4. Multi-segment module paths (the realistic case: `example.com/org/repo`).
+/// axum's `{module}` route param matches a single URL segment, so these go
+/// through the `/{repo}/{*rest}` wildcard dispatch: publish, @v/list,
+/// .info, .zip download and @latest must all resolve.
+#[tokio::test]
+async fn test_go_multi_segment_module() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let module = "example.com/org/repo";
+
+    publish_go_module(&client, &base_url, module, "v1.0.0").await;
+
+    // Publish v1.1.0 by hand, keeping the zip bytes for the download check.
+    let zip_v110 = build_go_module_zip(module, "v1.1.0");
+    let resp = client
+        .put(format!("{}/go-hosted/{}/@v/v1.1.0", base_url, module))
+        .bearer_auth("test-token")
+        .header("content-type", "application/zip")
+        .body(zip_v110.clone())
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "multi-segment publish failed: {:?}",
+        resp.text().await
+    );
+
+    // @v/list
+    let resp = client
+        .get(format!("{}/go-hosted/{}/@v/list", base_url, module))
+        .send()
+        .await
+        .expect("list request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body = resp.text().await.expect("failed to read body");
+    let versions: Vec<&str> = body.lines().collect();
+    assert!(versions.contains(&"v1.0.0"), "list should contain v1.0.0, got {versions:?}");
+    assert!(versions.contains(&"v1.1.0"), "list should contain v1.1.0, got {versions:?}");
+
+    // .info
+    let resp = client
+        .get(format!("{}/go-hosted/{}/@v/v1.0.0.info", base_url, module))
+        .send()
+        .await
+        .expect("info request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info: Value = resp.json().await.expect("invalid json");
+    assert_eq!(info["Version"], "v1.0.0");
+
+    // .zip download must return the exact published bytes
+    let resp = client
+        .get(format!("{}/go-hosted/{}/@v/v1.1.0.zip", base_url, module))
+        .send()
+        .await
+        .expect("download request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let downloaded = resp.bytes().await.expect("failed to read zip bytes");
+    assert_eq!(
+        downloaded.as_ref(),
+        zip_v110.as_slice(),
+        "downloaded zip should match the original"
+    );
+
+    // @latest returns the most recently published version
+    let resp = client
+        .get(format!("{}/go-hosted/{}/@latest", base_url, module))
+        .send()
+        .await
+        .expect("latest request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let latest: Value = resp.json().await.expect("invalid json");
+    assert_eq!(latest["Version"], "v1.1.0", "@latest should be the last published version");
+    assert!(latest["Time"].is_string(), "@latest should carry a Time field");
+}
+
+/// 5. Hostile module names must be rejected with 400 before touching storage:
+/// an empty path segment (`a//b`, wildcard route) and a forbidden character
+/// (`bad!mod`, single-segment route).
+#[tokio::test]
+async fn test_go_publish_rejects_invalid_module_names() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for bad_module in ["a//b", "bad!mod"] {
+        let zip_data = build_go_module_zip("whatever", "v1.0.0");
+        let resp = client
+            .put(format!("{}/go-hosted/{}/@v/v1.0.0", base_url, bad_module))
+            .bearer_auth("test-token")
+            .header("content-type", "application/zip")
+            .body(zip_data)
+            .send()
+            .await
+            .expect("publish request failed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "module name '{bad_module}' must be rejected with 400"
+        );
+    }
+
+    // Invalid version too
+    let zip_data = build_go_module_zip("okmod", "v1.0.0");
+    let resp = client
+        .put(format!("{}/go-hosted/okmod/@v/v1.0%2F0", base_url))
+        .bearer_auth("test-token")
+        .header("content-type", "application/zip")
+        .body(zip_data)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a version containing a slash must be rejected with 400"
+    );
+}
+
+/// 6. B19 regression: a Go module whose go.mod exceeds the 1 MiB cap is
 /// rejected at publish (400 "go.mod entry too large") rather than read fully
 /// into memory — the zip-bomb defense in extract_go_mod_from_zip. We assert on
 /// the declared-size guard (file.size() > MAX), which fires deterministically.

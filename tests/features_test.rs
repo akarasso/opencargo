@@ -975,3 +975,36 @@ async fn test_dashboard_hides_private_packages() {
         names
     );
 }
+
+/// Hostile crate names in the publish metadata must be rejected with 400
+/// before touching DB or storage: the name is interpolated into the storage
+/// path (`cargo/{repo}/{name}/{name}-{vers}.crate`).
+#[tokio::test]
+async fn test_cargo_publish_rejects_invalid_crate_name() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for bad_meta in [
+        // Path traversal in the name
+        r#"{"name":"../evil","vers":"1.0.0","deps":[],"features":{},"authors":[],"description":"x"}"#,
+        // Slash in the name -> arbitrary storage subtree
+        r#"{"name":"a/b","vers":"1.0.0","deps":[],"features":{},"authors":[],"description":"x"}"#,
+        // Version with a slash
+        r#"{"name":"okcrate","vers":"1.0/0","deps":[],"features":{},"authors":[],"description":"x"}"#,
+    ] {
+        let body = build_cargo_publish_body(bad_meta, &build_crate_data());
+        let resp = client
+            .put(format!("{}/cargo-private/api/v1/crates/new", base_url))
+            .bearer_auth("test-token")
+            .header("content-type", "application/octet-stream")
+            .body(body)
+            .send()
+            .await
+            .expect("cargo publish request failed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_REQUEST,
+            "hostile cargo metadata must be rejected with 400: {bad_meta}"
+        );
+    }
+}

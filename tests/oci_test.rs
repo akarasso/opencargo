@@ -683,3 +683,65 @@ async fn test_oci_manifest_by_digest() {
     let pulled_manifest: Value = resp.json().await.expect("invalid json");
     assert_eq!(pulled_manifest, manifest);
 }
+
+/// Hostile image names and tags must be rejected with 400 at manifest push:
+/// the image name lands in DB rows and storage paths, the tag in oci_tags.
+#[tokio::test]
+async fn test_oci_push_rejects_invalid_name_and_tag() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":0,"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"layers":[]}"#;
+
+    // Uppercase image name violates the distribution-spec name rule.
+    let resp = client
+        .put(format!(
+            "{}/v2/oci-private/MyApp/manifests/latest",
+            base_url
+        ))
+        .bearer_auth("test-token")
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest.to_vec())
+        .send()
+        .await
+        .expect("put manifest request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "an uppercase OCI image name must be rejected with 400"
+    );
+
+    // Leading-dot tag violates the distribution-spec tag rule.
+    let resp = client
+        .put(format!(
+            "{}/v2/oci-private/myapp/manifests/.badtag",
+            base_url
+        ))
+        .bearer_auth("test-token")
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest.to_vec())
+        .send()
+        .await
+        .expect("put manifest request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a leading-dot OCI tag must be rejected with 400"
+    );
+
+    // Starting an upload with a hostile image name fails as early as possible.
+    let resp = client
+        .post(format!(
+            "{}/v2/oci-private/Evil..Image/blobs/uploads/",
+            base_url
+        ))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("start upload request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_REQUEST,
+        "a hostile image name must be rejected at upload start"
+    );
+}
