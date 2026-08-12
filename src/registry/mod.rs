@@ -44,7 +44,7 @@ pub async fn ensure_can_read(
     }
     match auth_user {
         Some(user) => {
-            if check_repo_permission(db, user.user_id, &user.role, repo.id, "read").await {
+            if check_repo_permission(db, user.user_id, &user.role, repo.id, "read").await? {
                 Ok(())
             } else {
                 Err(AppError::Forbidden(format!(
@@ -68,7 +68,7 @@ pub async fn ensure_can_write(
     repo: &Repository,
     auth_user: &AuthUser,
 ) -> AppResult<()> {
-    if check_repo_permission(db, auth_user.user_id, &auth_user.role, repo.id, "write").await {
+    if check_repo_permission(db, auth_user.user_id, &auth_user.role, repo.id, "write").await? {
         Ok(())
     } else {
         Err(AppError::Forbidden(format!(

@@ -27,6 +27,12 @@ pub enum AppError {
     #[error("{0}")]
     TooManyRequests(String),
 
+    /// Transient backend failure (e.g. the DB is unavailable during an authz
+    /// check): retryable 503, consistent with the auth middleware's treatment
+    /// of DB errors — never a 4xx that would misreport the caller's rights.
+    #[error("{0}")]
+    ServiceUnavailable(String),
+
     #[error("{0}")]
     Internal(String),
 
@@ -49,6 +55,7 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
+            AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::Database(err) => {
                 // A UNIQUE-constraint violation is a client-visible conflict, not
