@@ -5,6 +5,15 @@
 import { createResource, onCleanup, type Resource } from 'solid-js';
 import { onEvent } from '../ws.ts';
 
+interface LiveOpts {
+  debounce?: number;
+  /**
+   * Refetch every `pollMs` milliseconds — for data no WS event covers
+   * (Prometheus metrics, health probes). Skipped while the tab is hidden.
+   */
+  pollMs?: number;
+}
+
 /**
  * Re-run `refetch` whenever one of `events` fires (plus on reconnect/resync),
  * debounced so a burst of publishes causes one refetch, not fifty.
@@ -13,7 +22,7 @@ import { onEvent } from '../ws.ts';
 export function useLive(
   refetch: () => unknown,
   events: string[],
-  opts: { debounce?: number } = {},
+  opts: LiveOpts = {},
 ): void {
   const wait = opts.debounce ?? 350;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -28,8 +37,16 @@ export function useLive(
 
   const unsubs = [...events, '$connected', '$resync'].map((e) => onEvent(e, trigger));
 
+  let poll: ReturnType<typeof setInterval> | null = null;
+  if (opts.pollMs !== undefined) {
+    poll = setInterval(() => {
+      if (!document.hidden) void refetch();
+    }, opts.pollMs);
+  }
+
   onCleanup(() => {
     if (timer) clearTimeout(timer);
+    if (poll) clearInterval(poll);
     unsubs.forEach((u) => u());
   });
 }
@@ -41,7 +58,7 @@ export function useLive(
 export function createLiveResource<T>(
   fetcher: () => Promise<T>,
   events: string[],
-  opts: { debounce?: number } = {},
+  opts: LiveOpts = {},
 ): [Resource<T>, () => unknown] {
   const [data, { refetch }] = createResource(fetcher);
   useLive(refetch, events, opts);

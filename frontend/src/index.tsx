@@ -1,4 +1,5 @@
 /* @refresh reload */
+import { ErrorBoundary } from 'solid-js';
 import { render } from 'solid-js/web';
 import { Router, Route } from '@solidjs/router';
 import Layout from './components/Layout.tsx';
@@ -25,9 +26,37 @@ import './styles/global.css';
 const root = document.getElementById('app');
 if (!root) throw new Error('Root element not found');
 
+/**
+ * Last-resort recovery screen: any uncaught render/effect error anywhere in
+ * the tree lands here instead of leaving a blank page. Plain markup on
+ * existing global.css classes only — no app components that could themselves
+ * throw again.
+ */
+function CrashScreen(props: { error: unknown }) {
+  const message = () =>
+    props.error instanceof Error ? props.error.message : String(props.error);
+  return (
+    <div class="empty" style={{ 'min-height': '100vh' }}>
+      <div class="empty-title">Something went wrong</div>
+      <div class="empty-text" style={{ 'margin-bottom': '14px' }}>
+        The interface hit an unexpected error and stopped rendering. Reloading
+        usually fixes it — your session is kept.
+      </div>
+      <div class="alert alert-error" role="alert" style={{ 'max-width': '520px' }}>
+        <span class="mono small" style={{ 'word-break': 'break-word' }}>
+          {message()}
+        </span>
+      </div>
+      <button class="btn btn-primary" onClick={() => window.location.reload()}>
+        Reload
+      </button>
+    </div>
+  );
+}
+
 render(
   () => (
-    <>
+    <ErrorBoundary fallback={(error) => <CrashScreen error={error} />}>
       <Router>
         {/* Login page has its own layout (no shell) */}
         <Route path="/login" component={Login} />
@@ -54,7 +83,7 @@ render(
       </Router>
 
       <Toaster />
-    </>
+    </ErrorBoundary>
   ),
   root,
 );
