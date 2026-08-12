@@ -729,7 +729,66 @@ pub fn decode_percent_encoded_slashes<B>(
             Some(q) => format!("{}?{}", decoded, q),
             None => decoded,
         };
-        *req.uri_mut() = new_uri_str.parse().expect("decoded URI is invalid");
+        // The decoded form can stop being a parseable URI (e.g. `/%2f` decodes
+        // to `//`, an authority form with an empty authority). This middleware
+        // runs on every request, so it must never panic: keep the original URI
+        // and let the router 404 it.
+        match new_uri_str.parse() {
+            Ok(new_uri) => *req.uri_mut() = new_uri,
+            Err(e) => {
+                tracing::warn!(uri = %req.uri(), error = %e, "re-parse of percent-decoded URI failed; keeping original");
+            }
+        }
     }
     req
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_percent_encoded_slashes;
+
+    fn req(uri: &str) -> axum::http::Request<()> {
+        axum::http::Request::builder()
+            .uri(uri)
+            .body(())
+            .expect("test URI should build")
+    }
+
+    /// Nominal npm/pnpm case: scoped package names arrive with `%2f`-encoded
+    /// slashes and must be decoded so the router can match `@{scope}/{name}`.
+    #[test]
+    fn decodes_scoped_npm_slashes() {
+        let out = decode_percent_encoded_slashes(req("/npm-dev/@scope%2fpkg"));
+        assert_eq!(out.uri().path(), "/npm-dev/@scope/pkg");
+
+        // Uppercase encoding, with a query string that must survive.
+        let out = decode_percent_encoded_slashes(req("/npm-dev/@scope%2Fpkg?write=true"));
+        assert_eq!(out.uri().path(), "/npm-dev/@scope/pkg");
+        assert_eq!(out.uri().query(), Some("write=true"));
+    }
+
+    /// A URI without any encoded slash passes through untouched.
+    #[test]
+    fn leaves_uris_without_encoded_slash_untouched() {
+        let out = decode_percent_encoded_slashes(req("/npm-dev/react?abbrev=true"));
+        assert_eq!(out.uri(), &"/npm-dev/react?abbrev=true".parse::<axum::http::Uri>().unwrap());
+    }
+
+    /// Degenerate inputs: none of these may panic (the old `.expect()` made
+    /// this middleware a remote panic vector on every request). Today's
+    /// `http::Uri` happens to re-parse all of these decoded forms; the
+    /// invariant under test is that hostile paths flow through — decoded or
+    /// left as-is — without crashing.
+    #[test]
+    fn degenerate_encoded_paths_never_panic() {
+        for uri in ["/%2f", "/%2F%2f%2F", "/a%2f..%2f..%2fetc", "/%2f%2f?q=1"] {
+            let out = decode_percent_encoded_slashes(req(uri));
+            assert!(!out.uri().to_string().is_empty(), "uri {uri} must survive");
+        }
+
+        // Only the path is decoded: a `%2f` in the query must stay encoded.
+        let out = decode_percent_encoded_slashes(req("/npm-dev/@a%2fb?rev=x%2fy"));
+        assert_eq!(out.uri().path(), "/npm-dev/@a/b");
+        assert_eq!(out.uri().query(), Some("rev=x%2fy"));
+    }
 }

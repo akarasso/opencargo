@@ -69,7 +69,14 @@ pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
 
     let opts = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
-        .journal_mode(SqliteJournalMode::Wal);
+        .journal_mode(SqliteJournalMode::Wal)
+        // Wait for a busy writer instead of failing immediately: instant
+        // SQLITE_BUSY errors under load used to surface as spurious 401s in
+        // the auth middleware.
+        .busy_timeout(std::time::Duration::from_secs(5))
+        // SQLite leaves foreign-key enforcement OFF per connection unless
+        // asked; the schema declares FK constraints and relies on them.
+        .pragma("foreign_keys", "ON");
 
     let pool = sqlx::sqlite::SqlitePoolOptions::new()
         .max_connections(5)

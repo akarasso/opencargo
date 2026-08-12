@@ -7,6 +7,7 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;
 use crate::server::AppState;
@@ -28,6 +29,32 @@ async fn find_package_by_name(
     .await
 }
 
+/// Load the repository hosting a package.
+async fn load_repository(
+    db: &sqlx::SqlitePool,
+    repository_id: i64,
+) -> AppResult<crate::db::Repository> {
+    sqlx::query_as("SELECT * FROM repositories WHERE id = ?1")
+        .bind(repository_id)
+        .fetch_one(db)
+        .await
+        .map_err(|_| AppError::Internal("failed to fetch repository".to_string()))
+}
+
+/// Read-access gate shared by the vulns read and rescan paths. A package whose
+/// repository the caller cannot read must be indistinguishable from a package
+/// that does not exist, so the denial maps to the same 404 as the name lookup.
+async fn ensure_readable_or_not_found(
+    db: &sqlx::SqlitePool,
+    repo: &crate::db::Repository,
+    auth_user: Option<&AuthUser>,
+    name: &str,
+) -> AppResult<()> {
+    crate::registry::ensure_can_read(db, repo, auth_user)
+        .await
+        .map_err(|_| AppError::NotFound(format!("package not found: {name}")))
+}
+
 // ---------------------------------------------------------------------------
 // GET /api/v1/packages/@{scope}/{name}/versions/{version}/vulns
 // ---------------------------------------------------------------------------
@@ -35,6 +62,7 @@ async fn find_package_by_name(
 pub async fn get_vulns(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let name = extract_package_name(&params);
     let version_str = params
@@ -42,24 +70,29 @@ pub async fn get_vulns(
         .cloned()
         .ok_or_else(|| AppError::BadRequest("missing version".to_string()))?;
 
-    get_vulns_impl(state, name, version_str).await
+    get_vulns_impl(state, name, version_str, auth.map(|e| e.0)).await
 }
 
 pub async fn get_vulns_unscoped(
     State(state): State<AppState>,
     Path((name, version)): Path<(String, String)>,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    get_vulns_impl(state, name, version).await
+    get_vulns_impl(state, name, version, auth.map(|e| e.0)).await
 }
 
 async fn get_vulns_impl(
     state: AppState,
     name: String,
     version_str: String,
+    auth_user: Option<AuthUser>,
 ) -> AppResult<impl IntoResponse> {
     let pkg = find_package_by_name(&state.db, &name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
+
+    let repo = load_repository(&state.db, pkg.repository_id).await?;
+    ensure_readable_or_not_found(&state.db, &repo, auth_user.as_ref(), &name).await?;
 
     let version = crate::db::get_version(&state.db, pkg.id, &version_str)
         .await?
@@ -106,6 +139,7 @@ async fn get_vulns_impl(
 pub async fn rescan(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
     let name = extract_package_name(&params);
     let version_str = params
@@ -113,24 +147,38 @@ pub async fn rescan(
         .cloned()
         .ok_or_else(|| AppError::BadRequest("missing version".to_string()))?;
 
-    rescan_impl(state, name, version_str).await
+    rescan_impl(state, name, version_str, auth.map(|e| e.0)).await
 }
 
 pub async fn rescan_unscoped(
     State(state): State<AppState>,
     Path((name, version)): Path<(String, String)>,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    rescan_impl(state, name, version).await
+    rescan_impl(state, name, version, auth.map(|e| e.0)).await
 }
 
 async fn rescan_impl(
     state: AppState,
     name: String,
     version_str: String,
+    auth_user: Option<AuthUser>,
 ) -> AppResult<impl IntoResponse> {
     let pkg = find_package_by_name(&state.db, &name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
+
+    let repo = load_repository(&state.db, pkg.repository_id).await?;
+    ensure_readable_or_not_found(&state.db, &repo, auth_user.as_ref(), &name).await?;
+
+    // Rescan destroys the stored scan results and triggers outbound OSV
+    // queries, so it requires write access on the repo, like publish. The
+    // POST never reaches this handler anonymously (the auth middleware only
+    // lets anonymous GET/HEAD through), but stay defensive.
+    let caller = auth_user
+        .as_ref()
+        .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
+    crate::registry::ensure_can_write(&state.db, &repo, caller).await?;
 
     let version = crate::db::get_version(&state.db, pkg.id, &version_str)
         .await?
@@ -139,14 +187,6 @@ async fn rescan_impl(
         })?;
 
     // Determine ecosystem from the repository format
-    let repo: crate::db::Repository = sqlx::query_as(
-        "SELECT * FROM repositories WHERE id = ?1",
-    )
-    .bind(pkg.repository_id)
-    .fetch_one(&state.db)
-    .await
-    .map_err(|_| AppError::Internal("failed to fetch repository".to_string()))?;
-
     let ecosystem = match repo.format.as_str() {
         "npm" => "npm",
         "cargo" => "crates.io",
