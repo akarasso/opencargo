@@ -43,7 +43,10 @@ function UsersInner() {
 
   async function handleCreate(e: Event) {
     e.preventDefault();
-    if (!newUsername() || !newPassword()) return;
+    if (!newUsername() || !newPassword()) {
+      toasts.error('Username and password are required');
+      return;
+    }
     setCreateLoading(true);
     try {
       await createUser({
@@ -75,7 +78,10 @@ function UsersInner() {
   async function handleEdit(e: Event) {
     e.preventDefault();
     const user = editingUser();
-    if (!user) return;
+    if (!user) {
+      toasts.error('No user selected');
+      return;
+    }
     setEditLoading(true);
     try {
       const data: { email?: string; password?: string; role?: string } = {};
@@ -234,13 +240,13 @@ function UsersInner() {
             <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
               Cancel
             </button>
-            <button class="btn btn-primary" onClick={handleCreate} disabled={createLoading()}>
+            <button type="submit" form="create-user-form" class="btn btn-primary" disabled={createLoading()}>
               {createLoading() ? 'Creating…' : 'Create user'}
             </button>
           </>
         }
       >
-        <form onSubmit={handleCreate}>
+        <form id="create-user-form" onSubmit={handleCreate}>
           <div class="field">
             <label class="field-label">Username</label>
             <input class="input" value={newUsername()} onInput={(e) => setNewUsername(e.currentTarget.value)} required spellcheck={false} />
@@ -275,13 +281,13 @@ function UsersInner() {
             <button class="btn btn-ghost" onClick={() => setEditingUser(null)}>
               Cancel
             </button>
-            <button class="btn btn-primary" onClick={handleEdit} disabled={editLoading()}>
+            <button type="submit" form="edit-user-form" class="btn btn-primary" disabled={editLoading()}>
               {editLoading() ? 'Saving…' : 'Save changes'}
             </button>
           </>
         }
       >
-        <form onSubmit={handleEdit}>
+        <form id="edit-user-form" onSubmit={handleEdit}>
           <div class="field">
             <label class="field-label">Email</label>
             <input class="input" type="email" value={editEmail()} onInput={(e) => setEditEmail(e.currentTarget.value)} />

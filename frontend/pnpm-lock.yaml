@@ -14,9 +14,6 @@ importers:
       solid-js:
         specifier: ^1.9.11
         version: 1.9.11
-      vite-plugin-solid:
-        specifier: ^2.11.11
-        version: 2.11.11(solid-js@1.9.11)(vite@8.0.1)
     devDependencies:
       typescript:
         specifier: ~5.9.3
@@ -24,6 +21,9 @@ importers:
       vite:
         specifier: ^8.0.1
         version: 8.0.1
+      vite-plugin-solid:
+        specifier: ^2.11.11
+        version: 2.11.11(solid-js@1.9.11)(vite@8.0.1)
 
 packages:
 

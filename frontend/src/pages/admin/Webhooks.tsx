@@ -58,7 +58,10 @@ function WebhooksInner() {
 
   async function handleCreate(e: Event) {
     e.preventDefault();
-    if (!url()) return;
+    if (!url()) {
+      toasts.error('Endpoint URL is required');
+      return;
+    }
     setBusy(true);
     try {
       await createWebhook({ url: url(), events: events(), secret: secret() || undefined });
@@ -74,7 +77,10 @@ function WebhooksInner() {
   async function handleEdit(e: Event) {
     e.preventDefault();
     const hook = editing();
-    if (!hook) return;
+    if (!hook) {
+      toasts.error('No webhook selected');
+      return;
+    }
     setBusy(true);
     try {
       await updateWebhook(hook.id, {
@@ -258,13 +264,13 @@ function WebhooksInner() {
             <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
               Cancel
             </button>
-            <button class="btn btn-primary" onClick={handleCreate} disabled={busy() || !url()}>
+            <button type="submit" form="create-webhook-form" class="btn btn-primary" disabled={busy()}>
               {busy() ? 'Creating…' : 'Create webhook'}
             </button>
           </>
         }
       >
-        <form onSubmit={handleCreate}>
+        <form id="create-webhook-form" onSubmit={handleCreate}>
           <div class="field">
             <label class="field-label">Endpoint URL</label>
             <input
@@ -301,13 +307,13 @@ function WebhooksInner() {
             <button class="btn btn-ghost" onClick={() => setEditing(null)}>
               Cancel
             </button>
-            <button class="btn btn-primary" onClick={handleEdit} disabled={busy() || !url()}>
+            <button type="submit" form="edit-webhook-form" class="btn btn-primary" disabled={busy()}>
               {busy() ? 'Saving…' : 'Save changes'}
             </button>
           </>
         }
       >
-        <form onSubmit={handleEdit}>
+        <form id="edit-webhook-form" onSubmit={handleEdit}>
           <div class="field">
             <label class="field-label">Endpoint URL</label>
             <input class="input" type="url" value={url()} onInput={(e) => setUrl(e.currentTarget.value)} required spellcheck={false} />

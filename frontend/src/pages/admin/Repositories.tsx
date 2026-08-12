@@ -46,7 +46,10 @@ function RepositoriesInner() {
 
   async function handleCreate(e: Event) {
     e.preventDefault();
-    if (!name()) return;
+    if (!name()) {
+      toasts.error('Repository name is required');
+      return;
+    }
     setBusy(true);
     try {
       await createRepository({
@@ -85,7 +88,10 @@ function RepositoriesInner() {
   async function handleEdit(e: Event) {
     e.preventDefault();
     const repo = editing();
-    if (!repo) return;
+    if (!repo) {
+      toasts.error('No repository selected');
+      return;
+    }
     setBusy(true);
     try {
       await updateRepository(repo.name, {
@@ -250,13 +256,13 @@ function RepositoriesInner() {
             <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
               Cancel
             </button>
-            <button class="btn btn-primary" onClick={handleCreate} disabled={busy() || !name()}>
+            <button type="submit" form="create-repo-form" class="btn btn-primary" disabled={busy()}>
               {busy() ? 'Creating…' : 'Create repository'}
             </button>
           </>
         }
       >
-        <form onSubmit={handleCreate}>
+        <form id="create-repo-form" onSubmit={handleCreate}>
           <div class="field">
             <label class="field-label">Name</label>
             <input
@@ -332,13 +338,13 @@ function RepositoriesInner() {
             <button class="btn btn-ghost" onClick={() => setEditing(null)}>
               Cancel
             </button>
-            <button class="btn btn-primary" onClick={handleEdit} disabled={busy()}>
+            <button type="submit" form="edit-repo-form" class="btn btn-primary" disabled={busy()}>
               {busy() ? 'Saving…' : 'Save changes'}
             </button>
           </>
         }
       >
-        <form onSubmit={handleEdit}>
+        <form id="edit-repo-form" onSubmit={handleEdit}>
           <div class="field">
             <label class="field-label">Visibility</label>
             <select class="select" value={editVisibility()} onChange={(e) => setEditVisibility(e.currentTarget.value)}>
