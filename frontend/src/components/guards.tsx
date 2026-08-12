@@ -14,6 +14,24 @@ function CheckingSession() {
   );
 }
 
+/**
+ * whoami() failed for network/server reasons: we could not verify the session,
+ * which is not the same as being signed out — offer a retry, never "sign in".
+ */
+function SessionUnavailable() {
+  return (
+    <EmptyState
+      icon="alert-triangle"
+      title="Can't verify your session"
+      text="The server could not be reached to check who you are. You have not been signed out — retry once the connection is back."
+    >
+      <button class="btn btn-primary" onClick={() => void session.retryIdentity()}>
+        Retry
+      </button>
+    </EmptyState>
+  );
+}
+
 /** Renders children only for signed-in users; otherwise explains and offers sign-in. */
 export function RequireAuth(props: { children: JSX.Element }) {
   return (
@@ -21,15 +39,17 @@ export function RequireAuth(props: { children: JSX.Element }) {
       <Show
         when={session.isAuthenticated()}
         fallback={
-          <EmptyState
-            icon="lock"
-            title="Sign in required"
-            text="This page shows information tied to your account."
-          >
-            <A class="btn btn-primary" href="/login">
-              Sign in
-            </A>
-          </EmptyState>
+          <Show when={!session.identityError()} fallback={<SessionUnavailable />}>
+            <EmptyState
+              icon="lock"
+              title="Sign in required"
+              text="This page shows information tied to your account."
+            >
+              <A class="btn btn-primary" href="/login">
+                Sign in
+              </A>
+            </EmptyState>
+          </Show>
         }
       >
         {props.children}
@@ -48,15 +68,17 @@ export function RequireAdmin(props: { children: JSX.Element }) {
           <Show
             when={session.isAuthenticated()}
             fallback={
-              <EmptyState
-                icon="lock"
-                title="Sign in required"
-                text="Administration requires an admin account."
-              >
-                <A class="btn btn-primary" href="/login">
-                  Sign in
-                </A>
-              </EmptyState>
+              <Show when={!session.identityError()} fallback={<SessionUnavailable />}>
+                <EmptyState
+                  icon="lock"
+                  title="Sign in required"
+                  text="Administration requires an admin account."
+                >
+                  <A class="btn btn-primary" href="/login">
+                    Sign in
+                  </A>
+                </EmptyState>
+              </Show>
             }
           >
             <EmptyState

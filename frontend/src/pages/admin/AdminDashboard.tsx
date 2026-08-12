@@ -27,7 +27,8 @@ function AdminDashboardInner() {
   ]);
   const [repos] = createLiveResource(fetchRepositories, ['repositories.changed']);
   const [users] = createLiveResource(fetchUsers, ['audit.entry', 'permissions.changed'], { debounce: 600 });
-  const [health] = createLiveResource(fetchHealthReady, [], { debounce: 1000 });
+  // No WS event carries health changes — poll while the tab is visible.
+  const [health] = createLiveResource(fetchHealthReady, [], { debounce: 1000, pollMs: 15_000 });
   const [audit] = createLiveResource(() => fetchAudit(1, 8), ['audit.entry'], { debounce: 400 });
 
   return (

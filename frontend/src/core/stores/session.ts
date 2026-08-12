@@ -9,14 +9,26 @@
 
 import { createResource, createRoot, createSignal } from 'solid-js';
 import { fetchMyPermissions, npmLogin, whoami } from '../api.ts';
+import { ApiError } from '../http.ts';
 import { setToken, token } from '../token.ts';
 import { connectWs, onEvent, reconnectWs } from '../ws.ts';
 import type { EffectivePermission, MyPermissions, SessionUser } from '../types.ts';
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+/** whoami attempts before giving up on a network/server failure. */
+const WHOAMI_ATTEMPTS = 3;
 
 function createSessionStore() {
   const [user, setUser] = createSignal<SessionUser | null>(null);
   /** True until the startup whoami round-trip settles — gate redirects on it. */
   const [checking, setChecking] = createSignal(true);
+  /**
+   * Set when whoami() keeps failing for network/server reasons: identity is
+   * *unknown*, not absent. Guards use it to show a retry screen instead of
+   * wrongly claiming "sign in required" to an authenticated user.
+   */
+  const [identityError, setIdentityError] = createSignal(false);
 
   const [permissions, { refetch: refetchPermissions }] = createResource<MyPermissions | null>(
     async () => {
@@ -31,27 +43,51 @@ function createSessionStore() {
   async function refreshIdentity(): Promise<void> {
     if (!token()) {
       setUser(null);
+      setIdentityError(false);
       setChecking(false);
       return;
     }
-    try {
-      const me = await whoami();
-      if (me.username && me.username !== 'anonymous') {
-        setUser({
-          username: me.username,
-          role: me.role,
-          mustChangePassword: me.must_change_password,
-        });
-      } else {
-        // Token no longer valid.
-        setToken(null);
-        setUser(null);
+    for (let attempt = 1; attempt <= WHOAMI_ATTEMPTS; attempt++) {
+      try {
+        const me = await whoami();
+        if (me.username && me.username !== 'anonymous') {
+          setUser({
+            username: me.username,
+            role: me.role,
+            mustChangePassword: me.must_change_password,
+          });
+        } else {
+          // Token no longer valid.
+          setToken(null);
+          setUser(null);
+        }
+        setIdentityError(false);
+        setChecking(false);
+        return;
+      } catch (err) {
+        if (err instanceof ApiError && err.status === 401) {
+          // Real invalid session (http.ts already purged the token).
+          setToken(null);
+          setUser(null);
+          setIdentityError(false);
+          setChecking(false);
+          return;
+        }
+        // Network failure or 5xx: back off and retry.
+        if (attempt < WHOAMI_ATTEMPTS) await sleep(attempt * 800);
       }
-    } catch {
-      // Network failure: keep the token, stay optimistic; WS status will
-      // surface connectivity problems.
     }
+    // Identity unverifiable: keep the token (the session may well still be
+    // valid) and flag the failure instead of concluding "signed out". Any
+    // user already resolved stays in place.
+    setIdentityError(true);
     setChecking(false);
+  }
+
+  /** Manual retry from the guards' connection-problem screen. */
+  async function retryIdentity(): Promise<void> {
+    setChecking(true);
+    await refreshIdentity();
   }
 
   async function login(username: string, password: string): Promise<string | null> {
@@ -80,6 +116,7 @@ function createSessionStore() {
   function logout(): void {
     setToken(null);
     setUser(null);
+    setIdentityError(false);
     reconnectWs();
     void refetchPermissions();
   }
@@ -121,6 +158,8 @@ function createSessionStore() {
   return {
     user,
     checking,
+    identityError,
+    retryIdentity,
     permissions,
     refetchPermissions,
     permissionFor,

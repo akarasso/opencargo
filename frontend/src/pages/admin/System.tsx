@@ -39,8 +39,9 @@ export default function System() {
 }
 
 function SystemInner() {
-  const [health, refetchHealth] = createLiveResource(fetchHealthReady, [], { debounce: 500 });
-  const [metricsRaw, refetchMetrics] = createLiveResource(fetchMetrics, [], { debounce: 500 });
+  // No WS event carries health/metrics changes — poll while the tab is visible.
+  const [health, refetchHealth] = createLiveResource(fetchHealthReady, [], { debounce: 500, pollMs: 15_000 });
+  const [metricsRaw, refetchMetrics] = createLiveResource(fetchMetrics, [], { debounce: 500, pollMs: 15_000 });
   const [filter, setFilter] = createSignal('');
 
   const metrics = () => {
