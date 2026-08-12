@@ -11,7 +11,8 @@ export function parseDate(value: string | null | undefined): Date | null {
   return Number.isNaN(d.getTime()) ? null : d;
 }
 
-const rtf = new Intl.RelativeTimeFormat('en', { numeric: 'auto' });
+// `undefined` locale everywhere below → inherit the browser's locale.
+const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: 'auto' });
 
 /** "just now", "12 minutes ago", "3 days ago", else a short date. */
 export function timeAgo(value: string | null | undefined): string {
@@ -29,13 +30,13 @@ export function timeAgo(value: string | null | undefined): string {
 export function shortDate(value: string | null | undefined): string {
   const d = parseDate(value);
   if (!d) return '—';
-  return d.toLocaleDateString('en-US', { year: 'numeric', month: 'short', day: 'numeric' });
+  return d.toLocaleDateString(undefined, { year: 'numeric', month: 'short', day: 'numeric' });
 }
 
 export function fullDate(value: string | null | undefined): string {
   const d = parseDate(value);
   if (!d) return '—';
-  return d.toLocaleString('en-US', {
+  return d.toLocaleString(undefined, {
     year: 'numeric',
     month: 'short',
     day: 'numeric',
@@ -44,8 +45,8 @@ export function fullDate(value: string | null | undefined): string {
   });
 }
 
-const compact = new Intl.NumberFormat('en-US', { notation: 'compact', maximumFractionDigits: 1 });
-const plain = new Intl.NumberFormat('en-US');
+const compact = new Intl.NumberFormat(undefined, { notation: 'compact', maximumFractionDigits: 1 });
+const plain = new Intl.NumberFormat(undefined);
 
 /** 1234 → "1,234" below 10k, "12.3K" above. */
 export function formatNumber(n: number | null | undefined): string {

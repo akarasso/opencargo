@@ -44,6 +44,25 @@ async fn serve_asset(Path(path): Path<String>) -> impl IntoResponse {
     }
 }
 
+/// Serve the favicon from the embedded build. It lives at the dist/ root
+/// (copied from frontend/public/), so the /assets/ handler never matches it
+/// and without this route the SPA fallback would answer with HTML.
+async fn serve_favicon() -> impl IntoResponse {
+    match FrontendAssets::get("favicon.svg") {
+        Some(content) => (
+            StatusCode::OK,
+            [
+                (header::CONTENT_TYPE, "image/svg+xml".to_string()),
+                // Not content-hashed like /assets/, so keep the cache short.
+                (header::CACHE_CONTROL, "public, max-age=86400".to_string()),
+            ],
+            content.data.to_vec(),
+        )
+            .into_response(),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
 /// SPA fallback: serve index.html for all non-API, non-asset routes.
 async fn serve_spa() -> impl IntoResponse {
     match FrontendAssets::get("index.html") {
@@ -68,6 +87,7 @@ async fn serve_spa() -> impl IntoResponse {
 pub fn web_routes() -> Router<AppState> {
     Router::new()
         .route("/assets/{*path}", get(serve_asset))
+        .route("/favicon.svg", get(serve_favicon))
         // Explicit SPA routes to prevent conflicts with npm protocol routes
         // (e.g. /{repo}/@{scope}/{name} would match /packages/@scope/name)
         .route("/", get(serve_spa))

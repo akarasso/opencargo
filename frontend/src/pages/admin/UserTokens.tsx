@@ -36,7 +36,10 @@ function UserTokensInner() {
 
   async function handleCreate(e: Event) {
     e.preventDefault();
-    if (!tokenName()) return;
+    if (!tokenName()) {
+      toasts.error('Token name is required');
+      return;
+    }
     setCreateLoading(true);
     try {
       const days = parseInt(expiresInDays(), 10);
@@ -187,13 +190,13 @@ function UserTokensInner() {
             <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
               Cancel
             </button>
-            <button class="btn btn-primary" onClick={handleCreate} disabled={createLoading() || !tokenName()}>
+            <button type="submit" form="create-token-form" class="btn btn-primary" disabled={createLoading()}>
               {createLoading() ? 'Creating…' : 'Create token'}
             </button>
           </>
         }
       >
-        <form onSubmit={handleCreate}>
+        <form id="create-token-form" onSubmit={handleCreate}>
           <div class="field">
             <label class="field-label">Name</label>
             <input
