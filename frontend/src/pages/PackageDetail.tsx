@@ -22,6 +22,8 @@ import type { VulnReport } from '../core/types.ts';
 
 type Tab = 'readme' | 'versions' | 'dependencies' | 'security';
 
+const TAB_ORDER: Tab[] = ['readme', 'versions', 'dependencies', 'security'];
+
 const SEVERITY_CHIP: Record<string, string> = {
   critical: 'chip-danger',
   high: 'chip-danger',
@@ -96,6 +98,32 @@ export default function PackageDetail() {
     if (tab === 'security' && !vulnData() && !vulnLoading()) void loadVulns();
   }
 
+  // Roving tabindex: arrows move both focus and selection; Home/End jump.
+  function onTabKeyDown(e: KeyboardEvent) {
+    const idx = TAB_ORDER.indexOf(activeTab());
+    let next: number;
+    switch (e.key) {
+      case 'ArrowRight':
+        next = (idx + 1) % TAB_ORDER.length;
+        break;
+      case 'ArrowLeft':
+        next = (idx - 1 + TAB_ORDER.length) % TAB_ORDER.length;
+        break;
+      case 'Home':
+        next = 0;
+        break;
+      case 'End':
+        next = TAB_ORDER.length - 1;
+        break;
+      default:
+        return;
+    }
+    e.preventDefault();
+    const tab = TAB_ORDER[next];
+    onTabChange(tab);
+    document.getElementById(`pkg-tab-${tab}`)?.focus();
+  }
+
   async function handlePromote() {
     const d = data();
     if (!d) return;
@@ -114,7 +142,10 @@ export default function PackageDetail() {
   return (
     <div class="page-enter">
       <Show when={data.error}>
-        <LoadError what="this package" detail="It may not exist, or you may not have read access to its repository." />
+        <LoadError
+          what="this package"
+          detail="It may not exist, or you may not have read access to its repository."
+        />
       </Show>
 
       <Show
@@ -122,8 +153,14 @@ export default function PackageDetail() {
         fallback={
           <Show when={!data.error}>
             <div>
-              <div class="skeleton" style={{ width: '40%', height: '30px', 'margin-bottom': '10px' }} />
-              <div class="skeleton skeleton-text" style={{ width: '60%', 'margin-bottom': '24px' }} />
+              <div
+                class="skeleton"
+                style={{ width: '40%', height: '30px', 'margin-bottom': '10px' }}
+              />
+              <div
+                class="skeleton skeleton-text"
+                style={{ width: '60%', 'margin-bottom': '24px' }}
+              />
               <TableSkeleton rows={6} cols={3} />
             </div>
           </Show>
@@ -134,7 +171,10 @@ export default function PackageDetail() {
             <div class="page-head">
               <div class="grow">
                 <div class="row" style={{ 'margin-bottom': '4px' }}>
-                  <h1 class="page-title mono" style={{ 'font-family': 'var(--font-mono)', 'font-weight': 500 }}>
+                  <h1
+                    class="page-title mono"
+                    style={{ 'font-family': 'var(--font-mono)', 'font-weight': 500 }}
+                  >
                     {d().name}
                   </h1>
                   <span class="version" style={{ 'font-size': '0.8rem' }}>
@@ -167,21 +207,27 @@ export default function PackageDetail() {
                   <CopyButton text={`pnpm add ${d().name}`} />
                 </div>
 
-                <div class="tabs" role="tablist">
+                <div class="tabs" role="tablist" aria-label="Package details">
                   <For
-                    each={[
-                      ['readme', 'Readme'],
-                      ['versions', `Versions · ${d().versions.length}`],
-                      ['dependencies', 'Dependencies'],
-                      ['security', 'Security'],
-                    ] as [Tab, string][]}
+                    each={
+                      [
+                        ['readme', 'Readme'],
+                        ['versions', `Versions · ${d().versions.length}`],
+                        ['dependencies', 'Dependencies'],
+                        ['security', 'Security'],
+                      ] as [Tab, string][]
+                    }
                   >
                     {([tab, label]) => (
                       <button
                         class={`tab ${activeTab() === tab ? 'active' : ''}`}
                         role="tab"
+                        id={`pkg-tab-${tab}`}
                         aria-selected={activeTab() === tab}
+                        aria-controls={`pkg-tabpanel-${tab}`}
+                        tabindex={activeTab() === tab ? 0 : -1}
                         onClick={() => onTabChange(tab)}
+                        onKeyDown={onTabKeyDown}
                       >
                         {label}
                       </button>
@@ -191,22 +237,39 @@ export default function PackageDetail() {
 
                 {/* Readme */}
                 <Show when={activeTab() === 'readme'}>
-                  <Show
-                    when={d().readme_html}
-                    fallback={
-                      <div class="card">
-                        <EmptyState icon="package" title="No readme" text="This package was published without one." />
-                      </div>
-                    }
+                  <div
+                    role="tabpanel"
+                    id="pkg-tabpanel-readme"
+                    aria-labelledby="pkg-tab-readme"
+                    tabindex="0"
                   >
-                    {/* eslint-disable-next-line solid/no-innerhtml -- readme_html is sanitized server-side before storage */}
-                    <div class="card card-pad readme" innerHTML={d().readme_html} />
-                  </Show>
+                    <Show
+                      when={d().readme_html}
+                      fallback={
+                        <div class="card">
+                          <EmptyState
+                            icon="package"
+                            title="No readme"
+                            text="This package was published without one."
+                          />
+                        </div>
+                      }
+                    >
+                      {/* eslint-disable-next-line solid/no-innerhtml -- readme_html is sanitized server-side before storage */}
+                      <div class="card card-pad readme" innerHTML={d().readme_html} />
+                    </Show>
+                  </div>
                 </Show>
 
                 {/* Versions */}
                 <Show when={activeTab() === 'versions'}>
-                  <div class="table-card">
+                  <div
+                    role="tabpanel"
+                    id="pkg-tabpanel-versions"
+                    aria-labelledby="pkg-tab-versions"
+                    tabindex="0"
+                    class="table-card"
+                  >
                     <table class="table">
                       <thead>
                         <tr>
@@ -223,7 +286,11 @@ export default function PackageDetail() {
                                 <span class="version">{v.version}</span>
                               </td>
                               <td class="cell-mono cell-muted">{v.size_display}</td>
-                              <td class="cell-dim nowrap" style={{ 'text-align': 'right' }} title={v.published_at}>
+                              <td
+                                class="cell-dim nowrap"
+                                style={{ 'text-align': 'right' }}
+                                title={v.published_at}
+                              >
                                 {timeAgo(v.published_at)}
                               </td>
                             </tr>
@@ -236,151 +303,183 @@ export default function PackageDetail() {
 
                 {/* Dependencies */}
                 <Show when={activeTab() === 'dependencies'}>
-                  <Show when={!deps.loading} fallback={<TableSkeleton rows={4} cols={3} />}>
-                    <Show
-                      when={(deps() ?? []).length > 0}
-                      fallback={
-                        <div class="card">
-                          <EmptyState icon="layers" title="No dependencies recorded" text="Nothing declared, or metadata hasn't been indexed yet." />
-                        </div>
-                      }
-                    >
-                      <div class="table-card">
-                        <table class="table">
-                          <thead>
-                            <tr>
-                              <th>Name</th>
-                              <th>Requirement</th>
-                              <th style={{ 'text-align': 'right' }}>Type</th>
-                            </tr>
-                          </thead>
-                          <tbody>
-                            <For each={deps()}>
-                              {(dep) => (
-                                <tr>
-                                  <td class="cell-mono" style={{ color: 'var(--ink)' }}>
-                                    {dep.name}
-                                  </td>
-                                  <td class="cell-mono cell-muted">{dep.version_req}</td>
-                                  <td style={{ 'text-align': 'right' }}>
-                                    <span class={`chip ${dep.dep_type === 'dev' ? 'chip-neutral' : 'chip-info'}`}>
-                                      {dep.dep_type}
-                                    </span>
-                                  </td>
-                                </tr>
-                              )}
-                            </For>
-                          </tbody>
-                        </table>
-                      </div>
-                    </Show>
-                  </Show>
-
-                  <Show when={(dependents() ?? []).length > 0}>
-                    <div class="section-head" style={{ 'margin-top': '20px' }}>
-                      <span class="section-title">Used by</span>
-                      <span class="dim small">{dependents()!.length} package(s) in this registry</span>
-                    </div>
-                    <div class="grid-cards">
-                      <For each={dependents()}>
-                        {(dep) => (
-                          <div class="card card-pad row">
-                            <Icon name="package" size={15} class="icon dim" />
-                            <span class="mono grow truncate" style={{ color: 'var(--ink)' }}>
-                              {dep.name}
-                            </span>
-                            <span class="version">{dep.version}</span>
-                          </div>
-                        )}
-                      </For>
-                    </div>
-                  </Show>
-                </Show>
-
-                {/* Security */}
-                <Show when={activeTab() === 'security'}>
-                  <div class="section-head">
-                    <div class="row">
-                      <span class="section-title">Vulnerability scan</span>
-                      <Show when={vulnData()}>
-                        {(vd) => (
-                          <span class={`chip ${vd().vulnerabilities.length === 0 ? 'chip-ok' : 'chip-danger'}`}>
-                            {vd().vulnerabilities.length === 0
-                              ? 'clean'
-                              : `${vd().vulnerabilities.length} finding(s)`}
-                          </span>
-                        )}
-                      </Show>
-                    </div>
-                    <div class="row">
-                      <Show when={vulnData()?.scanned_at}>
-                        <span class="dim small nowrap">scanned {timeAgo(vulnData()!.scanned_at)}</span>
-                      </Show>
-                      <button class="btn btn-ghost btn-sm" onClick={() => loadVulns(true)} disabled={vulnLoading()}>
-                        <Icon name="refresh" size={13} />
-                        Rescan
-                      </button>
-                    </div>
-                  </div>
-
-                  <Show when={vulnError()}>
-                    <div class="alert alert-warn">
-                      <Icon name="alert-triangle" size={15} />
-                      <span>{vulnError()}</span>
-                    </div>
-                  </Show>
-
-                  <Show when={vulnLoading()}>
-                    <TableSkeleton rows={3} cols={4} />
-                  </Show>
-
-                  <Show when={!vulnLoading() && vulnData()}>
-                    {(vd) => (
+                  <div
+                    role="tabpanel"
+                    id="pkg-tabpanel-dependencies"
+                    aria-labelledby="pkg-tab-dependencies"
+                    tabindex="0"
+                  >
+                    <Show when={!deps.loading} fallback={<TableSkeleton rows={4} cols={3} />}>
                       <Show
-                        when={vd().vulnerabilities.length > 0}
+                        when={(deps() ?? []).length > 0}
                         fallback={
                           <div class="card">
                             <EmptyState
-                              icon="shield-check"
-                              title="No known vulnerabilities"
-                              text={`OSV.dev has no advisories for ${d().name}@${vd().version}.`}
+                              icon="layers"
+                              title="No dependencies recorded"
+                              text="Nothing declared, or metadata hasn't been indexed yet."
                             />
                           </div>
                         }
                       >
                         <div class="table-card">
-                          <div class="table-scroll">
-                            <table class="table">
-                              <thead>
-                                <tr>
-                                  <th>Advisory</th>
-                                  <th>Severity</th>
-                                  <th>Title</th>
-                                  <th>Fixed in</th>
-                                </tr>
-                              </thead>
-                              <tbody>
-                                <For each={vd().vulnerabilities}>
-                                  {(vuln) => (
-                                    <tr>
-                                      <td class="cell-mono">{vuln.id}</td>
-                                      <td>
-                                        <span class={`chip ${SEVERITY_CHIP[vuln.severity.toLowerCase()] ?? 'chip-neutral'}`}>
-                                          {vuln.severity}
-                                        </span>
-                                      </td>
-                                      <td class="cell-muted">{vuln.title}</td>
-                                      <td class="cell-mono cell-muted">{vuln.fixed_in || '—'}</td>
-                                    </tr>
-                                  )}
-                                </For>
-                              </tbody>
-                            </table>
-                          </div>
+                          <table class="table">
+                            <thead>
+                              <tr>
+                                <th>Name</th>
+                                <th>Requirement</th>
+                                <th style={{ 'text-align': 'right' }}>Type</th>
+                              </tr>
+                            </thead>
+                            <tbody>
+                              <For each={deps()}>
+                                {(dep) => (
+                                  <tr>
+                                    <td class="cell-mono" style={{ color: 'var(--ink)' }}>
+                                      {dep.name}
+                                    </td>
+                                    <td class="cell-mono cell-muted">{dep.version_req}</td>
+                                    <td style={{ 'text-align': 'right' }}>
+                                      <span
+                                        class={`chip ${dep.dep_type === 'dev' ? 'chip-neutral' : 'chip-info'}`}
+                                      >
+                                        {dep.dep_type}
+                                      </span>
+                                    </td>
+                                  </tr>
+                                )}
+                              </For>
+                            </tbody>
+                          </table>
                         </div>
                       </Show>
-                    )}
-                  </Show>
+                    </Show>
+
+                    <Show when={(dependents() ?? []).length > 0}>
+                      <div class="section-head" style={{ 'margin-top': '20px' }}>
+                        <span class="section-title">Used by</span>
+                        <span class="dim small">
+                          {dependents()!.length} package(s) in this registry
+                        </span>
+                      </div>
+                      <div class="grid-cards">
+                        <For each={dependents()}>
+                          {(dep) => (
+                            <div class="card card-pad row">
+                              <Icon name="package" size={15} class="icon dim" />
+                              <span class="mono grow truncate" style={{ color: 'var(--ink)' }}>
+                                {dep.name}
+                              </span>
+                              <span class="version">{dep.version}</span>
+                            </div>
+                          )}
+                        </For>
+                      </div>
+                    </Show>
+                  </div>
+                </Show>
+
+                {/* Security */}
+                <Show when={activeTab() === 'security'}>
+                  <div
+                    role="tabpanel"
+                    id="pkg-tabpanel-security"
+                    aria-labelledby="pkg-tab-security"
+                    tabindex="0"
+                  >
+                    <div class="section-head">
+                      <div class="row">
+                        <span class="section-title">Vulnerability scan</span>
+                        <Show when={vulnData()}>
+                          {(vd) => (
+                            <span
+                              class={`chip ${vd().vulnerabilities.length === 0 ? 'chip-ok' : 'chip-danger'}`}
+                            >
+                              {vd().vulnerabilities.length === 0
+                                ? 'clean'
+                                : `${vd().vulnerabilities.length} finding(s)`}
+                            </span>
+                          )}
+                        </Show>
+                      </div>
+                      <div class="row">
+                        <Show when={vulnData()?.scanned_at}>
+                          <span class="dim small nowrap">
+                            scanned {timeAgo(vulnData()!.scanned_at)}
+                          </span>
+                        </Show>
+                        <button
+                          class="btn btn-ghost btn-sm"
+                          onClick={() => loadVulns(true)}
+                          disabled={vulnLoading()}
+                        >
+                          <Icon name="refresh" size={13} />
+                          Rescan
+                        </button>
+                      </div>
+                    </div>
+
+                    <Show when={vulnError()}>
+                      <div class="alert alert-warn">
+                        <Icon name="alert-triangle" size={15} />
+                        <span>{vulnError()}</span>
+                      </div>
+                    </Show>
+
+                    <Show when={vulnLoading()}>
+                      <TableSkeleton rows={3} cols={4} />
+                    </Show>
+
+                    <Show when={!vulnLoading() && vulnData()}>
+                      {(vd) => (
+                        <Show
+                          when={vd().vulnerabilities.length > 0}
+                          fallback={
+                            <div class="card">
+                              <EmptyState
+                                icon="shield-check"
+                                title="No known vulnerabilities"
+                                text={`OSV.dev has no advisories for ${d().name}@${vd().version}.`}
+                              />
+                            </div>
+                          }
+                        >
+                          <div class="table-card">
+                            <div class="table-scroll">
+                              <table class="table">
+                                <thead>
+                                  <tr>
+                                    <th>Advisory</th>
+                                    <th>Severity</th>
+                                    <th>Title</th>
+                                    <th>Fixed in</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  <For each={vd().vulnerabilities}>
+                                    {(vuln) => (
+                                      <tr>
+                                        <td class="cell-mono">{vuln.id}</td>
+                                        <td>
+                                          <span
+                                            class={`chip ${SEVERITY_CHIP[vuln.severity.toLowerCase()] ?? 'chip-neutral'}`}
+                                          >
+                                            {vuln.severity}
+                                          </span>
+                                        </td>
+                                        <td class="cell-muted">{vuln.title}</td>
+                                        <td class="cell-mono cell-muted">{vuln.fixed_in || '—'}</td>
+                                      </tr>
+                                    )}
+                                  </For>
+                                </tbody>
+                              </table>
+                            </div>
+                          </div>
+                        </Show>
+                      )}
+                    </Show>
+                  </div>
                 </Show>
               </div>
 
@@ -443,7 +542,12 @@ export default function PackageDetail() {
                   <button
                     class="btn btn-primary"
                     onClick={handlePromote}
-                    disabled={promoteLoading() || !promoteFrom() || !promoteTo() || promoteFrom() === promoteTo()}
+                    disabled={
+                      promoteLoading() ||
+                      !promoteFrom() ||
+                      !promoteTo() ||
+                      promoteFrom() === promoteTo()
+                    }
                   >
                     {promoteLoading() ? 'Promoting…' : 'Promote'}
                   </button>
@@ -451,19 +555,37 @@ export default function PackageDetail() {
               }
             >
               <div class="field">
-                <label class="field-label">From repository</label>
-                <select class="select" value={promoteFrom()} onChange={(e) => setPromoteFrom(e.currentTarget.value)}>
+                <label class="field-label" for="pkg-promote-from">
+                  From repository
+                </label>
+                <select
+                  id="pkg-promote-from"
+                  class="select"
+                  value={promoteFrom()}
+                  onChange={(e) => setPromoteFrom(e.currentTarget.value)}
+                >
                   <option value="">Select source…</option>
                   <For each={sourceRepos()}>{(r) => <option value={r.name}>{r.name}</option>}</For>
                 </select>
               </div>
               <div class="field">
-                <label class="field-label">To repository</label>
-                <select class="select" value={promoteTo()} onChange={(e) => setPromoteTo(e.currentTarget.value)}>
+                <label class="field-label" for="pkg-promote-to">
+                  To repository
+                </label>
+                <select
+                  id="pkg-promote-to"
+                  class="select"
+                  value={promoteTo()}
+                  onChange={(e) => setPromoteTo(e.currentTarget.value)}
+                >
                   <option value="">Select target…</option>
-                  <For each={writableRepos()}>{(r) => <option value={r.name}>{r.name}</option>}</For>
+                  <For each={writableRepos()}>
+                    {(r) => <option value={r.name}>{r.name}</option>}
+                  </For>
                 </select>
-                <div class="field-hint">Only hosted repositories where you hold write access are listed.</div>
+                <div class="field-hint">
+                  Only hosted repositories where you hold write access are listed.
+                </div>
               </div>
             </Modal>
           </>

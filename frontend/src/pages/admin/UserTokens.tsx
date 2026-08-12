@@ -77,7 +77,14 @@ function UserTokensInner() {
         <div>
           <h1 class="page-title">API tokens</h1>
           <p class="page-sub">
-            <Show when={isSelf()} fallback={<>Tokens held by <span class="mono">{username()}</span> — you're viewing as admin.</>}>
+            <Show
+              when={isSelf()}
+              fallback={
+                <>
+                  Tokens held by <span class="mono">{username()}</span> — you're viewing as admin.
+                </>
+              }
+            >
               Bearer tokens for npm, cargo, docker and the HTTP API — same rights as your account.
             </Show>
           </p>
@@ -112,10 +119,20 @@ function UserTokensInner() {
       </Show>
 
       <Show when={tokens.error}>
-        <LoadError what="tokens" detail={session.isAdmin() ? undefined : 'You can only view your own tokens.'} />
+        <LoadError
+          what="tokens"
+          detail={session.isAdmin() ? undefined : 'You can only view your own tokens.'}
+        />
       </Show>
 
-      <Show when={tokens()} fallback={<Show when={!tokens.error}><TableSkeleton rows={3} cols={5} /></Show>}>
+      <Show
+        when={tokens()}
+        fallback={
+          <Show when={!tokens.error}>
+            <TableSkeleton rows={3} cols={5} />
+          </Show>
+        }
+      >
         {(list) => (
           <Show
             when={list().length > 0}
@@ -164,7 +181,10 @@ function UserTokensInner() {
                           </td>
                           <td>
                             <div class="cell-actions">
-                              <button class="btn btn-danger btn-sm" onClick={() => setDeletingToken(token.id)}>
+                              <button
+                                class="btn btn-danger btn-sm"
+                                onClick={() => setDeletingToken(token.id)}
+                              >
                                 Revoke
                               </button>
                             </div>
@@ -190,7 +210,12 @@ function UserTokensInner() {
             <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
               Cancel
             </button>
-            <button type="submit" form="create-token-form" class="btn btn-primary" disabled={createLoading()}>
+            <button
+              type="submit"
+              form="create-token-form"
+              class="btn btn-primary"
+              disabled={createLoading()}
+            >
               {createLoading() ? 'Creating…' : 'Create token'}
             </button>
           </>
@@ -198,8 +223,11 @@ function UserTokensInner() {
       >
         <form id="create-token-form" onSubmit={handleCreate}>
           <div class="field">
-            <label class="field-label">Name</label>
+            <label class="field-label" for="create-token-name">
+              Name
+            </label>
             <input
+              id="create-token-name"
               class="input"
               value={tokenName()}
               onInput={(e) => setTokenName(e.currentTarget.value)}
@@ -207,11 +235,16 @@ function UserTokensInner() {
               spellcheck={false}
               required
             />
-            <div class="field-hint">Name it after where it will live — you'll thank yourself when revoking.</div>
+            <div class="field-hint">
+              Name it after where it will live — you'll thank yourself when revoking.
+            </div>
           </div>
           <div class="field">
-            <label class="field-label">Expires in (days)</label>
+            <label class="field-label" for="create-token-expires">
+              Expires in (days)
+            </label>
             <input
+              id="create-token-expires"
               class="input"
               type="number"
               min="1"

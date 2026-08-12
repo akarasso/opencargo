@@ -1,4 +1,13 @@
-import { For, Show, createEffect, createMemo, createResource, createSignal, onCleanup, onMount } from 'solid-js';
+import {
+  For,
+  Show,
+  createEffect,
+  createMemo,
+  createResource,
+  createSignal,
+  onCleanup,
+  onMount,
+} from 'solid-js';
 import { useNavigate } from '@solidjs/router';
 import Icon from './Icon.tsx';
 import { fetchSearch } from '../core/api.ts';
@@ -55,15 +64,51 @@ export default function CommandPalette() {
     }
     if (session.isAdmin()) {
       items.push(
-        { id: 'nav-admin', label: 'Admin overview', icon: 'activity', group: 'Go to', run: go('/admin') },
-        { id: 'nav-repos', label: 'Repositories', icon: 'database', group: 'Go to', run: go('/admin/repositories') },
-        { id: 'nav-users', label: 'Users & access', icon: 'users', group: 'Go to', run: go('/admin/users') },
-        { id: 'nav-audit', label: 'Audit log', icon: 'history', group: 'Go to', run: go('/admin/audit') },
-        { id: 'nav-webhooks', label: 'Webhooks', icon: 'webhook', group: 'Go to', run: go('/admin/webhooks') },
+        {
+          id: 'nav-admin',
+          label: 'Admin overview',
+          icon: 'activity',
+          group: 'Go to',
+          run: go('/admin'),
+        },
+        {
+          id: 'nav-repos',
+          label: 'Repositories',
+          icon: 'database',
+          group: 'Go to',
+          run: go('/admin/repositories'),
+        },
+        {
+          id: 'nav-users',
+          label: 'Users & access',
+          icon: 'users',
+          group: 'Go to',
+          run: go('/admin/users'),
+        },
+        {
+          id: 'nav-audit',
+          label: 'Audit log',
+          icon: 'history',
+          group: 'Go to',
+          run: go('/admin/audit'),
+        },
+        {
+          id: 'nav-webhooks',
+          label: 'Webhooks',
+          icon: 'webhook',
+          group: 'Go to',
+          run: go('/admin/webhooks'),
+        },
       );
     }
     if (!session.isAuthenticated()) {
-      items.push({ id: 'act-login', label: 'Sign in', icon: 'log-in', group: 'Actions', run: go('/login') });
+      items.push({
+        id: 'act-login',
+        label: 'Sign in',
+        icon: 'log-in',
+        group: 'Actions',
+        run: go('/login'),
+      });
     } else {
       items.push({
         id: 'act-logout',
@@ -86,9 +131,7 @@ export default function CommandPalette() {
       group: 'Packages' as const,
       run: () => navigate(`/packages/${r.name}`),
     }));
-    const nav = q
-      ? navCommands().filter((c) => c.label.toLowerCase().includes(q))
-      : navCommands();
+    const nav = q ? navCommands().filter((c) => c.label.toLowerCase().includes(q)) : navCommands();
     return [...pkgCommands, ...nav];
   });
 
@@ -150,12 +193,25 @@ export default function CommandPalette() {
   return (
     <Show when={ui.paletteOpen()}>
       <div class="palette-overlay" onClick={ui.closePalette}>
-        <div class="palette" onClick={(e) => e.stopPropagation()}>
+        <div
+          class="palette"
+          role="dialog"
+          aria-modal="true"
+          aria-label="Command palette"
+          onClick={(e) => e.stopPropagation()}
+        >
           <div class="palette-input-row">
             <Icon name="search" size={16} />
             <input
               ref={inputRef}
               class="palette-input"
+              role="combobox"
+              aria-expanded={visible().length > 0}
+              aria-controls="palette-listbox"
+              aria-autocomplete="list"
+              aria-activedescendant={
+                visible().length > 0 ? `palette-option-${selected()}` : undefined
+              }
               placeholder="Search packages or jump to…"
               value={query()}
               onInput={(e) => setQuery(e.currentTarget.value)}
@@ -167,7 +223,7 @@ export default function CommandPalette() {
               <span class="spinner" />
             </Show>
           </div>
-          <div class="palette-list">
+          <div class="palette-list" role="listbox" id="palette-listbox" aria-label="Commands">
             <Show
               when={visible().length > 0}
               fallback={
@@ -177,29 +233,38 @@ export default function CommandPalette() {
               }
             >
               <For each={groups()}>
-                {(g) => (
-                  <>
-                    <div class="palette-group">{g.group}</div>
-                    <For each={g.items}>
-                      {(cmd) => {
-                        const idx = () => visible().indexOf(cmd);
-                        return (
-                          <button
-                            class={`palette-item ${selected() === idx() ? 'selected' : ''}`}
-                            onMouseEnter={() => setSelected(idx())}
-                            onClick={runSelected}
-                          >
-                            <Icon name={cmd.icon} size={15} />
-                            <span class="truncate">{cmd.label}</span>
-                            <Show when={cmd.detail}>
-                              <span class="palette-item-detail">{cmd.detail}</span>
-                            </Show>
-                          </button>
-                        );
-                      }}
-                    </For>
-                  </>
-                )}
+                {(g) => {
+                  const groupId = `palette-group-${g.group.toLowerCase().replace(/\s+/g, '-')}`;
+                  return (
+                    <div role="group" aria-labelledby={groupId}>
+                      <div class="palette-group" role="presentation" id={groupId}>
+                        {g.group}
+                      </div>
+                      <For each={g.items}>
+                        {(cmd) => {
+                          const idx = () => visible().indexOf(cmd);
+                          return (
+                            <button
+                              class={`palette-item ${selected() === idx() ? 'selected' : ''}`}
+                              role="option"
+                              id={`palette-option-${idx()}`}
+                              aria-selected={selected() === idx()}
+                              tabindex={-1}
+                              onMouseEnter={() => setSelected(idx())}
+                              onClick={runSelected}
+                            >
+                              <Icon name={cmd.icon} size={15} />
+                              <span class="truncate">{cmd.label}</span>
+                              <Show when={cmd.detail}>
+                                <span class="palette-item-detail">{cmd.detail}</span>
+                              </Show>
+                            </button>
+                          );
+                        }}
+                      </For>
+                    </div>
+                  );
+                }}
               </For>
             </Show>
           </div>
