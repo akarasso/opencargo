@@ -12,7 +12,7 @@ import {
   updateWebhook,
 } from '../../core/api.ts';
 import { createLiveResource } from '../../core/stores/live.ts';
-import { toasts } from '../../core/stores/toasts.ts';
+import { reportError, toasts } from '../../core/stores/toasts.ts';
 import { timeAgo } from '../../core/format.ts';
 import type { Webhook } from '../../core/types.ts';
 
@@ -69,7 +69,7 @@ function WebhooksInner() {
       setShowCreate(false);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not create webhook', err instanceof Error ? err.message : undefined);
+      reportError('Could not create webhook', err);
     }
     setBusy(false);
   }
@@ -92,7 +92,7 @@ function WebhooksInner() {
       setEditing(null);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not update webhook', err instanceof Error ? err.message : undefined);
+      reportError('Could not update webhook', err);
     }
     setBusy(false);
   }
@@ -103,7 +103,7 @@ function WebhooksInner() {
       toasts.success(hook.active ? 'Webhook paused' : 'Webhook resumed', hook.url);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not update webhook', err instanceof Error ? err.message : undefined);
+      reportError('Could not update webhook', err);
     }
   }
 
@@ -112,7 +112,7 @@ function WebhooksInner() {
       await testWebhook(hook.id);
       toasts.success('Test event sent', `Check the receiver behind ${hook.url}`);
     } catch (err: unknown) {
-      toasts.error('Test delivery failed', err instanceof Error ? err.message : undefined);
+      reportError('Test delivery failed', err);
     }
   }
 
@@ -125,7 +125,7 @@ function WebhooksInner() {
       setDeleting(null);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not delete webhook', err instanceof Error ? err.message : undefined);
+      reportError('Could not delete webhook', err);
     }
   }
 

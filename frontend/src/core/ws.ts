@@ -16,7 +16,9 @@ import { createSignal } from 'solid-js';
 import { token } from './token.ts';
 import type { WsEvent } from './types.ts';
 
-export type WsStatus = 'connecting' | 'online' | 'offline';
+/** `unauthorized`: the server refused the socket's credentials (close
+ * 4401/4403) — no automatic retry; `reconnectWs()` (e.g. after login) lifts it. */
+export type WsStatus = 'connecting' | 'online' | 'offline' | 'unauthorized';
 
 const [status, setStatus] = createSignal<WsStatus>('offline');
 export { status as wsStatus };
@@ -41,13 +43,19 @@ const STALE_MS = 70_000;
 
 /** Subscribe to an event type ('*' for all). Returns an unsubscribe fn. */
 export function onEvent(type: string, handler: Handler): () => void {
-  let set = listeners.get(type);
-  if (!set) {
-    set = new Set();
-    listeners.set(type, set);
+  let existing = listeners.get(type);
+  if (!existing) {
+    existing = new Set();
+    listeners.set(type, existing);
   }
+  const set = existing;
   set.add(handler);
-  return () => set!.delete(handler);
+  return () => {
+    set.delete(handler);
+    // Purge emptied sets so short-lived subscriptions (per-page useLive)
+    // don't slowly grow the map with dead entries.
+    if (set.size === 0 && listeners.get(type) === set) listeners.delete(type);
+  };
 }
 
 function emit(type: string, event: WsEvent): void {
@@ -114,13 +122,14 @@ export function connectWs(): void {
     if (socket !== ws) return; // superseded by a newer connection
     socket = null;
     stopHeartbeat();
-    setStatus('offline');
     // 4401 invalid/missing token, 4403 password change required: retrying
     // with the same credentials would loop forever.
     if (e.code === 4401 || e.code === 4403) {
       suspended = true;
+      setStatus('unauthorized');
       return;
     }
+    setStatus('offline');
     scheduleReconnect();
   };
 

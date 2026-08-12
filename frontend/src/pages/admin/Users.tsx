@@ -10,7 +10,7 @@ import { LoadError, TableSkeleton } from '../../components/bits.tsx';
 import { createUser, deleteUser, fetchUsers, updateUser } from '../../core/api.ts';
 import { createLiveResource } from '../../core/stores/live.ts';
 import { session } from '../../core/stores/session.ts';
-import { toasts } from '../../core/stores/toasts.ts';
+import { reportError, toasts } from '../../core/stores/toasts.ts';
 import { initials, timeAgo } from '../../core/format.ts';
 import type { User } from '../../core/types.ts';
 
@@ -63,7 +63,7 @@ function UsersInner() {
       setNewRole('reader');
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not create user', err instanceof Error ? err.message : undefined);
+      reportError('Could not create user', err);
     }
     setCreateLoading(false);
   }
@@ -93,7 +93,7 @@ function UsersInner() {
       setEditingUser(null);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not update user', err instanceof Error ? err.message : undefined);
+      reportError('Could not update user', err);
     }
     setEditLoading(false);
   }
@@ -107,7 +107,7 @@ function UsersInner() {
       setDeletingUser(null);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not delete user', err instanceof Error ? err.message : undefined);
+      reportError('Could not delete user', err);
     }
   }
 

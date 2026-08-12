@@ -11,6 +11,7 @@ import {
 import { useNavigate } from '@solidjs/router';
 import Icon from './Icon.tsx';
 import { fetchSearch } from '../core/api.ts';
+import { createDebounced } from '../core/debounce.ts';
 import { session } from '../core/stores/session.ts';
 import { ui } from '../core/stores/ui.ts';
 
@@ -32,13 +33,8 @@ export default function CommandPalette() {
 
   // Debounced package search against the registry.
   const [debounced, setDebounced] = createSignal('');
-  let timer: ReturnType<typeof setTimeout> | null = null;
-  createEffect(() => {
-    const q = query();
-    if (timer) clearTimeout(timer);
-    timer = setTimeout(() => setDebounced(q), 180);
-  });
-  onCleanup(() => timer && clearTimeout(timer));
+  const debounceQuery = createDebounced((q: string) => setDebounced(q), 180);
+  createEffect(() => debounceQuery(query()));
 
   const [results] = createResource(debounced, (q) =>
     q.trim() ? fetchSearch(q.trim()) : Promise.resolve({ query: '', results: [] }),

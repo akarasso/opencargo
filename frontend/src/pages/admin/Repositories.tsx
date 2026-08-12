@@ -18,7 +18,7 @@ import {
   updateRepository,
 } from '../../core/api.ts';
 import { createLiveResource } from '../../core/stores/live.ts';
-import { toasts } from '../../core/stores/toasts.ts';
+import { reportError, toasts } from '../../core/stores/toasts.ts';
 import type { Repository } from '../../core/types.ts';
 
 export default function Repositories() {
@@ -79,7 +79,7 @@ function RepositoriesInner() {
       setMembers('');
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not create repository', err instanceof Error ? err.message : undefined);
+      reportError('Could not create repository', err);
     }
     setBusy(false);
   }
@@ -115,7 +115,7 @@ function RepositoriesInner() {
       setEditing(null);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not update repository', err instanceof Error ? err.message : undefined);
+      reportError('Could not update repository', err);
     }
     setBusy(false);
   }
@@ -129,7 +129,7 @@ function RepositoriesInner() {
       setDeleting(null);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not delete repository', err instanceof Error ? err.message : undefined);
+      reportError('Could not delete repository', err);
       setDeleting(null);
     }
   }
@@ -139,7 +139,7 @@ function RepositoriesInner() {
       const res = await purgeRepositoryCache(repoName);
       toasts.success('Cache purged', res.message);
     } catch (err: unknown) {
-      toasts.error('Could not purge cache', err instanceof Error ? err.message : undefined);
+      reportError('Could not purge cache', err);
     }
   }
 

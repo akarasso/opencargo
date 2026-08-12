@@ -8,7 +8,7 @@ import { RequireAuth } from '../../components/guards.tsx';
 import { LoadError, TableSkeleton } from '../../components/bits.tsx';
 import { createToken, deleteToken, fetchTokens } from '../../core/api.ts';
 import { session } from '../../core/stores/session.ts';
-import { toasts } from '../../core/stores/toasts.ts';
+import { reportError, toasts } from '../../core/stores/toasts.ts';
 import { timeAgo } from '../../core/format.ts';
 import type { CreateTokenResponse } from '../../core/types.ts';
 
@@ -53,7 +53,7 @@ function UserTokensInner() {
       setExpiresInDays('30');
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not create token', err instanceof Error ? err.message : undefined);
+      reportError('Could not create token', err);
     }
     setCreateLoading(false);
   }
@@ -67,7 +67,7 @@ function UserTokensInner() {
       setDeletingToken(null);
       void refetch();
     } catch (err: unknown) {
-      toasts.error('Could not revoke token', err instanceof Error ? err.message : undefined);
+      reportError('Could not revoke token', err);
     }
   }
 

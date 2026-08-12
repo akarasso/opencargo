@@ -48,3 +48,9 @@ function createToastStore() {
 }
 
 export const toasts = createRoot(createToastStore);
+
+/** Standard `catch` reporting: error toast titled `title`, with the thrown
+ * value's message as detail when it is an `Error`. */
+export function reportError(title: string, err: unknown): void {
+  toasts.error(title, err instanceof Error ? err.message : undefined);
+}
