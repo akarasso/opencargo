@@ -45,7 +45,6 @@ export default function Search() {
           onInput={(e) => handleInput(e.currentTarget.value)}
           placeholder="Search packages…"
           spellcheck={false}
-          autofocus
         />
         <Show when={data.loading}>
           <span class="spinner" style={{ position: 'absolute', right: '12px' }} />
@@ -88,10 +87,17 @@ export default function Search() {
               <div class="col stagger" style={{ gap: '10px' }}>
                 <For each={d().results}>
                   {(r) => (
-                    <A href={`/packages/${r.name}`} class="card card-pad card-hover" style={{ display: 'block' }}>
+                    <A
+                      href={`/packages/${r.name}`}
+                      class="card card-pad card-hover"
+                      style={{ display: 'block' }}
+                    >
                       <div class="row">
                         <Icon name="package" size={15} class="icon dim" />
-                        <span class="mono grow truncate" style={{ color: 'var(--ink)', 'font-weight': 500 }}>
+                        <span
+                          class="mono grow truncate"
+                          style={{ color: 'var(--ink)', 'font-weight': 500 }}
+                        >
                           {r.name}
                         </span>
                         <span class="version">{r.latest_version}</span>

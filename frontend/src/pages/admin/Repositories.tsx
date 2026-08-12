@@ -3,7 +3,13 @@ import Icon from '../../components/Icon.tsx';
 import Modal, { ConfirmModal } from '../../components/Modal.tsx';
 import EmptyState from '../../components/EmptyState.tsx';
 import { RequireAdmin } from '../../components/guards.tsx';
-import { FormatTag, LoadError, RepoTypeChip, TableSkeleton, VisibilityChip } from '../../components/bits.tsx';
+import {
+  FormatTag,
+  LoadError,
+  RepoTypeChip,
+  TableSkeleton,
+  VisibilityChip,
+} from '../../components/bits.tsx';
 import {
   createRepository,
   deleteRepository,
@@ -209,7 +215,10 @@ function RepositoriesInner() {
                           <td>
                             <VisibilityChip visibility={repo.visibility} />
                           </td>
-                          <td class="cell-dim cell-mono cell-hide-sm truncate" style={{ 'max-width': '220px' }}>
+                          <td
+                            class="cell-dim cell-mono cell-hide-sm truncate"
+                            style={{ 'max-width': '220px' }}
+                          >
                             {repo.upstream || '—'}
                           </td>
                           <td>
@@ -223,7 +232,11 @@ function RepositoriesInner() {
                                   <Icon name="refresh" size={14} />
                                 </button>
                               </Show>
-                              <button class="btn btn-quiet btn-icon" title="Edit repository" onClick={() => openEdit(repo)}>
+                              <button
+                                class="btn btn-quiet btn-icon"
+                                title="Edit repository"
+                                onClick={() => openEdit(repo)}
+                              >
                                 <Icon name="pencil" size={14} />
                               </button>
                               <button
@@ -264,8 +277,11 @@ function RepositoriesInner() {
       >
         <form id="create-repo-form" onSubmit={handleCreate}>
           <div class="field">
-            <label class="field-label">Name</label>
+            <label class="field-label" for="create-repo-name">
+              Name
+            </label>
             <input
+              id="create-repo-name"
               class="input"
               value={name()}
               onInput={(e) => setName(e.currentTarget.value)}
@@ -276,16 +292,30 @@ function RepositoriesInner() {
           </div>
           <div class="form-row">
             <div class="field">
-              <label class="field-label">Type</label>
-              <select class="select" value={type()} onChange={(e) => setType(e.currentTarget.value)}>
+              <label class="field-label" for="create-repo-type">
+                Type
+              </label>
+              <select
+                id="create-repo-type"
+                class="select"
+                value={type()}
+                onChange={(e) => setType(e.currentTarget.value)}
+              >
                 <option value="hosted">hosted — you publish into it</option>
                 <option value="proxy">proxy — caches an upstream</option>
                 <option value="group">group — one endpoint over several</option>
               </select>
             </div>
             <div class="field">
-              <label class="field-label">Format</label>
-              <select class="select" value={format()} onChange={(e) => setFormat(e.currentTarget.value)}>
+              <label class="field-label" for="create-repo-format">
+                Format
+              </label>
+              <select
+                id="create-repo-format"
+                class="select"
+                value={format()}
+                onChange={(e) => setFormat(e.currentTarget.value)}
+              >
                 <option value="npm">npm</option>
                 <option value="cargo">cargo</option>
                 <option value="oci">oci</option>
@@ -294,16 +324,26 @@ function RepositoriesInner() {
             </div>
           </div>
           <div class="field">
-            <label class="field-label">Visibility</label>
-            <select class="select" value={visibility()} onChange={(e) => setVisibility(e.currentTarget.value)}>
+            <label class="field-label" for="create-repo-visibility">
+              Visibility
+            </label>
+            <select
+              id="create-repo-visibility"
+              class="select"
+              value={visibility()}
+              onChange={(e) => setVisibility(e.currentTarget.value)}
+            >
               <option value="private">private — read requires permission</option>
               <option value="public">public — anyone can read</option>
             </select>
           </div>
           <Show when={type() === 'proxy'}>
             <div class="field">
-              <label class="field-label">Upstream URL</label>
+              <label class="field-label" for="create-repo-upstream">
+                Upstream URL
+              </label>
               <input
+                id="create-repo-upstream"
                 class="input"
                 value={upstream()}
                 onInput={(e) => setUpstream(e.currentTarget.value)}
@@ -314,8 +354,11 @@ function RepositoriesInner() {
           </Show>
           <Show when={type() === 'group'}>
             <div class="field">
-              <label class="field-label">Members (resolution order)</label>
+              <label class="field-label" for="create-repo-members">
+                Members (resolution order)
+              </label>
               <input
+                id="create-repo-members"
                 class="input"
                 value={members()}
                 onInput={(e) => setMembers(e.currentTarget.value)}
@@ -346,22 +389,40 @@ function RepositoriesInner() {
       >
         <form id="edit-repo-form" onSubmit={handleEdit}>
           <div class="field">
-            <label class="field-label">Visibility</label>
-            <select class="select" value={editVisibility()} onChange={(e) => setEditVisibility(e.currentTarget.value)}>
+            <label class="field-label" for="edit-repo-visibility">
+              Visibility
+            </label>
+            <select
+              id="edit-repo-visibility"
+              class="select"
+              value={editVisibility()}
+              onChange={(e) => setEditVisibility(e.currentTarget.value)}
+            >
               <option value="private">private</option>
               <option value="public">public</option>
             </select>
           </div>
           <Show when={editing()?.type === 'proxy'}>
             <div class="field">
-              <label class="field-label">Upstream URL</label>
-              <input class="input" value={editUpstream()} onInput={(e) => setEditUpstream(e.currentTarget.value)} spellcheck={false} />
+              <label class="field-label" for="edit-repo-upstream">
+                Upstream URL
+              </label>
+              <input
+                id="edit-repo-upstream"
+                class="input"
+                value={editUpstream()}
+                onInput={(e) => setEditUpstream(e.currentTarget.value)}
+                spellcheck={false}
+              />
             </div>
           </Show>
           <Show when={editing()?.type === 'group'}>
             <div class="field">
-              <label class="field-label">Members (resolution order)</label>
+              <label class="field-label" for="edit-repo-members">
+                Members (resolution order)
+              </label>
               <input
+                id="edit-repo-members"
                 class="input"
                 value={editMembers()}
                 onInput={(e) => setEditMembers(e.currentTarget.value)}

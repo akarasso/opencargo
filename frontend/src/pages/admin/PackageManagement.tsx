@@ -37,7 +37,9 @@ function PackageManagementInner() {
   );
   useLive(refetch, ['package.published', 'package.promoted', 'registry.changed']);
 
-  const [promoteTarget, setPromoteTarget] = createSignal<{ name: string; version: string } | null>(null);
+  const [promoteTarget, setPromoteTarget] = createSignal<{ name: string; version: string } | null>(
+    null,
+  );
   const [promoteFrom, setPromoteFrom] = createSignal('');
   const [promoteTo, setPromoteTo] = createSignal('');
   const [promoteLoading, setPromoteLoading] = createSignal(false);
@@ -59,7 +61,10 @@ function PackageManagementInner() {
     setPromoteLoading(true);
     try {
       await promotePackage(target.name, target.version, promoteFrom(), promoteTo());
-      toasts.success(`${target.name} ${target.version} promoted`, `${promoteFrom()} → ${promoteTo()}`);
+      toasts.success(
+        `${target.name} ${target.version} promoted`,
+        `${promoteFrom()} → ${promoteTo()}`,
+      );
       setPromoteTarget(null);
       void refetch();
     } catch (e: unknown) {
@@ -100,10 +105,14 @@ function PackageManagementInner() {
           <select
             class="select"
             value={repoFilter()}
-            onChange={(e) => setSearchParams({ repo: e.currentTarget.value || undefined, page: '1' })}
+            onChange={(e) =>
+              setSearchParams({ repo: e.currentTarget.value || undefined, page: '1' })
+            }
           >
             <option value="">All repositories</option>
-            <For each={repos()?.repositories}>{(r) => <option value={r.name}>{r.name}</option>}</For>
+            <For each={repos()?.repositories}>
+              {(r) => <option value={r.name}>{r.name}</option>}
+            </For>
           </select>
         </Show>
       </div>
@@ -118,7 +127,11 @@ function PackageManagementInner() {
             when={d().packages.length > 0}
             fallback={
               <div class="card">
-                <EmptyState icon="layers" title="Nothing to promote" text="No packages match the current filter." />
+                <EmptyState
+                  icon="layers"
+                  title="Nothing to promote"
+                  text="No packages match the current filter."
+                />
               </div>
             }
           >
@@ -151,7 +164,11 @@ function PackageManagementInner() {
                           <td class="cell-mono cell-num" style={{ 'text-align': 'right' }}>
                             {formatNumber(p.downloads)}
                           </td>
-                          <td class="cell-dim cell-hide-sm nowrap" style={{ 'text-align': 'right' }} title={p.published_at}>
+                          <td
+                            class="cell-dim cell-hide-sm nowrap"
+                            style={{ 'text-align': 'right' }}
+                            title={p.published_at}
+                          >
                             {timeAgo(p.published_at)}
                           </td>
                           <td>
@@ -216,7 +233,9 @@ function PackageManagementInner() {
             <button
               class="btn btn-primary"
               onClick={handlePromote}
-              disabled={promoteLoading() || !promoteFrom() || !promoteTo() || promoteFrom() === promoteTo()}
+              disabled={
+                promoteLoading() || !promoteFrom() || !promoteTo() || promoteFrom() === promoteTo()
+              }
             >
               {promoteLoading() ? 'Promoting…' : 'Promote'}
             </button>
@@ -224,15 +243,29 @@ function PackageManagementInner() {
         }
       >
         <div class="field">
-          <label class="field-label">From repository</label>
-          <select class="select" value={promoteFrom()} onChange={(e) => setPromoteFrom(e.currentTarget.value)}>
+          <label class="field-label" for="admin-promote-from">
+            From repository
+          </label>
+          <select
+            id="admin-promote-from"
+            class="select"
+            value={promoteFrom()}
+            onChange={(e) => setPromoteFrom(e.currentTarget.value)}
+          >
             <option value="">Select source…</option>
             <For each={hostedRepos()}>{(r) => <option value={r.name}>{r.name}</option>}</For>
           </select>
         </div>
         <div class="field">
-          <label class="field-label">To repository</label>
-          <select class="select" value={promoteTo()} onChange={(e) => setPromoteTo(e.currentTarget.value)}>
+          <label class="field-label" for="admin-promote-to">
+            To repository
+          </label>
+          <select
+            id="admin-promote-to"
+            class="select"
+            value={promoteTo()}
+            onChange={(e) => setPromoteTo(e.currentTarget.value)}
+          >
             <option value="">Select target…</option>
             <For each={hostedRepos()}>{(r) => <option value={r.name}>{r.name}</option>}</For>
           </select>

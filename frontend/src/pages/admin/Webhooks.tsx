@@ -129,9 +129,13 @@ function WebhooksInner() {
     }
   }
 
-  const EventPicker = () => (
-    <div class="field">
-      <label class="field-label">Events</label>
+  // Group of checkboxes: a bare <label> can't reference several inputs, so
+  // the caption is a <span> wired up via role="group" + aria-labelledby.
+  const EventPicker = (p: { idPrefix: string }) => (
+    <div class="field" role="group" aria-labelledby={`${p.idPrefix}-events-label`}>
+      <span class="field-label" id={`${p.idPrefix}-events-label`}>
+        Events
+      </span>
       <div class="row-wrap">
         <For each={KNOWN_EVENTS}>
           {(ev) => (
@@ -212,11 +216,16 @@ function WebhooksInner() {
                               class={`switch ${hook.active ? 'on' : ''}`}
                               role="switch"
                               aria-checked={hook.active}
-                              title={hook.active ? 'Active — click to pause' : 'Paused — click to resume'}
+                              title={
+                                hook.active ? 'Active — click to pause' : 'Paused — click to resume'
+                              }
                               onClick={() => handleToggleActive(hook)}
                             />
                           </td>
-                          <td class="cell-mono truncate" style={{ 'max-width': '300px', color: 'var(--ink)' }}>
+                          <td
+                            class="cell-mono truncate"
+                            style={{ 'max-width': '300px', color: 'var(--ink)' }}
+                          >
                             {hook.url}
                           </td>
                           <td>
@@ -231,14 +240,26 @@ function WebhooksInner() {
                           </td>
                           <td>
                             <div class="cell-actions">
-                              <button class="btn btn-ghost btn-sm" title="Send a test event" onClick={() => handleTest(hook)}>
+                              <button
+                                class="btn btn-ghost btn-sm"
+                                title="Send a test event"
+                                onClick={() => handleTest(hook)}
+                              >
                                 <Icon name="send" size={13} />
                                 Test
                               </button>
-                              <button class="btn btn-quiet btn-icon" title="Edit webhook" onClick={() => openEdit(hook)}>
+                              <button
+                                class="btn btn-quiet btn-icon"
+                                title="Edit webhook"
+                                onClick={() => openEdit(hook)}
+                              >
                                 <Icon name="pencil" size={14} />
                               </button>
-                              <button class="btn btn-quiet btn-icon" title="Delete webhook" onClick={() => setDeleting(hook)}>
+                              <button
+                                class="btn btn-quiet btn-icon"
+                                title="Delete webhook"
+                                onClick={() => setDeleting(hook)}
+                              >
                                 <Icon name="trash" size={14} />
                               </button>
                             </div>
@@ -264,7 +285,12 @@ function WebhooksInner() {
             <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
               Cancel
             </button>
-            <button type="submit" form="create-webhook-form" class="btn btn-primary" disabled={busy()}>
+            <button
+              type="submit"
+              form="create-webhook-form"
+              class="btn btn-primary"
+              disabled={busy()}
+            >
               {busy() ? 'Creating…' : 'Create webhook'}
             </button>
           </>
@@ -272,8 +298,11 @@ function WebhooksInner() {
       >
         <form id="create-webhook-form" onSubmit={handleCreate}>
           <div class="field">
-            <label class="field-label">Endpoint URL</label>
+            <label class="field-label" for="create-webhook-url">
+              Endpoint URL
+            </label>
             <input
+              id="create-webhook-url"
               class="input"
               type="url"
               value={url()}
@@ -283,10 +312,13 @@ function WebhooksInner() {
               required
             />
           </div>
-          <EventPicker />
+          <EventPicker idPrefix="create-webhook" />
           <div class="field">
-            <label class="field-label">Secret (optional)</label>
+            <label class="field-label" for="create-webhook-secret">
+              Secret (optional)
+            </label>
             <input
+              id="create-webhook-secret"
               class="input"
               value={secret()}
               onInput={(e) => setSecret(e.currentTarget.value)}
@@ -307,7 +339,12 @@ function WebhooksInner() {
             <button class="btn btn-ghost" onClick={() => setEditing(null)}>
               Cancel
             </button>
-            <button type="submit" form="edit-webhook-form" class="btn btn-primary" disabled={busy()}>
+            <button
+              type="submit"
+              form="edit-webhook-form"
+              class="btn btn-primary"
+              disabled={busy()}
+            >
               {busy() ? 'Saving…' : 'Save changes'}
             </button>
           </>
@@ -315,13 +352,26 @@ function WebhooksInner() {
       >
         <form id="edit-webhook-form" onSubmit={handleEdit}>
           <div class="field">
-            <label class="field-label">Endpoint URL</label>
-            <input class="input" type="url" value={url()} onInput={(e) => setUrl(e.currentTarget.value)} required spellcheck={false} />
-          </div>
-          <EventPicker />
-          <div class="field">
-            <label class="field-label">Secret</label>
+            <label class="field-label" for="edit-webhook-url">
+              Endpoint URL
+            </label>
             <input
+              id="edit-webhook-url"
+              class="input"
+              type="url"
+              value={url()}
+              onInput={(e) => setUrl(e.currentTarget.value)}
+              required
+              spellcheck={false}
+            />
+          </div>
+          <EventPicker idPrefix="edit-webhook" />
+          <div class="field">
+            <label class="field-label" for="edit-webhook-secret">
+              Secret
+            </label>
+            <input
+              id="edit-webhook-secret"
               class="input"
               value={secret()}
               onInput={(e) => setSecret(e.currentTarget.value)}

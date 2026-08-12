@@ -140,7 +140,11 @@ function UsersInner() {
             when={list().length > 0}
             fallback={
               <div class="card">
-                <EmptyState icon="users" title="No users yet" text="Add the first account to hand out access." />
+                <EmptyState
+                  icon="users"
+                  title="No users yet"
+                  text="Add the first account to hand out access."
+                />
               </div>
             }
           >
@@ -168,10 +172,15 @@ function UsersInner() {
                         <tr>
                           <td>
                             <div class="row">
-                              <div class="avatar" style={{ width: '28px', height: '28px', 'font-size': '0.62rem' }}>
+                              <div
+                                class="avatar"
+                                style={{ width: '28px', height: '28px', 'font-size': '0.62rem' }}
+                              >
                                 {initials(user.username)}
                               </div>
-                              <span style={{ 'font-weight': 600, color: 'var(--ink)' }}>{user.username}</span>
+                              <span style={{ 'font-weight': 600, color: 'var(--ink)' }}>
+                                {user.username}
+                              </span>
                               <Show when={user.username === session.user()?.username}>
                                 <span class="chip chip-neutral">you</span>
                               </Show>
@@ -201,7 +210,11 @@ function UsersInner() {
                               >
                                 <Icon name="key" size={14} />
                               </A>
-                              <button class="btn btn-quiet btn-icon" title="Edit user" onClick={() => openEdit(user)}>
+                              <button
+                                class="btn btn-quiet btn-icon"
+                                title="Edit user"
+                                onClick={() => openEdit(user)}
+                              >
                                 <Icon name="pencil" size={14} />
                               </button>
                               <button
@@ -240,7 +253,12 @@ function UsersInner() {
             <button class="btn btn-ghost" onClick={() => setShowCreate(false)}>
               Cancel
             </button>
-            <button type="submit" form="create-user-form" class="btn btn-primary" disabled={createLoading()}>
+            <button
+              type="submit"
+              form="create-user-form"
+              class="btn btn-primary"
+              disabled={createLoading()}
+            >
               {createLoading() ? 'Creating…' : 'Create user'}
             </button>
           </>
@@ -248,25 +266,60 @@ function UsersInner() {
       >
         <form id="create-user-form" onSubmit={handleCreate}>
           <div class="field">
-            <label class="field-label">Username</label>
-            <input class="input" value={newUsername()} onInput={(e) => setNewUsername(e.currentTarget.value)} required spellcheck={false} />
+            <label class="field-label" for="create-user-username">
+              Username
+            </label>
+            <input
+              id="create-user-username"
+              class="input"
+              value={newUsername()}
+              onInput={(e) => setNewUsername(e.currentTarget.value)}
+              required
+              spellcheck={false}
+            />
           </div>
           <div class="field">
-            <label class="field-label">Email (optional)</label>
-            <input class="input" type="email" value={newEmail()} onInput={(e) => setNewEmail(e.currentTarget.value)} />
+            <label class="field-label" for="create-user-email">
+              Email (optional)
+            </label>
+            <input
+              id="create-user-email"
+              class="input"
+              type="email"
+              value={newEmail()}
+              onInput={(e) => setNewEmail(e.currentTarget.value)}
+            />
           </div>
           <div class="field">
-            <label class="field-label">Password</label>
-            <input class="input" type="password" value={newPassword()} onInput={(e) => setNewPassword(e.currentTarget.value)} required />
+            <label class="field-label" for="create-user-password">
+              Password
+            </label>
+            <input
+              id="create-user-password"
+              class="input"
+              type="password"
+              value={newPassword()}
+              onInput={(e) => setNewPassword(e.currentTarget.value)}
+              required
+            />
           </div>
           <div class="field">
-            <label class="field-label">Role</label>
-            <select class="select" value={newRole()} onChange={(e) => setNewRole(e.currentTarget.value)}>
+            <label class="field-label" for="create-user-role">
+              Role
+            </label>
+            <select
+              id="create-user-role"
+              class="select"
+              value={newRole()}
+              onChange={(e) => setNewRole(e.currentTarget.value)}
+            >
               <option value="reader">reader — install only</option>
               <option value="publisher">publisher — install & publish</option>
               <option value="admin">admin — everything, everywhere</option>
             </select>
-            <div class="field-hint">Fine-grained per-repository rights can be set after creation via “Access”.</div>
+            <div class="field-hint">
+              Fine-grained per-repository rights can be set after creation via “Access”.
+            </div>
           </div>
         </form>
       </Modal>
@@ -281,7 +334,12 @@ function UsersInner() {
             <button class="btn btn-ghost" onClick={() => setEditingUser(null)}>
               Cancel
             </button>
-            <button type="submit" form="edit-user-form" class="btn btn-primary" disabled={editLoading()}>
+            <button
+              type="submit"
+              form="edit-user-form"
+              class="btn btn-primary"
+              disabled={editLoading()}
+            >
               {editLoading() ? 'Saving…' : 'Save changes'}
             </button>
           </>
@@ -289,12 +347,27 @@ function UsersInner() {
       >
         <form id="edit-user-form" onSubmit={handleEdit}>
           <div class="field">
-            <label class="field-label">Email</label>
-            <input class="input" type="email" value={editEmail()} onInput={(e) => setEditEmail(e.currentTarget.value)} />
+            <label class="field-label" for="edit-user-email">
+              Email
+            </label>
+            <input
+              id="edit-user-email"
+              class="input"
+              type="email"
+              value={editEmail()}
+              onInput={(e) => setEditEmail(e.currentTarget.value)}
+            />
           </div>
           <div class="field">
-            <label class="field-label">Role</label>
-            <select class="select" value={editRole()} onChange={(e) => setEditRole(e.currentTarget.value)}>
+            <label class="field-label" for="edit-user-role">
+              Role
+            </label>
+            <select
+              id="edit-user-role"
+              class="select"
+              value={editRole()}
+              onChange={(e) => setEditRole(e.currentTarget.value)}
+            >
               <option value="reader">reader</option>
               <option value="publisher">publisher</option>
               <option value="admin">admin</option>
@@ -302,8 +375,11 @@ function UsersInner() {
             <div class="field-hint">Role changes reach the user's open sessions immediately.</div>
           </div>
           <div class="field">
-            <label class="field-label">New password</label>
+            <label class="field-label" for="edit-user-password">
+              New password
+            </label>
             <input
+              id="edit-user-password"
               class="input"
               type="password"
               value={editPassword()}
