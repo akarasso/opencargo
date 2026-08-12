@@ -26,7 +26,6 @@ use crate::storage::StorageBackend;
 
 #[derive(Deserialize)]
 pub struct PublishBody {
-    #[allow(dead_code)]
     name: String,
     description: Option<String>,
     #[serde(rename = "dist-tags", default)]
@@ -110,16 +109,23 @@ pub async fn publish_package(
     })?;
     let package_name = extract_package_name(&params);
 
+    // Reject hostile names before touching DB or storage, and require the
+    // body's `name` to match the URL: a mismatch would store the tarball under
+    // one name while the metadata claims another.
+    crate::registry::validate_package_name("npm", &package_name)?;
+    if body.name != package_name {
+        return Err(AppError::BadRequest(format!(
+            "package name in body ('{}') does not match URL ('{}')",
+            body.name, package_name
+        )));
+    }
+
     // Validate repo exists and is hosted
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
 
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only publish to hosted repositories".to_string(),
-        ));
-    }
+    crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, "npm")?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
@@ -166,6 +172,8 @@ pub async fn publish_package(
 
     // Process each version in the publish body
     for (version_str, version_meta) in &body.versions {
+        crate::registry::validate_version(version_str)?;
+
         // A publish carries a tarball attachment; an `npm deprecate` (or other
         // metadata-only PUT) does not.
         let attachment_key = find_attachment_key(&body.attachments, &package_name, version_str);
@@ -315,7 +323,7 @@ pub async fn publish_package(
             repo_name,
             &package_name,
             version_str,
-            version_id,
+            Some(version_id),
             &metadata_json,
             &auth_user.username,
         )

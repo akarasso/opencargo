@@ -273,16 +273,14 @@ pub async fn start_upload(
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only push to hosted repositories".to_string(),
-        ));
-    }
+    crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, "oci")?;
 
     // Create upload record
     let upload_id = uuid::Uuid::new_v4().to_string();
     let name = params.get("name").cloned().unwrap_or_default();
+    // Reject hostile image names at the very start of a push flow.
+    crate::registry::validate_package_name("oci", &name)?;
 
     sqlx::query(
         "INSERT INTO oci_uploads (id, repository_id, name) VALUES (?1, ?2, ?3)",
@@ -710,17 +708,21 @@ pub async fn put_manifest(
         .clone();
     let name = params.get("name").cloned().unwrap_or_default();
 
+    // The image name lands in DB rows and storage paths; the reference, when
+    // it is a tag, lands in oci_tags. Validate both before any write. A digest
+    // reference is checked against the computed content digest below.
+    crate::registry::validate_package_name("oci", &name)?;
+    if !is_digest(&reference) {
+        crate::registry::validate_oci_tag(&reference)?;
+    }
+
     let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only push to hosted repositories".to_string(),
-        ));
-    }
+    crate::registry::ensure_hosted(&repo)?;
 
     // Read the manifest body
     let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
@@ -801,6 +803,24 @@ pub async fn put_manifest(
         .execute(&state.db)
         .await?;
     }
+
+    // Shared post-publish side effects (`package.published` webhook +
+    // real-time event), like npm/cargo/go. The "package" is the image name as
+    // recorded in oci_manifests/oci_tags; the "version" is the pushed
+    // reference — the tag when pushed by tag, otherwise the digest.
+    // `version_id: None`: OCI has no row in the `versions` table, so the
+    // vulnerability-scan step does not apply.
+    crate::registry::finalize_publish(
+        &state,
+        "oci",
+        &repo_name,
+        &name,
+        &reference,
+        None,
+        &String::from_utf8_lossy(&body),
+        &auth_user.username,
+    )
+    .await?;
 
     info!(
         reference = %reference,

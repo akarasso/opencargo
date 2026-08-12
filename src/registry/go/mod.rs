@@ -58,6 +58,41 @@ pub async fn list_versions(
 }
 
 // ---------------------------------------------------------------------------
+// Latest version — GET /{repo}/{module}/@latest
+// ---------------------------------------------------------------------------
+
+/// GOPROXY `@latest`: JSON info about the most recently published version.
+/// Reached through the wildcard Go dispatcher in `server.rs` (the module path
+/// may span multiple URL segments).
+pub async fn latest_version(
+    State(state): State<AppState>,
+    Path((repo_name, module_name)): Path<(String, String)>,
+    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
+) -> AppResult<impl IntoResponse> {
+    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+
+    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
+
+    let package = crate::db::get_package(&state.db, repo.id, &module_name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("module not found: {module_name}")))?;
+
+    let versions = crate::db::get_versions(&state.db, package.id).await?;
+    // get_versions is ordered by insertion (id): the last row is the most
+    // recently published version.
+    let latest = versions
+        .last()
+        .ok_or_else(|| AppError::NotFound(format!("no versions for module: {module_name}")))?;
+
+    Ok(Json(json!({
+        "Version": latest.version,
+        "Time": latest.published_at,
+    })))
+}
+
+// ---------------------------------------------------------------------------
 // Version info — GET /{repo}/{module}/@v/{version}.info
 // ---------------------------------------------------------------------------
 
@@ -234,6 +269,12 @@ pub async fn publish_module(
         AppError::BadRequest("missing version".to_string())
     })?;
 
+    // Reject hostile module paths ('..' or empty segments, forbidden chars)
+    // and versions before touching DB or storage — the module path is
+    // interpolated into the storage path and may span multiple segments.
+    crate::registry::validate_package_name("go", module_name)?;
+    crate::registry::validate_version(version_str)?;
+
     // Validate repo exists and is hosted
     let repo = crate::db::get_repository_by_name(&state.db, repo_name)
         .await?
@@ -241,11 +282,7 @@ pub async fn publish_module(
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only publish to hosted repositories".to_string(),
-        ));
-    }
+    crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, "go")?;
 
     // Read the zip body
@@ -300,7 +337,7 @@ pub async fn publish_module(
         .await?;
 
     // Store go.mod content in metadata_json, zip path in tarball_path
-    let _version_id = crate::db::create_version(
+    let version_id = crate::db::create_version(
         &state.db,
         package.id,
         version_str,
@@ -310,6 +347,21 @@ pub async fn publish_module(
         None,
         size,
         &storage_path,
+    )
+    .await?;
+
+    // Shared post-publish side effects: `package.published` webhook, real-time
+    // event, vulnerability scan — same as npm/cargo. "Go" is the OSV.dev
+    // ecosystem name (like "crates.io" for cargo).
+    crate::registry::finalize_publish(
+        &state,
+        "Go",
+        repo_name,
+        module_name,
+        version_str,
+        Some(version_id),
+        &go_mod_content,
+        &auth_user.username,
     )
     .await?;
 
