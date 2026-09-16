@@ -44,7 +44,7 @@ All notable changes to this project will be documented in this file.
   works without a config file (it previously exited with "Permission denied")
 - Helm chart default image repository pointed at a non-existent registry path
 
-## [0.1.0] - 2026-03-23
+## [0.1.0] - 2026-03-23 (initial version, never tagged; the first tagged release will be v0.1.0-rc.1)
 
 ### Added
 - npm package registry (publish, install, search, dist-tags)

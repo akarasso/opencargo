@@ -11,7 +11,7 @@ Self-hosted universal package registry (npm, Cargo, OCI, Go). Rust + axum + SQLi
 
 - `src/registry/{npm,cargo,oci,go}` protocol handlers, `src/proxy` upstream cache, `src/auth` (Argon2, hashed tokens, permission matrix, rate limit), `src/api` admin REST + WS, `src/web` SPA serving.
 - `frontend/` SolidJS, `core/` is framework-agnostic (API client, WS client, stores).
-- `tests/` integration tests, real `pnpm` and `docker` clients for E2E.
+- `tests/` integration tests over HTTP; `pnpm_e2e_test.rs` drives a real `pnpm` binary, the Docker E2E does not use a real client.
 - `k8s/` Kustomize (`base/`, `scaleway/`, `sidecar/`), `helm/opencargo` chart.
 
 ## Commands

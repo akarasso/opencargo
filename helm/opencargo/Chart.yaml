@@ -9,6 +9,6 @@ keywords:
   - npm
   - cargo
   - oci
-home: https://github.com/trace/opencargo
+home: https://github.com/akarasso/opencargo
 maintainers:
   - name: opencargo

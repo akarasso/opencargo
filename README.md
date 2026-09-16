@@ -3,7 +3,7 @@
 **A self-hosted package registry for npm, Cargo, Docker/OCI and Go modules, in one 10 MB binary.**
 
 Host your private packages, proxy and cache npmjs.org, promote releases from
-dev to prod, and see every dependency your organisation pulls.
+dev to prod, one binary for the whole team.
 No JVM, no Postgres, no telemetry. SQLite inside, runs on 30 MB of RAM.
 
 [![CI](https://github.com/akarasso/opencargo/actions/workflows/ci.yml/badge.svg)](https://github.com/akarasso/opencargo/actions/workflows/ci.yml)

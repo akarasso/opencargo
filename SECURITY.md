@@ -42,8 +42,8 @@ compromised admin token.
 - Static "break-glass" tokens are empty by default and documented as such.
 - Weak admin passwords in config (`admin`, `changeme`) are rejected; a random
   one is generated and must be changed at first login.
-- Container runs as an unprivileged user (uid 10001) on a read-only image
-  root; only `/data` is writable.
+- Container runs as an unprivileged user (uid 10001); only `/data` needs to
+  be writable, so `readOnlyRootFilesystem` can be enabled in Kubernetes.
 - `cargo audit` and a Trivy image scan run in CI.
 
 ## Hardening checklist for operators
