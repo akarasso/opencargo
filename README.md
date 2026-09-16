@@ -2,8 +2,8 @@
 
 **A self-hosted package registry for npm, Cargo, Docker/OCI and Go modules, in one 10 MB binary.**
 
-Host your private packages, proxy and cache the public registries, promote
-releases from dev to prod, and see every dependency your organisation pulls.
+Host your private packages, proxy and cache npmjs.org, promote releases from
+dev to prod, and see every dependency your organisation pulls.
 No JVM, no Postgres, no telemetry. SQLite inside, runs on 30 MB of RAM.
 
 [![CI](https://github.com/akarasso/opencargo/actions/workflows/ci.yml/badge.svg)](https://github.com/akarasso/opencargo/actions/workflows/ci.yml)
@@ -84,7 +84,7 @@ the enterprise ones.
   (sparse index, yank/unyank), OCI Distribution v2 (Docker push/pull),
   Go modules (GOPROXY).
 - **Repository types**: `hosted` (you publish), `proxy` (transparent cache of
-  an upstream), `group` (one URL in front of several repos, ordered
+  an upstream, npm today), `group` (one URL in front of several repos, ordered
   resolution).
 - **Promotion**: move a version from `dev` to `prod` without re-uploading or
   changing lockfiles; full audit trail.
@@ -127,7 +127,7 @@ issue or write to the address in `SECURITY.md`.
 | | opencargo | Forgejo / Gitea Packages | Nexus Repository CE | Verdaccio | Harbor | JFrog Artifactory |
 |---|---|---|---|---|---|---|
 | Formats | npm, Cargo, OCI, Go | 20+ | 15+ | npm only | OCI, Helm | 30+ |
-| Upstream proxy + cache | yes | no | yes | yes | yes | yes |
+| Upstream proxy + cache | npm (Cargo, Go, OCI planned) | no | yes | yes | yes | yes |
 | Group / virtual repos | yes | no | yes | n/a | no | yes |
 | Promotion dev → prod | yes | no | paid | no | replication | yes |
 | Per-user × per-repo permissions | yes | per forge repo | yes | basic | project-level | yes |
@@ -135,8 +135,20 @@ issue or write to the address in `SECURITY.md`.
 | Footprint | 1 binary, SQLite, ~30 MB RAM | part of a forge | JVM, 2 GB+ RAM | Node.js | 8+ containers, Postgres, Redis | JVM, 4 GB+ RAM |
 | License | MIT | MIT | EPL, usage caps | MIT | Apache-2.0 | proprietary |
 
-Missing here and on the roadmap: PyPI, Maven, NuGet. If you need those today,
-Forgejo Packages or Nexus are better choices.
+## Known limitations
+
+Read this before the comparison table sells you anything.
+
+- Upstream proxying and caching work for npm only. Cargo, Go and OCI
+  repositories are `hosted` today; pull-through proxies for crates.io, the Go
+  module proxy and Docker Hub are the next items on the roadmap.
+- OCI image names are a single path segment: `registry/oci-private/app`
+  works, `registry/oci-private/team/app` does not yet.
+- No PyPI, Maven or NuGet. If you need those today, Forgejo Packages or Nexus
+  are better choices.
+- Storage is local disk (a volume or PVC), no S3 backend yet. No SSO; users
+  and tokens are local.
+- One maintainer, pre-1.0. Pin the image by digest and keep backups of `/data`.
 
 ---
 

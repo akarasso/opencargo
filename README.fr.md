@@ -5,7 +5,7 @@ Registry de packages universel, leger et auto-heberge, ecrit en Rust.
 - **Multi-format** : npm, Cargo, OCI/Docker, Go modules
 - **Binaire unique**, ~10 Mo, ~10-30 Mo RAM
 - **Zero JVM**, zero GC — SQLite embarque
-- **Proxy + cache** : cache transparent vers npmjs.org, crates.io
+- **Proxy + cache** : cache transparent vers npmjs.org (Cargo, Go et OCI : hosted uniquement pour l'instant)
 - **Repos group** : un seul endpoint pour packages prives + publics
 - **Promotion de packages** : workflow dev → prod avec audit trail
 - **Permissions granulaires** : par utilisateur × par repository
