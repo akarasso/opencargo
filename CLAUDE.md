@@ -21,4 +21,4 @@ Self-hosted universal package registry (npm, Cargo, OCI, Go). Rust + axum + SQLi
 
 ## Private files
 
-`plan-produit.md` and `plan-lancement.md` are business documents, gitignored, never commit or publish them.
+`plan-produit.md` and `plan-lancement.md` are business documents, gitignored, never commit or publish them. Real deployment values (hostnames, gateway, kubeconfig) live in `~/workspaces/perso/opencargo-deploy/`, outside this repository; `k8s/` only carries generic examples.
