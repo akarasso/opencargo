@@ -156,11 +156,11 @@ pub async fn init_repositories(
             crate::config::RepositoryFormat::Pypi => "pypi",
         };
         if repo_type != "hosted" && format != "npm" {
-            tracing::warn!(
-                repository = %repo.name,
+            anyhow::bail!(
+                "repository {}: {} repositories are only supported for npm today ({} must be hosted)",
+                repo.name,
                 repo_type,
-                format,
-                "proxy and group repositories only work for npm today; this repository will answer 404"
+                format
             );
         }
 

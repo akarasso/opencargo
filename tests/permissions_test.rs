@@ -618,6 +618,43 @@ async fn test_delete_non_empty_repository_conflicts() {
     );
 }
 
+/// Proxy and group repositories exist for npm only: creating one in another
+/// format is refused up front instead of producing a repository that answers 404.
+#[tokio::test]
+async fn test_create_repository_refuses_non_npm_proxy_and_group() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for (name, repo_type, format, expected) in [
+        ("cargo-group", "group", "cargo", StatusCode::BAD_REQUEST),
+        ("oci-proxy", "proxy", "oci", StatusCode::BAD_REQUEST),
+        ("go-proxy", "proxy", "go", StatusCode::BAD_REQUEST),
+        ("cargo-hosted-ok", "hosted", "cargo", StatusCode::CREATED),
+        ("npm-group-ok", "group", "npm", StatusCode::CREATED),
+    ] {
+        let mut body = json!({
+            "name": name,
+            "type": repo_type,
+            "format": format,
+            "visibility": "public"
+        });
+        if repo_type == "proxy" {
+            body["upstream"] = json!("https://example.com/");
+        }
+        if repo_type == "group" {
+            body["members"] = json!([]);
+        }
+        let resp = client
+            .post(format!("{}/api/v1/repositories", base_url))
+            .bearer_auth("test-token")
+            .json(&body)
+            .send()
+            .await
+            .expect("create repo request failed");
+        assert_eq!(resp.status(), expected, "{repo_type}/{format}: {:?}", resp.text().await);
+    }
+}
+
 /// S18 regression: creating a proxy repo with an upstream URL whose scheme is
 /// not http(s), or that is malformed, is rejected at the API boundary (400)
 /// instead of being stored and later used for outbound requests. Private and

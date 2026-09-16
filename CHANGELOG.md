@@ -33,16 +33,35 @@ All notable changes to this project will be documented in this file.
 - Dashboard stats apply the same visibility rules as the package list
   (anonymous callers no longer see private version/download/repo counts)
 
-### Fixed
-- Production CSP silently blocked Google Fonts and Material Symbols; fonts
-  are now bundled and icons inlined, so typography and iconography render
-  under the strict CSP
+### Security
+- A public `group` no longer serves metadata, tarballs or search results of a
+  private member to callers without read access on that member. Members are
+  filtered by the caller's rights; unreadable ones are skipped.
+- `ammonia`, `h2` and `rustls` bumped past their RustSec advisories; CI pins
+  Rust 1.93.0 and Trivy blocks the image push on fixable HIGH/CRITICAL findings.
 
 ### Fixed
+- Unscoped npm packages (`lodash`) had no metadata route and fell through to
+  the web UI, so installing a public package through a proxy never worked with
+  a real client.
+- Tarball URLs served through a `group` pointed at the member repository;
+  clients with a token declared on the group path only (pnpm) got 401 once
+  anonymous reads were disabled. They now point at the repository the client
+  asked for.
+- `--base-url` / `OPENCARGO_BASE_URL` override the public URL; a warning is
+  logged when listening on a non-loopback address with a `localhost` base URL.
+- Creating a `proxy` or `group` repository in a format other than npm is
+  refused (they answered 404 to everything); the phantom `pypi` format is gone
+  and a config-seeded one fails at startup instead of silently serving nothing.
+- reqwest moved to rustls with a single crypto provider; OpenSSL is out of the
+  container build and the image binary shrank from 17 MB to 11 MB.
 - Container image: `/data` is pre-created and owned by the runtime user, the
   default command listens on `0.0.0.0`, so `docker run -v x:/data ghcr.io/akarasso/opencargo`
   works without a config file (it previously exited with "Permission denied")
 - Helm chart default image repository pointed at a non-existent registry path
+- Production CSP silently blocked Google Fonts and Material Symbols; fonts
+  are now bundled and icons inlined, so typography and iconography render
+  under the strict CSP
 
 ## [0.1.0] - 2026-03-23 (initial version, never tagged; the first tagged release will be v0.1.0-rc.1)
 
