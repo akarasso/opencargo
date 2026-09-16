@@ -4,7 +4,7 @@
 
 Host your private packages, proxy and cache npmjs.org, promote releases from
 dev to prod, one binary for the whole team.
-No JVM, no Postgres, no telemetry. SQLite inside, runs on 30 MB of RAM.
+No JVM, no Postgres, no telemetry. SQLite inside, about 20 MB of RAM at rest.
 
 [![CI](https://github.com/akarasso/opencargo/actions/workflows/ci.yml/badge.svg)](https://github.com/akarasso/opencargo/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -133,7 +133,7 @@ issue or write to the address in `SECURITY.md`.
 | Promotion dev → prod | yes | no | paid | no | replication | yes |
 | Per-user × per-repo permissions | yes | per forge repo | yes | basic | project-level | yes |
 | Vulnerability scan | OSV, built in | no | paid (Firewall) | no | Trivy | paid (Xray) |
-| Footprint | 1 binary, SQLite, ~30 MB RAM | part of a forge | JVM, 2 GB+ RAM | Node.js | 8+ containers, Postgres, Redis | JVM, 4 GB+ RAM |
+| Footprint | 1 binary, SQLite, ~20 MB RAM | part of a forge | JVM, 2 GB+ RAM | Node.js | 8+ containers, Postgres, Redis | JVM, 4 GB+ RAM |
 | License | MIT | MIT | EPL, usage caps | MIT | Apache-2.0 | proprietary |
 
 ## Known limitations
@@ -313,7 +313,7 @@ make test-quick     # no network
 make test           # everything, including proxy and OSV tests
 ```
 
-114 integration tests in `tests/` cover the four protocols over HTTP (npm
+115 integration tests in `tests/` cover the four protocols over HTTP (npm
 also through a real `pnpm` client), auth, permissions, promotion, webhooks,
 TLS and the WebSocket stream.
 

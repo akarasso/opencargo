@@ -13,6 +13,24 @@ use opencargo::server;
 ///
 /// Returns `(base_url, port, server_handle, temp_dir)`.
 async fn setup() -> (String, u16, tokio::task::JoinHandle<()>, TempDir) {
+    setup_with(
+        true,
+        vec![RepositoryConfig {
+            name: "npm-private".to_string(),
+            repo_type: RepositoryType::Hosted,
+            format: RepositoryFormat::Npm,
+            visibility: Visibility::Public,
+            upstream: None,
+            members: None,
+        }],
+    )
+    .await
+}
+
+async fn setup_with(
+    anonymous_read: bool,
+    repositories: Vec<RepositoryConfig>,
+) -> (String, u16, tokio::task::JoinHandle<()>, TempDir) {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let storage_path = tmp.path().join("storage");
     let db_path = tmp.path().join("test.db");
@@ -34,18 +52,11 @@ async fn setup() -> (String, u16, tokio::task::JoinHandle<()>, TempDir) {
         },
         database: DatabaseConfig { url: db_url },
         auth: AuthConfig {
-            anonymous_read: true,
+            anonymous_read,
             static_tokens: vec!["test-token".to_string()],
             ..Default::default()
         },
-        repositories: vec![RepositoryConfig {
-            name: "npm-private".to_string(),
-            repo_type: RepositoryType::Hosted,
-            format: RepositoryFormat::Npm,
-            visibility: Visibility::Public,
-            upstream: None,
-            members: None,
-        }],
+        repositories,
         ..Default::default()
     };
 
@@ -240,6 +251,109 @@ async fn pnpm_publish_and_install_inner() {
         "Hello World",
         "unexpected output: {stdout}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Install through a group with anonymous reads disabled and the token declared
+// on the group path only: tarball URLs must point at the group, not the member.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_pnpm_install_through_private_group() {
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pnpm_install_through_private_group_inner(),
+    )
+    .await;
+    assert!(result.is_ok(), "test timed out after 120s");
+}
+
+async fn pnpm_install_through_private_group_inner() {
+    let (base_url, port, _handle, _server_tmp) = setup_with(
+        false,
+        vec![
+            RepositoryConfig {
+                name: "npm-private".to_string(),
+                repo_type: RepositoryType::Hosted,
+                format: RepositoryFormat::Npm,
+                visibility: Visibility::Private,
+                upstream: None,
+                members: None,
+            },
+            RepositoryConfig {
+                name: "npm-all".to_string(),
+                repo_type: RepositoryType::Group,
+                format: RepositoryFormat::Npm,
+                visibility: Visibility::Private,
+                upstream: None,
+                members: Some(vec!["npm-private".to_string()]),
+            },
+        ],
+    )
+    .await;
+
+    let tmp = TempDir::new().expect("failed to create work temp dir");
+    let fake_home = tmp.path().join("home");
+    std::fs::create_dir_all(&fake_home).unwrap();
+
+    let pkg_dir = tmp.path().join("grouped-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::json!({"name": "@test/grouped", "version": "1.0.0", "main": "index.js"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), "module.exports = 'grouped';").unwrap();
+    std::fs::write(
+        pkg_dir.join(".npmrc"),
+        format!(
+            "@test:registry=http://127.0.0.1:{port}/npm-private/\n\
+             //127.0.0.1:{port}/npm-private/:_authToken=test-token\n"
+        ),
+    )
+    .unwrap();
+
+    let (ok, stdout, stderr) =
+        run_cmd(&PNPM, &["publish", "--no-git-checks"], &pkg_dir, &fake_home).await;
+    assert!(ok, "pnpm publish failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let client = reqwest::Client::new();
+    let meta: serde_json::Value = client
+        .get(format!("{base_url}/npm-all/@test/grouped"))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let tarball = meta["versions"]["1.0.0"]["dist"]["tarball"].as_str().unwrap();
+    assert!(
+        tarball.contains("/npm-all/@test/grouped/-/"),
+        "tarball must be served through the requested group, got {tarball}"
+    );
+
+    let consumer_dir = tmp.path().join("consumer");
+    std::fs::create_dir_all(&consumer_dir).unwrap();
+    std::fs::write(
+        consumer_dir.join("package.json"),
+        serde_json::json!({"name": "consumer", "version": "1.0.0", "dependencies": {"@test/grouped": "1.0.0"}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer_dir.join(".npmrc"),
+        format!(
+            "@test:registry=http://127.0.0.1:{port}/npm-all/\n\
+             //127.0.0.1:{port}/npm-all/:_authToken=test-token\n\
+             node-linker=hoisted\n"
+        ),
+    )
+    .unwrap();
+
+    let (ok, stdout, stderr) =
+        run_cmd(&PNPM, &["install", "--no-lockfile"], &consumer_dir, &fake_home).await;
+    assert!(ok, "pnpm install through group failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert!(consumer_dir.join("node_modules/@test/grouped/index.js").exists());
 }
 
 // ---------------------------------------------------------------------------

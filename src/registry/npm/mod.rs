@@ -381,14 +381,14 @@ pub async fn get_package(
 
     match repo.repo_type.as_str() {
         "proxy" => {
-            get_package_proxy(&state, &repo, &package_name, repo_name, abbreviated).await
+            get_package_proxy(&state, &repo, &package_name, repo_name, repo_name, abbreviated).await
         }
         "group" => {
-            get_package_group(&state, &repo, &package_name, repo_name, abbreviated, 0).await
+            get_package_group(&state, &repo, &package_name, repo_name, repo_name, abbreviated, 0).await
         }
         _ => {
             // "hosted" — original logic
-            get_package_hosted(&state, &repo, &package_name, abbreviated).await
+            get_package_hosted(&state, &repo, &package_name, repo_name, abbreviated).await
         }
     }
 }
@@ -398,6 +398,7 @@ async fn get_package_hosted(
     state: &AppState,
     repo: &crate::db::Repository,
     package_name: &str,
+    url_repo_name: &str,
     abbreviated: bool,
 ) -> AppResult<axum::response::Response> {
     let package = crate::db::get_package(&state.db, repo.id, package_name)
@@ -433,7 +434,7 @@ async fn get_package_hosted(
         versions_map.insert(v.version.clone(), meta);
     }
 
-    let response = json!({
+    let mut response = json!({
         "_id": package_name,
         "name": package_name,
         "description": package.description,
@@ -441,6 +442,7 @@ async fn get_package_hosted(
         "versions": versions_map,
         "time": time_map,
     });
+    proxy::rewrite_tarball_urls(&mut response, &state.base_url, url_repo_name, package_name);
 
     if abbreviated {
         Ok((
@@ -464,6 +466,7 @@ async fn get_package_proxy(
     repo: &crate::db::Repository,
     package_name: &str,
     repo_name: &str,
+    url_repo_name: &str,
     abbreviated: bool,
 ) -> AppResult<axum::response::Response> {
     let upstream_url = repo.upstream_url.as_deref().ok_or_else(|| {
@@ -480,7 +483,7 @@ async fn get_package_proxy(
         .await?;
 
     // Rewrite tarball URLs to point to our server
-    proxy::rewrite_tarball_urls(&mut metadata, &state.base_url, repo_name, package_name);
+    proxy::rewrite_tarball_urls(&mut metadata, &state.base_url, url_repo_name, package_name);
 
     if abbreviated {
         // Strip version fields for abbreviated response
@@ -509,6 +512,7 @@ fn get_package_group<'a>(
     repo: &'a crate::db::Repository,
     package_name: &'a str,
     repo_name: &'a str,
+    url_repo_name: &'a str,
     abbreviated: bool,
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<axum::response::Response>> + Send + 'a>>
@@ -544,15 +548,15 @@ fn get_package_group<'a>(
 
             let result = match member_repo.repo_type.as_str() {
                 "proxy" => {
-                    get_package_proxy(state, &member_repo, package_name, member_name, abbreviated)
+                    get_package_proxy(state, &member_repo, package_name, member_name, url_repo_name, abbreviated)
                         .await
                 }
                 "hosted" => {
-                    get_package_hosted(state, &member_repo, package_name, abbreviated).await
+                    get_package_hosted(state, &member_repo, package_name, url_repo_name, abbreviated).await
                 }
                 "group" => {
                     // Nested groups — recurse (boxed)
-                    get_package_group(state, &member_repo, package_name, member_name, abbreviated, depth + 1)
+                    get_package_group(state, &member_repo, package_name, member_name, url_repo_name, abbreviated, depth + 1)
                         .await
                 }
                 _ => continue,

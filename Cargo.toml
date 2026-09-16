@@ -61,7 +61,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 
 # HTTP client (proxy upstream)
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 
 # Auth (password hashing)
 argon2 = "0.5"
@@ -85,7 +85,7 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 zip = "8.3.1"
 
 [dev-dependencies]
-reqwest = { version = "0.12", features = ["json", "native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tempfile = "3"
 tokio-test = "0.4"
 rcgen = "0.13"

@@ -75,7 +75,7 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, audit]
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     # GITHUB_TOKEN needs packages:write to push the image to GHCR.
     permissions:
@@ -113,14 +113,9 @@ jobs:
           ignore-unfixed: true
           severity: HIGH,CRITICAL
 
-      # `provenance: false` keeps `:latest` a single manifest so digest pinning works.
-      - name: Push image
-        uses: docker/build-push-action@v6
-        with:
-          context: .
-          push: true
-          platforms: linux/amd64
-          provenance: false
-          tags: |
-            ghcr.io/akarasso/opencargo:latest
-            ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
+      - name: Push the scanned image
+        run: |
+          docker tag opencargo:ci ghcr.io/akarasso/opencargo:latest
+          docker tag opencargo:ci ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
+          docker push ghcr.io/akarasso/opencargo:latest
+          docker push ghcr.io/akarasso/opencargo:sha-${{ github.sha }}

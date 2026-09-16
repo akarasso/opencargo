@@ -9,7 +9,7 @@ RUN pnpm build
 
 # Stage 2: Rust build
 FROM rust:1.93-alpine AS builder
-RUN apk add --no-cache musl-dev openssl-dev openssl-libs-static perl
+RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src frontend/dist && echo "fn main() {}" > src/main.rs && cargo build --release 2>/dev/null || true && rm -rf src
