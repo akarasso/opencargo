@@ -24,6 +24,10 @@ FROM alpine:3.21
 # matching fsGroup), so the binary never needs to write to the image rootfs.
 RUN addgroup -S -g 10001 opencargo && adduser -S -u 10001 -G opencargo opencargo
 COPY --from=builder /app/target/release/opencargo /usr/local/bin/
+RUN mkdir -p /data && chown 10001:10001 /data
+VOLUME ["/data"]
+WORKDIR /
 USER 10001:10001
 EXPOSE 6789
 ENTRYPOINT ["opencargo"]
+CMD ["--bind", "0.0.0.0:6789"]

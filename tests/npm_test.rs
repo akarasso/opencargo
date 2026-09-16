@@ -218,6 +218,47 @@ async fn test_publish_and_get_metadata() {
 }
 
 #[tokio::test]
+async fn test_unscoped_publish_and_get_metadata() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let pkg_json = r#"{"name":"plainpkg","version":"2.0.0","main":"index.js"}"#;
+    let tarball = build_tarball(pkg_json);
+    let body = build_publish_body("plainpkg", "2.0.0", "", &tarball);
+
+    let resp = client
+        .put(format!("{}/test-npm/plainpkg", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "publish failed: {:?}", resp.text().await);
+
+    let resp = client
+        .get(format!("{}/test-npm/plainpkg", base_url))
+        .send()
+        .await
+        .expect("get metadata request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()[reqwest::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"),
+        "unscoped metadata must not fall through to the SPA"
+    );
+    let meta: Value = resp.json().await.expect("invalid json");
+    assert_eq!(meta["name"], "plainpkg");
+    assert_eq!(meta["dist-tags"]["latest"], "2.0.0");
+    let tarball_url = meta["versions"]["2.0.0"]["dist"]["tarball"].as_str().unwrap();
+    assert!(tarball_url.contains("/test-npm/plainpkg/-/plainpkg-2.0.0.tgz"), "{tarball_url}");
+
+    let resp = client.get(tarball_url).send().await.expect("tarball request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_download_tarball() {
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();

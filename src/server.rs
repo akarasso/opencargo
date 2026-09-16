@@ -204,6 +204,11 @@ pub fn build_router(state: AppState) -> Router {
         )
         // Unscoped packages
         .route(
+            "/{repo}/{name}",
+            get(crate::registry::npm::get_package)
+                .put(crate::registry::npm::publish_package),
+        )
+        .route(
             "/{repo}/{name}/-/{filename}",
             get(crate::registry::npm::download_tarball),
         )
