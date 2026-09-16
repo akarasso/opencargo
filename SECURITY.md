@@ -1,7 +1,8 @@
 # Security policy
 
 opencargo sits on the critical path of your builds and holds credentials for
-your developers and CI. We take reports seriously and answer quickly.
+your developers and CI. It is maintained by one person; reports are read
+within days, not weeks.
 
 ## Reporting a vulnerability
 
@@ -12,8 +13,8 @@ Use GitHub's private vulnerability reporting on this repository
 `a.karassouloff@gmail.com` with `[opencargo security]` in the subject.
 
 You will get an acknowledgement within 3 business days and a fix or a
-mitigation plan within 30 days for confirmed issues. We credit reporters in
-the changelog unless they prefer otherwise.
+mitigation plan within 30 days for confirmed issues. Reporters are credited
+in the changelog unless they prefer otherwise.
 
 ## Supported versions
 

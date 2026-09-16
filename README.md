@@ -93,7 +93,8 @@ the enterprise ones.
 - **Dependency graph**: dependencies extracted at publish time; "who depends on
   this?" and impact analysis before you delete a version.
 - **Vulnerability scanning** through [OSV.dev](https://osv.dev) on every
-  publish, optional block on critical CVEs.
+  publish (advisory IDs today; severity-based blocking is being fixed, see
+  known limitations).
 - **Webhooks** with HMAC signatures, **WebSocket event stream**, **Prometheus
   metrics**, full-text search, rate limiting, native TLS.
 - **Web UI** embedded in the binary: live dashboard, package pages with
@@ -148,6 +149,9 @@ Read this before the comparison table sells you anything.
   are better choices.
 - Storage is local disk (a volume or PVC), no S3 backend yet. No SSO; users
   and tokens are local.
+- `vuln_scan.block_on_critical` does not work yet: the OSV batch API returns
+  advisory IDs without severity, so nothing is ever classified critical. A fix
+  is in progress; until then treat the scan as an inventory, not a gate.
 - One maintainer, pre-1.0. Pin the image by digest and keep backups of `/data`.
 
 ---
@@ -309,9 +313,9 @@ make test-quick     # no network
 make test           # everything, including proxy and OSV tests
 ```
 
-150+ integration tests cover the four protocols end to end (real `pnpm` and
-`docker` clients), auth, permissions, promotion, webhooks, TLS and the
-WebSocket stream.
+114 integration tests in `tests/` cover the four protocols over HTTP (npm
+also through a real `pnpm` client), auth, permissions, promotion, webhooks,
+TLS and the WebSocket stream.
 
 ---
 
