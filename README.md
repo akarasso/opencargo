@@ -88,8 +88,9 @@ the enterprise ones.
   (sparse index, yank/unyank), OCI Distribution v2 (Docker push/pull),
   Go modules (GOPROXY).
 - **Repository types**: `hosted` (you publish), `proxy` (transparent cache of
-  an upstream, npm today), `group` (one URL in front of several repos, ordered
-  resolution).
+  an upstream) and `group` (one URL in front of several repos, ordered
+  resolution). Proxy and group exist for npm today; Cargo, Go and OCI are
+  hosted only.
 - **Promotion**: move a version from `dev` to `prod` without re-uploading or
   changing lockfiles; full audit trail.
 - **Permissions**: roles plus a per-user × per-repository matrix, editable in
@@ -133,7 +134,7 @@ issue or write to the address in `SECURITY.md`.
 |---|---|---|---|---|---|---|
 | Formats | npm, Cargo, OCI, Go | 20+ | 15+ | npm only | OCI, Helm | 30+ |
 | Upstream proxy + cache | npm (Cargo, Go, OCI planned) | no | yes | yes | yes | yes |
-| Group / virtual repos | yes | no | yes | n/a | no | yes |
+| Group / virtual repos | npm (others planned) | no | yes | n/a | no | yes |
 | Promotion dev → prod | yes | no | paid | no | replication | yes |
 | Per-user × per-repo permissions | yes | per forge repo | yes | basic | project-level | yes |
 | Vulnerability scan | OSV, built in | no | paid (Firewall) | no | Trivy | paid (Xray) |
@@ -144,9 +145,10 @@ issue or write to the address in `SECURITY.md`.
 
 Read this before the comparison table sells you anything.
 
-- Upstream proxying and caching work for npm only. Cargo, Go and OCI
-  repositories are `hosted` today; pull-through proxies for crates.io, the Go
-  module proxy and Docker Hub are the next items on the roadmap.
+- Upstream proxying, caching and groups work for npm only. Cargo, Go and OCI
+  repositories are `hosted` today, and the API refuses to create a proxy or a
+  group in those formats; pull-through proxies for crates.io, the Go module
+  proxy and Docker Hub are the next items on the roadmap.
 - OCI image names are a single path segment: `registry/oci-private/app`
   works, `registry/oci-private/team/app` does not yet.
 - No PyPI, Maven or NuGet. If you need those today, Forgejo Packages or Nexus
@@ -318,7 +320,7 @@ make test-quick     # no network
 make test           # everything, including proxy and OSV tests
 ```
 
-115 integration tests in `tests/` cover the four protocols over HTTP (npm
+116 integration tests in `tests/` cover the four protocols over HTTP (npm
 also through a real `pnpm` client), auth, permissions, promotion, webhooks,
 TLS and the WebSocket stream.
 

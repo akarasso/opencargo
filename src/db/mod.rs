@@ -155,6 +155,14 @@ pub async fn init_repositories(
             crate::config::RepositoryFormat::Go => "go",
             crate::config::RepositoryFormat::Pypi => "pypi",
         };
+        if repo_type != "hosted" && format != "npm" {
+            tracing::warn!(
+                repository = %repo.name,
+                repo_type,
+                format,
+                "proxy and group repositories only work for npm today; this repository will answer 404"
+            );
+        }
 
         let visibility = match repo.visibility {
             crate::config::Visibility::Public => "public",

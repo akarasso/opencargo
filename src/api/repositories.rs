@@ -66,13 +66,17 @@ pub async fn create_repository(
     }
 
     // Validate format
-    if !matches!(
-        body.format.as_str(),
-        "npm" | "cargo" | "oci" | "go" | "pypi"
-    ) {
+    if !matches!(body.format.as_str(), "npm" | "cargo" | "oci" | "go") {
         return Err(AppError::BadRequest(format!(
             "invalid repository format: {}",
             body.format
+        )));
+    }
+
+    if body.repo_type != "hosted" && body.format != "npm" {
+        return Err(AppError::BadRequest(format!(
+            "{} repositories are only supported for npm today; {} repositories must be hosted",
+            body.repo_type, body.format
         )));
     }
 
