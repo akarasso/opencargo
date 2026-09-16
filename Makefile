@@ -146,24 +146,6 @@ sidecar-undeploy: ## Supprimer le sidecar CI
 	kubectl delete -f k8s/sidecar/configmap.yaml -n $(NAMESPACE) --ignore-not-found
 
 # ---------------------------------------------------------------------------
-# Publish des packages @acme (test)
-# ---------------------------------------------------------------------------
-
-publish-trace: ## Publier les 4 packages @acme/* sur le registry local
-	@echo "Publication des packages @acme/* sur http://localhost:6789/npm-private/"
-	@for pkg in package-context package-logger package-httpclient package-httpservice; do \
-		echo "=== $$pkg ==="; \
-		TMPDIR=$$(mktemp -d); \
-		cp -r ../packages/$$pkg/* "$$TMPDIR/"; \
-		if [ -d "../packages/$$pkg/node_modules" ]; then \
-			cp -r ../packages/$$pkg/node_modules "$$TMPDIR/"; \
-		fi; \
-		echo '@acme:registry=http://localhost:6789/npm-private/\n//localhost:6789/npm-private/:_authToken=test-token' > "$$TMPDIR/.npmrc"; \
-		cd "$$TMPDIR" && pnpm publish --no-git-checks 2>&1 | tail -3; \
-		rm -rf "$$TMPDIR"; \
-	done
-
-# ---------------------------------------------------------------------------
 # Maintenance
 # ---------------------------------------------------------------------------
 

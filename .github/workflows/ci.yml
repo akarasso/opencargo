@@ -81,6 +81,7 @@ jobs:
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -94,14 +95,26 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build (the Dockerfile builds the frontend + Rust release itself) and PUSH:
-      # previously the job built `:latest` locally and discarded it, so GHCR
-      # `:latest` never tracked main and every deploy needed a manual build.
-      # `platforms: linux/amd64` + `provenance: false` publish a single clean
-      # manifest — `:latest` resolves to ONE digest instead of an attestation index
-      # whose "unknown/unknown" child breaks digest pinning. `:sha-<commit>` is the
-      # immutable tag deployments pin to.
-      - name: Build and push image
+      - name: Build image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          platforms: linux/amd64
+          provenance: false
+          tags: opencargo:ci
+
+      - name: Scan image for vulnerabilities (Trivy)
+        uses: aquasecurity/trivy-action@0.35.0
+        with:
+          image-ref: opencargo:ci
+          format: table
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: HIGH,CRITICAL
+
+      # `provenance: false` keeps `:latest` a single manifest so digest pinning works.
+      - name: Push image
         uses: docker/build-push-action@v6
         with:
           context: .
@@ -111,14 +124,3 @@ jobs:
           tags: |
             ghcr.io/akarasso/opencargo:latest
             ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
-
-      - name: Scan image for vulnerabilities (Trivy)
-        uses: aquasecurity/trivy-action@0.35.0
-        with:
-          image-ref: ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
-          format: table
-          # Report HIGH/CRITICAL but do not fail the build on unfixed CVEs yet.
-          # Flip exit-code to '1' once the base image is reliably clean.
-          exit-code: '0'
-          ignore-unfixed: true
-          severity: HIGH,CRITICAL

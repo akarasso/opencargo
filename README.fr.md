@@ -846,7 +846,6 @@ make docker              # Build image Docker
 make deploy              # Deployer sur k8s
 make helm-install        # Deployer avec Helm
 make sidecar-deploy      # Deployer le sidecar CI
-make publish-trace       # Publier les @acme/* pour tester
 make clean               # Nettoyer
 make reset-db            # Reset la DB
 ```
