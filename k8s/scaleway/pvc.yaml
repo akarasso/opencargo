@@ -1,0 +1,18 @@
+# Scaleway variant of the base pvc.yaml, same caveat: apply once by hand when
+# creating from scratch, never through the kustomization (the spec is immutable).
+# `sbs-5k-retain` keeps the volume when the PVC or the namespace is deleted, so
+# the only copy of every published package survives a cluster loss.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: opencargo-data
+  namespace: infra
+  labels:
+    app: opencargo
+spec:
+  accessModes:
+    - ReadWriteOnce
+  storageClassName: sbs-5k-retain
+  resources:
+    requests:
+      storage: 50Gi

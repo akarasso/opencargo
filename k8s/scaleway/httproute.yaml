@@ -1,0 +1,23 @@
+# Routes the registry hostname through a shared Gateway API gateway (Cilium).
+# The HTTPS listener and its certificate belong to the cluster's gateway, not here.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: opencargo-infra
+  namespace: infra
+  labels:
+    app: opencargo
+spec:
+  parentRefs:
+    - name: gateway
+      namespace: gateway
+  hostnames:
+    - registry.example.com
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: opencargo
+          port: 6789
