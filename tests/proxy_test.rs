@@ -391,6 +391,7 @@ async fn test_group_repo_serves_hosted_first() {
     // Now fetch @test/mylib from the GROUP repo
     let resp = client
         .get(format!("{}/npm-group/@test/mylib", base_url))
+        .bearer_auth("test-token")
         .send()
         .await
         .expect("group metadata request failed");

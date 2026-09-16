@@ -56,6 +56,10 @@ npm publish --registry http://localhost:6789/npm-private/
 npm install @acme/hello lodash        # @acme from you, lodash proxied and cached
 ```
 
+Running it on a server rather than your laptop? Add
+`-e OPENCARGO_BASE_URL=https://registry.example.com`: package metadata embeds
+absolute download URLs, and they default to `http://localhost:6789`.
+
 Without `OPENCARGO_ADMIN_PASSWORD`, a random admin password is generated at
 first boot. Read it with `docker exec opencargo cat /data/admin.password`; the
 UI will make you change it at first login.
@@ -263,6 +267,7 @@ without a flag: `./config.toml`, `~/.opencargo/config.toml`, built-in defaults.
 |---|---|
 | `OPENCARGO_CONFIG` | Path to the config file |
 | `OPENCARGO_ADMIN_PASSWORD` | Initial admin password (no generated file, no forced change) |
+| `OPENCARGO_BASE_URL` | Public URL of the server, used in tarball and download URLs (also `--base-url`) |
 | `RUST_LOG` | Log filter, default `opencargo=info,tower_http=info` |
 
 ---

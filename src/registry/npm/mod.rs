@@ -384,7 +384,7 @@ pub async fn get_package(
             get_package_proxy(&state, &repo, &package_name, repo_name, repo_name, abbreviated).await
         }
         "group" => {
-            get_package_group(&state, &repo, &package_name, repo_name, repo_name, abbreviated, 0).await
+            get_package_group(&state, &repo, &package_name, repo_name, repo_name, auth.as_ref().map(|e| &e.0), abbreviated, 0).await
         }
         _ => {
             // "hosted" — original logic
@@ -507,12 +507,14 @@ async fn get_package_proxy(
 
 /// Serve package metadata from a group repository.
 /// Tries each member repo in order and returns the first hit.
+#[allow(clippy::too_many_arguments)]
 fn get_package_group<'a>(
     state: &'a AppState,
     repo: &'a crate::db::Repository,
     package_name: &'a str,
     repo_name: &'a str,
     url_repo_name: &'a str,
+    auth: Option<&'a AuthUser>,
     abbreviated: bool,
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<axum::response::Response>> + Send + 'a>>
@@ -546,6 +548,9 @@ fn get_package_group<'a>(
                     }
                 };
 
+            if crate::registry::ensure_can_read(&state.db, &member_repo, auth).await.is_err() {
+                continue;
+            }
             let result = match member_repo.repo_type.as_str() {
                 "proxy" => {
                     get_package_proxy(state, &member_repo, package_name, member_name, url_repo_name, abbreviated)
@@ -556,7 +561,7 @@ fn get_package_group<'a>(
                 }
                 "group" => {
                     // Nested groups — recurse (boxed)
-                    get_package_group(state, &member_repo, package_name, member_name, url_repo_name, abbreviated, depth + 1)
+                    get_package_group(state, &member_repo, package_name, member_name, url_repo_name, auth, abbreviated, depth + 1)
                         .await
                 }
                 _ => continue,
@@ -637,7 +642,7 @@ pub async fn download_tarball(
             download_tarball_proxy(&state, &repo, &package_name, filename, repo_name).await
         }
         "group" => {
-            download_tarball_group(&state, &repo, &package_name, filename, repo_name, 0).await
+            download_tarball_group(&state, &repo, &package_name, filename, repo_name, auth.as_ref().map(|e| &e.0), 0).await
         }
         _ => {
             // "hosted"
@@ -737,6 +742,7 @@ fn download_tarball_group<'a>(
     package_name: &'a str,
     filename: &'a str,
     repo_name: &'a str,
+    auth: Option<&'a AuthUser>,
     depth: u32,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = AppResult<axum::response::Response>> + Send + 'a>>
 {
@@ -762,6 +768,9 @@ fn download_tarball_group<'a>(
                     None => continue,
                 };
 
+            if crate::registry::ensure_can_read(&state.db, &member_repo, auth).await.is_err() {
+                continue;
+            }
             let result = match member_repo.repo_type.as_str() {
                 "proxy" => {
                     download_tarball_proxy(
@@ -783,6 +792,7 @@ fn download_tarball_group<'a>(
                         package_name,
                         filename,
                         member_name,
+                        auth,
                         depth + 1,
                     )
                     .await
@@ -859,6 +869,9 @@ pub async fn search(
                 // starting at offset 0 — NOT (size, from). The merged result is
                 // re-paginated below, so passing `from` here skipped it twice and
                 // dropped results for from > 0.
+                if crate::registry::ensure_can_read(&state.db, &member_repo, auth.as_ref().map(|e| &e.0)).await.is_err() {
+                    continue;
+                }
                 let member_objects =
                     search_in_repo(&state, member_repo.id, &search_text, from + size, 0).await?;
 

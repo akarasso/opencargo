@@ -357,6 +357,73 @@ async fn pnpm_install_through_private_group_inner() {
 }
 
 // ---------------------------------------------------------------------------
+// A public group must not expose a private member to callers who cannot read it.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_public_group_hides_private_member_from_anonymous() {
+    let (base_url, port, _handle, _server_tmp) = setup_with(
+        true,
+        vec![
+            RepositoryConfig {
+                name: "npm-private".to_string(),
+                repo_type: RepositoryType::Hosted,
+                format: RepositoryFormat::Npm,
+                visibility: Visibility::Private,
+                upstream: None,
+                members: None,
+            },
+            RepositoryConfig {
+                name: "npm-all".to_string(),
+                repo_type: RepositoryType::Group,
+                format: RepositoryFormat::Npm,
+                visibility: Visibility::Public,
+                upstream: None,
+                members: Some(vec!["npm-private".to_string()]),
+            },
+        ],
+    )
+    .await;
+
+    let tmp = TempDir::new().unwrap();
+    let fake_home = tmp.path().join("home");
+    std::fs::create_dir_all(&fake_home).unwrap();
+    let pkg_dir = tmp.path().join("secret-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::json!({"name": "@test/secret", "version": "1.0.0", "main": "index.js"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), "module.exports = 'secret';").unwrap();
+    std::fs::write(
+        pkg_dir.join(".npmrc"),
+        format!(
+            "@test:registry=http://127.0.0.1:{port}/npm-private/\n\
+             //127.0.0.1:{port}/npm-private/:_authToken=test-token\n"
+        ),
+    )
+    .unwrap();
+    let (ok, stdout, stderr) =
+        run_cmd(&PNPM, &["publish", "--no-git-checks"], &pkg_dir, &fake_home).await;
+    assert!(ok, "pnpm publish failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let client = reqwest::Client::new();
+    let meta_url = format!("{base_url}/npm-all/@test/secret");
+    let tarball_url = format!("{base_url}/npm-all/@test/secret/-/secret-1.0.0.tgz");
+
+    let anon_meta = client.get(&meta_url).send().await.unwrap().status();
+    assert_eq!(anon_meta.as_u16(), 404, "anonymous metadata through public group must not resolve a private member");
+    let anon_tarball = client.get(&tarball_url).send().await.unwrap().status();
+    assert_eq!(anon_tarball.as_u16(), 404, "anonymous tarball through public group must not resolve a private member");
+
+    let auth_meta = client.get(&meta_url).bearer_auth("test-token").send().await.unwrap().status();
+    assert_eq!(auth_meta.as_u16(), 200);
+    let auth_tarball = client.get(&tarball_url).bearer_auth("test-token").send().await.unwrap().status();
+    assert_eq!(auth_tarball.as_u16(), 200);
+}
+
+// ---------------------------------------------------------------------------
 // Test 2: Publish multiple versions, install resolves latest matching
 // ---------------------------------------------------------------------------
 
