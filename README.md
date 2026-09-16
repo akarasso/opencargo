@@ -1,123 +1,229 @@
 # opencargo
 
-Registry de packages universel, leger et auto-heberge, ecrit en Rust.
+**A self-hosted package registry for npm, Cargo, Docker/OCI and Go modules, in one 10 MB binary.**
 
-- **Multi-format** : npm, Cargo, OCI/Docker, Go modules
-- **Binaire unique**, ~10 Mo, ~10-30 Mo RAM
-- **Zero JVM**, zero GC — SQLite embarque
-- **Proxy + cache** : cache transparent vers npmjs.org, crates.io
-- **Repos group** : un seul endpoint pour packages prives + publics
-- **Promotion de packages** : workflow dev → prod avec audit trail
-- **Permissions granulaires** : par utilisateur × par repository
-- **Dependency graph** : suivi des deps + analyse d'impact
-- **Vulnerability scanning** : scan automatique via OSV.dev
-- **Webhooks** : notifications sur evenements (publish, promote)
-- **Temps reel** : WebSocket d'evenements (publications, promotions, audit) — l'UI se met a jour sans recharger
-- **UI web** SolidJS embarquee dans le binaire (dashboard live, matrice de permissions, palette Cmd+K)
-- **Metriques Prometheus** integrees
-- **Recherche full-text** (SQLite FTS5)
-- **Rate limiting** sur les endpoints sensibles
-- **TLS natif** (rustls)
+Host your private packages, proxy and cache the public registries, promote
+releases from dev to prod, and see every dependency your organisation pulls.
+No JVM, no Postgres, no telemetry. SQLite inside, runs on 30 MB of RAM.
+
+[![CI](https://github.com/akarasso/opencargo/actions/workflows/ci.yml/badge.svg)](https://github.com/akarasso/opencargo/actions/workflows/ci.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Container image](https://img.shields.io/badge/ghcr.io-akarasso%2Fopencargo-blue)](https://github.com/akarasso/opencargo/pkgs/container/opencargo)
+
+*Version française : [README.fr.md](README.fr.md).*
 
 ---
 
-## Quickstart
-
-### 1. Build
+## Try it in one command
 
 ```bash
-make build       # dev
-make release     # production
+docker run -d --name opencargo -p 6789:6789 \
+  -v opencargo-data:/data \
+  -e OPENCARGO_ADMIN_PASSWORD=change-me \
+  ghcr.io/akarasso/opencargo:latest
 ```
 
-Ou manuellement :
-```bash
-cd frontend && pnpm install && pnpm build && cd ..
-cargo build --release
-```
-
-### 2. Configuration
+Open <http://localhost:6789>, log in as `admin`, and create repositories from
+the UI. Or script it: the same three calls give you a private npm registry
+that falls back to npmjs.org and caches what it fetches.
 
 ```bash
-cp config.example.toml config.toml
+R=http://localhost:6789
+
+curl -u admin:change-me -X POST $R/api/v1/repositories -H 'Content-Type: application/json' \
+  -d '{"name":"npm-private","type":"hosted","format":"npm","visibility":"private"}'
+curl -u admin:change-me -X POST $R/api/v1/repositories -H 'Content-Type: application/json' \
+  -d '{"name":"npm-proxy","type":"proxy","format":"npm","visibility":"public","upstream":"https://registry.npmjs.org"}'
+curl -u admin:change-me -X POST $R/api/v1/repositories -H 'Content-Type: application/json' \
+  -d '{"name":"npm-all","type":"group","format":"npm","visibility":"public","members":["npm-private","npm-proxy"]}'
+
+# A token for your laptop or CI (shown once)
+curl -u admin:change-me -X POST $R/api/v1/users/admin/tokens -H 'Content-Type: application/json' \
+  -d '{"name":"laptop","expires_in_days":365}'
 ```
 
-### 3. Lancer
+Publish to the hosted repo, install through the group:
+
+```ini
+# .npmrc
+registry=http://localhost:6789/npm-all/
+//localhost:6789/npm-all/:_authToken=trg_...
+//localhost:6789/npm-private/:_authToken=trg_...
+```
 
 ```bash
-make dev         # dev (avec logs debug)
-make serve       # production
+npm publish --registry http://localhost:6789/npm-private/
+npm install @acme/hello lodash        # @acme from you, lodash proxied and cached
 ```
 
-Ou manuellement :
+Without `OPENCARGO_ADMIN_PASSWORD`, a random admin password is generated at
+first boot. Read it with `docker exec opencargo cat /data/admin.password`; the
+UI will make you change it at first login.
+
+---
+
+## Why another registry
+
+Teams of 5 to 60 developers usually end up with one of these:
+
+- **Artifactory or Nexus**: does everything, needs a JVM, gigabytes of RAM and
+  someone to babysit it. Priced for enterprises.
+- **GitHub or GitLab Packages**: tied to a repo, no real upstream proxy, no
+  promotion, permissions follow the repo rather than the package.
+- **Verdaccio + Harbor + a Go proxy**: three services, three auth systems,
+  three things to upgrade.
+
+opencargo is the fourth option: one static binary that serves the four
+formats a polyglot team actually uses, with the features the "light" options
+lack (proxy, group, promotion, per-user permissions) and without the weight of
+the enterprise ones.
+
+## What it does today
+
+- **Formats**: npm (incl. scoped packages, dist-tags, `npm login`), Cargo
+  (sparse index, yank/unyank), OCI Distribution v2 (Docker push/pull),
+  Go modules (GOPROXY).
+- **Repository types**: `hosted` (you publish), `proxy` (transparent cache of
+  an upstream), `group` (one URL in front of several repos, ordered
+  resolution).
+- **Promotion**: move a version from `dev` to `prod` without re-uploading or
+  changing lockfiles; full audit trail.
+- **Permissions**: roles plus a per-user × per-repository matrix, editable in
+  the UI, enforced server-side and on the event stream.
+- **Dependency graph**: dependencies extracted at publish time; "who depends on
+  this?" and impact analysis before you delete a version.
+- **Vulnerability scanning** through [OSV.dev](https://osv.dev) on every
+  publish, optional block on critical CVEs.
+- **Webhooks** with HMAC signatures, **WebSocket event stream**, **Prometheus
+  metrics**, full-text search, rate limiting, native TLS.
+- **Web UI** embedded in the binary: live dashboard, package pages with
+  README and install snippets, admin screens, Cmd+K palette.
+- **Ops**: Dockerfile, Kustomize manifests, Helm chart, CI sidecar mode for
+  caching in GitHub Actions / GitLab CI runners.
+
+Argon2 for passwords, hashed API tokens, path-traversal guards and the
+permission matrix are covered by integration tests. See [SECURITY.md](SECURITY.md).
+
+## Where it is going
+
+The registry is the foundation. The next layer is a **dependency policy
+engine, in audit mode first**: rules versioned with your code
+(`package.age < 72h`, `cve.severity >= high`, `install_scripts && !allowlisted`,
+`license in [AGPL]`), evaluated at resolution time, scoped per repository so
+internal packages are not judged like public ones. The first deliverable is a
+weekly report of *what would have been blocked*, before anything is actually
+blocked. Then PyPI, migration importers from Nexus / Artifactory / Verdaccio /
+GitHub Packages, and governance of MCP servers and agent skills distributed
+through npm, PyPI and OCI.
+
+The registry and audit mode are and will stay MIT. Organisation-level
+enforcement (quarantine, approvals, SSO, audit exports, compliance reports)
+is planned as a paid add-on for self-hosted deployments. If you run opencargo
+and would talk for 30 minutes about what you would want blocked, open an
+issue or write to the address in `SECURITY.md`.
+
+## Comparison
+
+| | opencargo | Forgejo / Gitea Packages | Nexus Repository CE | Verdaccio | Harbor | JFrog Artifactory |
+|---|---|---|---|---|---|---|
+| Formats | npm, Cargo, OCI, Go | 20+ | 15+ | npm only | OCI, Helm | 30+ |
+| Upstream proxy + cache | yes | no | yes | yes | yes | yes |
+| Group / virtual repos | yes | no | yes | n/a | no | yes |
+| Promotion dev → prod | yes | no | paid | no | replication | yes |
+| Per-user × per-repo permissions | yes | per forge repo | yes | basic | project-level | yes |
+| Vulnerability scan | OSV, built in | no | paid (Firewall) | no | Trivy | paid (Xray) |
+| Footprint | 1 binary, SQLite, ~30 MB RAM | part of a forge | JVM, 2 GB+ RAM | Node.js | 8+ containers, Postgres, Redis | JVM, 4 GB+ RAM |
+| License | MIT | MIT | EPL, usage caps | MIT | Apache-2.0 | proprietary |
+
+Missing here and on the roadmap: PyPI, Maven, NuGet. If you need those today,
+Forgejo Packages or Nexus are better choices.
+
+---
+
+## Client configuration
+
+### npm / pnpm / yarn
+
+```ini
+# .npmrc
+@acme:registry=http://registry.example.com/npm-all/
+//registry.example.com/npm-all/:_authToken=trg_...
+```
+
+`npm login --registry http://registry.example.com/npm-all/` also works.
+
+### Cargo
+
+```toml
+# .cargo/config.toml
+[registries.private]
+index = "sparse+http://registry.example.com/cargo-private/index/"
+token = "Bearer trg_..."
+```
+
 ```bash
-./target/release/opencargo --config config.toml
+cargo publish --registry private
 ```
 
-Au premier lancement, un mot de passe admin aleatoire est genere et ecrit dans `data/admin.password`.
+```toml
+[dependencies]
+my-crate = { version = "0.1", registry = "private" }
+```
+
+### Docker / OCI
 
 ```bash
-cat data/admin.password
+docker login registry.example.com -u dev1
+docker tag myapp:latest registry.example.com/oci-private/myapp:latest
+docker push registry.example.com/oci-private/myapp:latest
 ```
 
-Ouvrir `http://localhost:6789/` dans un navigateur, se connecter et changer le mot de passe.
+Over plain HTTP, add the host to `insecure-registries` in Docker's
+`daemon.json`. Use TLS in production.
+
+### Go modules
+
+```bash
+export GOPROXY=http://registry.example.com/go-private,direct
+export GONOSUMCHECK=example.com/*
+```
+
+Publish with `PUT /go-private/{module}/@v/{version}` (zip body); see
+[docs/api.md](docs/api.md).
 
 ---
 
 ## Configuration
 
-### Config minimale
+opencargo starts with sane defaults and no config file. Everything below is
+optional, and repositories, users, permissions and webhooks are normally
+managed through the API or the UI rather than the file.
 
 ```toml
 [server]
-bind = "127.0.0.1:6789"
-base_url = "http://localhost:6789"
-storage_path = "./data/storage"
+bind = "0.0.0.0:6789"
+base_url = "https://registry.example.com"
+storage_path = "/data/storage"
+
+[server.tls]                       # optional native TLS (rustls)
+cert_path = "/certs/cert.pem"
+key_path = "/certs/key.pem"
 
 [database]
-url = "sqlite:./data/db/opencargo.db"
+url = "sqlite:/data/db/opencargo.db"
 
 [auth]
-anonymous_read = true
+anonymous_read = true              # set false for a fully private registry
+static_tokens = []                 # break-glass admin tokens; keep empty
 
 [auth.admin]
-username = "admin"
-```
-
-Les repositories, webhooks et permissions se gerent via l'API admin ou l'UI web — pas besoin de les definir dans le fichier de config.
-
-### Config complete
-
-```toml
-[server]
-bind = "127.0.0.1:6789"
-base_url = "http://localhost:6789"
-storage_path = "./data/storage"
-
-[server.tls]
-cert_path = "/path/to/cert.pem"
-key_path = "/path/to/key.pem"
-
-[database]
-url = "sqlite:./data/db/opencargo.db"
-
-[auth]
-anonymous_read = true
-token_prefix = "trg_"
-static_tokens = []
-
-[auth.admin]
-username = "admin"
-# password genere automatiquement au premier lancement
-# Pour forcer : password = "mon-mdp"
-# En k8s : variable d'env OPENCARGO_ADMIN_PASSWORD
+username = "admin"                 # password: OPENCARGO_ADMIN_PASSWORD, or generated
 
 [proxy]
 default_ttl = "24h"
 negative_cache_ttl = "1h"
-connect_timeout = "10s"
 
-[cleanup]
+[cleanup]                          # optional retention GC
 enabled = true
 prerelease_older_than_days = 90
 proxy_cache_older_than_days = 180
@@ -126,762 +232,85 @@ proxy_cache_older_than_days = 180
 enabled = true
 block_on_critical = false
 
-# Repositories (optionnel — seed au premier lancement, ensuite gerable via API)
+# Optional seed; managed via API afterwards
 [[repositories]]
 name = "npm-private"
 type = "hosted"
 format = "npm"
 visibility = "private"
-
-[[repositories]]
-name = "npm-proxy"
-type = "proxy"
-format = "npm"
-visibility = "public"
-upstream = "https://registry.npmjs.org"
-
-[[repositories]]
-name = "npm-all"
-type = "group"
-format = "npm"
-visibility = "public"
-members = ["npm-private", "npm-proxy"]
-
-# Webhooks (optionnel — seed, ensuite gerable via API)
-[[webhooks]]
-url = "https://ci.company.com/hooks"
-events = ["package.published", "package.promoted"]
-secret = "mon-secret"
 ```
 
-### Variables d'environnement
+Pass it with `--config /path/config.toml` or `OPENCARGO_CONFIG`. Lookup order
+without a flag: `./config.toml`, `~/.opencargo/config.toml`, built-in defaults.
 
-| Variable | Description |
-|----------|-------------|
-| `OPENCARGO_CONFIG` | Chemin vers le fichier de config |
-| `OPENCARGO_ADMIN_PASSWORD` | Mot de passe admin (prioritaire sur la generation aleatoire) |
+| Variable | Purpose |
+|---|---|
+| `OPENCARGO_CONFIG` | Path to the config file |
+| `OPENCARGO_ADMIN_PASSWORD` | Initial admin password (no generated file, no forced change) |
+| `RUST_LOG` | Log filter, default `opencargo=info,tower_http=info` |
 
 ---
 
-## Types de repositories
+## Deployment
 
-| Type | Description |
-|------|-------------|
-| **hosted** | Stockage local. C'est la que vous publiez vos packages. |
-| **proxy** | Cache transparent vers un registry upstream. Les packages sont telecharges a la demande puis caches. |
-| **group** | Agregation de plusieurs repos derriere une URL unique. Resolution dans l'ordre configure. |
+**Docker**: see the one-liner above. Pass `--config /config/config.toml`
+after the image name to use a mounted config file (it replaces the default
+`--bind 0.0.0.0:6789`, so set `server.bind` in the file).
 
-### Gestion dynamique des repositories
-
-Les repos peuvent etre crees, modifies et supprimes via l'API sans redemarrer le serveur :
-
-```bash
-# Creer un repo
-curl -X POST http://localhost:6789/api/v1/repositories \
-  -H "Authorization: Bearer admin-token" \
-  -d '{"name": "npm-dev", "type": "hosted", "format": "npm", "visibility": "private"}'
-
-# Lister les repos
-curl http://localhost:6789/api/v1/repositories \
-  -H "Authorization: Bearer admin-token"
-
-# Supprimer un repo
-curl -X DELETE http://localhost:6789/api/v1/repositories/npm-dev \
-  -H "Authorization: Bearer admin-token"
-```
-
----
-
-## Architectures type
-
-### Setup simple (equipe unique)
-
-```toml
-[[repositories]]
-name = "npm-private"
-type = "hosted"
-format = "npm"
-
-[[repositories]]
-name = "npm-proxy"
-type = "proxy"
-format = "npm"
-upstream = "https://registry.npmjs.org"
-
-[[repositories]]
-name = "npm-all"
-type = "group"
-format = "npm"
-members = ["npm-private", "npm-proxy"]
-```
-
-```ini
-# .npmrc
-@monscope:registry=http://registry:6789/npm-all/
-//registry:6789/npm-all/:_authToken=mon-token
-```
-
-### Setup avec promotion (dev → prod)
-
-```toml
-[[repositories]]
-name = "npm-dev"
-type = "hosted"
-format = "npm"
-
-[[repositories]]
-name = "npm-prod"
-type = "hosted"
-format = "npm"
-
-[[repositories]]
-name = "npm-proxy"
-type = "proxy"
-format = "npm"
-upstream = "https://registry.npmjs.org"
-
-[[repositories]]
-name = "npm-all"
-type = "group"
-format = "npm"
-members = ["npm-prod", "npm-dev", "npm-proxy"]
-```
-
-L'ordre des `members` compte : `npm-prod` est resolu en premier.
-
-```bash
-# Promouvoir un package
-curl -X POST http://registry:6789/api/v1/promote/@monscope/auth-sdk/1.0.0-dev.28 \
-  -H "Authorization: Bearer admin-token" \
-  -d '{"from": "npm-dev", "to": "npm-prod"}'
-```
-
-Le tarball n'est pas copie — les deux repos pointent vers le meme fichier. Le lockfile ne change pas car tout le monde utilise `npm-all`.
-
----
-
-## Utilisation npm / pnpm
-
-### Configurer le client
-
-```ini
-# .npmrc
-@monscope:registry=http://localhost:6789/npm-all/
-//localhost:6789/npm-all/:_authToken=mon-token
-```
-
-### Publier
-
-```bash
-pnpm publish
-```
-
-### Installer
-
-```bash
-pnpm install @monscope/mon-package
-```
-
-### npm login
-
-```bash
-npm login --registry http://localhost:6789/npm-all/
-```
-
----
-
-## Utilisation Cargo (crates Rust)
-
-### Configurer Cargo
-
-```toml
-# .cargo/config.toml
-[registries.private]
-index = "sparse+http://localhost:6789/cargo-private/index/"
-token = "Bearer mon-token"
-```
-
-### Publier
-
-```bash
-cargo publish --registry private
-```
-
-### Dependre d'une crate privee
-
-```toml
-[dependencies]
-ma-crate = { version = "0.1", registry = "private" }
-```
-
-### Yank / unyank
-
-```bash
-curl -X DELETE http://localhost:6789/cargo-private/api/v1/crates/ma-crate/0.1.0/yank \
-  -H "Authorization: Bearer mon-token"
-
-curl -X PUT http://localhost:6789/cargo-private/api/v1/crates/ma-crate/0.1.0/unyank \
-  -H "Authorization: Bearer mon-token"
-```
-
----
-
-## Utilisation Docker / OCI
-
-opencargo supporte le protocole OCI Distribution Spec v2.
-
-### Configurer un repository OCI
-
-Via l'API :
-```bash
-curl -X POST http://localhost:6789/api/v1/repositories \
-  -H "Authorization: Bearer admin-token" \
-  -d '{"name": "oci-private", "type": "hosted", "format": "oci", "visibility": "private"}'
-```
-
-### Docker login
-
-```bash
-docker login localhost:6789 -u mon-user -p mon-password
-```
-
-Docker utilise Basic Auth — opencargo le supporte nativement avec les memes users/passwords que le reste.
-
-### Push une image
-
-```bash
-docker tag myapp:latest localhost:6789/oci-private/myapp:latest
-docker push localhost:6789/oci-private/myapp:latest
-```
-
-### Pull une image
-
-```bash
-docker pull localhost:6789/oci-private/myapp:latest
-```
-
-### Lister les tags
-
-```bash
-curl http://localhost:6789/v2/oci-private/myapp/tags/list
-```
-
-> Note : pour utiliser Docker en HTTP (sans TLS), ajoutez `"insecure-registries": ["localhost:6789"]` dans `/etc/docker/daemon.json` et redemarrez Docker. En production, utilisez TLS ou un reverse proxy HTTPS.
-
----
-
-## Utilisation Go modules
-
-### Configurer un repository Go
-
-```bash
-curl -X POST http://localhost:6789/api/v1/repositories \
-  -H "Authorization: Bearer admin-token" \
-  -d '{"name": "go-private", "type": "hosted", "format": "go", "visibility": "private"}'
-```
-
-### Configurer GOPROXY
-
-```bash
-export GOPROXY=http://localhost:6789/go-private,direct
-export GONOSUMCHECK=mycompany.com/*
-```
-
-### Publier un module
-
-```bash
-curl -X PUT http://localhost:6789/go-private/mymodule/@v/v1.0.0 \
-  -H "Authorization: Bearer mon-token" \
-  --data-binary @module.zip
-```
-
-### Installer un module
-
-```bash
-go get mymodule@v1.0.0
-```
-
----
-
-## Authentification et autorisation
-
-### Mot de passe admin initial
-
-- **Standalone** : mot de passe aleatoire genere → `data/admin.password` → doit etre change au premier login
-- **Kubernetes** : `OPENCARGO_ADMIN_PASSWORD` env var depuis un Secret k8s → pas de fichier, pas de changement force
-
-### Roles par defaut
-
-| Role | Lecture | Publication | Promotion | Administration |
-|------|---------|-------------|-----------|----------------|
-| `admin` | oui | oui | oui | oui |
-| `publisher` | oui | oui | non | non |
-| `reader` | oui | non | non | non |
-
-### Permissions granulaires
-
-Les permissions peuvent etre definies par utilisateur et par repository, overridant les roles par defaut :
-
-```bash
-# Donner le droit de write sur npm-dev mais pas npm-prod
-curl -X PUT http://localhost:6789/api/v1/users/dev1/permissions/npm-dev \
-  -H "Authorization: Bearer admin-token" \
-  -d '{"can_read": true, "can_write": true, "can_delete": false, "can_admin": false}'
-
-# Lister les permissions d'un user
-curl http://localhost:6789/api/v1/users/dev1/permissions \
-  -H "Authorization: Bearer admin-token"
-
-# Supprimer une permission specifique (retour au role par defaut)
-curl -X DELETE http://localhost:6789/api/v1/users/dev1/permissions/npm-dev \
-  -H "Authorization: Bearer admin-token"
-```
-
-Resolution des permissions :
-1. Role `admin` → acces total, toujours
-2. Permission specifique dans `user_permissions` → appliquee si presente
-3. Sinon, role par defaut (publisher = read+write, reader = read)
-
-Dans l'UI web : **Admin → Users & access → Access** ouvre la matrice de permissions
-(user × repository, un toggle par droit) ; chaque utilisateur voit ses propres droits
-effectifs et leur origine sur **My access**.
-
-### Consulter ses droits effectifs
-
-```bash
-# Droits effectifs du porteur du token, repo par repo, avec la regle qui les produit
-curl http://localhost:6789/api/v1/me/permissions \
-  -H "Authorization: Bearer mon-token"
-
-# Reponse (extrait) :
-# {"username":"dev1","role":"publisher","permissions":[
-#   {"repository":"npm-dev","format":"npm","visibility":"private",
-#    "can_read":true,"can_write":true,"can_delete":false,"can_admin":false,
-#    "source":"grant"}]}
-```
-
-`source` vaut `admin` (role admin), `grant` (permission explicite), `role` (defaut du
-role) ou `anonymous` (lecture anonyme sur repo public).
-
-### Creer un utilisateur
-
-```bash
-curl -X POST http://localhost:6789/api/v1/users \
-  -H "Authorization: Bearer admin-token" \
-  -d '{"username": "dev1", "email": "dev1@company.com", "role": "publisher"}'
-
-# Reponse : {"username": "dev1", "password": "aB3kX9...", "role": "publisher"}
-# Le mot de passe est genere aleatoirement et retourne UNE SEULE FOIS.
-```
-
-### Changer son mot de passe
-
-```bash
-curl -X PUT http://localhost:6789/api/v1/users/dev1/password \
-  -H "Authorization: Bearer dev1-token" \
-  -d '{"current_password": "ancien-mdp", "new_password": "nouveau-mdp"}'
-```
-
-### Creer un token API
-
-```bash
-curl -X POST http://localhost:6789/api/v1/users/dev1/tokens \
-  -H "Authorization: Bearer admin-token" \
-  -d '{"name": "laptop", "expires_in_days": 365}'
-
-# Reponse : {"id": "...", "token": "trg_a1b2c3...", ...}
-# Le token brut est retourne UNIQUEMENT a la creation.
-```
-
----
-
-## Temps reel (WebSocket)
-
-L'UI web est alimentee par un flux d'evenements sur `GET /api/v1/events/ws`.
-Le navigateur ne pouvant pas poser de header `Authorization` sur un handshake
-WebSocket, l'authentification se fait par le **premier frame** :
-
-```
-→ {"type":"auth","token":"trg_..."}     # ou {"type":"auth"} pour anonyme
-← {"type":"hello","username":"dev1","role":"publisher","anonymous":false}
-← {"type":"package.published","data":{"package":"@scope/pkg","version":"1.2.0",
-    "repository":"npm-dev","format":"npm","published_by":"dev1"},"ts":"..."}
-```
-
-Chaque evenement porte un niveau de visibilite applique cote serveur :
-
-| Evenement | Visibilite | Contenu |
-|-----------|-----------|---------|
-| `package.published`, `package.promoted` (repo public) | tous | payload complet |
-| `package.published`, `package.promoted` (repo prive) | admin | payload complet |
-| `registry.changed` | authentifies | `{repository}` seulement (indice de refetch, sans fuite de noms de packages prives) |
-| `repositories.changed` | tous | vide (la liste refetchee est filtree par l'API REST) |
-| `permissions.changed` | authentifies | `{username}` — les sessions ouvertes rafraichissent leurs droits |
-| `audit.entry` | admin | `{username, action, target}` |
-
-Keepalive : le client peut envoyer `{"type":"ping"}` (reponse `{"type":"pong"}`) ;
-le serveur envoie des pings proto toutes les 30 s et re-valide le token toutes les
-~5 min (un token revoque ferme la connexion, code 4401). En cas de retard de
-lecture, le serveur emet `{"type":"resync"}` : le client doit refetch ce qu'il affiche.
-
----
-
-## Dependency graph
-
-opencargo suit les dependances entre packages et permet l'analyse d'impact.
-
-```bash
-# Dependances d'un package
-curl http://localhost:6789/api/v1/deps/@acme/httpservice/dependencies
-
-# Qui depend de ce package ?
-curl http://localhost:6789/api/v1/deps/@acme/context/dependents
-
-# Analyse d'impact : que se passe-t-il si on supprime cette version ?
-curl http://localhost:6789/api/v1/deps/@acme/context/versions/1.0.0/impact \
-  -H "Authorization: Bearer admin-token"
-```
-
-Les dependances sont extraites automatiquement au moment de la publication (npm: dependencies/devDependencies, Cargo: deps, Go: go.mod).
-
----
-
-## Webhooks
-
-Les webhooks notifient des systemes externes quand des evenements se produisent.
-
-### Gestion via API
-
-```bash
-# Creer un webhook
-curl -X POST http://localhost:6789/api/v1/webhooks \
-  -H "Authorization: Bearer admin-token" \
-  -d '{"url": "https://ci.company.com/hooks", "events": "package.published,package.promoted", "secret": "mon-secret"}'
-
-# Lister les webhooks
-curl http://localhost:6789/api/v1/webhooks \
-  -H "Authorization: Bearer admin-token"
-
-# Tester un webhook
-curl -X POST http://localhost:6789/api/v1/webhooks/1/test \
-  -H "Authorization: Bearer admin-token"
-
-# Supprimer
-curl -X DELETE http://localhost:6789/api/v1/webhooks/1 \
-  -H "Authorization: Bearer admin-token"
-```
-
-### Evenements disponibles
-
-| Evenement | Declencheur |
-|-----------|-------------|
-| `package.published` | Publication d'une nouvelle version |
-| `package.promoted` | Promotion d'un package entre repos |
-| `*` | Tous les evenements |
-
-### Signature
-
-Si un `secret` est configure, chaque requete webhook inclut un header `X-Webhook-Signature` contenant le HMAC-SHA256 du body.
-
----
-
-## Vulnerability scanning (OSV.dev)
-
-opencargo scanne les dependances de chaque package publie via l'API gratuite [OSV.dev](https://osv.dev/).
-
-### Configuration
-
-```toml
-[vuln_scan]
-enabled = true
-block_on_critical = false  # true = bloquer la publication si CVE critique
-```
-
-### API
-
-```bash
-# Resultats du scan
-curl http://localhost:6789/api/v1/vulns/@acme/httpclient/1.0.0 \
-  -H "Authorization: Bearer mon-token"
-
-# Re-scanner une version
-curl -X POST http://localhost:6789/api/v1/vulns/@acme/httpclient/1.0.0/rescan \
-  -H "Authorization: Bearer mon-token"
-```
-
----
-
-## Interface Web
-
-SPA SolidJS embarquee dans le binaire. Ouvrir `http://localhost:6789/`.
-
-**Public :**
-- Dashboard (stats, packages recents)
-- Packages (liste, recherche, filtre par repo)
-- Detail package (README, versions, dependances, securite, install command)
-- Recherche full-text
-- Containers (guide OCI/Docker)
-- Go Modules (guide GOPROXY)
-
-**Admin (apres login) :**
-- Vue d'ensemble
-- Repositories (CRUD)
-- Users (CRUD, permissions)
-- Packages (promote, yank, delete)
-- Webhooks (CRUD)
-- Audit log
-- System (health, metrics)
-- Password change
-
----
-
-## API REST
-
-### Protocole npm
-
-```
-GET    /{repo}/@{scope}/{name}                    Metadata
-GET    /{repo}/@{scope}/{name}/-/{file}.tgz       Tarball
-PUT    /{repo}/@{scope}/{name}                    Publier
-GET    /{repo}/-/v1/search?text=query             Recherche
-GET    /{repo}/-/package/@{scope}/{name}/dist-tags  Dist-tags
-PUT    /{repo}/-/package/@{scope}/{name}/dist-tags/{tag}  Set dist-tag
-DELETE /{repo}/-/package/@{scope}/{name}/dist-tags/{tag}  Delete dist-tag
-PUT    /-/user/org.couchdb.user:{username}        npm login
-GET    /-/whoami                                  Utilisateur courant
-```
-
-### Protocole Cargo (sparse)
-
-```
-GET    /{repo}/index/config.json                  Config
-GET    /{repo}/index/{prefix}/{name}              Index
-PUT    /{repo}/api/v1/crates/new                  Publier
-GET    /{repo}/api/v1/crates/{name}/{ver}/download  Telecharger
-DELETE /{repo}/api/v1/crates/{name}/{ver}/yank      Yank
-PUT    /{repo}/api/v1/crates/{name}/{ver}/unyank    Unyank
-```
-
-### Protocole OCI (Docker)
-
-```
-GET    /v2/                                         Version check
-HEAD   /v2/{repo}/{name}/blobs/{digest}              Head blob
-GET    /v2/{repo}/{name}/blobs/{digest}              Get blob
-DELETE /v2/{repo}/{name}/blobs/{digest}              Delete blob
-POST   /v2/{repo}/{name}/blobs/uploads/              Start upload
-PATCH  /v2/{repo}/{name}/blobs/uploads/{uuid}        Upload chunk
-PUT    /v2/{repo}/{name}/blobs/uploads/{uuid}?digest= Complete upload
-GET    /v2/{repo}/{name}/manifests/{reference}       Get manifest
-HEAD   /v2/{repo}/{name}/manifests/{reference}       Head manifest
-PUT    /v2/{repo}/{name}/manifests/{reference}       Push manifest
-DELETE /v2/{repo}/{name}/manifests/{reference}       Delete manifest
-GET    /v2/{repo}/{name}/tags/list                   List tags
-```
-
-### Protocole Go (GOPROXY)
-
-```
-GET    /{repo}/{module}/@v/list                   Lister les versions
-GET    /{repo}/{module}/@v/{version}.info          Info version
-GET    /{repo}/{module}/@v/{version}.mod           go.mod
-GET    /{repo}/{module}/@v/{version}.zip           Module zip
-PUT    /{repo}/{module}/@v/{version}               Publier
-```
-
-### Administration
-
-```
-POST   /api/v1/repositories                       Creer un repo
-GET    /api/v1/repositories                        Lister les repos
-GET    /api/v1/repositories/{name}                 Detail repo
-PUT    /api/v1/repositories/{name}                 Modifier repo
-DELETE /api/v1/repositories/{name}                 Supprimer repo
-POST   /api/v1/repositories/{name}/purge-cache     Purger le cache proxy
-
-POST   /api/v1/users                              Creer un utilisateur
-GET    /api/v1/users                              Lister les utilisateurs
-GET    /api/v1/users/{username}                    Detail utilisateur
-PUT    /api/v1/users/{username}                    Modifier utilisateur
-DELETE /api/v1/users/{username}                    Supprimer utilisateur
-PUT    /api/v1/users/{username}/password           Changer le mot de passe
-GET    /api/v1/users/{username}/tokens             Lister les tokens
-POST   /api/v1/users/{username}/tokens             Creer un token
-DELETE /api/v1/users/{username}/tokens/{id}        Revoquer un token
-GET    /api/v1/users/{username}/permissions         Lister les permissions
-PUT    /api/v1/users/{username}/permissions/{repo}  Set permissions
-DELETE /api/v1/users/{username}/permissions/{repo}  Supprimer permissions
-
-GET    /api/v1/webhooks                            Lister les webhooks
-POST   /api/v1/webhooks                            Creer un webhook
-PUT    /api/v1/webhooks/{id}                       Modifier un webhook
-DELETE /api/v1/webhooks/{id}                       Supprimer un webhook
-POST   /api/v1/webhooks/{id}/test                  Tester un webhook
-
-GET    /api/v1/system/audit?page=1&size=50         Journal d'audit
-```
-
-### Promotion
-
-```
-POST   /api/v1/promote/@{scope}/{name}/{version}              Promouvoir (scoped)
-POST   /api/v1/promote/{name}/{version}                       Promouvoir (unscoped)
-GET    /api/v1/promotions/@{scope}/{name}/{version}            Historique (scoped)
-GET    /api/v1/promotions/{name}/{version}                     Historique (unscoped)
-```
-
-### Dependency graph
-
-```
-GET    /api/v1/deps/@{scope}/{name}/dependencies               Dependances
-GET    /api/v1/deps/{name}/dependencies                        Dependances (unscoped)
-GET    /api/v1/deps/@{scope}/{name}/dependents                 Dependants
-GET    /api/v1/deps/{name}/dependents                          Dependants (unscoped)
-GET    /api/v1/deps/@{scope}/{name}/versions/{ver}/impact      Impact analysis
-GET    /api/v1/deps/{name}/versions/{ver}/impact               Impact analysis (unscoped)
-```
-
-### Vulnerability scanning
-
-```
-GET    /api/v1/vulns/@{scope}/{name}/{version}                 Resultats scan
-POST   /api/v1/vulns/@{scope}/{name}/{version}/rescan          Re-scanner
-GET    /api/v1/vulns/{name}/{version}                          Resultats (unscoped)
-POST   /api/v1/vulns/{name}/{version}/rescan                   Re-scanner (unscoped)
-```
-
-### Frontend API
-
-```
-GET    /api/v1/dashboard                           Stats globales
-GET    /api/v1/packages?q=&repo=&page=             Liste paginee
-GET    /api/v1/packages/{name}                     Detail package
-GET    /api/v1/search?q=                           Recherche
-```
-
-### Systeme
-
-```
-GET    /health/live     Liveness probe
-GET    /health/ready    Readiness probe
-GET    /metrics         Metriques Prometheus
-```
-
----
-
-## Metriques Prometheus
-
-```
-opencargo_http_requests_total{method, path, status}
-opencargo_http_request_duration_seconds{method, path}
-opencargo_downloads_total{repo, package}
-opencargo_publishes_total{repo, package}
-opencargo_cache_hits_total{repo}
-opencargo_cache_misses_total{repo}
-opencargo_storage_bytes{repo}
-```
-
----
-
-## Deploiement
-
-### Docker
-
-```bash
-docker build -t opencargo .
-docker run -p 6789:6789 \
-  -e OPENCARGO_ADMIN_PASSWORD=mon-mdp-secure \
-  -v opencargo-data:/data \
-  opencargo --config /config/config.toml
-```
-
-### Kubernetes
+**Kubernetes (Kustomize)**:
 
 ```bash
 kubectl apply -k k8s/
 ```
 
-### Helm
+**Helm**:
 
 ```bash
 helm install opencargo helm/opencargo/ \
-  --set auth.adminPassword=mon-mdp-secure \
+  --set auth.adminPassword=change-me \
   --set ingress.enabled=true \
-  --set ingress.host=registry.company.com
+  --set ingress.host=registry.example.com
 ```
 
-### TLS natif
+**CI sidecar**: run opencargo next to your runners as a pull-through cache.
+Examples for GitHub Actions and GitLab CI in [`k8s/sidecar/`](k8s/sidecar/).
 
-```toml
-[server.tls]
-cert_path = "/path/to/cert.pem"
-key_path = "/path/to/key.pem"
-```
-
-Si configure, opencargo sert en HTTPS directement via rustls. En k8s, il est plus courant de terminer le TLS a l'Ingress.
-
-### Tilt (dev loop)
-
-```bash
-tilt up
-```
-
-### Mode sidecar CI
-
-opencargo peut tourner comme sidecar dans les pods CI pour cacher les telechargements. Voir `k8s/sidecar/` pour les manifests et exemples GitHub Actions / GitLab CI.
+Health: `GET /health/live`, `GET /health/ready`. Metrics: `GET /metrics`.
 
 ---
 
-## Makefile
+## Build from source
 
 ```bash
-make help                # Toutes les commandes disponibles
-make build               # Build frontend + Rust (dev)
-make release             # Build en mode release
-make dev                 # Lancer en dev avec logs
-make test                # Tous les tests
-make test-quick          # Tests sans reseau
-make check               # Lint + tests (CI local)
-make docker              # Build image Docker
-make deploy              # Deployer sur k8s
-make helm-install        # Deployer avec Helm
-make sidecar-deploy      # Deployer le sidecar CI
-make publish-trace       # Publier les @acme/* pour tester
-make clean               # Nettoyer
-make reset-db            # Reset la DB
+cd frontend && pnpm install && pnpm build && cd ..
+cargo build --release
+./target/release/opencargo --bind 0.0.0.0:6789
 ```
 
----
+`make help` lists the dev targets (`make dev`, `make test`, `make check`,
+`make docker`, `tilt up`).
 
 ## Tests
 
 ```bash
-# Via Makefile
-make test                # Tous les tests
-make test-quick          # Sans reseau
-make test-docker         # Docker/OCI
-make test-e2e            # E2E complets
-
-# Par suite
-cargo test --test npm_test           # Integration npm
-cargo test --test pnpm_e2e_test      # E2E pnpm 10
-cargo test --test proxy_test         # Proxy + group (reseau)
-cargo test --test auth_test          # Auth, users, tokens, rate limit
-cargo test --test features_test      # UI, metrics, Cargo
-cargo test --test promote_test       # Promotion de packages
-cargo test --test oci_test           # OCI push/pull/tags
-cargo test --test docker_e2e_test    # Docker Basic Auth E2E
-cargo test --test go_test            # Go modules
-cargo test --test deps_test          # Dependency graph
-cargo test --test webhook_test       # Webhooks
-cargo test --test vuln_test          # Vulnerability scanning (reseau)
-cargo test --test tls_test           # TLS natif
-cargo test --test e2e_scoped_test    # E2E packages scoped
-cargo test --test permissions_test   # Permissions granulaires
+make test-quick     # no network
+make test           # everything, including proxy and OSV tests
 ```
+
+150+ integration tests cover the four protocols end to end (real `pnpm` and
+`docker` clients), auth, permissions, promotion, webhooks, TLS and the
+WebSocket stream.
 
 ---
 
+## Documentation
+
+- [docs/api.md](docs/api.md): every HTTP route, the WebSocket protocol, webhook
+  payloads and Prometheus metrics.
+- [README.fr.md](README.fr.md): full French guide.
+- [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
+- [CHANGELOG.md](CHANGELOG.md).
+
 ## License
 
-MIT
+[MIT](LICENSE).

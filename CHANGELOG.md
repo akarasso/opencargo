@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `LICENSE` (MIT) and `SECURITY.md` (private vulnerability reporting, scope,
+  operator hardening checklist)
+- English `README.md` (benefits first, one-command install, honest comparison
+  with Forgejo Packages / Nexus / Verdaccio / Harbor / Artifactory); the
+  previous French README moved to `README.fr.md`; API reference in `docs/api.md`
 - Real-time event WebSocket at `/api/v1/events/ws` (first-frame token auth,
   server-side visibility scoping public/authenticated/admin, heartbeat,
   periodic token re-validation, `resync` marker on lag)
@@ -32,6 +37,12 @@ All notable changes to this project will be documented in this file.
 - Production CSP silently blocked Google Fonts and Material Symbols; fonts
   are now bundled and icons inlined, so typography and iconography render
   under the strict CSP
+
+### Fixed
+- Container image: `/data` is pre-created and owned by the runtime user, the
+  default command listens on `0.0.0.0`, so `docker run -v x:/data ghcr.io/akarasso/opencargo`
+  works without a config file (it previously exited with "Permission denied")
+- Helm chart default image repository pointed at a non-existent registry path
 
 ## [0.1.0] - 2026-03-23
 
