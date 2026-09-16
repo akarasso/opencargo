@@ -61,7 +61,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 
 # HTTP client (proxy upstream)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 
 # Auth (password hashing)
 argon2 = "0.5"
@@ -82,10 +82,11 @@ ammonia = "4"
 
 # TLS
 axum-server = { version = "0.7", features = ["tls-rustls"] }
+rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 zip = "8.3.1"
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 tempfile = "3"
 tokio-test = "0.4"
 rcgen = "0.13"

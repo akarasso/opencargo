@@ -56,6 +56,7 @@ pub struct AppState {
 }
 
 pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     // Ensure storage directory exists
     std::fs::create_dir_all(&config.server.storage_path)?;
 
