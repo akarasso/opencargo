@@ -12,9 +12,8 @@ use tracing::error;
 use crate::db::kinds::Format;
 use crate::events::{EventBus, Visibility};
 
+use super::rules::osv_severity;
 use super::{facts, rules, store, Pending, Resolution, RuleVerdict, Shared, Verdict, BATCH};
-
-const TICK: Duration = Duration::from_millis(100);
 
 type Done = (Resolution, Vec<Option<RuleVerdict>>);
 
@@ -80,17 +79,23 @@ impl Notify {
 
 /// A `select!` over the channel, the gather tasks, a tick that runs only
 /// while there is timed work, and the spawned flushes: an idle writer holds
-/// no timer and is woken by the channel alone.
+/// no timer and is woken by the channel alone; waking restarts the tick so
+/// the first flush after idleness has a full period to fill.
 pub(crate) async fn run_writer(mut rx: mpsc::Receiver<Pending>, shared: Arc<Shared>) {
     let mut tasks: JoinSet<Done> = JoinSet::new();
     let mut flushes: JoinSet<()> = JoinSet::new();
     let mut ready: Vec<Done> = Vec::new();
-    let mut tick = tokio::time::interval(TICK);
+    let mut tick = tokio::time::interval(shared.tuning.flush_period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
+    let mut was_awake = false;
     loop {
         let awake = !ready.is_empty()
             || shared.holds_oci_state()
             || shared.notify.lock().unwrap().pending();
+        if awake && !was_awake {
+            tick.reset();
+        }
+        was_awake = awake;
         tokio::select! {
             received = rx.recv() => match received {
                 Some(p) => next_event(&shared, p, &mut tasks).await,
@@ -145,14 +150,21 @@ async fn spawn_work(shared: &Arc<Shared>, p: Pending, tasks: &mut JoinSet<Done>)
     });
 }
 
-/// Spawned: the receive loop never waits on SQLite.
+/// Spawned: the receive loop never waits on OSV or SQLite.
 fn flush(shared: &Arc<Shared>, ready: &mut Vec<Done>, flushes: &mut JoinSet<()>) {
     if ready.is_empty() {
         return;
     }
-    let batch = std::mem::take(ready);
+    let mut batch = std::mem::take(ready);
     let shared = shared.clone();
     flushes.spawn(async move {
+        osv_severity::evaluate_batch(
+            &shared.scanner,
+            &shared.osv_memo,
+            |r| shared.config_for(&r.member_repo).osv_severity,
+            &mut batch,
+        )
+        .await;
         let rows: Vec<(Resolution, Vec<RuleVerdict>)> = batch
             .into_iter()
             .map(|(r, verdicts)| (r, verdicts.into_iter().flatten().collect()))

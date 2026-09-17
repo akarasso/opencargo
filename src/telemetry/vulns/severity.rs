@@ -21,6 +21,16 @@ pub enum Severity {
 }
 
 impl Severity {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::Critical => "critical",
+        }
+    }
+
     fn from_label(label: &str) -> Option<Self> {
         match label.to_ascii_lowercase().as_str() {
             "critical" => Some(Self::Critical),
@@ -39,6 +49,12 @@ impl Severity {
             cvss::Severity::Low => Self::Low,
             cvss::Severity::None => Self::Unknown,
         }
+    }
+}
+
+impl std::fmt::Display for Severity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
     }
 }
 

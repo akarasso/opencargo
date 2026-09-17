@@ -6,19 +6,21 @@ use std::time::Duration;
 use reqwest::{Client, StatusCode};
 use serde_json::{json, Value};
 
+use common::fake_osv::{self, cvss_record};
 use common::fake_upstream::cargo as fake_index;
 use common::fake_upstream::npm as fake_npm;
 use common::fake_upstream::oci::{self as fake_oci, Blob, FakeRegistry, Options};
 use common::upstream_tap;
 use common::{
     backdate_version, build_npm_publish_body, build_tarball, group, hosted, named_token,
-    policy_rows, proxy, proxy_with, publish_go_module, respawn, seed_error_opts, sentinel,
-    sha256_digest, spawn_server, user_id, wait_for_policy_rows, PolicyRow, ProxyOpts, SpawnOpts,
-    TestServer, STATIC_TOKEN,
+    policy_rows, policy_verdicts, proxy, proxy_with, publish_go_module, respawn, rules_of,
+    seed_error_opts, sentinel, sha256_digest, spawn_server, user_id, verdict_of,
+    wait_for_policy_rows, PolicyRow, ProxyOpts, SpawnOpts, TestServer, STATIC_TOKEN,
 };
-use opencargo::config::{RepositoryFormat, Visibility};
+use opencargo::config::{RepositoryFormat, Visibility, VulnScanConfig};
 use opencargo::policy::rules::PolicyConfig;
 use opencargo::policy::Tuning;
+use opencargo::telemetry::vulns::severity::Severity;
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
@@ -179,6 +181,23 @@ async fn npm_two_tokens_two_rows_with_dates() {
         "the recorder fetched the packument the client never asked for"
     );
     assert_eq!(tap.count("/npm-hosted/@acme/widget"), 1);
+    let verdicts = policy_verdicts(&a).await;
+    for row in &rows {
+        assert!(row.would_block && !row.unknown);
+        assert_eq!(
+            rules_of(&verdicts, row.id),
+            ["install_scripts", "min_release_age"],
+            "only the enabled rules leave a verdict"
+        );
+        assert_eq!(
+            verdict_of(&verdicts, row.id, "min_release_age"),
+            ("would_block", "published 2h ago, threshold 48h")
+        );
+        assert_eq!(
+            verdict_of(&verdicts, row.id, "install_scripts"),
+            ("pass", "no install script")
+        );
+    }
 }
 
 #[tokio::test]
@@ -202,6 +221,12 @@ async fn npm_ci_without_packument_still_dated() {
         1,
         "exactly one packument request, the recorder's"
     );
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(
+        verdict_of(&verdicts, rows[0].id, "min_release_age").0,
+        "pass"
+    );
+    assert!(!rows[0].would_block && !rows[0].unknown);
 }
 
 #[tokio::test]
@@ -247,6 +272,16 @@ async fn npm_version_newer_than_cached_packument_refreshes() {
     let rows = wait_for_policy_rows(&a, 3).await;
     assert_eq!(rows[2].published_at, None);
     assert_eq!(rows[2].date_source, "not-in-packument");
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(
+        verdict_of(&verdicts, rows[2].id, "min_release_age"),
+        ("unknown", "no publish date (not-in-packument)")
+    );
+    assert!(rows[2].unknown && !rows[2].would_block);
+    assert_eq!(
+        verdict_of(&verdicts, rows[1].id, "min_release_age").0,
+        "pass"
+    );
     let hits = fake.packument_hits();
     assert_eq!(hits.len(), 3);
     assert_eq!(
@@ -285,6 +320,9 @@ async fn npm_ci_fetch_gated_on_rules() {
         fake.packument_hits().is_empty(),
         "typosquat needs no packument"
     );
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(rules_of(&verdicts, rows[0].id), ["typosquat"]);
+    assert_eq!(verdict_of(&verdicts, rows[0].id, "typosquat").0, "pass");
 
     let a = respawn(
         a,
@@ -301,12 +339,22 @@ async fn npm_ci_fetch_gated_on_rules() {
     let rows = wait_for_policy_rows(&a, 2).await;
     assert_eq!(rows[1].date_source, "not-fetched");
     assert!(fake.packument_hits().is_empty());
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(
+        verdict_of(&verdicts, rows[1].id, "install_scripts"),
+        ("unknown", "packument not read (not-fetched)")
+    );
 
     let a = respawn(a, npm_proxy(&fake.base_url, scripts())).await;
     get_ok(&url(&a), None).await;
     let rows = wait_for_policy_rows(&a, 3).await;
     assert_eq!(rows[2].date_source, "fetch");
     assert_eq!(fake.packument_hits().len(), 1);
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(
+        verdict_of(&verdicts, rows[2].id, "install_scripts"),
+        ("pass", "no install script")
+    );
 }
 
 #[tokio::test]
@@ -338,6 +386,53 @@ async fn npm_tarball_stem_without_name_prefix() {
     let rows = wait_for_policy_rows(&a, 2).await;
     assert_eq!(rows[1].version, None);
     assert_eq!(rows[1].date_source, "filename-unparsed");
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(
+        verdict_of(&verdicts, rows[1].id, "install_scripts"),
+        ("unknown", "version unresolved (filename-unparsed)")
+    );
+    assert_eq!(
+        verdict_of(&verdicts, rows[0].id, "install_scripts").0,
+        "pass"
+    );
+}
+
+#[tokio::test]
+async fn npm_install_scripts_from_cached_packument() {
+    let mut p = packument(
+        "widget",
+        "http://placeholder",
+        &[
+            ("1.0.0", "widget-1.0.0.tgz", "2026-01-01T00:00:00Z"),
+            ("1.1.0", "widget-1.1.0.tgz", "2026-01-02T00:00:00Z"),
+        ],
+    );
+    p["versions"]["1.0.0"]["scripts"] = json!({ "postinstall": "node install.js" });
+    let fake = fake_npm::start(p, "\"v1\"").await;
+    fake.add_tarball("widget-1.0.0.tgz", b"1.0.0");
+    fake.add_tarball("widget-1.1.0.tgz", b"1.1.0");
+    let a = spawn_server(npm_proxy(&fake.base_url, scripts())).await;
+    get_ok(&format!("{}/npm-proxy/widget", a.base_url), None).await;
+    for filename in ["widget-1.0.0.tgz", "widget-1.1.0.tgz"] {
+        get_ok(&tarball_url(&a, "npm-proxy", "widget", filename), None).await;
+    }
+    let rows = wait_for_policy_rows(&a, 2).await;
+    let verdicts = policy_verdicts(&a).await;
+    assert!(rows.iter().all(|r| r.date_source == "cache"));
+    let (verdict, reason) = verdict_of(&verdicts, rows[0].id, "install_scripts");
+    assert_eq!(verdict, "would_block");
+    assert!(reason.contains("postinstall"), "{reason}");
+    assert!(rows[0].would_block);
+    assert_eq!(
+        verdict_of(&verdicts, rows[1].id, "install_scripts"),
+        ("pass", "no install script")
+    );
+    assert!(!rows[1].would_block && !rows[1].unknown);
+    assert_eq!(
+        fake.packument_hits().len(),
+        1,
+        "the client's own packument request; the recorder read the cache"
+    );
 }
 
 fn cargo_proxy(
@@ -372,7 +467,9 @@ fn crate_url(server: &TestServer, name: &str, version: &str) -> String {
 async fn cargo_row_dates_from_api_or_unknown() {
     let fake = fake_index::start().await;
     fake.add_crate("widget", "0.1.0", b"widget-bytes");
-    fake.set_created_at("widget", "0.1.0", "2026-03-01T12:00:00Z");
+    let created = (chrono::Utc::now() - chrono::Duration::minutes(30))
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    fake.set_created_at("widget", "0.1.0", &created);
     fake.add_crate("other", "0.1.0", b"other-bytes");
     let a = spawn_server(cargo_proxy(&fake, aged("1h"), None)).await;
     let client = Client::new();
@@ -382,12 +479,18 @@ async fn cargo_row_dates_from_api_or_unknown() {
     get_ok(&crate_url(&a, "widget", "0.1.0"), Some(&dev)).await;
     let rows = wait_for_policy_rows(&a, 2).await;
     assert_eq!(actors(&rows), ["ci-runner", "dev-laptop"]);
+    let verdicts = policy_verdicts(&a).await;
     for row in &rows {
-        assert_eq!(row.published_at.as_deref(), Some("2026-03-01T12:00:00Z"));
+        assert_eq!(row.published_at.as_deref(), Some(created.as_str()));
         assert_eq!(
             (row.format.as_str(), row.name.as_str()),
             ("cargo", "widget")
         );
+        assert_eq!(
+            verdict_of(&verdicts, row.id, "min_release_age"),
+            ("would_block", "published 30m ago, threshold 1h")
+        );
+        assert!(row.would_block);
         assert_eq!(row.version.as_deref(), Some("0.1.0"));
         assert_eq!(
             row.digest.as_deref(),
@@ -407,6 +510,12 @@ async fn cargo_row_dates_from_api_or_unknown() {
     assert_eq!(rows[2].published_at, None);
     assert_eq!(rows[2].date_source, "not-found");
     assert_eq!(rows[2].actor_kind, "anonymous");
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(
+        verdict_of(&verdicts, rows[2].id, "min_release_age"),
+        ("unknown", "no publish date (not-found)")
+    );
+    assert!(rows[2].unknown && !rows[2].would_block);
 }
 
 #[tokio::test]
@@ -453,6 +562,10 @@ async fn cargo_api_is_paced_and_429_is_unknown() {
         (None, "rate-limited")
     );
     assert_eq!(fake.api_hits().len(), 7);
+    assert_eq!(
+        verdict_of(&policy_verdicts(&a).await, rows[6].id, "min_release_age"),
+        ("unknown", "no publish date (rate-limited)")
+    );
     get_ok(&crate_url(&a, "c7", "0.1.0"), None).await;
     let rows = wait_for_policy_rows(&a, 8).await;
     assert_eq!(rows[7].date_source, "rate-limited");
@@ -519,6 +632,7 @@ async fn go_row_reads_time_from_cached_info() {
         }
     }
     let rows = wait_for_policy_rows(&a, 2).await;
+    let verdicts = policy_verdicts(&a).await;
     for (row, (version, time)) in rows
         .iter()
         .zip([("v1.0.0", &times[0]), ("v1.1.0", &times[1])])
@@ -528,6 +642,9 @@ async fn go_row_reads_time_from_cached_info() {
         assert_eq!(row.published_at.as_deref(), Some(time.as_str()));
         assert_eq!(row.date_source, "cache", "the .info the client fetched");
         assert!(row.digest.is_some());
+        let (verdict, reason) = verdict_of(&verdicts, row.id, "min_release_age");
+        assert_eq!(verdict, "would_block", "published just now: {reason}");
+        assert!(reason.ends_with("threshold 48h"), "{reason}");
     }
     assert_eq!(
         policy_rows(&a).await.len(),
@@ -619,7 +736,12 @@ async fn oci_manifest_get_records_head_does_not() {
     })
     .await;
     let digest = add_image(&reg, IMAGE, Some("1.0"), "2026-03-01T00:00:00Z", true);
-    let a = spawn_server(oci_proxy(&reg, aged("48h"), None)).await;
+    let cfg = PolicyConfig {
+        osv_severity: Some(Severity::High),
+        typosquat: true,
+        ..aged("48h")
+    };
+    let a = spawn_server(oci_proxy(&reg, cfg, None)).await;
     let client = Client::new();
     let ci = named_token(&client, &a.base_url, "ci", "ci-runner").await;
     let dev = named_token(&client, &a.base_url, "alice", "dev-laptop").await;
@@ -628,6 +750,7 @@ async fn oci_manifest_get_records_head_does_not() {
         get_ok(&manifest_url(&a, IMAGE, "1.0"), Some(token)).await;
     }
     let rows = wait_for_policy_rows(&a, 2).await;
+    let verdicts = policy_verdicts(&a).await;
     assert_eq!(actors(&rows), ["ci-runner", "dev-laptop"]);
     for row in &rows {
         assert_eq!((row.format.as_str(), row.name.as_str()), ("oci", IMAGE));
@@ -635,6 +758,19 @@ async fn oci_manifest_get_records_head_does_not() {
         assert_eq!(row.digest.as_deref(), Some(digest.as_str()));
         assert_eq!(row.published_at.as_deref(), Some("2026-03-01T00:00:00Z"));
         assert_eq!(row.date_source, "annotation");
+        assert_eq!(
+            verdict_of(&verdicts, row.id, "osv_severity"),
+            ("not_applicable", "oci: no osv ecosystem")
+        );
+        assert_eq!(
+            verdict_of(&verdicts, row.id, "typosquat"),
+            (
+                "not_applicable",
+                "oci: a misspelt official image is never served"
+            )
+        );
+        assert_eq!(verdict_of(&verdicts, row.id, "min_release_age").0, "pass");
+        assert!(!row.would_block && !row.unknown);
     }
     assert_eq!(
         upstream_manifest_hits(&reg),
@@ -787,6 +923,11 @@ async fn oci_index_without_child_is_unknown_after_ttl() {
         ),
         (None, "index-unpulled")
     );
+    assert_eq!(
+        verdict_of(&policy_verdicts(&a).await, rows[1].id, "min_release_age"),
+        ("unknown", "no publish date (index-unpulled)")
+    );
+    assert!(rows[1].unknown);
 
     get_ok(&manifest_url(&a, "team/zero", "1.0"), None).await;
     let rows = wait_for_policy_rows(&a, 3).await;
@@ -798,6 +939,97 @@ async fn oci_index_without_child_is_unknown_after_ttl() {
         ),
         (None, "unset-created")
     );
+    assert_eq!(
+        verdict_of(&policy_verdicts(&a).await, rows[2].id, "min_release_age"),
+        ("unknown", "no publish date (unset-created)")
+    );
+}
+
+const V3_CRITICAL: &str = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H";
+
+#[tokio::test]
+async fn osv_rule_uses_fake_osv_and_id_cache() {
+    let osv = fake_osv::start().await;
+    osv.affect("npm", "widget", "1.0.0", &["GHSA-x"]);
+    osv.record(cvss_record("GHSA-x", "CVSS_V3", V3_CRITICAL));
+    let versions: Vec<(String, String)> = (0..70)
+        .map(|i| (format!("2.0.{i}"), format!("widget-2.0.{i}.tgz")))
+        .collect();
+    let mut all: Vec<(&str, &str, &str)> =
+        vec![("1.0.0", "widget-1.0.0.tgz", "2026-01-01T00:00:00Z")];
+    all.extend(
+        versions
+            .iter()
+            .map(|(v, f)| (v.as_str(), f.as_str(), "2026-01-01T00:00:00Z")),
+    );
+    let fake = fake_widget(&all).await;
+    let a = spawn_server(SpawnOpts {
+        vuln: VulnScanConfig {
+            enabled: true,
+            osv_base_url: osv.base_url.clone(),
+            ..Default::default()
+        },
+        policy_tuning: Some(Tuning {
+            flush_period: Duration::from_secs(2),
+            ..Tuning::default()
+        }),
+        ..npm_proxy(
+            &fake.base_url,
+            PolicyConfig {
+                osv_severity: Some(Severity::High),
+                ..Default::default()
+            },
+        )
+    })
+    .await;
+    let url = |filename: &str| tarball_url(&a, "npm-proxy", "widget", filename);
+
+    get_ok(&url("widget-1.0.0.tgz"), None).await;
+    wait_for_policy_rows(&a, 1).await;
+    get_ok(&url("widget-1.0.0.tgz"), None).await;
+    get_ok(&url("widget-1.0.0.tgz"), None).await;
+    let rows = wait_for_policy_rows(&a, 3).await;
+    let verdicts = policy_verdicts(&a).await;
+    for row in &rows {
+        assert_eq!(
+            verdict_of(&verdicts, row.id, "osv_severity"),
+            ("would_block", "GHSA-x critical >= high")
+        );
+        assert!(row.would_block);
+    }
+    assert_eq!(osv.hits("GHSA-x"), 1, "the record is fetched once");
+    assert_eq!(
+        osv.batches(),
+        [1],
+        "one querybatch, one query, then the memo"
+    );
+
+    let urls: Vec<String> = versions.iter().map(|(_, f)| url(f)).collect();
+    futures_util::future::join_all(urls.iter().map(|u| get_ok(u, None))).await;
+    let rows = wait_for_policy_rows(&a, 73).await;
+    let verdicts = policy_verdicts(&a).await;
+    for row in &rows[3..] {
+        assert_eq!(
+            verdict_of(&verdicts, row.id, "osv_severity"),
+            ("pass", "no known vulnerability")
+        );
+    }
+    assert_eq!(
+        osv.batches(),
+        [1, 64, 6],
+        "70 distinct versions cost two POSTs, one per flush, none above 64 queries"
+    );
+
+    osv.set_down(true);
+    fake.add_version("3.0.0", "2026-01-01T00:00:00Z");
+    fake.add_tarball("widget-3.0.0.tgz", b"3");
+    get_ok(&url("widget-3.0.0.tgz"), None).await;
+    let rows = wait_for_policy_rows(&a, 74).await;
+    let verdicts = policy_verdicts(&a).await;
+    let (verdict, reason) = verdict_of(&verdicts, rows[73].id, "osv_severity");
+    assert_eq!(verdict, "unknown");
+    assert!(reason.starts_with("osv unreachable: "), "{reason}");
+    assert!(rows[73].unknown);
 }
 
 #[tokio::test]

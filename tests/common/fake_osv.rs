@@ -23,6 +23,7 @@ struct Inner {
     affected: Mutex<HashMap<(String, String, String), Vec<String>>>,
     records: Mutex<HashMap<String, Value>>,
     hits: Mutex<HashMap<String, usize>>,
+    batches: Mutex<Vec<usize>>,
     inflight: AtomicUsize,
     peak: AtomicUsize,
     down: AtomicBool,
@@ -83,6 +84,11 @@ impl FakeOsv {
             .unwrap_or(0)
     }
 
+    /// The number of queries each `POST /v1/querybatch` carried, in order.
+    pub fn batches(&self) -> Vec<usize> {
+        self.inner.batches.lock().unwrap().clone()
+    }
+
     /// The most record fetches ever in flight at once.
     pub fn peak_inflight(&self) -> usize {
         self.inner.peak.load(Ordering::SeqCst)
@@ -115,14 +121,13 @@ async fn query_batch(
     State(inner): State<Arc<Inner>>,
     Json(body): Json<Value>,
 ) -> (StatusCode, Json<Value>) {
+    let queries = body["queries"].as_array().cloned().unwrap_or_default();
+    inner.batches.lock().unwrap().push(queries.len());
     if inner.down.load(Ordering::SeqCst) {
         return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({})));
     }
     let affected = inner.affected.lock().unwrap();
-    let results: Vec<Value> = body["queries"]
-        .as_array()
-        .map(|qs| qs.iter().map(|q| batch_result(&affected, q)).collect())
-        .unwrap_or_default();
+    let results: Vec<Value> = queries.iter().map(|q| batch_result(&affected, q)).collect();
     (StatusCode::OK, Json(json!({ "results": results })))
 }
 

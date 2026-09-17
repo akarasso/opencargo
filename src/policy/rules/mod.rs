@@ -1,10 +1,19 @@
+pub mod install_scripts;
+pub mod min_release_age;
+pub mod osv_severity;
+pub mod typosquat;
+
+use std::sync::Arc;
+
 use chrono::{DateTime, Utc};
 use serde::Deserialize;
 
 use crate::telemetry::vulns::severity::Severity;
+use crate::telemetry::vulns::VulnScanner;
 
 use super::age::Age;
 use super::{Resolution, RuleVerdict};
+use osv_severity::{OsvMemo, OsvSeverity};
 
 /// The rules of one proxy member, all off unless configured; a member with
 /// none on records nothing.
@@ -56,8 +65,15 @@ pub trait Rule: Send + Sync {
     ) -> Option<RuleVerdict>;
 }
 
-pub fn all_rules() -> Vec<Box<dyn Rule>> {
-    Vec::new()
+/// The four strategies, in report order; `osv_severity` shares its memo
+/// with the writer's flush.
+pub fn all_rules(scanner: Arc<VulnScanner>, memo: Arc<OsvMemo>) -> Vec<Box<dyn Rule>> {
+    vec![
+        Box::new(min_release_age::MinReleaseAge),
+        Box::new(OsvSeverity::new(scanner, memo)),
+        Box::new(install_scripts::InstallScripts),
+        Box::new(typosquat::Typosquat),
+    ]
 }
 
 /// One slot per enabled rule, in `rules` order.
@@ -90,6 +106,43 @@ mod tests {
         assert!(scripts.needs_packument());
         let squat: PolicyConfig = toml::from_str("typosquat = true").unwrap();
         assert!(!squat.needs_packument() && !squat.is_empty());
+    }
+
+    #[test]
+    fn only_enabled_rules_leave_a_slot() {
+        let rules = all_rules(
+            Arc::new(VulnScanner::new(&crate::config::VulnScanConfig::default()).unwrap()),
+            osv_severity::new_memo(),
+        );
+        let names: Vec<&str> = rules.iter().map(|r| r.name()).collect();
+        assert_eq!(
+            names,
+            [
+                "min_release_age",
+                "osv_severity",
+                "install_scripts",
+                "typosquat"
+            ]
+        );
+        let r = Resolution {
+            requested_repo: "r".into(),
+            member_repo: "m".into(),
+            format: crate::db::kinds::Format::Npm,
+            name: "lodash".into(),
+            version: Some("1.0.0".into()),
+            digest: None,
+            actor: crate::policy::Actor::of(None),
+            published_at: None,
+            facts: crate::policy::Facts::default(),
+        };
+        let cfg = PolicyConfig {
+            typosquat: true,
+            ..Default::default()
+        };
+        let verdicts = evaluate_all(&rules, &cfg, &r, Utc::now());
+        assert_eq!(verdicts.len(), 1);
+        assert_eq!(verdicts[0].as_ref().unwrap().rule, "typosquat");
+        assert!(evaluate_all(&rules, &PolicyConfig::default(), &r, Utc::now()).is_empty());
     }
 
     #[test]

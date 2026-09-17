@@ -1,4 +1,5 @@
 pub mod age;
+pub mod distance;
 pub mod facts;
 mod memo;
 pub mod pacer;
@@ -27,11 +28,13 @@ use crate::events::EventBus;
 use crate::proxy::engine::Cached;
 use crate::proxy::ProxyEngine;
 use crate::registry::resolve::{CacheRepo, Cx, Upstream};
+use crate::telemetry::vulns::VulnScanner;
 
 pub use age::Age;
 use facts::NpmSlot;
 use memo::Memo;
 use pacer::Pacer;
+use rules::osv_severity::OsvMemo;
 use rules::{PolicyConfig, Rule};
 use writer::Notify;
 
@@ -177,11 +180,21 @@ impl Verdict {
     }
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RuleVerdict {
     pub rule: &'static str,
     pub verdict: Verdict,
     pub reason: String,
+}
+
+impl RuleVerdict {
+    pub fn new(rule: &'static str, verdict: Verdict, reason: impl Into<String>) -> Self {
+        Self {
+            rule,
+            verdict,
+            reason: reason.into(),
+        }
+    }
 }
 
 /// Timing knobs; tests shrink them, production runs the defaults.
@@ -193,6 +206,7 @@ pub struct Tuning {
     pub gather_timeout: Duration,
     pub notify_period: Duration,
     pub refresh_floor: Duration,
+    pub flush_period: Duration,
 }
 
 impl Default for Tuning {
@@ -204,6 +218,7 @@ impl Default for Tuning {
             gather_timeout: Duration::from_secs(15),
             notify_period: Duration::from_millis(500),
             refresh_floor: Duration::from_secs(300),
+            flush_period: Duration::from_millis(100),
         }
     }
 }
@@ -225,6 +240,8 @@ pub(crate) struct Shared {
     pub rules: Vec<Box<dyn Rule>>,
     pub config: HashMap<String, PolicyConfig>,
     pub events: Arc<EventBus>,
+    pub scanner: Arc<VulnScanner>,
+    pub osv_memo: Arc<OsvMemo>,
     pub recent_children: Mutex<HashMap<ChildKey, VecDeque<(u64, Instant)>>>,
     pub parked: Mutex<HashMap<u64, (Pending, Instant)>>,
     pub seq: AtomicU64,
@@ -273,21 +290,23 @@ impl PolicyEngine {
     pub fn new(
         db: SqlitePool,
         config: &HashMap<String, PolicyConfig>,
+        scanner: Arc<VulnScanner>,
         events: Arc<EventBus>,
         proxy: ProxyEngine,
     ) -> Self {
-        Self::new_tuned(db, config, events, proxy, Tuning::default())
+        Self::new_tuned(db, config, scanner, events, proxy, Tuning::default())
     }
 
     #[doc(hidden)]
     pub fn new_tuned(
         db: SqlitePool,
         config: &HashMap<String, PolicyConfig>,
+        scanner: Arc<VulnScanner>,
         events: Arc<EventBus>,
         proxy: ProxyEngine,
         tuning: Tuning,
     ) -> Self {
-        let (engine, writer) = Self::unspawned(db, config, events, proxy, tuning);
+        let (engine, writer) = Self::unspawned(db, config, scanner, events, proxy, tuning);
         tokio::spawn(writer);
         engine
     }
@@ -296,17 +315,21 @@ impl PolicyEngine {
     pub(crate) fn unspawned(
         db: SqlitePool,
         config: &HashMap<String, PolicyConfig>,
+        scanner: Arc<VulnScanner>,
         events: Arc<EventBus>,
         proxy: ProxyEngine,
         tuning: Tuning,
     ) -> (Self, impl Future<Output = ()>) {
         let (tx, rx) = mpsc::channel(QUEUE);
+        let osv_memo = rules::osv_severity::new_memo();
         let shared = Arc::new(Shared {
             db,
             proxy,
-            rules: rules::all_rules(),
+            rules: rules::all_rules(scanner.clone(), osv_memo.clone()),
             config: config.clone(),
             events,
+            scanner,
+            osv_memo,
             recent_children: Mutex::new(HashMap::new()),
             parked: Mutex::new(HashMap::new()),
             seq: AtomicU64::new(0),

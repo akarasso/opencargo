@@ -121,6 +121,7 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
         state.policy = PolicyEngine::new_tuned(
             state.db.clone(),
             &config.policy,
+            state.vuln_scanner.clone(),
             state.events.clone(),
             state.proxy.clone(),
             tuning,
@@ -216,6 +217,47 @@ pub async fn policy_rows(server: &TestServer) -> Vec<PolicyRow> {
         .expect("failed to read policy rows");
     pool.close().await;
     rows
+}
+
+/// One `policy_verdicts` row.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct VerdictRow {
+    pub resolution_id: i64,
+    pub rule: String,
+    pub verdict: String,
+    pub reason: String,
+}
+
+/// Every verdict, by resolution then rule.
+pub async fn policy_verdicts(server: &TestServer) -> Vec<VerdictRow> {
+    let pool = open_db(server).await;
+    let rows = sqlx::query_as::<_, VerdictRow>(
+        "SELECT resolution_id, rule, verdict, reason FROM policy_verdicts ORDER BY resolution_id, rule",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("failed to read policy verdicts");
+    pool.close().await;
+    rows
+}
+
+/// `(verdict, reason)` of `rule` on resolution `id`; a rule off in config
+/// left no row and that is a failure here.
+pub fn verdict_of<'a>(verdicts: &'a [VerdictRow], id: i64, rule: &str) -> (&'a str, &'a str) {
+    verdicts
+        .iter()
+        .find(|v| v.resolution_id == id && v.rule == rule)
+        .map(|v| (v.verdict.as_str(), v.reason.as_str()))
+        .unwrap_or_else(|| panic!("no {rule} verdict on resolution {id}: {verdicts:#?}"))
+}
+
+/// The rules that left a verdict on resolution `id`.
+pub fn rules_of(verdicts: &[VerdictRow], id: i64) -> Vec<&str> {
+    verdicts
+        .iter()
+        .filter(|v| v.resolution_id == id)
+        .map(|v| v.rule.as_str())
+        .collect()
 }
 
 /// Rows are written after the response: poll until `n` exist, then insist

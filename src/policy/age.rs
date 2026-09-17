@@ -18,6 +18,23 @@ impl Age {
     pub fn duration(self) -> Duration {
         Duration::from_secs(self.secs)
     }
+
+    /// `d` in its largest whole unit, for a reason such as "published 2h ago".
+    pub fn approx(d: Duration) -> Self {
+        let secs = d.as_secs();
+        let (unit, per_unit) = match secs {
+            s if s >= 86_400 => ('d', 86_400),
+            s if s >= 3600 => ('h', 3600),
+            s if s >= 60 => ('m', 60),
+            _ => ('s', 1),
+        };
+        let count = secs / per_unit;
+        Self {
+            secs: count * per_unit,
+            unit,
+            count,
+        }
+    }
 }
 
 impl FromStr for Age {
@@ -111,6 +128,9 @@ mod tests {
             serde_json::from_str::<Age>(&json).unwrap(),
             "48h".parse().unwrap()
         );
+        for (secs, text) in [(0, "0s"), (59, "59s"), (7_320, "2h"), (2_600_000, "30d")] {
+            assert_eq!(Age::approx(Duration::from_secs(secs)).to_string(), text);
+        }
     }
 
     #[test]

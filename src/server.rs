@@ -183,7 +183,13 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let vuln_scanner = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
     let events = Arc::new(crate::events::EventBus::new());
-    let policy = PolicyEngine::new(db.clone(), &config.policy, events.clone(), proxy.clone());
+    let policy = PolicyEngine::new(
+        db.clone(),
+        &config.policy,
+        vuln_scanner.clone(),
+        events.clone(),
+        proxy.clone(),
+    );
     warn_policy_notes(&policy_notes);
 
     info!(

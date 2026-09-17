@@ -81,6 +81,32 @@ impl VulnScanner {
         })
     }
 
+    pub fn enabled(&self) -> bool {
+        self.osv.is_some()
+    }
+
+    /// The advisories of each `(name, version)` itself, one `querybatch`
+    /// under the scanner's permit; a disabled scanner finds nothing.
+    pub async fn assess_batch(
+        &self,
+        ecosystem: &str,
+        deps: &[(String, String)],
+    ) -> Result<Vec<Vec<VulnDetail>>, ScanError> {
+        let Some(osv) = &self.osv else {
+            return Ok(vec![Vec::new(); deps.len()]);
+        };
+        let hits = osv.query_batch(ecosystem, deps).await?;
+        let ids: Vec<String> = hits
+            .iter()
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect();
+        let advisories = osv.advisories(&ids).await;
+        Ok(details_per_dep(deps, &hits, &advisories))
+    }
+
     /// Query OSV for the dependencies of `metadata_json`; pure, no DB.
     pub async fn assess(
         &self,
@@ -152,25 +178,40 @@ impl VulnScanner {
 
 /// One detail per (dependency, advisory); a record that could not be fetched
 /// is still a finding, of unknown severity.
+fn details_per_dep(
+    deps: &[(String, String)],
+    hits: &[Vec<String>],
+    advisories: &HashMap<String, Result<Arc<Advisory>, String>>,
+) -> Vec<Vec<VulnDetail>> {
+    deps.iter()
+        .zip(hits)
+        .map(|((name, version), ids)| {
+            ids.iter()
+                .map(|id| {
+                    let advisory = match advisories.get(id) {
+                        Some(Ok(a)) => Some(a.as_ref()),
+                        Some(Err(e)) => {
+                            warn!(advisory = %id, error = %e, "advisory record unavailable");
+                            None
+                        }
+                        None => None,
+                    };
+                    VulnDetail::new(name, version, id, advisory)
+                })
+                .collect()
+        })
+        .collect()
+}
+
 fn summarize(
     deps: &[(String, String)],
     hits: &[Vec<String>],
     advisories: &HashMap<String, Result<Arc<Advisory>, String>>,
 ) -> ScanResult {
-    let mut details = Vec::new();
-    for ((name, version), ids) in deps.iter().zip(hits) {
-        for id in ids {
-            let advisory = match advisories.get(id) {
-                Some(Ok(a)) => Some(a.as_ref()),
-                Some(Err(e)) => {
-                    warn!(advisory = %id, error = %e, "advisory record unavailable");
-                    None
-                }
-                None => None,
-            };
-            details.push(VulnDetail::new(name, version, id, advisory));
-        }
-    }
+    let details: Vec<VulnDetail> = details_per_dep(deps, hits, advisories)
+        .into_iter()
+        .flatten()
+        .collect();
     let vulnerable_deps = details
         .iter()
         .map(|d| d.dependency.as_str())

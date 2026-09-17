@@ -8,13 +8,14 @@ use serde_json::{json, Value};
 use super::*;
 use crate::db::proxy_cache::CacheEntry;
 use crate::policy::rules::PolicyConfig;
-use crate::policy::testing::{engine_over, fast, pending, repo};
+use crate::policy::testing::{engine_over, engine_with, fast, pending, repo, scanner, FakeOsv};
 use crate::policy::{PolicyEngine, Source, Tuning, QUEUE};
 use crate::proxy::engine::fixture::Fx;
 use crate::proxy::engine::Cached;
 use crate::proxy::UpstreamStrategy;
 use crate::registry::oci::upstream::{OciArtifact, OciUpstream};
 use crate::registry::resolve::{CacheRepo, Outcome};
+use crate::telemetry::vulns::severity::Severity;
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
@@ -439,6 +440,48 @@ async fn gather_timeout_writes_unknown_row() {
         engine.shared().inflight.available_permits(),
         crate::policy::INFLIGHT
     );
+}
+
+#[tokio::test]
+async fn flush_never_blocks_receive() {
+    let fx = Fx::new().await;
+    let osv = FakeOsv::start().await;
+    let cfg = PolicyConfig {
+        osv_severity: Some(Severity::High),
+        ..Default::default()
+    };
+    let (engine, writer) = engine_with(&fx, cfg, fast(), scanner(Some(&osv)));
+    tokio::spawn(writer);
+    osv.hold_next(Duration::from_secs(2));
+    let started = Instant::now();
+    engine.record(cargo(&fx, "held"));
+    for _ in 0..100 {
+        if osv.batches().len() == 1 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(osv.batches(), [1], "the first flush is in flight, held");
+    for i in 0..300 {
+        engine.record(cargo(&fx, &format!("crate-{i}")));
+    }
+    let rows = wait_rows(&fx, 300).await;
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "300 rows landed while the first flush was held: {:?}",
+        started.elapsed()
+    );
+    assert!(rows.iter().all(|(name, _, _)| name != "held"));
+    assert!(osv.batches().iter().all(|n| *n <= BATCH));
+    wait_rows(&fx, 301).await;
+    assert!(started.elapsed() >= Duration::from_secs(2));
+    let verdicts: Vec<(String, String)> = sqlx::query_as(
+        "SELECT rule, verdict FROM policy_verdicts v JOIN policy_resolutions r ON r.id = v.resolution_id WHERE r.name = 'held'",
+    )
+    .fetch_all(&fx.pool)
+    .await
+    .unwrap();
+    assert_eq!(verdicts, [("osv_severity".to_string(), "pass".to_string())]);
 }
 
 #[tokio::test]
