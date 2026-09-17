@@ -1,9 +1,11 @@
 use super::*;
 use crate::policy::{Actor, Facts};
 
-/// Ceilings set from the first run over the shipped lists: 82, 138 and 5.
+/// Ceilings set from the measured residual over the shipped lists: 67,
+/// 101 and 5 once digit, separator and short-head substitutions read as
+/// family markers (82, 138 and 5 before).
 const HOLDOUT_FP_MAX: [(Format, usize); 3] =
-    [(Format::Npm, 100), (Format::Cargo, 160), (Format::Go, 15)];
+    [(Format::Npm, 75), (Format::Cargo, 110), (Format::Go, 10)];
 
 fn lists(top: &str, known: &str) -> Lists {
     Lists::parse(top, known)
@@ -88,6 +90,40 @@ fn separator_added_passes() {
             passes(&concatenated, Format::Npm, name),
             "no top-N name within one edit"
         );
+    }
+}
+
+#[test]
+fn family_markers_pass() {
+    let families = lists(
+        "bzip2\nmurmur3\nis-array\ngit-config\nndk-sys\nsha1-asm\nreact-dom\n",
+        "",
+    );
+    for name in [
+        "bzip3",
+        "murmur2",
+        "is.array",
+        "gix-config",
+        "wdk-sys",
+        "sha3-asm",
+    ] {
+        assert_eq!(
+            passes(&families, Format::Npm, name),
+            "no top-N name within one edit"
+        );
+    }
+    would_block(&families, Format::Npm, "reakt-dom");
+    would_block(&families, Format::Npm, "gitxconfig");
+    let real = shipped(Format::Npm).unwrap();
+    for name in ["axois", "hasky", "kocha", "lodask", "lodahs"] {
+        assert_eq!(check(real, Format::Npm, name).0, Verdict::WouldBlock, "{name}");
+    }
+    let crates = shipped(Format::Cargo).unwrap();
+    for name in ["tokyo", "rustis"] {
+        assert_eq!(check(crates, Format::Cargo, name).0, Verdict::WouldBlock, "{name}");
+    }
+    for name in ["sha3-asm", "gix-config", "wdk-sys", "bzip3", "jl-sys"] {
+        assert_eq!(check(crates, Format::Cargo, name).0, Verdict::Pass, "{name}");
     }
 }
 
@@ -182,7 +218,12 @@ fn known_sibling_passes() {
     }
     let crates = lists("base64\n", "base32\n");
     passes(&crates, Format::Cargo, "base32");
-    would_block(&crates, Format::Cargo, "base65");
+    would_block(&crates, Format::Cargo, "basf64");
+    assert_eq!(
+        passes(&crates, Format::Cargo, "base65"),
+        "no top-N name within one edit",
+        "a digit swap is a version marker, known list or not"
+    );
     let real = shipped(Format::Npm).unwrap();
     for name in ["mssql", "es5-shim"] {
         assert_eq!(

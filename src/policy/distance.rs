@@ -83,9 +83,29 @@ fn strip_go_major(path: &str) -> &str {
     path
 }
 
+const SEPARATORS: [u8; 3] = [b'-', b'.', b'_'];
+const FAMILY_HEAD: usize = 3;
+
+/// A substitution that marks a sibling in a family, not a typo: a digit
+/// on either side (`bzip2`/`bzip3`), one separator for another
+/// (`is-array`/`is.array`), or a change inside a leading `-` token of up
+/// to three characters (`git-*`/`gix-*`, `ndk-sys`/`wdk-sys`).
+fn family_marker(c: &[u8], t: &[u8], i: usize) -> bool {
+    if c[i].is_ascii_digit() || t[i].is_ascii_digit() {
+        return true;
+    }
+    if SEPARATORS.contains(&c[i]) && SEPARATORS.contains(&t[i]) {
+        return true;
+    }
+    let Some(head) = t.iter().position(|b| *b == b'-') else {
+        return false;
+    };
+    i < head && head <= FAMILY_HEAD
+}
+
 /// A single substitution, an adjacent transposition, or one `-`/`.` of
 /// `top` missing from `candidate`; equal strings, a letter added or
-/// dropped, or a separator added are not edits.
+/// dropped, a separator added, or a family marker (above) are not edits.
 pub fn one_edit(candidate: &str, top: &str) -> Option<Edit> {
     let (c, t) = (candidate.as_bytes(), top.as_bytes());
     if c.len() == t.len() {
@@ -102,6 +122,7 @@ pub fn one_edit(candidate: &str, top: &str) -> Option<Edit> {
         }
         let [i, j] = differing;
         return match n {
+            1 if family_marker(c, t, i) => None,
             1 => Some(Edit::Substitution),
             2 if j == i + 1 && c[i] == t[j] && c[j] == t[i] => Some(Edit::Transposition),
             _ => None,
@@ -140,6 +161,18 @@ mod tests {
             ("abc", "xyz", None),
             ("abc", "abxc", None),
             ("acb", "bca", None),
+            ("bzip3", "bzip2", None),
+            ("soup2", "soup3", None),
+            ("sha3-asm", "sha1-asm", None),
+            ("es5-shim", "es6-shim", None),
+            ("is.array", "is-array", None),
+            ("is_array", "is-array", None),
+            ("gix-config", "git-config", None),
+            ("wdk-sys", "ndk-sys", None),
+            ("jl-sys", "js-sys", None),
+            ("gitxconfig", "git-config", Some(Edit::Substitution)),
+            ("reakt-dom", "react-dom", Some(Edit::Substitution)),
+            ("lodask", "lodash", Some(Edit::Substitution)),
         ];
         for (candidate, top, edit) in table {
             assert_eq!(one_edit(candidate, top), edit, "{candidate} vs {top}");
