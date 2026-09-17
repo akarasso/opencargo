@@ -218,7 +218,9 @@ export interface Dependent {
 
 export interface VulnEntry {
   id: string;
-  severity: string;
+  /** A lowercase label, or null when the scan predates severity classification. */
+  severity: string | null;
+  score: number | null;
   title: string;
   description: string;
   fixed_in: string | null;

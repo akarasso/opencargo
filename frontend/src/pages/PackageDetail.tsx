@@ -19,18 +19,11 @@ import { session } from '../core/stores/session.ts';
 import { reportError, toasts } from '../core/stores/toasts.ts';
 import { formatNumber, timeAgo } from '../core/format.ts';
 import type { VulnReport } from '../core/types.ts';
+import { severityChip } from '../core/vulns.ts';
 
 type Tab = 'readme' | 'versions' | 'dependencies' | 'security';
 
 const TAB_ORDER: Tab[] = ['readme', 'versions', 'dependencies', 'security'];
-
-const SEVERITY_CHIP: Record<string, string> = {
-  critical: 'chip-danger',
-  high: 'chip-danger',
-  medium: 'chip-warn',
-  moderate: 'chip-warn',
-  low: 'chip-info',
-};
 
 export default function PackageDetail() {
   const params = useParams<{ path: string }>();
@@ -461,10 +454,8 @@ export default function PackageDetail() {
                                       <tr>
                                         <td class="cell-mono">{vuln.id}</td>
                                         <td>
-                                          <span
-                                            class={`chip ${SEVERITY_CHIP[vuln.severity.toLowerCase()] ?? 'chip-neutral'}`}
-                                          >
-                                            {vuln.severity}
+                                          <span class={`chip ${severityChip(vuln.severity)}`}>
+                                            {vuln.severity ?? 'unknown'}
                                           </span>
                                         </td>
                                         <td class="cell-muted">{vuln.title}</td>

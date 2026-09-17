@@ -23,6 +23,7 @@ import type {
   Webhook,
   WhoAmI,
 } from './types.ts';
+import { toVulnReport, type VulnsResponse } from './vulns.ts';
 
 const enc = encodeURIComponent;
 
@@ -248,14 +249,16 @@ export function fetchDependents(name: string): Promise<Dependent[]> {
   return http.get(`/api/v1/deps/${name}/dependents`);
 }
 
-export function fetchVulns(name: string, version: string): Promise<VulnReport> {
+export async function fetchVulns(name: string, version: string): Promise<VulnReport> {
   // Scoped packages (@scope/name) go through as-is: the percent-decoding
   // middleware turns %2F back into / before routing.
-  return http.get(`/api/v1/vulns/${name}/${enc(version)}`);
+  return toVulnReport(await http.get<VulnsResponse>(`/api/v1/vulns/${name}/${enc(version)}`));
 }
 
-export function rescanVulns(name: string, version: string): Promise<VulnReport> {
-  return http.post(`/api/v1/vulns/${name}/${enc(version)}/rescan`, {});
+export async function rescanVulns(name: string, version: string): Promise<VulnReport> {
+  return toVulnReport(
+    await http.post<VulnsResponse>(`/api/v1/vulns/${name}/${enc(version)}/rescan`, {}),
+  );
 }
 
 export function promotePackage(
