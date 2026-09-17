@@ -6,6 +6,7 @@ pub mod pacer;
 pub mod rules;
 pub mod startup;
 pub mod store;
+mod totals;
 mod writer;
 
 use std::collections::{HashMap, VecDeque};
@@ -36,6 +37,8 @@ use memo::Memo;
 use pacer::Pacer;
 use rules::osv_severity::OsvMemo;
 use rules::{PolicyConfig, Rule};
+use store::{ReportFilter, Totals};
+use totals::TotalsCache;
 use writer::Notify;
 
 pub const QUEUE: usize = 4096;
@@ -251,6 +254,7 @@ pub(crate) struct Shared {
     pub cargo_pacer: Pacer,
     pub tuning: Tuning,
     pub dropped: AtomicU64,
+    pub totals: TotalsCache,
     warned_at: Mutex<Option<Instant>>,
 }
 
@@ -339,6 +343,7 @@ impl PolicyEngine {
             cargo_pacer: Pacer::default(),
             tuning,
             dropped: AtomicU64::new(0),
+            totals: TotalsCache::default(),
             warned_at: Mutex::new(None),
         });
         let writer = writer::run_writer(rx, shared.clone());
@@ -368,6 +373,17 @@ impl PolicyEngine {
 
     pub fn dropped(&self) -> u64 {
         self.shared.dropped.load(Ordering::Relaxed)
+    }
+
+    /// Report totals for `f`, snapshotted under `key` (the filter as the
+    /// client spelled it) so refetches read only the rows landed since.
+    pub async fn totals(&self, f: &ReportFilter<'_>, key: String) -> Result<Totals, sqlx::Error> {
+        self.shared.totals.totals(&self.shared.db, f, key).await
+    }
+
+    /// After an erasure: every snapshot counted rows that are gone.
+    pub fn forget_totals(&self) {
+        self.shared.totals.forget();
     }
 
     /// The strategies' names in report order, the report's `rule` filter domain.

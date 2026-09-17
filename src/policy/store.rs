@@ -92,6 +92,22 @@ pub struct Totals {
     pub by_rule: BTreeMap<String, RuleTotals>,
 }
 
+impl Totals {
+    /// Adds the counts of a later id range.
+    pub fn absorb(&mut self, delta: Totals) {
+        self.resolutions += delta.resolutions;
+        self.would_block += delta.would_block;
+        self.unknown += delta.unknown;
+        for (rule, d) in delta.by_rule {
+            let t = self.by_rule.entry(rule).or_default();
+            t.would_block += d.would_block;
+            t.unknown += d.unknown;
+            t.pass += d.pass;
+            t.not_applicable += d.not_applicable;
+        }
+    }
+}
+
 #[derive(Debug, Clone, sqlx::FromRow, Serialize)]
 pub struct ResolutionRow {
     pub id: i64,
@@ -137,16 +153,33 @@ fn sqlite_time(t: DateTime<Utc>) -> String {
     t.format("%Y-%m-%d %H:%M:%S").to_string()
 }
 
-/// `FROM policy_resolutions r [JOIN that rule's verdict v] WHERE ..`, the
-/// scan every report query shares.
-fn scope<'a>(q: &mut QueryBuilder<'a, Sqlite>, f: &ReportFilter<'a>) {
+/// Which rows of the window the totals cover: `after < id <= upto`, so
+/// a snapshot and the delta on top of it never count a row twice.
+#[derive(Debug, Clone, Copy)]
+pub struct IdRange {
+    pub after: i64,
+    pub upto: i64,
+}
+
+/// `FROM policy_resolutions r [JOIN that rule's verdict v]`, the scan
+/// every report query shares.
+fn from<'a>(q: &mut QueryBuilder<'a, Sqlite>, f: &ReportFilter<'a>) {
     q.push(" FROM policy_resolutions r");
     if let Some(rule) = f.rule {
         q.push(" JOIN policy_verdicts v ON v.resolution_id = r.id AND v.rule = ");
         q.push_bind(rule);
     }
+}
+
+fn filters<'a>(q: &mut QueryBuilder<'a, Sqlite>, f: &ReportFilter<'a>, range: Option<IdRange>) {
     q.push(" WHERE r.created_at >= ");
     q.push_bind(sqlite_time(f.since));
+    if let Some(range) = range {
+        q.push(" AND r.id > ");
+        q.push_bind(range.after);
+        q.push(" AND r.id <= ");
+        q.push_bind(range.upto);
+    }
     if let Some(repo) = f.repo {
         q.push(" AND (r.requested_repo = ");
         q.push_bind(repo);
@@ -173,25 +206,39 @@ fn flags(f: &ReportFilter<'_>) -> &'static str {
     }
 }
 
-pub async fn report_totals(pool: &SqlitePool, f: &ReportFilter<'_>) -> Result<Totals, sqlx::Error> {
+/// The newest resolution id, the upper bound of a totals snapshot.
+pub async fn max_id(pool: &SqlitePool) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar("SELECT COALESCE(MAX(id), 0) FROM policy_resolutions")
+        .fetch_one(pool)
+        .await
+}
+
+/// Totals over the rows of `range` in the window: one covering index scan
+/// for the head, one join for the per-rule counts.
+pub async fn report_totals(
+    pool: &SqlitePool,
+    f: &ReportFilter<'_>,
+    range: IdRange,
+) -> Result<Totals, sqlx::Error> {
     let mut q = QueryBuilder::new("SELECT COUNT(*) AS resolutions, ");
     q.push(match f.rule {
         Some(_) => "COALESCE(SUM(v.verdict = 'would_block'), 0) AS would_block, COALESCE(SUM(v.verdict = 'unknown'), 0) AS unknown",
         None => "COALESCE(SUM(r.would_block), 0) AS would_block, COALESCE(SUM(r.unknown), 0) AS unknown",
     });
-    scope(&mut q, f);
+    from(&mut q, f);
+    filters(&mut q, f, Some(range));
     let head: TotalsRow = q.build_query_as().fetch_one(pool).await?;
 
-    let mut q = QueryBuilder::new(
-        "SELECT pv.rule, pv.verdict, COUNT(*) AS count FROM policy_verdicts pv WHERE pv.resolution_id IN (SELECT r.id",
-    );
-    scope(&mut q, f);
-    q.push(")");
-    if let Some(rule) = f.rule {
-        q.push(" AND pv.rule = ");
-        q.push_bind(rule);
+    let verdicts = if f.rule.is_some() { "v" } else { "pv" };
+    let mut q = QueryBuilder::new(format!(
+        "SELECT {verdicts}.rule, {verdicts}.verdict, COUNT(*) AS count"
+    ));
+    from(&mut q, f);
+    if f.rule.is_none() {
+        q.push(" JOIN policy_verdicts pv ON pv.resolution_id = r.id");
     }
-    q.push(" GROUP BY pv.rule, pv.verdict");
+    filters(&mut q, f, Some(range));
+    q.push(" GROUP BY 1, 2");
     let counts: Vec<RuleCountRow> = q.build_query_as().fetch_all(pool).await?;
 
     let mut by_rule: BTreeMap<String, RuleTotals> = BTreeMap::new();
@@ -225,7 +272,8 @@ pub async fn list_resolutions(
                 r.format, r.name, r.version, r.digest, r.actor, r.actor_kind, r.user_id, r.published_at, ",
     );
     q.push(flags(f));
-    scope(&mut q, f);
+    from(&mut q, f);
+    filters(&mut q, f, None);
     q.push(" ORDER BY r.id DESC LIMIT ");
     q.push_bind(size);
     q.push(" OFFSET ");

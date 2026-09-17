@@ -101,6 +101,32 @@ describe('useLive', () => {
     });
   });
 
+  it('events during an in-flight refetch cost one more refetch after it lands', async () => {
+    let land!: () => void;
+    const refetch = vi.fn(() => new Promise<void>((resolve) => (land = resolve)));
+    const dispose = createRoot((d) => {
+      useLive(refetch, ['e'], { debounce: 100 });
+      return d;
+    });
+    bus.emit('e');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(refetch).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 5; i++) {
+      bus.emit('e');
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(refetch).toHaveBeenCalledTimes(1);
+    land();
+    await vi.advanceTimersByTimeAsync(99);
+    expect(refetch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(refetch).toHaveBeenCalledTimes(2);
+    land();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(refetch).toHaveBeenCalledTimes(2);
+    dispose();
+  });
+
   it('max_wait deadline is cleared once the debounce fires', () => {
     const refetch = vi.fn();
     createRoot((dispose) => {

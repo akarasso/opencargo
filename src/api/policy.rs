@@ -104,7 +104,13 @@ async fn render(
         rule,
         subject,
     };
-    let totals = store::report_totals(&state.db, &filter).await?;
+    let key = format!(
+        "{}|{}|{}|{subject:?}",
+        q.since.as_deref().unwrap_or(""),
+        q.repo.as_deref().unwrap_or(""),
+        rule.unwrap_or("")
+    );
+    let totals = state.policy.totals(&filter, key).await?;
     let rows = store::list_resolutions(&state.db, &filter, page, size).await?;
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
     let mut verdicts: BTreeMap<i64, Vec<store::VerdictRow>> = BTreeMap::new();
@@ -154,6 +160,7 @@ pub async fn erase(
         }
     };
     let deleted = store::delete_by_user(&state.db, user_id).await?;
+    state.policy.forget_totals();
     record_audit(
         &state,
         &caller,

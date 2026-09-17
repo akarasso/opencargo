@@ -24,8 +24,10 @@ CREATE TABLE IF NOT EXISTS policy_verdicts (
     PRIMARY KEY (resolution_id, rule)
 );
 
-CREATE INDEX IF NOT EXISTS idx_policy_res_created ON policy_resolutions(created_at);
+DROP INDEX IF EXISTS idx_policy_res_created;
+CREATE INDEX IF NOT EXISTS idx_policy_res_created_flags ON policy_resolutions(created_at, would_block, unknown);
 CREATE INDEX IF NOT EXISTS idx_policy_res_user ON policy_resolutions(user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_policy_res_repo_created ON policy_resolutions(requested_repo, created_at);
 CREATE INDEX IF NOT EXISTS idx_policy_res_member_name ON policy_resolutions(member_repo, name);
 CREATE INDEX IF NOT EXISTS idx_policy_verdicts_rule ON policy_verdicts(rule, verdict);
+CREATE INDEX IF NOT EXISTS idx_policy_verdicts_res ON policy_verdicts(resolution_id, rule, verdict);

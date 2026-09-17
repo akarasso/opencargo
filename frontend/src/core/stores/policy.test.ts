@@ -8,6 +8,8 @@ import {
   explain,
   isFiltered,
   outcome,
+  REFETCH_DEBOUNCE,
+  REFETCH_MAX_WAIT,
   toQuery,
 } from './policy.ts';
 
@@ -109,12 +111,31 @@ describe('createPolicyStore', () => {
     await Promise.resolve();
     expect(api.fetchPolicyReport).toHaveBeenCalledTimes(1);
     for (let i = 0; i < 20; i++) bus.emit('policy.resolution');
-    await vi.advanceTimersByTimeAsync(299);
+    await vi.advanceTimersByTimeAsync(REFETCH_DEBOUNCE - 1);
     expect(api.fetchPolicyReport).toHaveBeenCalledTimes(1);
     await vi.advanceTimersByTimeAsync(1);
     expect(api.fetchPolicyReport).toHaveBeenCalledTimes(2);
     await vi.advanceTimersByTimeAsync(5000);
     expect(api.fetchPolicyReport).toHaveBeenCalledTimes(2);
+    dispose();
+  });
+
+  it('refetches at a floor rate under a stream of flushes', async () => {
+    const dispose = createRoot((d) => {
+      createPolicyStore();
+      return d;
+    });
+    await Promise.resolve();
+    expect(REFETCH_DEBOUNCE).toBeGreaterThan(500);
+    for (let t = 0; t < 10_000; t += 100) {
+      bus.emit('policy.resolution');
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    const streamed = api.fetchPolicyReport.mock.calls.length - 1;
+    expect(streamed).toBeGreaterThanOrEqual(3);
+    expect(streamed).toBeLessThanOrEqual(10_000 / REFETCH_MAX_WAIT + 1);
+    await vi.advanceTimersByTimeAsync(REFETCH_DEBOUNCE);
+    expect(api.fetchPolicyReport.mock.calls.length - 1).toBe(streamed + 1);
     dispose();
   });
 });

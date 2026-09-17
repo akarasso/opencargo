@@ -20,26 +20,44 @@ interface LiveOpts {
   pollMs?: number;
 }
 
+function isThenable(value: unknown): value is PromiseLike<unknown> {
+  return typeof value === 'object' && value !== null && 'then' in value;
+}
+
 /**
  * Re-run `refetch` whenever one of `events` fires (plus on reconnect/resync),
  * debounced so a burst of publishes causes one refetch, not fifty.
  * Must be called inside a component/root so cleanup unsubscribes.
  */
-export function useLive(
-  refetch: () => unknown,
-  events: string[],
-  opts: LiveOpts = {},
-): void {
+export function useLive(refetch: () => unknown, events: string[], opts: LiveOpts = {}): void {
   const wait = opts.debounce ?? 350;
   let timer: ReturnType<typeof setTimeout> | null = null;
   let deadline: ReturnType<typeof setTimeout> | null = null;
+  let inflight = false;
+  let missed = false;
 
+  const settle = () => {
+    inflight = false;
+    if (missed) trigger();
+  };
+
+  // A refetch still in flight absorbs the events that arrive meanwhile:
+  // one more refetch follows it, never one per event.
   const fire = () => {
     if (timer) clearTimeout(timer);
     if (deadline) clearTimeout(deadline);
     timer = null;
     deadline = null;
-    void refetch();
+    if (inflight) {
+      missed = true;
+      return;
+    }
+    missed = false;
+    const result = refetch();
+    if (isThenable(result)) {
+      inflight = true;
+      result.then(settle, settle);
+    }
   };
 
   const trigger = () => {

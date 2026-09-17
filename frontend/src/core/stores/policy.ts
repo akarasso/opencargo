@@ -10,6 +10,8 @@ import { useLive } from './live.ts';
 export const SINCE_OPTIONS = ['1h', '24h', '7d', '30d'] as const;
 export const RULES = ['min_release_age', 'osv_severity', 'install_scripts', 'typosquat'] as const;
 export const DEFAULT_SINCE = '24h';
+export const REFETCH_DEBOUNCE = 1000;
+export const REFETCH_MAX_WAIT = 3000;
 
 export interface PolicyFilters {
   since: string;
@@ -82,7 +84,12 @@ export function createPolicyStore() {
   );
   const filtered = () => isFiltered({ since: since(), repo: repo(), rule: rule() });
   const [report, { refetch }] = createResource(query, (q) => fetchPolicyReport(q));
-  useLive(refetch, ['policy.resolution'], { debounce: 300, maxWait: 2000 });
+  // Above the writer's 500 ms notify period: a stream of flushes yields a
+  // refetch per second at most, and never one while the last is in flight.
+  useLive(refetch, ['policy.resolution'], {
+    debounce: REFETCH_DEBOUNCE,
+    maxWait: REFETCH_MAX_WAIT,
+  });
 
   const filter = (set: (v: string) => void) => (v: string) =>
     batch(() => {
