@@ -117,8 +117,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Private,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-proxy".into(),
@@ -126,15 +125,15 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
                 upstream: Some("https://registry.npmjs.org".into()),
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-group".into(),
                 repo_type: RepositoryType::Group,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
                 members: Some(vec!["npm-private".into(), "npm-proxy".into()]),
+                ..Default::default()
             },
         ],
         ..Default::default()

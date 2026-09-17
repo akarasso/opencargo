@@ -70,8 +70,7 @@ async fn test_tls_server() {
             repo_type: RepositoryType::Hosted,
             format: RepositoryFormat::Npm,
             visibility: Visibility::Public,
-            upstream: None,
-            members: None,
+            ..Default::default()
         }],
         ..Default::default()
     };

@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::proxy::UpstreamAuth;
+
 // ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
@@ -173,7 +175,7 @@ pub struct CleanupConfig {
 // Repository
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct RepositoryConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -183,6 +185,14 @@ pub struct RepositoryConfig {
     pub visibility: Visibility,
     pub upstream: Option<String>,
     pub members: Option<Vec<String>>,
+    /// Upstream credentials; config and environment only, never the API.
+    pub upstream_auth: Option<UpstreamAuth>,
+    /// Token realms off the upstream host that may still see `upstream_auth`.
+    #[serde(default)]
+    pub token_realms: Vec<String>,
+    /// Let an upstream-chosen download URL point at a private IP literal.
+    #[serde(default)]
+    pub dl_allow_private: bool,
 }
 
 /// Aliases kept so existing config and test code keep compiling; the enums

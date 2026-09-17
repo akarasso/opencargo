@@ -81,16 +81,14 @@ async fn setup(anonymous_read: bool) -> (String, tokio::task::JoinHandle<()>, Te
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-secret".to_string(),
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Private,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
         ],
         vuln_scan: VulnScanConfig {

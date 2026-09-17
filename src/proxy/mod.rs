@@ -10,6 +10,16 @@ use crate::error::AppError;
 use crate::storage::FilesystemStorage;
 use crate::storage::StorageBackend;
 
+pub mod auth;
+pub mod engine;
+pub mod purge;
+pub mod singleflight;
+pub mod strategy;
+
+pub use auth::{UpstreamAuth, UpstreamCreds};
+pub use engine::{Payload, ProxyEngine, Timeouts, TtlConfig};
+pub use strategy::UpstreamStrategy;
+
 /// Cap on a single upstream response body. Checked against the advertised
 /// Content-Length; chunked responses without one are not bounded here (a
 /// streaming reader would be needed for that).
@@ -61,6 +71,24 @@ pub fn validate_upstream_url(url: &str) -> Result<(), AppError> {
     Ok(())
 }
 
+/// SSRF hardening: cap redirects (was 10 by default) and refuse any hop whose
+/// host is a literal private/loopback/link-local IP.
+pub(crate) fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
+        }
+        match attempt
+            .url()
+            .host_str()
+            .and_then(|h| h.parse::<std::net::IpAddr>().ok())
+        {
+            Some(ip) if is_blocked_ip(&ip) => attempt.stop(),
+            _ => attempt.follow(),
+        }
+    })
+}
+
 impl ProxyClient {
     /// Create a new ProxyClient with the given timeout.
     pub fn new(
@@ -71,21 +99,7 @@ impl ProxyClient {
         let client = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(connect_timeout_secs))
             .timeout(Duration::from_secs(connect_timeout_secs * 3))
-            // SSRF hardening: cap redirects (was 10 by default) and refuse any
-            // hop whose host is a literal private/loopback/link-local IP.
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 5 {
-                    return attempt.error("too many redirects");
-                }
-                match attempt
-                    .url()
-                    .host_str()
-                    .and_then(|h| h.parse::<std::net::IpAddr>().ok())
-                {
-                    Some(ip) if is_blocked_ip(&ip) => attempt.stop(),
-                    _ => attempt.follow(),
-                }
-            }))
+            .redirect(redirect_policy())
             .build()
             .expect("failed to build reqwest client");
 

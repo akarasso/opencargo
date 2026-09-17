@@ -20,8 +20,7 @@ async fn setup() -> (String, u16, tokio::task::JoinHandle<()>, TempDir) {
             repo_type: RepositoryType::Hosted,
             format: RepositoryFormat::Npm,
             visibility: Visibility::Public,
-            upstream: None,
-            members: None,
+            ..Default::default()
         }],
     )
     .await
@@ -277,16 +276,15 @@ async fn pnpm_install_through_private_group_inner() {
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Private,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-all".to_string(),
                 repo_type: RepositoryType::Group,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Private,
-                upstream: None,
                 members: Some(vec!["npm-private".to_string()]),
+                ..Default::default()
             },
         ],
     )
@@ -370,16 +368,15 @@ async fn test_public_group_hides_private_member_from_anonymous() {
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Private,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-all".to_string(),
                 repo_type: RepositoryType::Group,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
                 members: Some(vec!["npm-private".to_string()]),
+                ..Default::default()
             },
         ],
     )

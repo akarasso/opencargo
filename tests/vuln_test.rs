@@ -116,8 +116,7 @@ async fn setup_with_vuln_scan(vuln_config: VulnScanConfig) -> (String, tokio::ta
             repo_type: RepositoryType::Hosted,
             format: RepositoryFormat::Npm,
             visibility: Visibility::Public,
-            upstream: None,
-            members: None,
+            ..Default::default()
         }],
         vuln_scan: vuln_config,
         ..Default::default()

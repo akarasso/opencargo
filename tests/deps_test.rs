@@ -115,8 +115,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
             repo_type: RepositoryType::Hosted,
             format: RepositoryFormat::Npm,
             visibility: Visibility::Public,
-            upstream: None,
-            members: None,
+            ..Default::default()
         }],
         ..Default::default()
     };

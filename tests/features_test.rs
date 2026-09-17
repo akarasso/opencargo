@@ -167,16 +167,14 @@ async fn setup_with(anonymous_read: bool) -> (String, tokio::task::JoinHandle<()
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "cargo-private".to_string(),
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Cargo,
                 visibility: Visibility::Private,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
         ],
         ..Default::default()

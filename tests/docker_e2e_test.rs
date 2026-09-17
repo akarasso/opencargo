@@ -46,8 +46,7 @@ async fn setup_with_anon(anonymous_read: bool) -> (String, tokio::task::JoinHand
             repo_type: RepositoryType::Hosted,
             format: RepositoryFormat::Oci,
             visibility: Visibility::Private,
-            upstream: None,
-            members: None,
+            ..Default::default()
         }],
         ..Default::default()
     };

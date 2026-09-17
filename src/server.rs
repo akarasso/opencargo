@@ -1,5 +1,6 @@
 pub mod rewrite;
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use axum::{
@@ -18,8 +19,8 @@ use tracing::{info, warn};
 
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::auth::rate_limit::RateLimiter;
-use crate::config::Config;
-use crate::proxy::ProxyClient;
+use crate::config::{Config, RepositoryConfig};
+use crate::proxy::{ProxyClient, ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
 use crate::storage::FilesystemStorage;
 use crate::telemetry;
 use crate::telemetry::vulns::VulnScanner;
@@ -42,6 +43,9 @@ pub struct AppState {
     pub storage: Arc<FilesystemStorage>,
     pub auth: Arc<AuthState>,
     pub proxy_client: ProxyClient,
+    pub proxy: ProxyEngine,
+    /// Per-repository upstream credentials, keyed by name; a missing key is the default.
+    pub upstream_auth: Arc<HashMap<String, UpstreamCreds>>,
     pub base_url: String,
     pub metrics_handle: PrometheusHandle,
     pub login_rate_limiter: Arc<RateLimiter>,
@@ -151,6 +155,17 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let connect_timeout_secs = parse_duration_secs(&config.proxy.connect_timeout);
     let proxy_client = ProxyClient::new(storage.clone(), db.clone(), connect_timeout_secs);
+    let ttl = TtlConfig {
+        default_secs: parse_duration_secs(&config.proxy.default_ttl),
+        negative_secs: parse_duration_secs(&config.proxy.negative_cache_ttl),
+    };
+    let proxy = ProxyEngine::new(
+        storage.clone(),
+        db.clone(),
+        Timeouts::from_connect_secs(connect_timeout_secs),
+        ttl,
+    );
+    let upstream_auth = Arc::new(load_upstream_creds(&config.repositories, std::env::vars())?);
 
     // Initialize Prometheus metrics
     let metrics_handle = telemetry::init_metrics();
@@ -176,6 +191,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         storage,
         auth,
         proxy_client,
+        proxy,
+        upstream_auth,
         base_url: config.server.base_url.clone(),
         metrics_handle,
         login_rate_limiter,
@@ -558,6 +575,79 @@ async fn npm_login(
     (StatusCode::CREATED, Json(json!({"ok": true, "token": raw_token, "must_change_password": must_change}))).into_response()
 }
 
+const ENV_UPSTREAM_AUTH: &str = "OPENCARGO_UPSTREAM_AUTH_";
+const ENV_DL_ALLOW_PRIVATE: &str = "OPENCARGO_DL_ALLOW_PRIVATE_";
+
+/// `<REPO>` in `OPENCARGO_*_<REPO>`: the name uppercased, every byte outside
+/// `[A-Za-z0-9]` becoming `_`.
+pub(crate) fn env_repo_key(name: &str) -> String {
+    name.chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_uppercase()
+            } else {
+                '_'
+            }
+        })
+        .collect()
+}
+
+/// Config credentials per repository, then the environment on top (env wins).
+fn load_upstream_creds(
+    repos: &[RepositoryConfig],
+    env: impl IntoIterator<Item = (String, String)>,
+) -> anyhow::Result<HashMap<String, UpstreamCreds>> {
+    let mut by_key: HashMap<String, &str> = HashMap::new();
+    let mut creds = HashMap::new();
+    for repo in repos {
+        let key = env_repo_key(&repo.name);
+        if let Some(other) = by_key.insert(key.clone(), &repo.name) {
+            anyhow::bail!(
+                "repositories '{other}' and '{}' both map to the environment key '{key}'",
+                repo.name
+            );
+        }
+        let token_realms = repo
+            .token_realms
+            .iter()
+            .map(|r| {
+                reqwest::Url::parse(r).map_err(|e| {
+                    anyhow::anyhow!("repository '{}': invalid token realm '{r}': {e}", repo.name)
+                })
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        creds.insert(
+            repo.name.clone(),
+            UpstreamCreds {
+                auth: repo.upstream_auth.clone(),
+                token_realms,
+                dl_allow_private: repo.dl_allow_private,
+            },
+        );
+    }
+    for (var, value) in env {
+        let (prefix, key) = match (
+            var.strip_prefix(ENV_UPSTREAM_AUTH),
+            var.strip_prefix(ENV_DL_ALLOW_PRIVATE),
+        ) {
+            (Some(key), _) => (ENV_UPSTREAM_AUTH, key),
+            (None, Some(key)) => (ENV_DL_ALLOW_PRIVATE, key),
+            (None, None) => continue,
+        };
+        let Some(entry) = by_key.get(key).and_then(|name| creds.get_mut(*name)) else {
+            warn!(var = %var, "environment override names no configured repository");
+            continue;
+        };
+        if prefix == ENV_UPSTREAM_AUTH {
+            entry.auth =
+                Some(UpstreamAuth::parse_env(&value).map_err(|e| anyhow::anyhow!("{var}: {e}"))?);
+        } else {
+            entry.dl_allow_private = matches!(value.trim(), "1" | "true" | "yes");
+        }
+    }
+    Ok(creds)
+}
+
 /// Parse a duration string like "10s", "24h", "30m" into seconds.
 /// Falls back to 10 seconds on parse failure.
 fn parse_duration_secs(s: &str) -> u64 {
@@ -608,7 +698,69 @@ pub fn decode_percent_encoded_slashes<B>(
 
 #[cfg(test)]
 mod tests {
-    use super::decode_percent_encoded_slashes;
+    use super::{decode_percent_encoded_slashes, env_repo_key, load_upstream_creds};
+    use crate::config::RepositoryConfig;
+    use crate::proxy::UpstreamAuth;
+
+    fn proxy(name: &str) -> RepositoryConfig {
+        RepositoryConfig {
+            name: name.to_string(),
+            repo_type: crate::db::kinds::RepoKind::Proxy,
+            upstream: Some("https://registry.npmjs.org".to_string()),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn env_repo_key_mangles_and_refuses_collisions() {
+        assert_eq!(env_repo_key("npm-proxy"), "NPM_PROXY");
+        assert_eq!(env_repo_key("npm.proxy"), "NPM_PROXY");
+        assert_eq!(env_repo_key("Oci_Hub2"), "OCI_HUB2");
+
+        let err = load_upstream_creds(&[proxy("npm-proxy"), proxy("npm.proxy")], Vec::new())
+            .expect_err("two names mangling alike must refuse startup");
+        assert!(err.to_string().contains("npm-proxy") && err.to_string().contains("npm.proxy"));
+
+        let mut configured = proxy("npm-proxy");
+        configured.upstream_auth = Some(UpstreamAuth::Bearer {
+            token: "from-config".to_string(),
+        });
+        configured.token_realms = vec!["https://auth.example/token".to_string()];
+        let env = vec![
+            (
+                "OPENCARGO_UPSTREAM_AUTH_NPM_PROXY".to_string(),
+                "basic:u:p".to_string(),
+            ),
+            (
+                "OPENCARGO_DL_ALLOW_PRIVATE_NPM_PROXY".to_string(),
+                "1".to_string(),
+            ),
+            (
+                "OPENCARGO_UPSTREAM_AUTH_UNKNOWN".to_string(),
+                "bearer:x".to_string(),
+            ),
+            ("OPENCARGO_BASE_URL".to_string(), "http://x".to_string()),
+        ];
+        let creds = load_upstream_creds(&[configured, proxy("other")], env).unwrap();
+        let npm = &creds["npm-proxy"];
+        assert!(
+            matches!(&npm.auth, Some(UpstreamAuth::Basic { username, .. }) if username == "u"),
+            "env wins over config"
+        );
+        assert!(npm.dl_allow_private);
+        assert_eq!(npm.token_realms[0].as_str(), "https://auth.example/token");
+        let other = &creds["other"];
+        assert!(other.auth.is_none() && !other.dl_allow_private && other.token_realms.is_empty());
+
+        assert!(load_upstream_creds(
+            &[proxy("npm-proxy")],
+            vec![(
+                "OPENCARGO_UPSTREAM_AUTH_NPM_PROXY".to_string(),
+                "digest:x".to_string()
+            )]
+        )
+        .is_err());
+    }
 
     fn req(uri: &str) -> axum::http::Request<()> {
         axum::http::Request::builder()

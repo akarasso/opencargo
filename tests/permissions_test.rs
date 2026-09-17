@@ -107,16 +107,14 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-prod".to_string(),
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
         ],
         ..Default::default()
