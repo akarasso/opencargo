@@ -441,6 +441,36 @@ async fn test_oci_list_tags() {
         "tags should contain latest: {:?}",
         tag_names
     );
+    assert!(
+        resp_link(&client, &base_url, "/v2/oci-private/myapp/tags/list").await.1.is_none(),
+        "a complete listing carries no Link"
+    );
+
+    // A partial page carries the cursor to the next one.
+    let (body, link) = resp_link(&client, &base_url, "/v2/oci-private/myapp/tags/list?n=1").await;
+    assert_eq!(body["tags"], json!(["latest"]));
+    assert_eq!(
+        link.as_deref(),
+        Some("</v2/oci-private/myapp/tags/list?n=1&last=latest>; rel=\"next\"")
+    );
+    let (body, link) = resp_link(&client, &base_url, "/v2/oci-private/myapp/tags/list?n=1&last=latest").await;
+    assert_eq!(body["tags"], json!(["v1.0"]));
+    assert!(link.is_none(), "the last page has no next");
+}
+
+/// `(body, Link header)` of a tag listing.
+async fn resp_link(client: &reqwest::Client, base_url: &str, path: &str) -> (Value, Option<String>) {
+    let resp = client
+        .get(format!("{base_url}{path}"))
+        .send()
+        .await
+        .expect("list tags request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let link = resp
+        .headers()
+        .get("link")
+        .map(|v| v.to_str().unwrap().to_string());
+    (resp.json().await.expect("invalid json"), link)
 }
 
 #[tokio::test]

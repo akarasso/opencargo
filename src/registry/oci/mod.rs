@@ -28,6 +28,9 @@ use crate::server::AppState;
 
 use upstream::DOCKER_CONTENT_DIGEST;
 
+/// The most tags one listing carries, locally and when asked of an upstream.
+pub const MAX_TAGS: usize = 10_000;
+
 /// `sha256:{hex}` of `data`, the wire form of every OCI digest.
 fn sha256_digest(data: &[u8]) -> String {
     format!("sha256:{:x}", sha2::Sha256::digest(data))

@@ -638,7 +638,7 @@ async fn tags_list_ttl() {
     let up = seed_upstream().await;
     let a = spawn_proxy(&up).await;
     let image = format!("oci-proxy/{IMAGE}");
-    let path = format!("/v2/{UPSTREAM_REPO}/{IMAGE}/tags/list");
+    let path = format!("/v2/{UPSTREAM_REPO}/{IMAGE}/tags/list?n=10000");
 
     for _ in 0..2 {
         assert_eq!(

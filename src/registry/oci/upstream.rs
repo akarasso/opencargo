@@ -7,6 +7,8 @@ use crate::proxy::strategy::{
 };
 use crate::registry::resolve::Upstream;
 
+use super::MAX_TAGS;
+
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
     application/vnd.oci.image.index.v1+json, \
     application/vnd.docker.distribution.manifest.v2+json, \
@@ -88,7 +90,9 @@ impl UpstreamStrategy for OciUpstream {
             format!("/v2/{prefix}/{}/{}", a.name(), a.endpoint())
         };
         url.set_path(&path);
-        url.set_query(None);
+        // The whole list in one page, so the merged view paginates complete.
+        let query = matches!(a, OciArtifact::Tags { .. }).then(|| format!("n={MAX_TAGS}"));
+        url.set_query(query.as_deref());
         Ok(url)
     }
 
@@ -273,7 +277,7 @@ mod tests {
         let tags = OciArtifact::Tags { name: "a".into() };
         assert_eq!(
             OciUpstream.upstream_url(&second, &tags).unwrap().as_str(),
-            "http://127.0.0.1:5000/v2/oci-hosted/a/tags/list"
+            "http://127.0.0.1:5000/v2/oci-hosted/a/tags/list?n=10000"
         );
         assert_eq!(
             OciUpstream.cache_policy(&tags),
