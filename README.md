@@ -197,6 +197,28 @@ cargo publish --registry private
 my-crate = { version = "0.1", registry = "private" }
 ```
 
+A `proxy` repository fronts a sparse index (`upstream = "https://index.crates.io/"`,
+or another opencargo's `http://host:port/cargo-hosted/index`); a `group` merges
+hosted and proxy members into one index, the first member holding a version
+winning. Point cargo at the group and it needs no other registry:
+
+```toml
+[registries.all]
+index = "sparse+http://registry.example.com/cargo-all/index/"
+```
+
+`config.json` is readable without a token even when `anonymous_read = false`,
+so cargo learns from `auth-required` to send the token kept in
+`$CARGO_HOME/credentials.toml` (cargo also wants
+`[registry] global-credential-providers = ["cargo:token"]` in its config for
+such a registry). Downloads are fetched from the upstream's `dl`
+template, verified against the index checksum and cached; a `dl` pointing at a
+private IP literal is refused unless the repository sets `dl_allow_private = true`
+(or `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>=1`), which a proxy over a local
+opencargo needs. When `upstream_auth` is set, a `dl` off the index host is
+refused as well: the credentials go with every upstream request and must not
+follow a `dl` elsewhere; list that host in `token_realms` to allow it.
+
 ### Docker / OCI
 
 ```bash
