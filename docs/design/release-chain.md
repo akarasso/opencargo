@@ -423,6 +423,10 @@ If the second `cosign verify` exits 0, stop: `verify-source` would accept an uns
 
 ## 14. As-built notes (2026-09-17)
 
+Unproven until the first main run after the merge, because the path is `main`-only and the pull-request dry run does not touch it: the scan-to-sign hand-off in `ci.yml` (`image-scan` records the loaded image id, `docker save`, the `image-tar` artifact, `load-image.sh` checking the id after `docker load`, then login, sign and push). `load-image.sh` itself is proven locally (match, wrong id, malformed id). The path fails closed: a mismatch or a failed download blocks the push, so no `sha-<commit>` tag appears and no release can promote it. Expect it as a first-run risk, not a regression.
+
+Fixed after review: `ci.yml` no longer triggers on `master` (`IDENTITY_CI` pins `refs/heads/main`, so a `master` push would have pushed an unsigned `sha-<commit>` before failing); the `image-tar` artifact is kept 7 days so the signing job can be re-run alone after a transient GHCR or Fulcio failure.
+
 Commits on `feat/release-chain`: `ci: pin every action by commit SHA`, `build(release): musl build, smoke and SBOM scripts`, `ci(release): tag-driven release workflow with PR dry run`,
 `ci: sign and attest main images by digest`, `docs: verifying a release, supported versions`, `chore(release): 0.1.0-rc.1`. Differences from sections 1-12:
 

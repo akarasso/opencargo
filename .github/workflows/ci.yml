@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
 
 # Least privilege for the automatically-provided token. Jobs that need more
 # must opt in explicitly.
@@ -112,7 +112,7 @@ jobs:
   image-scan:
     runs-on: ubuntu-latest
     needs: [test, audit]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
+    if: github.ref == 'refs/heads/main'
     timeout-minutes: 45
     # Build and third-party scan hold no packages or id-token permission; the signer gets the image as a file.
     permissions:
@@ -157,7 +157,7 @@ jobs:
           name: image-tar
           path: opencargo-ci.tar
           if-no-files-found: error
-          retention-days: 1
+          retention-days: 7
 
   docker:
     runs-on: ubuntu-latest
