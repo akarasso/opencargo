@@ -1,6 +1,6 @@
 use crate::error::{AppError, AppResult};
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, DEFAULT_MAX_UPSTREAM_BYTES,
+    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, MAX_METADATA_BYTES,
 };
 use crate::registry::resolve::Upstream;
 
@@ -142,7 +142,31 @@ impl UpstreamStrategy for GoUpstream {
                 kind: FileKind::Mod,
                 ..
             } => MAX_MOD_BYTES,
-            _ => DEFAULT_MAX_UPSTREAM_BYTES,
+            _ => MAX_METADATA_BYTES,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn caps_follow_the_artifact() {
+        let file = |kind| GoArtifact::File {
+            module: "m".into(),
+            version: "v1.0.0".into(),
+            kind,
+        };
+        assert_eq!(GoUpstream.max_bytes(&file(FileKind::Zip)), MAX_ZIP_BYTES);
+        assert_eq!(GoUpstream.max_bytes(&file(FileKind::Mod)), MAX_MOD_BYTES);
+        assert_eq!(
+            GoUpstream.max_bytes(&file(FileKind::Info)),
+            MAX_METADATA_BYTES
+        );
+        let list = GoArtifact::List { module: "m".into() };
+        assert_eq!(GoUpstream.max_bytes(&list), MAX_METADATA_BYTES);
+        assert_eq!(GoUpstream.transfer(&list), Transfer::Buffered);
+        assert_eq!(GoUpstream.transfer(&file(FileKind::Zip)), Transfer::Streamed);
     }
 }

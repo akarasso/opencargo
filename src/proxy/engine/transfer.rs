@@ -1,7 +1,6 @@
 use std::future::Future;
 
 use axum::http::{header, HeaderMap, StatusCode};
-use bytes::BytesMut;
 use sha2::{Digest, Sha256};
 
 use crate::db::proxy_cache::{self, CacheEntry, NewEntry};
@@ -20,23 +19,6 @@ pub(super) enum Reply {
     Miss(StatusCode),
     Refused,
     Failed(String),
-}
-
-enum Sink {
-    Buffer(BytesMut),
-    Part(PartFile),
-}
-
-impl Sink {
-    async fn push(&mut self, chunk: &[u8]) -> AppResult<()> {
-        match self {
-            Sink::Buffer(buf) => {
-                buf.extend_from_slice(chunk);
-                Ok(())
-            }
-            Sink::Part(part) => part.write_chunk(chunk).await,
-        }
-    }
 }
 
 struct Body {
@@ -119,8 +101,10 @@ impl ProxyEngine {
         }
     }
 
-    /// Hash, cap and verify the body, then land it under `store_key` by rename.
-    /// The inner `Err` is a mid-body transport failure.
+    /// Hash, cap and verify the body chunk by chunk into a part file, then
+    /// land it under `store_key` by rename: no transfer holds its body in
+    /// memory, `Transfer` only decides the timeout. The inner `Err` is a
+    /// mid-body transport failure.
     async fn read_body<S: UpstreamStrategy>(
         &self,
         s: &S,
@@ -135,10 +119,7 @@ impl ProxyEngine {
             cache_path(member, &s.cache_key(a)),
             uuid::Uuid::new_v4()
         );
-        let mut sink = match s.transfer(a) {
-            Transfer::Buffered => Sink::Buffer(BytesMut::new()),
-            Transfer::Streamed => Sink::Part(PartFile::new(&self.storage, part_rel.clone()).await?),
-        };
+        let mut part = PartFile::new(&self.storage, part_rel).await?;
         let mut hasher = Sha256::new();
         let mut size = 0u64;
         loop {
@@ -154,7 +135,7 @@ impl ProxyEngine {
                 )));
             }
             hasher.update(&chunk);
-            sink.push(&chunk).await?;
+            part.write_chunk(&chunk).await?;
         }
         let sha256 = format!("{:x}", hasher.finalize());
         if s.expected_sha256(a)
@@ -163,14 +144,6 @@ impl ProxyEngine {
             return Err(AppError::BadGateway("upstream body digest mismatch".into()));
         }
         s.verify_headers(a, &headers, &sha256)?;
-        let part = match sink {
-            Sink::Buffer(buf) => {
-                let mut part = PartFile::new(&self.storage, part_rel).await?;
-                part.write_chunk(&buf).await?;
-                part
-            }
-            Sink::Part(part) => part,
-        };
         let path = cache_path(member, &s.store_key(a, &sha256));
         part.commit(&self.storage, &path).await?;
         Ok(Ok(Body {

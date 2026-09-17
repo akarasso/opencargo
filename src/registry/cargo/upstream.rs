@@ -1,6 +1,7 @@
 use crate::error::{AppError, AppResult};
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource,
+    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
+    MAX_METADATA_BYTES,
 };
 use crate::registry::resolve::Upstream;
 
@@ -89,6 +90,13 @@ impl UpstreamStrategy for CargoUpstream {
         match a {
             CargoArtifact::Crate { .. } => Transfer::Streamed,
             _ => Transfer::Buffered,
+        }
+    }
+
+    fn max_bytes(&self, a: &CargoArtifact) -> u64 {
+        match a {
+            CargoArtifact::Crate { .. } => DEFAULT_MAX_UPSTREAM_BYTES,
+            CargoArtifact::Config | CargoArtifact::Index { .. } => MAX_METADATA_BYTES,
         }
     }
 
@@ -290,6 +298,8 @@ mod tests {
         );
         assert_eq!(s.cache_key(&index).key, "mycrate");
         assert_eq!(s.cache_policy(&index), CachePolicy::Ttl(Ttl::Secs(600)));
+        assert_eq!(s.max_bytes(&index), MAX_METADATA_BYTES);
+        assert_eq!(s.max_bytes(&CargoArtifact::Config), MAX_METADATA_BYTES);
         let c = crate_at("http://h/dl");
         assert_eq!(s.cache_key(&c).key, "serde/1.0.0", "one row per crate, any casing");
         assert_eq!(s.cache_policy(&c), CachePolicy::Immutable);

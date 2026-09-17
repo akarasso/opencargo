@@ -4,6 +4,8 @@ use crate::error::AppResult;
 use crate::registry::resolve::Upstream;
 
 pub const DEFAULT_MAX_UPSTREAM_BYTES: u64 = 100 * 1024 * 1024;
+/// Index lines, version lists, tag lists: far below this in practice.
+pub const MAX_METADATA_BYTES: u64 = 16 * 1024 * 1024;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Ttl {
@@ -17,6 +19,9 @@ pub enum CachePolicy {
     Ttl(Ttl),
 }
 
+/// Every body is written to disk as it arrives; `Buffered` only bounds the
+/// whole transfer by `Timeouts::buffered_total`, for the small documents a
+/// request waits on before answering.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Transfer {
     Buffered,

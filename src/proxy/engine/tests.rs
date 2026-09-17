@@ -386,6 +386,27 @@ async fn stale_pointer_without_target_regets_without_if_none_match() {
 }
 
 #[tokio::test]
+async fn buffered_bodies_land_on_disk_as_they_arrive() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/drip".to_string();
+    let strat = Strat::default();
+    let fetch = engine.fetch(&strat, &fx.up, fx.member(), &art);
+    tokio::pin!(fetch);
+    let mid_transfer = tokio::time::timeout(Duration::from_millis(500), &mut fetch).await;
+    assert!(mid_transfer.is_err(), "the drip is still going");
+    let parts: Vec<_> = fx
+        .files()
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains(".part-"))
+        .collect();
+    assert_eq!(parts.len(), 1, "a buffered body is on disk, not in memory");
+    let done = found(fetch.await);
+    assert_eq!(done.entry.size, 20);
+    assert!(fx.files().iter().all(|p| !p.to_string_lossy().contains(".part-")));
+}
+
+#[tokio::test]
 async fn buffered_total_timeout_is_502() {
     let fx = Fx::new().await;
     let engine = fx.engine(Timeouts {

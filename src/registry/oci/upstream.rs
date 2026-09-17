@@ -3,7 +3,7 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use crate::error::{AppError, AppResult};
 use crate::proxy::auth::is_docker_hub_host;
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Classified, Transfer, Ttl, UpstreamStrategy, DEFAULT_MAX_UPSTREAM_BYTES,
+    CacheKey, CachePolicy, Classified, Transfer, Ttl, UpstreamStrategy, MAX_METADATA_BYTES,
 };
 use crate::registry::resolve::Upstream;
 
@@ -158,7 +158,7 @@ impl UpstreamStrategy for OciUpstream {
         match a {
             OciArtifact::Blob { .. } => MAX_BLOB_BYTES,
             OciArtifact::Manifest { .. } | OciArtifact::Tag { .. } => MAX_MANIFEST_BYTES,
-            OciArtifact::Tags { .. } => DEFAULT_MAX_UPSTREAM_BYTES,
+            OciArtifact::Tags { .. } => MAX_METADATA_BYTES,
         }
     }
 
@@ -283,5 +283,6 @@ mod tests {
             OciUpstream.cache_policy(&tags),
             CachePolicy::Ttl(Ttl::Secs(600))
         );
+        assert_eq!(OciUpstream.max_bytes(&tags), MAX_METADATA_BYTES);
     }
 }
