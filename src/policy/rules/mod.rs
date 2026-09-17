@@ -6,7 +6,7 @@ pub mod typosquat;
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
-use serde::Deserialize;
+use serde::{Deserialize, Deserializer};
 
 use crate::telemetry::vulns::severity::Severity;
 use crate::telemetry::vulns::VulnScanner;
@@ -21,10 +21,22 @@ use osv_severity::{OsvMemo, OsvSeverity};
 #[serde(default, deny_unknown_fields)]
 pub struct PolicyConfig {
     pub min_release_age: Option<Age>,
+    #[serde(deserialize_with = "threshold")]
     pub osv_severity: Option<Severity>,
     pub install_scripts: bool,
     pub typosquat: bool,
     pub fetch_missing_facts: bool,
+}
+
+/// `Severity` deserialises `unknown` too, the level of an advisory
+/// without a score; as a threshold it would flag every advisory.
+fn threshold<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Severity>, D::Error> {
+    match Option::<Severity>::deserialize(d)? {
+        Some(Severity::Unknown) => Err(serde::de::Error::custom(
+            "osv_severity: expected one of low, medium, high, critical",
+        )),
+        level => Ok(level),
+    }
 }
 
 impl Default for PolicyConfig {
@@ -143,6 +155,19 @@ mod tests {
         assert_eq!(verdicts.len(), 1);
         assert_eq!(verdicts[0].as_ref().unwrap().rule, "typosquat");
         assert!(evaluate_all(&rules, &PolicyConfig::default(), &r, Utc::now()).is_empty());
+    }
+
+    #[test]
+    fn config_rejects_unknown_severity() {
+        let err = toml::from_str::<PolicyConfig>(r#"osv_severity = "unknown""#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("low, medium, high, critical"), "{err}");
+        assert!(toml::from_str::<PolicyConfig>(r#"osv_severity = "severe""#).is_err());
+        let high: PolicyConfig = toml::from_str(r#"osv_severity = "high""#).unwrap();
+        assert_eq!(high.osv_severity, Some(Severity::High));
+        let none: PolicyConfig = toml::from_str("typosquat = true").unwrap();
+        assert_eq!(none.osv_severity, None);
     }
 
     #[test]

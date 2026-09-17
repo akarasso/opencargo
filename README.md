@@ -352,7 +352,7 @@ max_concurrency = 8
 
 [policy.npm-proxy]                 # per proxy repository, all rules off by default
 min_release_age = "48h"            # Ns | Nm | Nh | Nd
-osv_severity = "high"              # needs vuln_scan.enabled
+osv_severity = "high"              # low | medium | high | critical; needs vuln_scan.enabled
 install_scripts = true             # npm only
 typosquat = true                   # not for OCI
 fetch_missing_facts = true         # false: cache-only facts, no recorder-initiated upstream request
