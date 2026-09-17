@@ -1,0 +1,393 @@
+pub mod age;
+pub mod facts;
+mod memo;
+pub mod pacer;
+pub mod rules;
+pub mod startup;
+pub mod store;
+mod writer;
+
+use std::collections::{HashMap, VecDeque};
+use std::future::Future;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
+
+use chrono::{DateTime, Utc};
+use serde::Serialize;
+use sqlx::SqlitePool;
+use tokio::sync::mpsc::{self, error::TrySendError};
+use tokio::sync::Semaphore;
+use tracing::warn;
+
+use crate::auth::middleware::AuthUser;
+use crate::db::kinds::Format;
+use crate::db::Repository;
+use crate::events::EventBus;
+use crate::proxy::engine::Cached;
+use crate::proxy::ProxyEngine;
+use crate::registry::resolve::{CacheRepo, Cx, Upstream};
+
+pub use age::Age;
+use facts::NpmSlot;
+use memo::Memo;
+use pacer::Pacer;
+use rules::{PolicyConfig, Rule};
+use writer::Notify;
+
+pub const QUEUE: usize = 4096;
+pub const INFLIGHT: usize = 64;
+pub const BATCH: usize = 64;
+const NPM_MEMO: usize = 1024;
+const WARN_EVERY: Duration = Duration::from_secs(60);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ActorKind {
+    Token,
+    User,
+    Static,
+    Anonymous,
+}
+
+impl ActorKind {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            ActorKind::Token => "token",
+            ActorKind::User => "user",
+            ActorKind::Static => "static",
+            ActorKind::Anonymous => "anonymous",
+        }
+    }
+}
+
+/// `name` is display only; `user_id` is the identity.
+#[derive(Debug, Clone, Serialize)]
+pub struct Actor {
+    pub name: String,
+    pub kind: ActorKind,
+    pub user_id: Option<i64>,
+}
+
+impl Actor {
+    pub fn of(auth: Option<&AuthUser>) -> Self {
+        match auth {
+            Some(AuthUser {
+                token_name: Some(name),
+                user_id,
+                ..
+            }) => Self {
+                name: name.clone(),
+                kind: ActorKind::Token,
+                user_id: *user_id,
+            },
+            Some(AuthUser {
+                user_id: Some(id),
+                username,
+                ..
+            }) => Self {
+                name: username.clone(),
+                kind: ActorKind::User,
+                user_id: Some(*id),
+            },
+            Some(user) => Self {
+                name: user.username.clone(),
+                kind: ActorKind::Static,
+                user_id: None,
+            },
+            None => Self {
+                name: "anonymous".to_string(),
+                kind: ActorKind::Anonymous,
+                user_id: None,
+            },
+        }
+    }
+}
+
+/// Values copied from the served `Cached`, never the handle; `Oci.served`
+/// is the child row the writer attaches to a released index.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum Source {
+    Npm {
+        filename: String,
+        digest: Option<String>,
+    },
+    Cargo {
+        cksum: String,
+    },
+    Go {
+        digest: Option<String>,
+    },
+    Oci {
+        body: Cached,
+        served: Option<Cached>,
+    },
+}
+
+/// One served artifact on its way to the writer; `name` is the client's.
+#[derive(Debug)]
+pub struct Pending {
+    pub requested_repo: String,
+    pub member: Repository,
+    pub upstream: Upstream,
+    pub format: Format,
+    pub name: String,
+    pub version: Option<String>,
+    pub actor: Actor,
+    pub source: Source,
+}
+
+#[derive(Debug, Clone)]
+pub struct Resolution {
+    pub requested_repo: String,
+    pub member_repo: String,
+    pub format: Format,
+    pub name: String,
+    pub version: Option<String>,
+    pub digest: Option<String>,
+    pub actor: Actor,
+    pub published_at: Option<DateTime<Utc>>,
+    pub facts: Facts,
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct Facts {
+    pub install_scripts: Option<bool>,
+    pub date_source: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Pass,
+    WouldBlock,
+    Unknown,
+    NotApplicable,
+}
+
+impl Verdict {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "pass",
+            Verdict::WouldBlock => "would_block",
+            Verdict::Unknown => "unknown",
+            Verdict::NotApplicable => "not_applicable",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RuleVerdict {
+    pub rule: &'static str,
+    pub verdict: Verdict,
+    pub reason: String,
+}
+
+/// Timing knobs; tests shrink them, production runs the defaults.
+#[derive(Clone, Copy, Debug)]
+pub struct Tuning {
+    pub child_ttl: Duration,
+    pub pacer_period: Duration,
+    pub pacer_cooldown: Duration,
+    pub gather_timeout: Duration,
+    pub notify_period: Duration,
+    pub refresh_floor: Duration,
+}
+
+impl Default for Tuning {
+    fn default() -> Self {
+        Self {
+            child_ttl: Duration::from_secs(60),
+            pacer_period: Duration::from_secs(1),
+            pacer_cooldown: Duration::from_secs(60),
+            gather_timeout: Duration::from_secs(15),
+            notify_period: Duration::from_millis(500),
+            refresh_floor: Duration::from_secs(300),
+        }
+    }
+}
+
+impl Tuning {
+    /// The pacer's waiting-line cap: the waiters a lane can serve within
+    /// one `gather_timeout`.
+    pub fn pacer_waiters(&self) -> usize {
+        let period = self.pacer_period.as_millis().max(1);
+        ((self.gather_timeout.as_millis() / period) as usize).max(1)
+    }
+}
+
+pub(crate) type ChildKey = (i64, String, String);
+
+pub(crate) struct Shared {
+    pub db: SqlitePool,
+    pub proxy: ProxyEngine,
+    pub rules: Vec<Box<dyn Rule>>,
+    pub config: HashMap<String, PolicyConfig>,
+    pub events: Arc<EventBus>,
+    pub recent_children: Mutex<HashMap<ChildKey, VecDeque<(u64, Instant)>>>,
+    pub parked: Mutex<HashMap<u64, (Pending, Instant)>>,
+    pub seq: AtomicU64,
+    pub npm_facts: Mutex<Memo<(i64, String), NpmSlot>>,
+    pub notify: Mutex<Notify>,
+    pub inflight: Arc<Semaphore>,
+    pub cargo_pacer: Pacer,
+    pub tuning: Tuning,
+    pub dropped: AtomicU64,
+    warned_at: Mutex<Option<Instant>>,
+}
+
+impl Shared {
+    pub fn config_for(&self, member: &str) -> PolicyConfig {
+        self.config.get(member).cloned().unwrap_or_default()
+    }
+
+    /// The writer's tick has OCI work while an index is parked or a child
+    /// key is alive.
+    pub fn holds_oci_state(&self) -> bool {
+        !self.parked.lock().unwrap().is_empty() || !self.recent_children.lock().unwrap().is_empty()
+    }
+
+    fn dropped(&self, why: &str) {
+        self.dropped.fetch_add(1, Ordering::Relaxed);
+        crate::telemetry::record_policy_dropped();
+        let mut warned = self.warned_at.lock().unwrap();
+        if warned.is_none_or(|at| at.elapsed() >= WARN_EVERY) {
+            *warned = Some(Instant::now());
+            warn!(
+                dropped = self.dropped.load(Ordering::Relaxed),
+                "policy event dropped: {why}"
+            );
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct PolicyEngine {
+    tx: mpsc::Sender<Pending>,
+    shared: Arc<Shared>,
+}
+
+impl PolicyEngine {
+    /// Builds the channel and spawns the writer; always called under a runtime.
+    pub fn new(
+        db: SqlitePool,
+        config: &HashMap<String, PolicyConfig>,
+        events: Arc<EventBus>,
+        proxy: ProxyEngine,
+    ) -> Self {
+        Self::new_tuned(db, config, events, proxy, Tuning::default())
+    }
+
+    #[doc(hidden)]
+    pub fn new_tuned(
+        db: SqlitePool,
+        config: &HashMap<String, PolicyConfig>,
+        events: Arc<EventBus>,
+        proxy: ProxyEngine,
+        tuning: Tuning,
+    ) -> Self {
+        let (engine, writer) = Self::unspawned(db, config, events, proxy, tuning);
+        tokio::spawn(writer);
+        engine
+    }
+
+    /// The engine and its writer future, not spawned: unit tests drive it.
+    pub(crate) fn unspawned(
+        db: SqlitePool,
+        config: &HashMap<String, PolicyConfig>,
+        events: Arc<EventBus>,
+        proxy: ProxyEngine,
+        tuning: Tuning,
+    ) -> (Self, impl Future<Output = ()>) {
+        let (tx, rx) = mpsc::channel(QUEUE);
+        let shared = Arc::new(Shared {
+            db,
+            proxy,
+            rules: rules::all_rules(),
+            config: config.clone(),
+            events,
+            recent_children: Mutex::new(HashMap::new()),
+            parked: Mutex::new(HashMap::new()),
+            seq: AtomicU64::new(0),
+            npm_facts: Mutex::new(Memo::new(NPM_MEMO)),
+            notify: Mutex::new(Notify::default()),
+            inflight: Arc::new(Semaphore::new(INFLIGHT)),
+            cargo_pacer: Pacer::default(),
+            tuning,
+            dropped: AtomicU64::new(0),
+            warned_at: Mutex::new(None),
+        });
+        let writer = writer::run_writer(rx, shared.clone());
+        (Self { tx, shared }, writer)
+    }
+
+    /// The leaves' gate: a borrow, no clone, before anything else happens.
+    pub fn records(&self, member: &str) -> bool {
+        self.shared
+            .config
+            .get(member)
+            .is_some_and(|cfg| !cfg.is_empty())
+    }
+
+    pub fn config_for(&self, member: &str) -> PolicyConfig {
+        self.shared.config_for(member)
+    }
+
+    /// Never awaits: a full queue drops and counts the event.
+    pub fn record(&self, p: Pending) {
+        match self.tx.try_send(p) {
+            Ok(()) => {}
+            Err(TrySendError::Full(_)) => self.shared.dropped("queue full"),
+            Err(TrySendError::Closed(_)) => self.shared.dropped("writer gone"),
+        }
+    }
+
+    pub fn dropped(&self) -> u64 {
+        self.shared.dropped.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn shared(&self) -> &Arc<Shared> {
+        &self.shared
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_capacity(&self) -> usize {
+        self.tx.capacity()
+    }
+}
+
+/// The one line each proxy leaf adds over its `Found(cached)`. Returns at
+/// once unless the member records; only then clones member and upstream
+/// and runs `source`.
+pub fn record(
+    cx: &Cx<'_>,
+    member: CacheRepo<'_>,
+    up: &Upstream,
+    format: Format,
+    name: &str,
+    version: Option<String>,
+    source: impl FnOnce() -> Source,
+) {
+    let engine = &cx.state.policy;
+    if !engine.records(&member.0.name) {
+        return;
+    }
+    engine.record(Pending {
+        requested_repo: cx.url.0.to_string(),
+        member: member.0.clone(),
+        upstream: up.clone(),
+        format,
+        name: name.to_string(),
+        version,
+        actor: Actor::of(cx.auth),
+        source: source(),
+    });
+}
+
+#[cfg(test)]
+pub(crate) mod testing;
+
+#[cfg(test)]
+mod tests;

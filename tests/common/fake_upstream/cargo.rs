@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -22,16 +23,30 @@ pub struct Hit {
     pub authorization: Option<String>,
 }
 
+/// One `/api/v1/crates/{name}/{version}` request: when it started and
+/// ended, and the `User-Agent` it carried.
+#[derive(Clone, Debug)]
+pub struct ApiHit {
+    pub path: String,
+    pub started: Instant,
+    pub ended: Instant,
+    pub user_agent: Option<String>,
+}
+
 #[derive(Default)]
 struct Script {
     dl: String,
     lines: HashMap<String, Vec<String>>,
     files: Vec<(String, String, Vec<u8>)>,
+    created_at: HashMap<(String, String), String>,
+    api_status: u16,
+    api_latency: Duration,
 }
 
 #[derive(Clone)]
 struct Shared {
     hits: Arc<Mutex<Vec<Hit>>>,
+    api_hits: Arc<Mutex<Vec<ApiHit>>>,
     script: Arc<Mutex<Script>>,
 }
 
@@ -94,6 +109,27 @@ impl FakeIndex {
             .push((name.to_string(), version.to_string(), bytes.to_vec()));
     }
 
+    /// `GET /api/v1/crates/{name}/{version}` answers `version.created_at`.
+    pub fn set_created_at(&self, name: &str, version: &str, created_at: &str) {
+        self.shared.script.lock().unwrap().created_at.insert(
+            (name.to_string(), version.to_string()),
+            created_at.to_string(),
+        );
+    }
+
+    /// Every version API request answers this status instead (200 restores).
+    pub fn set_api_status(&self, status: u16) {
+        self.shared.script.lock().unwrap().api_status = status;
+    }
+
+    pub fn set_api_latency(&self, latency: Duration) {
+        self.shared.script.lock().unwrap().api_latency = latency;
+    }
+
+    pub fn api_hits(&self) -> Vec<ApiHit> {
+        self.shared.api_hits.lock().unwrap().clone()
+    }
+
     /// An index file for `name` that lists no version at all.
     pub fn add_empty_index(&self, name: &str) {
         self.shared
@@ -145,8 +181,10 @@ pub async fn start() -> FakeIndex {
     let base_url = format!("http://{addr}");
     let shared = Shared {
         hits: Arc::new(Mutex::new(Vec::new())),
+        api_hits: Arc::new(Mutex::new(Vec::new())),
         script: Arc::new(Mutex::new(Script {
             dl: format!("{base_url}/dl"),
+            api_status: 200,
             ..Default::default()
         })),
     };
@@ -163,8 +201,9 @@ async fn serve(State(shared): State<Shared>, req: Request) -> Response {
         .path_and_query()
         .map(|p| p.to_string())
         .unwrap_or_else(|| "/".to_string());
+    let headers = req.headers().clone();
     let header_value = |name: header::HeaderName| {
-        req.headers()
+        headers
             .get(name)
             .and_then(|v| v.to_str().ok())
             .map(String::from)
@@ -175,9 +214,13 @@ async fn serve(State(shared): State<Shared>, req: Request) -> Response {
         if_none_match: if_none_match.clone(),
         authorization: header_value(header::AUTHORIZATION),
     });
+    if let Some(rest) = path.strip_prefix("/api/v1/crates/") {
+        return version_api(&shared, &path, rest, header_value(header::USER_AGENT)).await;
+    }
     let script = shared.script.lock().unwrap();
     if path == "/index/config.json" {
-        return axum::Json(json!({ "dl": script.dl, "api": "" })).into_response();
+        let api = script.dl.trim_end_matches("/dl").to_string();
+        return axum::Json(json!({ "dl": script.dl, "api": api })).into_response();
     }
     if let Some(name) = path
         .strip_prefix("/index/")
@@ -202,6 +245,45 @@ async fn serve(State(shared): State<Shared>, req: Request) -> Response {
         };
     }
     StatusCode::NOT_FOUND.into_response()
+}
+
+/// `{name}/{version}` -> `{"version": {"created_at": ..}}`, paced by the
+/// scripted latency and recorded with its start and end.
+async fn version_api(
+    shared: &Shared,
+    path: &str,
+    rest: &str,
+    user_agent: Option<String>,
+) -> Response {
+    let started = Instant::now();
+    let (status, created_at, latency) = {
+        let script = shared.script.lock().unwrap();
+        let created_at = rest
+            .split_once('/')
+            .and_then(|(name, version)| {
+                script
+                    .created_at
+                    .get(&(name.to_string(), version.to_string()))
+            })
+            .cloned();
+        (script.api_status, created_at, script.api_latency)
+    };
+    tokio::time::sleep(latency).await;
+    shared.api_hits.lock().unwrap().push(ApiHit {
+        path: path.to_string(),
+        started,
+        ended: Instant::now(),
+        user_agent,
+    });
+    let status = StatusCode::from_u16(status).expect("valid status");
+    match (status, created_at, rest.split_once('/')) {
+        (StatusCode::OK, Some(created_at), Some((name, version))) => axum::Json(json!({
+            "version": { "crate": name, "num": version, "created_at": created_at }
+        }))
+        .into_response(),
+        (StatusCode::OK, _, _) => StatusCode::NOT_FOUND.into_response(),
+        (other, _, _) => other.into_response(),
+    }
 }
 
 fn index_response(lines: &[String], if_none_match: Option<&str>) -> Response {

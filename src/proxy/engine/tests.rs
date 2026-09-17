@@ -670,3 +670,90 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
         "a digest-addressed body may be shared and stays for the sweep"
     );
 }
+
+#[tokio::test]
+async fn peek_never_hits_upstream() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let (strat, art) = (Strat::default(), "art/x".to_string());
+    assert!(engine.peek(&strat, fx.member(), &art).await.unwrap().is_none());
+    assert!(fx.hits().is_empty(), "a cold peek asks nobody");
+
+    let first = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    sqlx::query("UPDATE proxy_cache_entries SET last_used_at = datetime('now', '-1 day')")
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+    let before = fx.row("t-item", "art/x").await.unwrap();
+    let peeked = engine.peek(&strat, fx.member(), &art).await.unwrap().unwrap();
+    assert_eq!(peeked.entry.id, first.entry.id);
+    assert!(!peeked.stale);
+    let after = fx.row("t-item", "art/x").await.unwrap();
+    assert_eq!(after.last_used_at, before.last_used_at, "no row touched");
+
+    fx.expire().await;
+    let stale = engine.peek(&strat, fx.member(), &art).await.unwrap().unwrap();
+    assert!(stale.stale, "a stale body is still a body");
+    assert_eq!(fx.hits().len(), 1);
+
+    fx.set(|s| s.gone = true);
+    let missing = "art/missing".to_string();
+    assert!(matches!(
+        engine.fetch(&strat, &fx.up, fx.member(), &missing).await,
+        Ok(Outcome::NotFound)
+    ));
+    assert!(
+        engine.peek(&strat, fx.member(), &missing).await.unwrap().is_none(),
+        "a negative row is no body"
+    );
+    fx.set(|s| s.gone = false);
+    let tag = "art/tag".to_string();
+    let body = found(engine.fetch(&pointer_strat(), &fx.up, fx.member(), &tag).await);
+    let via_pointer = engine.peek(&pointer_strat(), fx.member(), &tag).await.unwrap().unwrap();
+    assert_eq!(via_pointer.entry.id, body.entry.id, "a pointer peeks its target");
+    assert_eq!(fx.hits().len(), 3);
+}
+
+#[tokio::test]
+async fn refresh_never_records_a_miss() {
+    let fx = Fx::new().await;
+    fx.set(|s| s.etag = Some("\"v1\"".into()));
+    let engine = fx.engine(timeouts());
+    let (strat, art) = (Strat::default(), "art/x".to_string());
+    let first = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    let path = first.entry.storage_path.clone().unwrap();
+
+    let same = found(engine.refresh(&strat, &fx.up, fx.member(), &art).await);
+    assert_eq!(same.entry.id, first.entry.id);
+    let hits = fx.hits();
+    assert_eq!(hits.len(), 2, "a fresh row is refreshed conditionally, never a hit");
+    assert_eq!(
+        hits[1].2.get(header::IF_NONE_MATCH).unwrap(),
+        "\"v1\"",
+        "the request carried the row's ETag"
+    );
+
+    fx.set(|s| s.gone = true);
+    let res = engine.refresh(&strat, &fx.up, fx.member(), &art).await;
+    assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
+    fx.set(|s| {
+        s.gone = false;
+        s.fail = true;
+    });
+    let res = engine.refresh(&strat, &fx.up, fx.member(), &art).await;
+    assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
+    let row = fx.row("t-item", "art/x").await.unwrap();
+    assert_eq!(row.status, 200, "no negative row");
+    assert!(fx.storage.exists(&path).await.unwrap(), "no file deleted");
+    fx.set(|s| s.fail = false);
+    let served = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    assert_eq!(served.entry.id, first.entry.id);
+    assert_eq!(fx.hits().len(), 4, "the fresh row still serves without a request");
+
+    fx.set(|s| s.gone = true);
+    fx.expire().await;
+    let res = engine.fetch(&strat, &fx.up, fx.member(), &art).await;
+    assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
+    let row = fx.row("t-item", "art/x").await.unwrap();
+    assert_eq!(row.status, 404, "the same route under fetch writes the 404 row");
+}

@@ -4,6 +4,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod events;
+pub mod policy;
 pub mod proxy;
 pub mod registry;
 pub mod server;

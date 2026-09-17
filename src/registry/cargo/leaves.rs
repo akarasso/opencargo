@@ -1,6 +1,8 @@
 use serde_json::{json, Value};
 
+use crate::db::kinds::Format;
 use crate::error::{AppError, AppResult};
+use crate::policy::{self, Source};
 use crate::proxy::{Payload, ProxyEngine};
 use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
 
@@ -96,9 +98,14 @@ impl Leaf for CrateLeaf {
             name: self.name.clone(),
             version: self.version.clone(),
             dl,
-            cksum,
+            cksum: cksum.clone(),
         };
         let cached = engine.fetch(&CargoUpstream, up, member, &artifact).await?;
+        if let Outcome::Found(_) = &cached {
+            policy::record(cx, member, up, Format::Cargo, &self.name, Some(self.version.clone()), || {
+                Source::Cargo { cksum }
+            });
+        }
         Ok(cached.into_payload())
     }
 }

@@ -1,8 +1,10 @@
+use std::collections::HashMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::policy::rules::PolicyConfig;
 use crate::proxy::UpstreamAuth;
 
 // ---------------------------------------------------------------------------
@@ -23,6 +25,9 @@ pub struct Config {
     pub webhooks: Vec<WebhookConfig>,
     #[serde(default)]
     pub vuln_scan: VulnScanConfig,
+    /// Policy rules per proxy repository name; a member with none on records nothing.
+    #[serde(default)]
+    pub policy: HashMap<String, PolicyConfig>,
 }
 
 // ---------------------------------------------------------------------------

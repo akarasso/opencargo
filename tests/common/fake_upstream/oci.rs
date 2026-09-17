@@ -16,6 +16,7 @@ use serde_json::json;
 use sha2::Digest;
 
 pub const PATTERN_CHUNK: usize = 1024 * 1024;
+pub const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
 const TRICKLE_CHUNK: &[u8] = b"drip";
 
 #[derive(Clone, Debug)]
@@ -165,6 +166,22 @@ impl FakeRegistry {
             image.tags.insert(tag.to_string(), digest.clone());
         }
         digest
+    }
+
+    /// An OCI image index over `children` (`(digest, architecture)`), by
+    /// tag; returns its digest.
+    pub fn add_index(&self, name: &str, tag: Option<&str>, children: &[(&str, &str)]) -> String {
+        let index = json!({
+            "schemaVersion": 2,
+            "mediaType": INDEX_TYPE,
+            "manifests": children.iter().map(|(digest, arch)| json!({
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": digest,
+                "size": 0,
+                "platform": { "architecture": arch, "os": "linux" }
+            })).collect::<Vec<_>>()
+        });
+        self.add_manifest(name, tag, &serde_json::to_vec(&index).unwrap(), INDEX_TYPE)
     }
 
     /// Register `blob` under its own digest.

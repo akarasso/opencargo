@@ -64,6 +64,21 @@ struct Stale {
     target: CacheEntry,
 }
 
+#[allow(clippy::large_enum_variant)]
+enum Lookup {
+    Fresh(Cached),
+    Negative,
+    Stale(Stale),
+    Cold,
+}
+
+/// Whether an upstream miss is remembered as a negative row or ignored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Miss {
+    Record,
+    Ignore,
+}
+
 impl ProxyEngine {
     pub fn new(
         storage: Arc<FilesystemStorage>,
@@ -97,30 +112,113 @@ impl ProxyEngine {
         a: &S::Artifact,
     ) -> AppResult<Outcome<Cached>> {
         let key = s.cache_key(a);
-        let lock_key = format!("{}/{}/{}", member.0.id, key.kind, key.key);
-        let _guard = self
-            .inflight
-            .acquire(&lock_key, self.timeouts.singleflight_wait)
-            .await;
-        let mut stale = None;
-        if let Some((row, fresh)) =
-            proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?
-        {
-            if row.status != 200 {
-                if fresh {
-                    crate::telemetry::record_cache_hit(&member.0.name);
-                    return Ok(Outcome::NotFound);
-                }
-            } else if let Some(target) = self.resolve_row(s, a, row.clone()).await {
-                if fresh {
-                    crate::telemetry::record_cache_hit(&member.0.name);
-                    return Ok(Outcome::Found(self.hit(&row, target).await?));
-                }
-                stale = Some(Stale { row, target });
+        let _guard = self.lock(member, &key).await;
+        let stale = match self.lookup(s, member, a, &key, false).await? {
+            Lookup::Fresh(cached) => {
+                crate::telemetry::record_cache_hit(&member.0.name);
+                return Ok(Outcome::Found(cached));
             }
-        }
+            Lookup::Negative => {
+                crate::telemetry::record_cache_hit(&member.0.name);
+                return Ok(Outcome::NotFound);
+            }
+            Lookup::Stale(stale) => Some(stale),
+            Lookup::Cold => None,
+        };
         crate::telemetry::record_cache_miss(&member.0.name);
         let reply = self.exchange(s, up, member, a, stale.as_ref()).await;
+        self.settle(s, member, a, reply, stale, Miss::Record).await
+    }
+
+    /// A conditional re-fetch of a `status 200` row whatever its freshness,
+    /// read-only on failure: no negative row, no file deleted. For a
+    /// recorder that must never change what clients are served.
+    pub async fn refresh<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+    ) -> AppResult<Outcome<Cached>> {
+        let key = s.cache_key(a);
+        let _guard = self.lock(member, &key).await;
+        let stale = match self.lookup(s, member, a, &key, true).await? {
+            Lookup::Fresh(cached) => return Ok(Outcome::Found(cached)),
+            Lookup::Negative => return Ok(Outcome::NotFound),
+            Lookup::Stale(stale) => Some(stale),
+            Lookup::Cold => None,
+        };
+        let reply = self.exchange(s, up, member, a, stale.as_ref()).await;
+        self.settle(s, member, a, reply, stale, Miss::Ignore).await
+    }
+
+    /// The cached body, fresh or stale, with no upstream request and no
+    /// row touched; `None` when there is none on disk.
+    pub async fn peek<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+    ) -> AppResult<Option<Cached>> {
+        let key = s.cache_key(a);
+        let Some((row, fresh)) =
+            proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?
+        else {
+            return Ok(None);
+        };
+        if row.status != 200 {
+            return Ok(None);
+        }
+        Ok(self.resolve_row(s, a, row).await.map(|entry| Cached {
+            entry,
+            stale: !fresh,
+        }))
+    }
+
+    async fn lock(&self, member: CacheRepo<'_>, key: &CacheKey) -> Option<super::singleflight::Guard> {
+        let lock_key = format!("{}/{}/{}", member.0.id, key.kind, key.key);
+        self.inflight
+            .acquire(&lock_key, self.timeouts.singleflight_wait)
+            .await
+    }
+
+    /// What the row says before any request; `force_stale` turns a fresh
+    /// `200` row into a conditional request instead of a hit.
+    async fn lookup<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        key: &CacheKey,
+        force_stale: bool,
+    ) -> AppResult<Lookup> {
+        let Some((row, fresh)) =
+            proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?
+        else {
+            return Ok(Lookup::Cold);
+        };
+        if row.status != 200 {
+            return Ok(if fresh { Lookup::Negative } else { Lookup::Cold });
+        }
+        let Some(target) = self.resolve_row(s, a, row.clone()).await else {
+            return Ok(Lookup::Cold);
+        };
+        if fresh && !force_stale {
+            return Ok(Lookup::Fresh(self.hit(&row, target).await?));
+        }
+        Ok(Lookup::Stale(Stale { row, target }))
+    }
+
+    async fn settle<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        reply: AppResult<Reply>,
+        stale: Option<Stale>,
+        miss: Miss,
+    ) -> AppResult<Outcome<Cached>> {
+        let key = s.cache_key(a);
         match reply {
             Ok(Reply::NotModified) => match stale {
                 Some(Stale { row, target }) => {
@@ -143,21 +241,26 @@ impl ProxyEngine {
                 entry: *entry,
                 stale: false,
             })),
-            Ok(Reply::Miss(status)) => {
+            Ok(Reply::Miss(status)) if miss == Miss::Record => {
                 self.record_miss(member, &key, status, stale.as_ref()).await?;
                 Ok(Outcome::NotFound)
             }
-            Ok(Reply::Refused) => Ok(Outcome::NotFound),
+            Ok(Reply::Miss(_)) | Ok(Reply::Refused) => Ok(Outcome::NotFound),
             Ok(Reply::Failed(why)) => match stale {
-                Some(Stale { target, .. }) => {
-                    warn!(key = %lock_key, error = %why, "upstream failed; serving stale cache");
+                Some(Stale { target, .. }) if miss == Miss::Record => {
+                    warn!(key = %key.key, error = %why, "upstream failed; serving stale cache");
                     Ok(Outcome::Found(Cached {
                         entry: target,
                         stale: true,
                     }))
                 }
+                Some(_) => Ok(Outcome::NotFound),
                 None => Err(AppError::BadGateway(why)),
             },
+            Err(e) if miss == Miss::Ignore => {
+                warn!(key = %key.key, error = %e, "refresh failed; cache left as is");
+                Ok(Outcome::NotFound)
+            }
             Err(e) => Err(e),
         }
     }
@@ -358,6 +461,6 @@ impl ProxyEngine {
 }
 
 #[cfg(test)]
-mod fixture;
+pub(crate) mod fixture;
 #[cfg(test)]
 mod tests;

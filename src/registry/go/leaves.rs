@@ -1,8 +1,10 @@
 use bytes::Bytes;
 use serde_json::Value;
 
+use crate::db::kinds::Format;
 use crate::db::{Package, Version};
 use crate::error::{AppError, AppResult};
+use crate::policy::{self, Source};
 use crate::proxy::Payload;
 use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
 
@@ -169,6 +171,14 @@ impl Leaf for FileLeaf {
             .proxy
             .fetch(&GoUpstream, up, member, &artifact)
             .await?;
+        if let (Outcome::Found(c), FileKind::Zip) = (&cached, self.kind) {
+            let version = Some(unescape(&self.version));
+            policy::record(cx, member, up, Format::Go, &unescape(&self.module), version, || {
+                Source::Go {
+                    digest: c.entry.digest.clone(),
+                }
+            });
+        }
         Ok(cached.into_payload())
     }
 }

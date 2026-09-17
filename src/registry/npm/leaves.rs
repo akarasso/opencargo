@@ -1,6 +1,8 @@
 use serde_json::Value;
 
+use crate::db::kinds::Format;
 use crate::error::{AppError, AppResult};
+use crate::policy::{self, Source};
 use crate::proxy::Payload;
 use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
 
@@ -93,6 +95,12 @@ impl Leaf for TarballLeaf {
             filename: self.filename.clone(),
         };
         let cached = cx.state.proxy.fetch(&NpmUpstream, up, member, &artifact).await?;
+        if let Outcome::Found(c) = &cached {
+            policy::record(cx, member, up, Format::Npm, &self.name, None, || Source::Npm {
+                filename: self.filename.clone(),
+                digest: c.entry.digest.clone(),
+            });
+        }
         Ok(cached.into_payload())
     }
 }

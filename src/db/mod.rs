@@ -12,7 +12,7 @@ pub mod proxy_cache;
 // Row types
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, sqlx::FromRow)]
+#[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Repository {
     pub id: i64,
     pub name: String,
@@ -132,6 +132,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 
     let sql13 = include_str!("migrations/013_proxy_cache_entries.sql");
     sqlx::raw_sql(sql13).execute(pool).await?;
+
+    let sql14 = include_str!("migrations/014_policy.sql");
+    sqlx::raw_sql(sql14).execute(pool).await?;
 
     info!("Database migrations applied");
     Ok(())

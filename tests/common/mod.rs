@@ -4,9 +4,11 @@ pub mod fake_osv;
 pub mod fake_upstream;
 pub mod upstream_tap;
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::io::Write;
 use std::path::Path;
+use std::time::Duration;
 
 use axum::ServiceExt as _;
 use base64::Engine;
@@ -20,6 +22,8 @@ use opencargo::config::{
     AuthConfig, Config, DatabaseConfig, ProxyConfig, RepositoryConfig, RepositoryFormat,
     RepositoryType, ServerConfig, Visibility, VulnScanConfig,
 };
+use opencargo::policy::rules::PolicyConfig;
+use opencargo::policy::{PolicyEngine, Tuning};
 use opencargo::proxy::UpstreamAuth;
 use opencargo::server;
 
@@ -31,6 +35,9 @@ pub struct SpawnOpts {
     pub repositories: Vec<RepositoryConfig>,
     pub proxy: ProxyConfig,
     pub vuln: VulnScanConfig,
+    pub policy: HashMap<String, PolicyConfig>,
+    /// Replaces the policy engine's timing knobs after `build_state`.
+    pub policy_tuning: Option<Tuning>,
 }
 
 impl Default for SpawnOpts {
@@ -40,6 +47,8 @@ impl Default for SpawnOpts {
             repositories: Vec::new(),
             proxy: ProxyConfig::default(),
             vuln: VulnScanConfig::default(),
+            policy: HashMap::new(),
+            policy_tuning: None,
         }
     }
 }
@@ -79,6 +88,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         proxy: opts.proxy,
         repositories: opts.repositories,
         vuln_scan: opts.vuln,
+        policy: opts.policy,
         ..Default::default()
     }
 }
@@ -102,10 +112,20 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
     let addr = listener.local_addr().expect("no local addr");
     let base_url = format!("http://{addr}");
 
+    let tuning = opts.policy_tuning;
     let config = test_config(&tmp, &base_url, opts);
-    let state = server::build_state(&config)
+    let mut state = server::build_state(&config)
         .await
         .expect("failed to build app state");
+    if let Some(tuning) = tuning {
+        state.policy = PolicyEngine::new_tuned(
+            state.db.clone(),
+            &config.policy,
+            state.events.clone(),
+            state.proxy.clone(),
+            tuning,
+        );
+    }
     let app = server::build_router(state)
         .map_request(server::decode_percent_encoded_slashes)
         .into_make_service();
@@ -132,17 +152,141 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
 
 /// The error a server refuses to start with under this repository seed.
 pub async fn seed_error(repositories: Vec<RepositoryConfig>) -> String {
-    let tmp = TempDir::new().expect("failed to create temp dir");
-    let opts = SpawnOpts {
+    seed_error_opts(SpawnOpts {
         repositories,
         ..Default::default()
-    };
+    })
+    .await
+}
+
+/// The error a server refuses to start with under these options.
+pub async fn seed_error_opts(opts: SpawnOpts) -> String {
+    let tmp = TempDir::new().expect("failed to create temp dir");
     let config = test_config(&tmp, "http://127.0.0.1:0", opts);
     server::build_state(&config)
         .await
         .err()
         .expect("the seed should be refused")
         .to_string()
+}
+
+async fn open_db(server: &TestServer) -> sqlx::SqlitePool {
+    let db_path = server.tmp.path().join("opencargo.db");
+    sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .expect("failed to open the server database")
+}
+
+/// One `policy_resolutions` row as the report will read it.
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct PolicyRow {
+    pub id: i64,
+    pub requested_repo: String,
+    pub member_repo: String,
+    pub format: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub digest: Option<String>,
+    pub published_at: Option<String>,
+    pub date_source: String,
+    pub actor: String,
+    pub actor_kind: String,
+    pub user_id: Option<i64>,
+    pub would_block: bool,
+    pub unknown: bool,
+}
+
+impl PolicyRow {
+    pub fn published(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let at = self.published_at.as_deref()?;
+        Some(
+            chrono::DateTime::parse_from_rfc3339(at)
+                .expect("published_at is RFC 3339")
+                .with_timezone(&chrono::Utc),
+        )
+    }
+}
+
+/// Every recorded resolution, oldest first.
+pub async fn policy_rows(server: &TestServer) -> Vec<PolicyRow> {
+    let pool = open_db(server).await;
+    let rows = sqlx::query_as::<_, PolicyRow>("SELECT * FROM policy_resolutions ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .expect("failed to read policy rows");
+    pool.close().await;
+    rows
+}
+
+/// Rows are written after the response: poll until `n` exist, then insist
+/// on exactly `n`.
+pub async fn wait_for_policy_rows(server: &TestServer, n: usize) -> Vec<PolicyRow> {
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let rows = policy_rows(server).await;
+        if rows.len() >= n || std::time::Instant::now() >= deadline {
+            assert_eq!(rows.len(), n, "policy rows: {rows:#?}");
+            return rows;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+}
+
+/// Absence is never proven with a sleep: pull one artifact that records
+/// (the sentinel) and wait for the row count it must bring the table to.
+/// The channel is FIFO, so the sentinel's row proves every earlier event
+/// was examined.
+pub async fn sentinel(server: &TestServer, url: &str, rows_after: usize) -> Vec<PolicyRow> {
+    let resp = reqwest::get(url).await.expect("sentinel request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "sentinel GET {url}");
+    wait_for_policy_rows(server, rows_after).await
+}
+
+/// `users.id` of `username`.
+pub async fn user_id(server: &TestServer, username: &str) -> i64 {
+    let pool = open_db(server).await;
+    let id: i64 = sqlx::query_scalar("SELECT id FROM users WHERE username = ?1")
+        .bind(username)
+        .fetch_one(&pool)
+        .await
+        .expect("user exists");
+    pool.close().await;
+    id
+}
+
+/// A user created through the admin API plus one API token named `name`.
+pub async fn named_token(
+    client: &reqwest::Client,
+    base_url: &str,
+    username: &str,
+    name: &str,
+) -> String {
+    create_user(client, base_url, STATIC_TOKEN, username, "reader").await;
+    let resp = client
+        .post(format!("{base_url}/api/v1/users/{username}/tokens"))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&json!({ "name": name }))
+        .send()
+        .await
+        .expect("create token request failed");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: Value = resp.json().await.expect("invalid json");
+    body["token"].as_str().expect("token").to_string()
+}
+
+/// Move a hosted version's `published_at` `hours` into the past.
+pub async fn backdate_version(server: &TestServer, package: &str, version: &str, hours: i64) {
+    let pool = open_db(server).await;
+    sqlx::query(
+        "UPDATE versions SET published_at = datetime('now', ?3 || ' hours')          WHERE version = ?2 AND package_id IN (SELECT id FROM packages WHERE name = ?1)",
+    )
+    .bind(package)
+    .bind(version)
+    .bind(format!("-{hours}"))
+    .execute(&pool)
+    .await
+    .expect("failed to backdate the version");
+    pool.close().await;
 }
 
 #[derive(Default)]
