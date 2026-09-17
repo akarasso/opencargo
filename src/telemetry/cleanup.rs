@@ -173,7 +173,7 @@ pub(crate) async fn sweep_proxy_cache(
         stats.rows += 1;
     }
     stats.parts = storage
-        .remove_stale_parts("_proxy_cache", STALE_PART_AGE)
+        .remove_stale_parts("", STALE_PART_AGE)
         .await?;
     info!(
         rows = stats.rows,

@@ -116,12 +116,19 @@ impl StorageBackend for FilesystemStorage {
         Ok(Bytes::from(data))
     }
 
+    /// Written next to its destination as `{name}.part-{uuid}` and renamed
+    /// over it, so a re-push swaps inodes and never truncates a reader.
     async fn put(&self, path: &str, data: Bytes) -> Result<(), AppError> {
         let full_path = self.safe_path(path)?;
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
         }
-        fs::write(&full_path, &data).await?;
+        let part = part_path(&full_path);
+        if let Err(e) = write_synced(&part, &data).await {
+            let _ = fs::remove_file(&part).await;
+            return Err(e.into());
+        }
+        fs::rename(&part, &full_path).await?;
         Ok(())
     }
 
@@ -216,6 +223,21 @@ impl StorageBackend for FilesystemStorage {
         }
         Ok(removed)
     }
+}
+
+fn part_path(full_path: &Path) -> PathBuf {
+    let mut name = full_path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    name.push(format!(".part-{}", uuid::Uuid::new_v4()));
+    full_path.with_file_name(name)
+}
+
+async fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
+    let mut file = fs::File::create(path).await?;
+    file.write_all(data).await?;
+    file.sync_data().await
 }
 
 async fn is_stale_part(path: &Path, cutoff: SystemTime) -> Result<bool, AppError> {
@@ -318,6 +340,32 @@ mod tests {
         );
         assert!(s.exists("c/a/blob").await.unwrap());
         assert_eq!(s.remove_stale_parts("nowhere", hour).await.unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn put_swaps_inodes_so_a_reader_keeps_the_old_body() {
+        use super::StorageBackend;
+        use tokio::io::AsyncReadExt;
+        let (_tmp, s) = storage();
+        s.put("oci/blob", bytes::Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        let (len, mut reader) = s.read_stream("oci/blob").await.unwrap();
+        assert_eq!(len, 5);
+
+        s.put("oci/blob", bytes::Bytes::from_static(b"the second push"))
+            .await
+            .unwrap();
+        let mut held = Vec::new();
+        reader.read_to_end(&mut held).await.unwrap();
+        assert_eq!(held, b"first", "never truncated under the reader");
+        assert_eq!(s.get("oci/blob").await.unwrap().as_ref(), b"the second push");
+        let leftovers: Vec<_> = std::fs::read_dir(s.resolve("oci").unwrap())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(leftovers, vec!["blob"], "no part file survives a put");
     }
 
     #[test]
