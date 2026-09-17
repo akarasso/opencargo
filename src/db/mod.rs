@@ -213,6 +213,23 @@ pub async fn get_package(
     .await
 }
 
+/// Case-insensitive lookup for ecosystems whose names are unique regardless
+/// of case (cargo): the row keeps the case it was published with.
+pub async fn get_package_nocase(
+    pool: &SqlitePool,
+    repo_id: i64,
+    name: &str,
+) -> Result<Option<Package>, sqlx::Error> {
+    sqlx::query_as::<_, Package>(
+        "SELECT * FROM packages WHERE repository_id = ?1 AND name = ?2 COLLATE NOCASE
+         ORDER BY id LIMIT 1",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
 pub async fn create_package(
     pool: &SqlitePool,
     repo_id: i64,

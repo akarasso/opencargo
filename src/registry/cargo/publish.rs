@@ -145,7 +145,7 @@ async fn set_yanked(
 ) -> AppResult<Json<Value>> {
     let user = require_user(auth_user)?;
     let repo = load_hosted(state, repo_name, &user).await?;
-    let package = crate::db::get_package(&state.db, repo.id, name)
+    let package = crate::db::get_package_nocase(&state.db, repo.id, name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("crate not found: {name}")))?;
     let row = crate::db::get_version(&state.db, package.id, version)
@@ -200,7 +200,7 @@ async fn get_or_create_package(
     repo_id: i64,
     meta: &CargoPublishMeta,
 ) -> AppResult<Package> {
-    if let Some(p) = crate::db::get_package(&state.db, repo_id, &meta.name).await? {
+    if let Some(p) = crate::db::get_package_nocase(&state.db, repo_id, &meta.name).await? {
         return Ok(p);
     }
     crate::db::create_package(&state.db, repo_id, &meta.name, meta.description.as_deref()).await?;

@@ -192,11 +192,16 @@ async fn publish_then_fetch_through_group(bin: &str) {
     })
     .await;
 
+    // greeter depends on helper, so its hosted index line carries a dependency
+    // that cargo must be able to parse and resolve through the group.
     let greeter = write_crate(
         tmp.path(),
         "greeter",
-        &[],
-        &[("hosted", sparse_index(&a, "cargo-hosted"))],
+        &["helper"],
+        &[
+            ("hosted", sparse_index(&a, "cargo-hosted")),
+            ("all", sparse_index(&a, "cargo-all")),
+        ],
     );
     cargo.publish(&greeter, "hosted").await;
 

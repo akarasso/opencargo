@@ -21,9 +21,11 @@ pub struct IndexLeaf {
 impl Leaf for IndexLeaf {
     type Out = IndexLines;
 
+    /// Cargo lowercases the index path; the line keeps the published case.
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<IndexLines>> {
         let db = &cx.state.db;
-        let Some(package) = crate::db::get_package(db, member.0.id, &self.name).await? else {
+        let Some(package) = crate::db::get_package_nocase(db, member.0.id, &self.name).await?
+        else {
             return Ok(Outcome::NotFound);
         };
         let versions = crate::db::get_versions(db, package.id).await?;
@@ -32,7 +34,7 @@ impl Leaf for IndexLeaf {
         }
         let lines = versions
             .iter()
-            .map(|v| build_index_line(&self.name, v))
+            .map(|v| build_index_line(&package.name, v))
             .collect::<Result<Vec<_>, _>>()?;
         Ok(Outcome::Found(IndexLines {
             lines,
@@ -61,7 +63,8 @@ impl Leaf for CrateLeaf {
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Payload>> {
         let db = &cx.state.db;
-        let Some(package) = crate::db::get_package(db, member.0.id, &self.name).await? else {
+        let Some(package) = crate::db::get_package_nocase(db, member.0.id, &self.name).await?
+        else {
             return Ok(Outcome::NotFound);
         };
         let Some(version) = crate::db::get_version(db, package.id, &self.version).await? else {
@@ -158,10 +161,15 @@ fn checksum_of(lines: &[String], version: &str) -> Option<String> {
 
 fn build_index_line(crate_name: &str, version: &crate::db::Version) -> AppResult<String> {
     let meta: Value = serde_json::from_str(&version.metadata_json).unwrap_or(json!({}));
+    let deps: Vec<Value> = meta
+        .get("deps")
+        .and_then(Value::as_array)
+        .map(|deps| deps.iter().map(index_dep).collect())
+        .unwrap_or_default();
     let mut line = json!({
         "name": crate_name,
         "vers": version.version,
-        "deps": meta.get("deps").cloned().unwrap_or(json!([])),
+        "deps": deps,
         "cksum": version.checksum_sha256.clone().unwrap_or_default(),
         "features": meta.get("features").cloned().unwrap_or(json!({})),
         "yanked": version.yanked != 0,
@@ -172,4 +180,81 @@ fn build_index_line(crate_name: &str, version: &crate::db::Version) -> AppResult
         }
     }
     Ok(serde_json::to_string(&line)?)
+}
+
+/// The publish payload names the package and its alias as `name` /
+/// `explicit_name_in_toml` with a `version_req`; the index wants `name` to
+/// be the alias, `package` the real name and `req` the requirement.
+fn index_dep(dep: &Value) -> Value {
+    let package = dep.get("name").cloned().unwrap_or(Value::Null);
+    let mut out = match dep.get("explicit_name_in_toml").filter(|a| a.is_string()) {
+        Some(alias) => json!({ "name": alias, "package": package }),
+        None => json!({ "name": package }),
+    };
+    out["req"] = dep.get("version_req").cloned().unwrap_or(json!("*"));
+    for key in [
+        "features",
+        "optional",
+        "default_features",
+        "target",
+        "kind",
+        "registry",
+    ] {
+        if let Some(v) = dep.get(key).filter(|v| !v.is_null()) {
+            out[key] = v.clone();
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn version(metadata_json: &str) -> crate::db::Version {
+        crate::db::Version {
+            id: 1,
+            package_id: 1,
+            version: "0.1.0".into(),
+            metadata_json: metadata_json.into(),
+            checksum_sha1: None,
+            checksum_sha256: Some("ab".repeat(32)),
+            integrity: None,
+            size: 1,
+            tarball_path: String::new(),
+            published_at: String::new(),
+            yanked: 0,
+        }
+    }
+
+    #[test]
+    fn index_line_uses_the_sparse_index_dependency_shape() {
+        let meta = r#"{"name":"App","vers":"0.1.0","deps":[
+            {"name":"serde","version_req":"^1.0","features":["derive"],"optional":false,
+             "default_features":true,"target":null,"kind":"normal","registry":null,
+             "explicit_name_in_toml":null},
+            {"name":"tokio","version_req":"1","kind":"dev","explicit_name_in_toml":"tk",
+             "registry":"https://github.com/rust-lang/crates.io-index"}
+        ],"features":{"x":[]},"links":"z"}"#;
+        let line: Value = serde_json::from_str(&build_index_line("App", &version(meta)).unwrap())
+            .unwrap();
+        assert_eq!(line["name"], "App");
+        assert_eq!(
+            line["deps"][0],
+            json!({"name":"serde","req":"^1.0","features":["derive"],"optional":false,
+                   "default_features":true,"kind":"normal"})
+        );
+        assert_eq!(
+            line["deps"][1],
+            json!({"name":"tk","package":"tokio","req":"1","kind":"dev",
+                   "registry":"https://github.com/rust-lang/crates.io-index"})
+        );
+        assert_eq!(line["links"], "z");
+        assert!(line["deps"][0].get("version_req").is_none());
+
+        let bare: Value =
+            serde_json::from_str(&build_index_line("a", &version("{}")).unwrap()).unwrap();
+        assert_eq!(bare["deps"], json!([]));
+        assert_eq!(bare["features"], json!({}));
+    }
 }

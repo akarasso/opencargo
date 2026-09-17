@@ -72,7 +72,7 @@ impl UpstreamStrategy for CargoUpstream {
             },
             CargoArtifact::Crate { name, version, .. } => CacheKey {
                 kind: "cargo-crate",
-                key: format!("{name}/{version}"),
+                key: format!("{}/{version}", name.to_lowercase()),
             },
         }
     }
@@ -291,7 +291,7 @@ mod tests {
         assert_eq!(s.cache_key(&index).key, "mycrate");
         assert_eq!(s.cache_policy(&index), CachePolicy::Ttl(Ttl::Secs(600)));
         let c = crate_at("http://h/dl");
-        assert_eq!(s.cache_key(&c).key, "Serde/1.0.0");
+        assert_eq!(s.cache_key(&c).key, "serde/1.0.0", "one row per crate, any casing");
         assert_eq!(s.cache_policy(&c), CachePolicy::Immutable);
         assert_eq!(s.transfer(&c), Transfer::Streamed);
         assert_eq!(

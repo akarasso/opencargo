@@ -208,6 +208,50 @@ async fn spawn_group() -> Grouped {
     }
 }
 
+/// cargo lowercases the index path but keeps the crate's case in `dl`; the
+/// hosted lookup follows suit, and the line carries the published case.
+#[tokio::test]
+async fn hosted_mixed_case_crate_resolves_through_lowercase_index_path() {
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![hosted("cargo-local", RepositoryFormat::Cargo, Visibility::Public)],
+        ..Default::default()
+    })
+    .await;
+    let bytes = crate_bytes("MyCrate");
+    let meta = r#"{"name":"MyCrate","vers":"1.0.0","deps":[{"name":"serde","version_req":"^1","kind":"normal","features":[],"optional":false,"default_features":true,"target":null,"registry":null,"explicit_name_in_toml":null}],"features":{},"authors":[],"description":"d"}"#;
+    let resp = reqwest::Client::new()
+        .put(format!("{}/cargo-local/api/v1/crates/new", a.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .body(build_cargo_publish_body(meta, &bytes))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = get(&format!("{}/cargo-local/index/my/cr/mycrate", a.base_url)).await;
+    assert_eq!(resp.status(), StatusCode::OK, "the lowercase path cargo requests");
+    let line: Value = serde_json::from_str(&resp.text().await.unwrap()).unwrap();
+    assert_eq!(line["name"], "MyCrate", "the published case, as crates.io does");
+    assert_eq!(line["deps"][0]["req"], "^1");
+    assert!(line["deps"][0].get("version_req").is_none());
+
+    for name in ["MyCrate", "mycrate"] {
+        assert_eq!(download(&download_url(&a, "cargo-local", name, "1.0.0")).await, bytes);
+    }
+    let resp = reqwest::Client::new()
+        .put(format!("{}/cargo-local/api/v1/crates/new", a.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .body(build_cargo_publish_body(&publish_meta("mycrate", "1.0.0"), &bytes))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::CONFLICT,
+        "another casing is the same crate"
+    );
+}
+
 #[tokio::test]
 async fn group_config_json_dl_points_at_group() {
     let g = spawn_group().await;
