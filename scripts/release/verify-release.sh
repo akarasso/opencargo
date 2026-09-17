@@ -52,11 +52,25 @@ got=$(gh attestation verify "oci://$IMAGE:$v" -R "$REPO" --cert-identity "$rel" 
 [[ $got == "[2,[\"$d\"]]" ]] || die "image SBOM attestations: $got, expected [2,[\"$d\"]]"
 echo "image OK: $IMAGE:$v = sha-$commit = sha256:$d, signed by release.yml and ci.yml, 2 SBOMs"
 
+IFS=. read -r major minor patch <<< "${v%%-*}"
+want_minor=sha256:$d want_major=sha256:$d
 if [[ $rc == true ]]; then
-  if cosign verify --new-bundle-format=false "$IMAGE:${v%%.*}.$(cut -d. -f2 <<< "$v")" \
-      --certificate-identity "$rel" --certificate-oidc-issuer "$ISSUER" > /dev/null 2>&1; then
-    die "an rc moved a floating tag"
-  fi
-  echo "floating tags OK: untouched by rc"
+  want_minor=absent-or-other want_major=absent-or-other
+else
+  while IFS= read -r t; do
+    [[ $t =~ ^v([0-9]+)\.([0-9]+)\.([0-9]+)$ ]] || continue
+    M=${BASH_REMATCH[1]} m=${BASH_REMATCH[2]} p=${BASH_REMATCH[3]}
+    if (( M == major && (m > minor || (m == minor && p > patch)) )); then want_major=unchecked; fi
+    if (( M == major && m == minor && p > patch )); then want_minor=unchecked; fi
+  done < <(gh api "repos/$REPO/git/matching-refs/tags/v" --paginate -q '.[].ref | ltrimstr("refs/tags/")')
 fi
+for pair in "$major.$minor:$want_minor" "$major:$want_major"; do
+  ft=${pair%%:*} want=${pair#*:}
+  got=$(tag_digest "$ft")
+  case $want in
+    unchecked) echo "floating tag $ft: a higher release owns it, not checked" ;;
+    absent-or-other) [[ $got != "sha256:$d" ]] || die "an rc moved $IMAGE:$ft"; echo "floating tag OK: $ft untouched by rc ($got)" ;;
+    *) [[ $got == "$want" ]] || die "$IMAGE:$ft is $got, expected $want"; echo "floating tag OK: $ft -> $got" ;;
+  esac
+done
 echo "release $tag verified"

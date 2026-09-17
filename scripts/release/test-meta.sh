@@ -81,7 +81,13 @@ expect "fail:is not on origin/main" "rejects a commit off main" run v0.1.0
 
 fixture nothead 0.1.0 0.1.0 0.1.0
 git tag v0.1.0 && git commit -q --allow-empty -m next && git push -q origin main
-expect "fail:checkout is" "rejects a tag that is not HEAD" run v0.1.0
+expect "fail:points at" "rejects a tag that is not HEAD" run v0.1.0
+
+fixture ghsha 0.1.0 0.1.0 0.1.0
+git tag v0.1.0
+expect "fail:the run was triggered for $(printf 'b%.0s' {1..40})" "rejects a checkout that is not GITHUB_SHA" \
+  env GITHUB_SHA="$(printf 'b%.0s' {1..40})" IMAGE_INSPECT_CMD="$root/found" "$meta" v0.1.0
+expect "version=0.1.0" "accepts GITHUB_SHA = HEAD" env GITHUB_SHA="$(git rev-parse HEAD)" IMAGE_INSPECT_CMD="$root/found" "$meta" v0.1.0
 
 fixture older 0.1.1 0.1.1 0.1.1
 git tag v0.2.0 && git tag v0.1.1

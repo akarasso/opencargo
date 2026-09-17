@@ -440,7 +440,7 @@ Every tag `vX.Y.Z` or `vX.Y.Z-rc.N` publishes, on the GitHub release, static
 `x86_64` and `aarch64` musl binaries, a CycloneDX SBOM per binary,
 `SHA256SUMS`, and one Sigstore bundle (`<asset>.sigstore.json`) per file. The
 container image `ghcr.io/akarasso/opencargo:X.Y.Z[-rc.N]` (plus `X.Y` and `X`
-for a final release) is the image main CI built and scanned for that commit,
+for a final release that is the highest in its line) is the image main CI built and scanned for that commit,
 copied by digest, never rebuilt. Everything is signed keyless by GitHub
 Actions; the certificate identity names this repository, the workflow file
 and the tag, so one command per artifact proves where it came from.

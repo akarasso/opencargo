@@ -55,6 +55,10 @@ pinned to this repository and workflow file. State on `main @ af5540c`: `release
     releases [9]. Enabling "immutable releases" in repository settings before the first tag is recommended (locks tag and assets once published).
 12. **Least privilege by job.** Top level `permissions: {}`. The job holding `id-token: write` never holds `contents: write`; the job holding `contents: write` never holds `id-token`.
     `trivy-action` is pinned by SHA to v0.36.0: its tags 0.0.1 to 0.34.2 were force-pushed with a credential stealer on 2026-03-19 [10]; `ci.yml`'s `@0.35.0` tag is replaced too.
+    **Trivy never shares a job with a publishing credential.** The action is pinned, but the binary it runs is not: `setup-trivy` runs trivy's `contrib/install.sh` and downloads a
+    release chosen by tag (`v0.70.0`), checked only against that release's own checksum file. So it runs in a job whose token cannot publish: `release.yml` `scan` has
+    `permissions: {}` (public image by digest, no login), and `ci.yml` builds and scans in `image-scan` (`contents: read`), then hands the image to the signing `docker` job as a
+    `docker save` tar whose image ID, recorded before Trivy ran, must match after `docker load` (section 4). `GH_TOKEN` is set per step, never at job level, in jobs that hold it.
 
 ## 2. Published outputs and identities
 
@@ -93,7 +97,8 @@ concurrency:
 | `sbom` | P, PR | meta | `contents: read` | checkout; `sbom.sh <V> dist` (both targets); upload `sbom` |
 | `assemble` | P, PR | meta, build, sbom | none | download `bin-*`, `sbom` merged; `checksums.sh dist`; upload `release-dist` |
 | `sign` | P | meta, assemble | `id-token: write`, `attestations: write`, `contents: read` | checkout; download `release-dist`; cosign; `sign-blobs.sh dist <tag>`; attest provenance + 2 SBOM; `gh attestation verify` self-check; upload `release-bundles` |
-| `image` | P | meta, assemble, sign (no tag moves unless every blob is signed and attested) | `contents: read`, `packages: write`, `id-token: write`, `attestations: write` | section 3.3 |
+| `scan` | P | meta | none (`permissions: {}`) | `trivy-action` on `ghcr.io/akarasso/opencargo@<source_digest>`, `HIGH,CRITICAL`, `ignore-unfixed`, exit 1, `cache: 'false'`; no checkout, no login |
+| `image` | P | meta, assemble, sign, scan (no tag moves unless every blob is signed and attested and the digest re-scanned) | `contents: read`, `packages: write`, `id-token: write`, `attestations: write` | section 3.3 |
 | `release` | P | meta, sign, image | `contents: write` | checkout; download `release-dist`, `release-bundles`; notes; `gh release create --draft`; `gh release edit --draft=false` |
 
 Every job has `timeout-minutes`, `runs-on: ubuntu-24.04` unless stated, and `persist-credentials: false` on checkout. Pinned actions: `actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1`,
@@ -103,7 +108,8 @@ Every job has `timeout-minutes`, `runs-on: ubuntu-24.04` unless stated, and `per
 `aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0` with `cache: 'false'`. No cache is restored anywhere in the release workflow. This must be explicit:
 trivy-action v0.36.0 defaults to `cache: 'true'`, which restores the trivy binary (`setup-trivy`, `actions/cache/restore` key `trivy-binary-<ver>-<os>-<arch>`) and the DB
 (`actions/cache` key `cache-trivy-*`) (checked in both `action.yaml` at the pinned SHAs). Tag runs read default-branch caches, and main's `test` job runs pnpm/cargo/go code able to
-write them: a planted binary would run next to `id-token: write` and `packages: write`. With `cache: 'false'` the binary comes from setup-trivy's install script and the DB from its registry.
+write them. With `cache: 'false'` the binary comes from setup-trivy's install script and the DB from its registry. That binary is still resolved by tag, so the scan runs in a job with no
+publishing credential (decision 12): even a planted or swapped binary sees no `id-token`, no `packages: write`, no registry login, at worst it passes a scan it should fail.
 
 ### 3.1 Build leg
 
@@ -157,13 +163,12 @@ failure fatal. `verify-assets.sh` runs the README's `gh attestation verify` comm
 
 ### 3.3 Image job
 
-Order: verify source, scan, sign, attest, verify everything **by digest**, and only then move tags. A failure at any step leaves no public `V`, `X.Y` or `X` tag; Rekor entries for a `sha-*`-only digest are harmless.
+Order: verify source, sign, attest, verify everything **by digest**, and only then move tags. The re-scan of the same digest is the `scan` job (no permissions), a `needs` of `image`. A failure at any step leaves no public `V`, `X.Y` or `X` tag; Rekor entries for a `sha-*`-only digest are harmless.
 
 ```yaml
     env:
       SOURCE_DIGEST: ${{ needs.meta.outputs.source_digest }}
       TAGS: ${{ needs.meta.outputs.tags }}
-      GH_TOKEN: ${{ github.token }}   # docker login and `gh attestation verify` (section 9)
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -172,14 +177,8 @@ Order: verify source, scan, sign, attest, verify everything **by digest**, and o
         with:
           cosign-release: v3.1.3
       - run: echo "$GH_TOKEN" | docker login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
+        env: { GH_TOKEN: '${{ github.token }}' }
       - run: scripts/release/promote-image.sh verify-source "$SOURCE_DIGEST" "$GITHUB_SHA"
-      - uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
-        with:
-          image-ref: ghcr.io/akarasso/opencargo@${{ needs.meta.outputs.source_digest }}
-          exit-code: '1'
-          ignore-unfixed: true
-          severity: HIGH,CRITICAL
-          cache: 'false'
       - run: cosign sign --yes --new-bundle-format=false --use-signing-config=false "ghcr.io/akarasso/opencargo@$SOURCE_DIGEST"
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with: { name: sbom, path: sbom }
@@ -193,6 +192,7 @@ Order: verify source, scan, sign, attest, verify everything **by digest**, and o
           create-storage-record: false
       # same step with sbom/opencargo-<V>-x86_64-unknown-linux-musl.cdx.json
       - run: scripts/release/verify-image.sh "$GITHUB_REF_NAME" "$SOURCE_DIGEST" "$GITHUB_SHA"
+        env: { GH_TOKEN: '${{ github.token }}' }   # `gh attestation verify` (section 9)
       - run: scripts/release/promote-image.sh tag "$SOURCE_DIGEST" "$TAGS"
 ```
 
@@ -217,7 +217,14 @@ and final = `--latest=$LATEST` (`meta` output); keep the created release id, req
 All actions pinned by SHA with the version comment (`dtolnay/rust-toolchain@283fb51ee3c8a49cd7c8ff30102f3fcf3cfbe0e1 # 1.93.0`, `Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2`,
 `actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0`, `docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1`,
 `docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0`, `docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0`, and the release set). New job
-`workflow-lint` (`contents: read`) runs `scripts/lint-workflows.sh` and `scripts/release/test-meta.sh` (the tag guards are tested in CI, not only locally). The `docker` job gains `attestations: write`; its "Push the scanned image" step is replaced, after Trivy, by:
+`workflow-lint` (`contents: read`) runs `scripts/lint-workflows.sh` and `scripts/release/test-meta.sh` (the tag guards are tested in CI, not only locally). `test` and `audit` get
+`persist-credentials: false` and `timeout-minutes` (60, 30). The old `docker` job is split (decision 12). New job `image-scan` (`needs: [test, audit]`, main only, `contents: read`):
+checkout, buildx, `build-push-action` `load: true` `provenance: false` `tags: opencargo:ci`, then `image-id=$(docker image inspect --format '{{.Id}}' opencargo:ci)` to its outputs
+**before** Trivy, Trivy (`cache: 'false'`), `docker save opencargo:ci -o opencargo-ci.tar`, upload artifact `image-tar` (retention 1 day). The `docker` job (`needs: [image-scan]`,
+`contents: read`, `packages: write`, `id-token: write`, `attestations: write`) downloads it and runs `scripts/release/load-image.sh opencargo-ci.tar opencargo:ci "$IMAGE_ID"`:
+`docker load`, then the loaded image ID must equal the one `image-scan` recorded (a job output, which other jobs cannot write). The ID is content-addressed (config digest on the classic
+store, manifest/index digest on the containerd store) and `docker load` checks every blob against it, so a tar swapped through the run's artifact store fails the job. Verified locally
+(containerd store): `save`/`rmi`/`load` keeps the ID, a different expected ID exits 1. Then buildx, **GHCR login (only now)**, and:
 
 ```yaml
       - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
@@ -246,7 +253,7 @@ store, `registry:2`): the parsed push digest equals the registry's `Docker-Conte
 The docker job gains `concurrency: { group: ghcr-main, cancel-in-progress: false, queue: max }`: the default `queue: single` cancels a pending job when a newer one queues [13],
 leaving that commit with no `sha-<commit>` (unreleasable); `queue: max` keeps up to 100 in arrival order (a re-run still arrives late, hence the head check; the group serializes check-then-push). actionlint
 v1.7.12 rejects `queue` (`parseConcurrency` knows `group`, `cancel-in-progress`): `lint-workflows.sh` ignores exactly that message. Also its Trivy step gets the v0.36.0 SHA pin and
-`cache: 'false'` (section 3).
+`cache: 'false'` (section 3), and runs in `image-scan`, never next to the login or the OIDC token.
 
 ## 5. Scripts (`scripts/release/`, bash, `set -euo pipefail`, each runnable locally)
 
@@ -258,22 +265,23 @@ v1.7.12 rejects `queue` (`parseConcurrency` knows `group`, `cancel-in-progress`)
 | `smoke.sh <bin> <V>` | `--version` = `opencargo <V>`; starts it in a `mktemp -d` cwd on `127.0.0.1:16789` with a throwaway `OPENCARGO_ADMIN_PASSWORD`; polls `/health/ready` for 60 s; body must be `{"status":"ok"}`; kills by PID in a trap. |
 | `sbom.sh <V> <out>` | downloads cargo-cyclonedx 0.5.9, `sha256sum -c`; for both targets `cargo cyclonedx -f json --spec-version 1.5 --no-build-deps --target <t> --override-filename opencargo-<V>-<t>.cdx`; asserts root version = `<V>`. |
 | `checksums.sh <dir>` | `sha256sum` of binaries and SBOMs, sorted by name, into `SHA256SUMS`; `sha256sum -c`. |
+| `load-image.sh <tar> <local image> <image id>` | `docker load`; exit 1 unless the loaded image's ID equals `<image id>` (section 4). |
 | `sign-blobs.sh`, `verify-assets.sh`, `sign-image.sh`, `push-latest.sh`, `promote-image.sh`, `image-sbom.sh`, `verify-image.sh` | sections 3-4; `promote-image.sh verify-source <digest> <sha>` = `cosign verify --new-bundle-format=false <image>@<digest>` with the ci.yml identity and `--certificate-github-workflow-sha <sha>`; `tag` = `imagetools create --prefer-index=false` per tag, then digest equality per tag. |
 | `changelog-section.sh <V> [file]` | prints lines between `## [<V>]` and the next `## [`; exit 1 if absent or blank. |
-| `verify-release.sh <V>` | section 10 as a script, for anyone to replay. |
+| `verify-release.sh <V>` | section 10 as a script, for anyone to replay. Floating tags read anonymously from the registry API (`lib.sh` `tag_digest`: digest, `absent` on 404, exit 1 on any other status): for an rc, `X.Y` and `X` must be absent or another digest; for a final, each must equal the release digest unless a higher final tag (`gh api …/git/matching-refs/tags/v`) owns it. |
 | `../lint-workflows.sh` | `GOBIN=<tmp> go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12`; shellcheck v0.11.0 tarball (sha256 `8c3be12b…4e227198`); `actionlint -ignore 'unexpected key "queue" for "concurrency" section'` (runs shellcheck on every `run:` block when on PATH [12]) and `shellcheck scripts/*.sh scripts/release/*.sh`. |
 
 ## 6. Guards (all fail closed)
 
 Tag shape (trigger filter [13] and regex); tag = Cargo.toml = Cargo.lock; commit is on `main`; CHANGELOG section present; `sha-<commit>` exists and carries a `.sig` signature (not just an attestation) by `ci.yml@refs/heads/main` for that exact commit (workflow-sha), and main CI signs only the digest its own push of the scanned image returned (checked against the registry, mismatch fails);
-Trivy re-scan clean (no cache restored); image signed, attested and verified by digest before any tag moves; promoted tags carry the source digest; every signature and attestation
+Trivy re-scan clean (no cache restored), in jobs holding no publishing credential, with image-ID continuity from scan to push on main; image signed, attested and verified by digest before any tag moves; promoted tags carry the source digest; every signature and attestation
 re-verified in-job with the published commands before `release` runs; GitHub release
 stays a draft until all assets are uploaded. The workflow file used on a tag is the tagged commit's, so the main check protects only together with branch protection on `main` and
 a tag ruleset restricting `v*` creation to maintainers (repository settings, section 11). Only `GITHUB_TOKEN` is used.
 
 ## 7. Pull request dry run
 
-On `pull_request` touching the paths of section 3, `meta` (no tag), `frontend`, `build` x2, `sbom`, `assemble` run with `contents: read` only; `sign`, `image`, `release` carry
+On `pull_request` touching the paths of section 3, `meta` (no tag), `frontend`, `build` x2, `sbom`, `assemble` run with `contents: read` only; `sign`, `scan`, `image`, `release` carry
 `if: github.event_name == 'push'` and never start, so no OIDC token is minted. It proves: both musl binaries build `--locked` and are static, `--version` prints the Cargo version, the binary boots and answers `/health/ready`, both SBOMs and `SHA256SUMS` are generated and self-check. Not a required check (a paths-filtered required check stays pending).
 Gap, stated: the PR run never executes cosign, `actions/attest`, `promote-image.sh`, the verify scripts or `gh release`. Their first GHCR run is the scratch proof of section 12
 (commit 4); the first run of the full `image`/`release` jobs is the `v0.1.0-rc.1` tag, where a failure leaves at most Rekor entries and a draft, never a moved tag (section 3.3).
@@ -311,8 +319,8 @@ takes today's Unreleased content plus an `### Added` line for signed/attested re
 ## 10. Post-merge verification (orchestrator)
 
 Host, after the squash merge: `M=$(git rev-parse origin/main)`; `gh run watch "$(gh run list -w ci.yml -b main -c "$M" -L1 --json databaseId -q '.[0].databaseId')" --exit-status` -> exit 0
-(re-run on the known flaky test). Pre-tag gate (today: 0 rulesets, 404), stop unless `gh api repos/akarasso/opencargo/rulesets -q 'map(select(.target=="tag"))|length'` >= 1 and `gh api repos/akarasso/opencargo/immutable-releases -q .enabled` = `true`. `git tag -a v0.1.0-rc.1 -m v0.1.0-rc.1 "$M" && git push origin v0.1.0-rc.1`; `gh run watch "$(gh run list -w release.yml -e push -L1 --json databaseId -q '.[0].databaseId')" --exit-status`
--> exit 0, 9 jobs green. Then `docker run --rm -it -e GH_TOKEN="$(gh auth token)" -e M="$M" ubuntu:24.04 bash`:
+(re-run on the known flaky test; jobs `test`, `workflow-lint`, `audit`, `image-scan`, `docker`). Then `cosign verify --new-bundle-format=false ghcr.io/akarasso/opencargo:sha-$M --certificate-identity https://github.com/akarasso/opencargo/.github/workflows/ci.yml@refs/heads/main --certificate-oidc-issuer https://token.actions.githubusercontent.com --certificate-github-workflow-sha $M` -> exit 0, and the GHCR negative check below. Pre-tag gate (today: 0 rulesets, 404), stop unless `gh api repos/akarasso/opencargo/rulesets -q 'map(select(.target=="tag"))|length'` >= 1 and `gh api repos/akarasso/opencargo/immutable-releases -q .enabled` = `true`. `git tag -a v0.1.0-rc.1 -m v0.1.0-rc.1 "$M" && git push origin v0.1.0-rc.1`; `gh run watch "$(gh run list -w release.yml -e push -L1 --json databaseId -q '.[0].databaseId')" --exit-status`
+-> exit 0, 10 jobs green (`scan` included). Then `docker run --rm -it -e GH_TOKEN="$(gh auth token)" -e M="$M" ubuntu:24.04 bash`:
 
 ```bash
 apt-get update -qq && apt-get install -y -qq --no-install-recommends curl ca-certificates jq >/dev/null
@@ -339,8 +347,39 @@ cosign verify --new-bundle-format=false $I:sha-$M --certificate-identity $CI --c
 gh attestation verify oci://$I:sha-$M -R $R --cert-identity $CI --cert-oidc-issuer $ISS --format json -q '.[0].verificationResult.statement.subject[0].digest.sha256'   # D
 gh attestation verify oci://$I:$V -R $R --cert-identity $REL --cert-oidc-issuer $ISS --predicate-type https://cyclonedx.org/bom --format json -q '[([.[].verificationResult.statement.predicate.metadata.component.name]|unique|length),([.[].verificationResult.statement.subject[0].digest.sha256]|unique)]'  # [2,["D"]] (distinct SBOMs, not entries: a re-run adds entries)
 cosign verify --new-bundle-format=false $I:0.1 --certificate-identity $REL --certificate-oidc-issuer $ISS; echo $?                         # MANIFEST_UNKNOWN, 1 (rc moves no floating tag)
+TOK=$(curl -sSf "https://ghcr.io/token?service=ghcr.io&scope=repository:akarasso/opencargo:pull" | jq -r .token)
+for t in 0.1 0; do curl -s -o /dev/null -w "$t %{http_code}\n" -I -H "Authorization: Bearer $TOK" -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' https://ghcr.io/v2/akarasso/opencargo/manifests/$t; done  # 0.1 404, 0 404
 cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity ${REL/rc.1/rc.9} --certificate-oidc-issuer $ISS SHA256SUMS; echo $?  # identity mismatch error, 1
 ```
+
+`scripts/release/verify-release.sh 0.1.0-rc.1 $M` (from a checkout, same container plus `git`) replays the block and ends with `floating tag OK: 0.1 untouched by rc (absent)`,
+`floating tag OK: 0 untouched by rc (absent)`, `release v0.1.0-rc.1 verified`.
+
+**GHCR negative check (once, after main CI is green on `M`, before the tag).** Proves on GHCR, not only on `registry:2`, that an attestation without a `.sig` does not pass the
+`--new-bundle-format=false` verify that `verify-source` and the README rely on. Host (`gh auth refresh -s write:packages,delete:packages` first):
+
+```bash
+TOK=$(curl -sSf "https://ghcr.io/token?service=ghcr.io&scope=repository:akarasso/opencargo:pull" | jq -r .token)
+D=$(curl -sSfI -H "Authorization: Bearer $TOK" -H 'Accept: application/vnd.docker.distribution.manifest.v2+json' \
+  https://ghcr.io/v2/akarasso/opencargo/manifests/sha-$M | tr -d '\r' | awk 'tolower($1)=="docker-content-digest:"{print $2}'); echo $D   # sha256:<64 hex>
+docker run --rm -e GH_TOKEN="$(gh auth token)" --entrypoint sh gcr.io/go-containerregistry/crane:debug@sha256:e78770b31258a3846f878036d9c1f63fbe4c871f9f56990bf77fd95c013e3c1b -c \
+  "crane auth login ghcr.io -u akarasso -p \"\$GH_TOKEN\" && crane copy ghcr.io/akarasso/opencargo@$D ghcr.io/akarasso/opencargo-negcheck:sha-$M \
+   && crane copy ghcr.io/akarasso/opencargo:sha256-${D#sha256:} ghcr.io/akarasso/opencargo-negcheck:sha256-${D#sha256:}"   # exit 0; the .sig tag is not copied
+docker run --rm -it -e GH_TOKEN="$(gh auth token)" -e M="$M" -e D="$D" ubuntu:24.04 bash
+```
+
+In that container, the first six lines of the block above (curl, cosign, gh installed and checked), then:
+
+```bash
+C=https://github.com/akarasso/opencargo/.github/workflows/ci.yml@refs/heads/main ISS=https://token.actions.githubusercontent.com
+mkdir -p ~/.docker && printf '{"auths":{"ghcr.io":{"auth":"%s"}}}' "$(printf 'akarasso:%s' "$GH_TOKEN" | base64 -w0)" > ~/.docker/config.json   # the scratch package is private
+cosign verify ghcr.io/akarasso/opencargo-negcheck@$D --certificate-identity $C --certificate-oidc-issuer $ISS >/dev/null; echo $?                           # 0 (attestation bundle taken as a signature)
+cosign verify --new-bundle-format=false ghcr.io/akarasso/opencargo-negcheck@$D --certificate-identity $C --certificate-oidc-issuer $ISS >/dev/null; echo $?  # "no signatures found", 10
+cosign verify --new-bundle-format=false ghcr.io/akarasso/opencargo@$D --certificate-identity $C --certificate-oidc-issuer $ISS --certificate-github-workflow-sha $M >/dev/null; echo $?  # 0
+gh api -X DELETE user/packages/container/opencargo-negcheck; echo $?                                                                                          # 0
+```
+
+If the second `cosign verify` exits 0, stop: `verify-source` would accept an unsigned image on GHCR. Record the three `cosign verify` exit codes in section 14.
 
 ## 11. Risks
 
@@ -354,6 +393,10 @@ cosign verify-blob --bundle SHA256SUMS.sigstore.json --certificate-identity ${RE
 - The released binary and the image binary are two builds of the same commit (same image family, same lock), not bit-identical. The image SBOM is the x86_64 lock-derived SBOM, valid
   because both use `--locked` and the same target; `cargo auditable` would make it observable, follow-up. Gap, stated in the README: neither SBOM lists the npm packages rust-embed puts in the binary (`solid-js`, `@solidjs/router`); follow-up = a pinned `syft scan file:frontend/pnpm-lock.yaml` SBOM merged or attested as a third one.
 - `rustup` in the rust image re-syncs `1.93.0` + clippy/rustfmt from `rust-toolchain.toml` (network, ~10 s, seen locally). Harmless; the image digest pins the compiler.
+- The `sbom` job is not in the pinned image: `cargo-cyclonedx` (prebuilt gnu binary, sha256-pinned) calls `cargo metadata` through the runner's preinstalled rustup, which installs
+  `1.93.0` + clippy/rustfmt from `rust-toolchain.toml` over the network (rustup verifies the dist manifest hashes). The musl image cannot run the gnu binary. Accepted: `cargo metadata`
+  only resolves `Cargo.lock` (`--locked` semantics are enforced by the build); the SBOM content depends on the lock, not on the compiler. Follow-up if needed: a pinned glibc
+  `rust:1.93.0` image by digest for this job.
 - Action major bumps in `ci.yml` (checkout v4->v7, build-push v6->v7, setup-go v5->v7): proven by the PR's own CI run; revert to the latest SHA of the current major if one breaks. Helm `appVersion` stays `0.1.0` (chart release out of scope); SQLite backup, `.gitlab-ci.yml`/legacy helm cleanup stay deferred as decided on 2026-08-12.
 
 ## 12. Delivery plan (`feat/release-chain`, each commit green on CI)
@@ -398,12 +441,18 @@ Commits on `feat/release-chain`: `ci: pin every action by commit SHA`, `build(re
 - **Old `release.yml:110` SC2086** quoted in commit 2 so `workflow-lint` is green on every commit; the file is replaced in commit 3.
 - **`lint-workflows.sh` runs `shellcheck -x`** so the sourced `lib.sh` is followed; `workflow-lint` installs Go 1.25 (actionlint v1.7.12 needs go >= 1.25.0).
 - **Commit 4 GHCR scratch proof not run**: this branch is never pushed by the implementer. Replaced by local proofs against `registry:2` (below). The first hosted run of
-  `sign-image.sh`/`actions/attest`/`push-latest.sh` is main CI after merge; section 10 checks its result before the tag is pushed (`cosign verify … sha-$M`).
+  `sign-image.sh`/`actions/attest`/`push-latest.sh` is main CI after merge; section 10 checks its result before the tag is pushed (`cosign verify … sha-$M`) and runs the GHCR
+  negative check (attestation copied without `.sig` to `opencargo-negcheck`, `--new-bundle-format=false` must fail). **Still unproven on GHCR** until that check runs: the
+  cosign v3 "no signatures found" behaviour on GHCR's referrers fallback, and the negative test. Result: _to fill after section 10_ (plain exit, legacy exit, source exit).
+- **Review fixes (scanner isolation)**: Trivy moved out of every job holding `packages: write`/`id-token: write` (release `scan` with `permissions: {}`; ci `image-scan` +
+  `load-image.sh` image-ID continuity); `GH_TOKEN` per step in `image`; `test`/`audit` checkouts `persist-credentials: false` with timeouts. `test-meta.sh` asserts the tag-not-HEAD
+  guard on `points at` and the `$GITHUB_SHA` guard on `the run was triggered for` (23 cases). `verify-release.sh` checks floating tags through the registry API instead of treating
+  any cosign failure as "untouched", and checks `X.Y`/`X` = release digest on finals when no higher final owns them. README: `X.Y`/`X` only "for a final release that is the highest in its line". Unproven until the tag: trivy-action/setup-trivy with a no-permission token (public `aquasecurity/trivy` and trivy-db reads only); if it fails, `image` never starts and no tag moves.
 
 Local proof, 2026-09-17 (Docker 29.6.2, containerd store, `registry:2` on `localhost:5055`, cosign v3.1.3):
 
 - `scripts/lint-workflows.sh`: `workflows and scripts: clean` after each commit; without the ignore, actionlint reports exactly `unexpected key "queue" for "concurrency" section`.
-- `test-meta.sh`: `21/21 passed`. `meta.sh` without a tag: `version=0.1.0`, empty `tags` and `source_digest`.
+- `test-meta.sh`: `21/21 passed` (after review fixes: `23/23 passed`). `meta.sh` without a tag: `version=0.1.0`, empty `tags` and `source_digest`.
 - `build-musl.sh x86_64-unknown-linux-musl 0.1.0 dist` exit 0; `smoke.sh` prints `opencargo 0.1.0` and `/health/ready {"status":"ok"}`; with a wrong version it exits 1.
   `build-musl.sh aarch64-…` on x86_64 and `x86_64-apple-darwin` exit 1.
 - `sbom.sh 0.1.0 dist`: 313 (x86_64) and 312 (aarch64) components, spec 1.5, no `rcgen`/`tempfile`/`cc`/`windows-sys`. `checksums.sh dist`: every line `OK`, sorted.
@@ -416,4 +465,10 @@ Local proof, 2026-09-17 (Docker 29.6.2, containerd store, `registry:2` on `local
   v3.1.3 refuses `--tlog-upload=false` with a signing config): plain `cosign verify` exit 0, `cosign verify --new-bundle-format=false` exit 10 "no signatures found".
 - `image-sbom.sh` on the local image (`SYFT_REGISTRY_INSECURE_USE_HTTP=true`): CycloneDX 1.7, `bomFormat`/`serialNumber`/`specVersion` present.
 - `publish-release.sh` with a stub `gh`: create draft, count 10, PATCH `draft=false prerelease=… make_latest=…`; leftover draft deleted first; 11 files -> exit 1 before any call.
+- `load-image.sh`: `docker save` of a buildx `--load` image, `rmi`, `load-image.sh` with the recorded ID -> exit 0; with another sha256 -> exit 1 naming both IDs; malformed -> exit 1.
+- `tag_digest`: GHCR anonymous `latest` -> its digest, `0.1`/`0` -> `absent`, a nonexistent package -> exit 1 (token 403); `registry:2` pushed tag -> the `imagetools inspect` digest.
+  The floating-tag block of `verify-release.sh` with a stubbed `gh`: rc + `0.1` = D -> exit 1 "an rc moved"; rc + other/absent -> OK; final with `0` absent -> exit 1; higher
+  `v0.2.0` -> `0` not checked; higher patch (`v0.1.1`, rc tags ignored) -> neither checked.
+- GHCR negative-check procedure (section 10) rehearsed on `registry:2` with a key pair: legacy `.sig` + `cosign attest` bundle on `rc/tt`, `crane copy` of the image and of the
+  `sha256-<hex>` tag only to `neg/tt`: plain `cosign verify` exit 0 on both, `--new-bundle-format=false` exit 0 on `rc/tt` and 10 "no signatures found" on `neg/tt`.
 - Not runnable locally (need GitHub OIDC): `sign-blobs.sh`, `verify-assets.sh`, `verify-image.sh`, `promote-image.sh verify-source`, `verify-release.sh`.
