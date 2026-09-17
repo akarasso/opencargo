@@ -6,12 +6,14 @@ use reqwest::StatusCode;
 use serde_json::Value;
 use sha2::Digest;
 
+use common::fake_upstream::cargo::{self as fake_index, FakeIndex};
 use common::upstream_tap::{self, Tap};
 use common::{
-    build_cargo_publish_body, group, hosted, proxy_with, spawn_server, ProxyOpts, SpawnOpts,
-    TestServer, STATIC_TOKEN,
+    build_cargo_publish_body, expire_entries, group, hosted, proxy, proxy_with, spawn_server,
+    ProxyOpts, SpawnOpts, TestServer, STATIC_TOKEN,
 };
 use opencargo::config::{RepositoryConfig, RepositoryFormat, Visibility};
+use opencargo::proxy::UpstreamAuth;
 use opencargo::registry::cargo::compute_prefix;
 
 const UPSTREAM_REPO: &str = "cargo-up";
@@ -363,4 +365,524 @@ async fn group_hides_private_member() {
     let resp = get_with_token(&dl).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), secret.as_slice());
+}
+
+/// Sum of the upstream's download counters: one per served `.crate`.
+async fn upstream_downloads(up: &Upstream) -> i64 {
+    let db_path = up.server.tmp.path().join("opencargo.db");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .expect("failed to open the upstream database");
+    let (count,): (i64,) = sqlx::query_as("SELECT COALESCE(SUM(count), 0) FROM download_counts")
+        .fetch_one(&pool)
+        .await
+        .expect("failed to read download counts");
+    pool.close().await;
+    count
+}
+
+async fn spawn_proxy_over_fake(fake: &FakeIndex, opts: ProxyOpts) -> TestServer {
+    spawn_server(SpawnOpts {
+        repositories: vec![proxy_with(
+            "cargo-proxy",
+            RepositoryFormat::Cargo,
+            &fake.index_url(),
+            opts,
+        )],
+        ..Default::default()
+    })
+    .await
+}
+
+/// Every regular file below `dir`, recursively; an absent dir holds none.
+fn files_under(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .flat_map(|e| {
+            if e.path().is_dir() {
+                files_under(&e.path())
+            } else {
+                vec![e.path()]
+            }
+        })
+        .collect()
+}
+
+fn allow_private() -> ProxyOpts {
+    ProxyOpts {
+        dl_allow_private: true,
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn proxy_index_and_download_from_second_instance() {
+    let up = spawn_upstream().await;
+    let bytes = crate_bytes("widget-1.0.0");
+    publish(&up.server, UPSTREAM_REPO, CRATE, "1.0.0", &bytes).await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy_repo("cargo-proxy", &up)],
+        ..Default::default()
+    })
+    .await;
+
+    let resp = get(&index_url(&a, "cargo-proxy", CRATE)).await;
+    assert!(
+        resp.headers().contains_key("etag"),
+        "the index carries an ETag"
+    );
+    let entries = index_entries(resp).await;
+    assert_eq!(entries, vec![("1.0.0".to_string(), cksum(&bytes))]);
+
+    let dl = download_url(&a, "cargo-proxy", CRATE, "1.0.0");
+    assert_eq!(download(&dl).await, bytes);
+    assert_eq!(download(&dl).await, bytes);
+    assert_eq!(
+        up.tap.count(&up.index_path(CRATE)),
+        1,
+        "a fresh index row never hits upstream"
+    );
+    assert_eq!(
+        upstream_downloads(&up).await,
+        1,
+        "an immutable crate is downloaded once"
+    );
+
+    let mut rows = cache_rows(&a).await;
+    rows.sort();
+    assert_eq!(
+        rows,
+        vec![
+            ("cargo-config".to_string(), "config.json".to_string(), 200),
+            ("cargo-crate".to_string(), "widget/1.0.0".to_string(), 200),
+            ("cargo-index".to_string(), "widget".to_string(), 200),
+        ]
+    );
+}
+
+#[tokio::test]
+async fn download_verifies_cksum_from_index() {
+    let fake = fake_index::start().await;
+    let bytes = crate_bytes("tampered");
+    fake.add_crate_with_cksum(CRATE, "1.0.0", &bytes, &"00".repeat(32));
+    let a = spawn_proxy_over_fake(&fake, allow_private()).await;
+
+    let resp = get(&download_url(&a, "cargo-proxy", CRATE, "1.0.0")).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "a cksum mismatch is 502"
+    );
+    assert_eq!(
+        fake.downloads().len(),
+        1,
+        "the body was fetched, then refused"
+    );
+    let rows = cache_rows(&a).await;
+    assert!(
+        !rows.iter().any(|(kind, _, _)| kind == "cargo-crate"),
+        "nothing stored for the crate: {rows:?}"
+    );
+    let crate_dir = a
+        .tmp
+        .path()
+        .join("storage/_proxy_cache/cargo-proxy/cargo-crate");
+    assert!(
+        files_under(&crate_dir).is_empty(),
+        "no file, not even a part, is left behind: {:?}",
+        files_under(&crate_dir)
+    );
+}
+
+#[tokio::test]
+async fn dl_template_markers_and_default_expand() {
+    let fake = fake_index::start().await;
+    let plain = crate_bytes("plain");
+    let marked = crate_bytes("marked");
+    let plain_cksum = fake.add_crate(CRATE, "1.0.0", &plain);
+    let marked_cksum = fake.add_crate(CRATE, "1.1.0", &marked);
+    let a = spawn_proxy_over_fake(&fake, allow_private()).await;
+
+    assert_eq!(
+        download(&download_url(&a, "cargo-proxy", CRATE, "1.0.0")).await,
+        plain
+    );
+    assert_eq!(
+        fake.downloads(),
+        vec!["/dl/widget/1.0.0/download".to_string()],
+        "a dl without markers gets /{{crate}}/{{version}}/download appended"
+    );
+
+    fake.set_dl("/{lowerprefix}/{prefix}/{crate}/{crate}-{version}.crate?cksum={sha256-checksum}");
+    expire_entries(&a).await;
+    assert_eq!(
+        download(&download_url(&a, "cargo-proxy", CRATE, "1.1.0")).await,
+        marked
+    );
+    assert_eq!(
+        fake.downloads().last().map(String::as_str),
+        Some(format!("/dl/wi/dg/wi/dg/widget/widget-1.1.0.crate?cksum={marked_cksum}").as_str()),
+        "every marker is substituted"
+    );
+    assert_ne!(plain_cksum, marked_cksum);
+}
+
+#[tokio::test]
+async fn index_etag_revalidation_touches_row() {
+    let fake = fake_index::start().await;
+    let bytes = crate_bytes("etag");
+    fake.add_crate(CRATE, "1.0.0", &bytes);
+    let a = spawn_proxy_over_fake(&fake, allow_private()).await;
+    let url = index_url(&a, "cargo-proxy", CRATE);
+    let path = fake.index_path(CRATE);
+
+    let first = get(&url).await;
+    let etag = first.headers()["etag"].to_str().unwrap().to_string();
+    let entries = index_entries(first).await;
+    get(&url).await;
+    assert_eq!(fake.count(&path), 1, "a fresh row never hits upstream");
+
+    expire_entries(&a).await;
+    let refreshed = index_entries(get(&url).await).await;
+    assert_eq!(refreshed, entries);
+    assert_eq!(fake.count(&path), 2, "an expired row is revalidated once");
+    assert_eq!(
+        fake.revalidations(&path),
+        1,
+        "with If-None-Match, answered 304"
+    );
+    get(&url).await;
+    assert_eq!(fake.count(&path), 2, "the 304 renewed the row's TTL");
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_MODIFIED,
+        "clients revalidate against us too"
+    );
+}
+
+#[tokio::test]
+async fn prefix_routes_for_1_2_3_4_char_names() {
+    let up = spawn_upstream().await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy_repo("cargo-proxy", &up)],
+        ..Default::default()
+    })
+    .await;
+    for (name, prefix) in [("a", "1"), ("ab", "2"), ("abc", "3/a"), ("abcd", "ab/cd")] {
+        publish(&up.server, UPSTREAM_REPO, name, "0.1.0", &crate_bytes(name)).await;
+        let url = format!("{}/cargo-proxy/index/{prefix}/{name}", a.base_url);
+        let entries = index_entries(get(&url).await).await;
+        assert_eq!(entries.len(), 1, "{name} under {prefix}");
+        assert_eq!(
+            up.tap
+                .count(&format!("/{UPSTREAM_REPO}/index/{prefix}/{name}")),
+            1
+        );
+    }
+    let resp = get(&format!("{}/cargo-proxy/index/2/a", a.base_url)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "a prefix cargo would not derive is 404"
+    );
+    assert_eq!(
+        up.tap.count(&format!("/{UPSTREAM_REPO}/index/2/a")),
+        0,
+        "and never asked upstream"
+    );
+}
+
+#[tokio::test]
+async fn config_json_anonymous_on_private_repo_points_at_requested_repo_with_auth_required() {
+    let up = spawn_upstream().await;
+    let a = spawn_server(SpawnOpts {
+        anonymous_read: false,
+        repositories: vec![RepositoryConfig {
+            visibility: Visibility::Private,
+            ..proxy_repo("cargo-proxy", &up)
+        }],
+        ..Default::default()
+    })
+    .await;
+
+    let resp = get(&format!("{}/cargo-proxy/index/config.json", a.base_url)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "no credentials sent, still 200"
+    );
+    let config: Value = resp.json().await.expect("invalid json");
+    assert_eq!(
+        config["dl"],
+        format!("{}/cargo-proxy/api/v1/crates", a.base_url)
+    );
+    assert_eq!(config["api"], format!("{}/cargo-proxy", a.base_url));
+    assert_eq!(config["auth-required"], true);
+    assert_eq!(
+        up.tap.hits.lock().unwrap().len(),
+        0,
+        "config.json is generated, never proxied"
+    );
+
+    let resp = get(&index_url(&a, "cargo-proxy", CRATE)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "the index stays gated"
+    );
+}
+
+#[tokio::test]
+async fn unknown_crate_negative_cached() {
+    let up = spawn_upstream().await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy_repo("cargo-proxy", &up)],
+        ..Default::default()
+    })
+    .await;
+
+    for url in [
+        index_url(&a, "cargo-proxy", "nope"),
+        index_url(&a, "cargo-proxy", "nope"),
+        download_url(&a, "cargo-proxy", "nope", "1.0.0"),
+    ] {
+        let resp = get(&url).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "GET {url}");
+    }
+    assert_eq!(
+        up.tap.count(&up.index_path("nope")),
+        1,
+        "the second and third misses are answered from the negative entry"
+    );
+    let rows = cache_rows(&a).await;
+    assert!(
+        rows.contains(&("cargo-index".to_string(), "nope".to_string(), 404)),
+        "{rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn known_crate_unknown_version_is_404() {
+    let up = spawn_upstream().await;
+    publish(&up.server, UPSTREAM_REPO, CRATE, "1.0.0", &crate_bytes("w")).await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy_repo("cargo-proxy", &up)],
+        ..Default::default()
+    })
+    .await;
+
+    let resp = get(&download_url(&a, "cargo-proxy", CRATE, "9.9.9")).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "the index knows the crate but not the version"
+    );
+    assert_eq!(
+        upstream_downloads(&up).await,
+        0,
+        "no download was attempted"
+    );
+    let rows = cache_rows(&a).await;
+    assert!(
+        rows.iter()
+            .any(|(k, key, s)| k == "cargo-index" && key == CRATE && *s == 200),
+        "the index itself was read and cached: {rows:?}"
+    );
+    assert!(
+        !rows.iter().any(|(k, _, _)| k == "cargo-crate"),
+        "no crate row: {rows:?}"
+    );
+}
+
+#[tokio::test]
+async fn upstream_503_is_502() {
+    let up = spawn_upstream().await;
+    publish(&up.server, UPSTREAM_REPO, CRATE, "1.0.0", &crate_bytes("w")).await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy_repo("cargo-proxy", &up)],
+        ..Default::default()
+    })
+    .await;
+    up.tap.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    for url in [
+        index_url(&a, "cargo-proxy", CRATE),
+        download_url(&a, "cargo-proxy", CRATE, "1.0.0"),
+    ] {
+        let resp = get(&url).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "GET {url}: an upstream 503 with no cached copy is a 502, never a 404"
+        );
+    }
+    assert!(cache_rows(&a).await.is_empty(), "failures are never cached");
+}
+
+#[tokio::test]
+async fn stale_index_served_on_upstream_error() {
+    let up = spawn_upstream().await;
+    publish(&up.server, UPSTREAM_REPO, CRATE, "1.0.0", &crate_bytes("w")).await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy_repo("cargo-proxy", &up)],
+        ..Default::default()
+    })
+    .await;
+    let url = index_url(&a, "cargo-proxy", CRATE);
+
+    let fresh = index_entries(get(&url).await).await;
+    expire_entries(&a).await;
+    up.tap.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let resp = get(&url).await;
+    assert_eq!(resp.status(), StatusCode::OK, "a stale index beats a 503");
+    let warning = resp
+        .headers()
+        .get("warning")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(
+        warning.starts_with("110"),
+        "stale response carries Warning 110, got {warning:?}"
+    );
+    let etag = resp.headers()["etag"].to_str().unwrap().to_string();
+    assert_eq!(index_entries(resp).await, fresh);
+    assert_eq!(
+        up.tap.count(&up.index_path(CRATE)),
+        2,
+        "the refresh was attempted once"
+    );
+
+    let resp = reqwest::Client::new()
+        .get(&url)
+        .header("if-none-match", &etag)
+        .send()
+        .await
+        .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::NOT_MODIFIED);
+    let warning = resp
+        .headers()
+        .get("warning")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    assert!(
+        warning.starts_with("110"),
+        "a 304 on a stale index still says so, got {warning:?}"
+    );
+}
+
+#[tokio::test]
+async fn index_routes_leave_npm_and_go_packages_named_index_alone() {
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            hosted("npm-hosted", RepositoryFormat::Npm, Visibility::Public),
+            hosted("go-hosted", RepositoryFormat::Go, Visibility::Public),
+        ],
+        ..Default::default()
+    })
+    .await;
+    for (path, handler) in [
+        ("/npm-hosted/index/-/index-1.0.0.tgz", "npm tarball"),
+        ("/go-hosted/index/@latest", "go @latest"),
+    ] {
+        let resp = get(&format!("{}{path}", a.base_url)).await;
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{handler}");
+        let body = resp.text().await.expect("failed to read body");
+        assert!(
+            !body.contains("cargo"),
+            "{handler} answered by the cargo index handler: {body}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn dl_host_on_private_literal_is_refused_without_optin() {
+    let fake = fake_index::start().await;
+    fake.add_crate(CRATE, "1.0.0", &crate_bytes("w"));
+    fake.set_dl_absolute("http://127.0.0.1:1/");
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy(
+            "cargo-proxy",
+            RepositoryFormat::Cargo,
+            &fake.index_url(),
+        )],
+        ..Default::default()
+    })
+    .await;
+
+    let resp = get(&download_url(&a, "cargo-proxy", CRATE, "1.0.0")).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let rows = cache_rows(&a).await;
+    assert!(
+        !rows.iter().any(|(kind, _, _)| kind == "cargo-crate"),
+        "no crate row: {rows:?}"
+    );
+    assert!(
+        fake.downloads().is_empty(),
+        "no download was attempted anywhere"
+    );
+    assert_eq!(
+        fake.count(&fake.index_path(CRATE)),
+        1,
+        "the index itself was read"
+    );
+}
+
+#[tokio::test]
+async fn dl_off_host_never_sees_upstream_credentials() {
+    let index = fake_index::start().await;
+    let elsewhere = fake_index::start().await;
+    let bytes = crate_bytes("guarded");
+    index.add_crate(CRATE, "1.0.0", &bytes);
+    elsewhere.add_crate(CRATE, "1.0.0", &bytes);
+    index.set_dl_absolute(&format!("{}/dl", elsewhere.base_url));
+    let a = spawn_proxy_over_fake(
+        &index,
+        ProxyOpts {
+            upstream_auth: Some(UpstreamAuth::Bearer {
+                token: "secret".into(),
+            }),
+            ..allow_private()
+        },
+    )
+    .await;
+
+    let url = download_url(&a, "cargo-proxy", CRATE, "1.0.0");
+    let resp = get(&url).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "a dl off the index host is refused while upstream_auth is set"
+    );
+    assert!(
+        elsewhere.downloads().is_empty(),
+        "the other host was never contacted, so it never saw the credentials"
+    );
+    assert_eq!(
+        index.authorization(&index.index_path(CRATE)).as_deref(),
+        Some("Bearer secret"),
+        "the index itself is read with the credentials"
+    );
+
+    index.set_dl("");
+    expire_entries(&a).await;
+    assert_eq!(download(&url).await, bytes);
+    assert_eq!(
+        index
+            .authorization(&format!("/dl/{CRATE}/1.0.0/download"))
+            .as_deref(),
+        Some("Bearer secret"),
+        "a same-origin dl keeps the credentials"
+    );
 }

@@ -204,7 +204,9 @@ index = "sparse+http://registry.example.com/cargo-all/index/"
 
 `config.json` is readable without a token even when `anonymous_read = false`,
 so cargo learns from `auth-required` to send the token kept in
-`$CARGO_HOME/credentials.toml`. Downloads are fetched from the upstream's `dl`
+`$CARGO_HOME/credentials.toml` (cargo also wants
+`[registry] global-credential-providers = ["cargo:token"]` in its config for
+such a registry). Downloads are fetched from the upstream's `dl`
 template, verified against the index checksum and cached; a `dl` pointing at a
 private IP literal is refused unless the repository sets `dl_allow_private = true`
 (or `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>=1`), which a proxy over a local
