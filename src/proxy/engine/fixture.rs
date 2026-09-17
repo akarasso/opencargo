@@ -18,6 +18,7 @@ use crate::storage::FilesystemStorage;
 pub(super) struct FakeState {
     pub hits: Vec<(Method, String, HeaderMap)>,
     pub fail: bool,
+    pub gone: bool,
     pub body: Vec<u8>,
     pub etag: Option<String>,
     pub delay: Duration,
@@ -31,15 +32,15 @@ async fn serve(State(st): State<Shared>, req: Request) -> Response {
         req.uri().path().to_string(),
         req.headers().clone(),
     );
-    let (fail, body, etag, delay) = {
+    let (fail, gone, body, etag, delay) = {
         let mut s = st.lock().unwrap();
         s.hits.push((method, path.clone(), headers.clone()));
-        (s.fail, s.body.clone(), s.etag.clone(), s.delay)
+        (s.fail, s.gone, s.body.clone(), s.etag.clone(), s.delay)
     };
     if fail {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
     }
-    if path.ends_with("/missing") {
+    if gone || path.ends_with("/missing") {
         return StatusCode::NOT_FOUND.into_response();
     }
     if path.ends_with("/drip") {

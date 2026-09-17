@@ -123,8 +123,9 @@ impl ProxyEngine {
                 Some(Stale { row, target }) => {
                     let ttl = self.ttl_secs(s.cache_policy(a));
                     proxy_cache::touch_entry(&self.db, row.id, ttl).await?;
+                    // A content-addressed target keeps its own (immutable) policy.
                     if target.id != row.id {
-                        proxy_cache::touch_entry(&self.db, target.id, ttl).await?;
+                        proxy_cache::touch_entry(&self.db, target.id, None).await?;
                     }
                     Ok(Outcome::Found(Cached {
                         entry: target,
@@ -140,7 +141,7 @@ impl ProxyEngine {
                 stale: false,
             })),
             Ok(Reply::Miss(status)) => {
-                self.record_miss(member, &key, status).await?;
+                self.record_miss(member, &key, status, stale.as_ref()).await?;
                 Ok(Outcome::NotFound)
             }
             Ok(Reply::Failed(why)) => match stale {
@@ -215,12 +216,18 @@ impl ProxyEngine {
     }
 
     /// A negative row under `cache_key`, never `store_key`: no body, no sha256.
+    /// The body a stale row of its own held loses its last reference here, so
+    /// it goes now; a pointer's target stays shared by digest.
     async fn record_miss(
         &self,
         member: CacheRepo<'_>,
         key: &CacheKey,
         status: StatusCode,
+        stale: Option<&Stale>,
     ) -> AppResult<()> {
+        if let Some(path) = stale.and_then(|st| st.row.storage_path.as_deref()) {
+            self.storage.delete(path).await?;
+        }
         let entry = NewEntry {
             repository_id: member.0.id,
             kind: key.kind,

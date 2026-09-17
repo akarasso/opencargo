@@ -578,3 +578,56 @@ async fn missing_stored_file_is_404_not_502() {
     let res = engine.stream_response(&payload, Vec::new()).await;
     assert!(matches!(res, Err(AppError::NotFound(_))), "{res:?}");
 }
+
+#[tokio::test]
+async fn revalidated_pointer_keeps_its_target_immutable() {
+    let fx = Fx::new().await;
+    fx.set(|s| s.etag = Some("\"v1\"".into()));
+    let engine = fx.engine(timeouts());
+    let art = "art/tag".to_string();
+    let first = found(engine.fetch(&pointer_strat(), &fx.up, fx.member(), &art).await);
+    assert_eq!(first.entry.expires_at, None);
+
+    fx.expire().await;
+    let revalidated = found(engine.fetch(&pointer_strat(), &fx.up, fx.member(), &art).await);
+    assert_eq!(revalidated.entry.id, first.entry.id);
+    let target = fx.row("t-body", &first.entry.cache_key).await.unwrap();
+    assert_eq!(target.expires_at, None, "a 304 extends the pointer, never the body");
+    let pointer = fx.row("t-item", "art/tag").await.unwrap();
+    assert!(pointer.expires_at.is_some());
+    assert_eq!(fx.hits().len(), 2);
+}
+
+#[tokio::test]
+async fn negative_refresh_unlinks_the_body_it_replaces() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/x".to_string();
+    let cached = found(engine.fetch(&Strat::default(), &fx.up, fx.member(), &art).await);
+    let path = cached.entry.storage_path.unwrap();
+    assert!(fx.storage.exists(&path).await.unwrap());
+
+    fx.expire().await;
+    fx.set(|s| s.gone = true);
+    let res = engine.fetch(&Strat::default(), &fx.up, fx.member(), &art).await;
+    assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
+    let row = fx.row("t-item", "art/x").await.unwrap();
+    assert_eq!((row.status, row.storage_path), (404, None));
+    assert!(
+        !fx.storage.exists(&path).await.unwrap(),
+        "no row references the old body any more"
+    );
+    assert!(fx.files().is_empty(), "{:?}", fx.files());
+
+    fx.set(|s| s.gone = false);
+    let shared = found(engine.fetch(&pointer_strat(), &fx.up, fx.member(), &"art/tag".to_string()).await);
+    let body_path = shared.entry.storage_path.unwrap();
+    fx.expire().await;
+    fx.set(|s| s.gone = true);
+    let res = engine.fetch(&pointer_strat(), &fx.up, fx.member(), &"art/tag".to_string()).await;
+    assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
+    assert!(
+        fx.storage.exists(&body_path).await.unwrap(),
+        "a digest-addressed body may be shared and stays for the sweep"
+    );
+}
