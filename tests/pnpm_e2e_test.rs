@@ -4,7 +4,8 @@ use std::ffi::OsStr;
 use std::path::Path;
 use tempfile::TempDir;
 
-use common::{client_bin, group, hosted, run_cmd, spawn_server, SpawnOpts};
+use common::upstream_tap;
+use common::{client_bin, group, hosted, proxy, run_cmd, spawn_server, SpawnOpts};
 use opencargo::config::{RepositoryConfig, RepositoryFormat, Visibility};
 
 /// Start a test server on a random port with a public `npm-private` repository.
@@ -273,6 +274,94 @@ async fn pnpm_install_through_private_group_inner(pnpm: &str) {
         run_in_home(pnpm, &["install", "--no-lockfile"], &consumer_dir, &fake_home).await;
     assert!(ok, "pnpm install through group failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
     assert!(consumer_dir.join("node_modules/@test/grouped/index.js").exists());
+}
+
+// ---------------------------------------------------------------------------
+// Install through a group whose proxy member fronts a second opencargo: pnpm
+// only ever talks to the group, the tap sees the packument and the tarball.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn pnpm_install_through_group_over_second_instance() {
+    let Some(pnpm) = client_bin("PNPM_BIN") else {
+        return;
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        pnpm_install_through_group_over_second_instance_inner(&pnpm),
+    )
+    .await;
+    assert!(result.is_ok(), "test timed out after 120s");
+}
+
+async fn pnpm_install_through_group_over_second_instance_inner(pnpm: &str) {
+    let b = spawn_server(SpawnOpts {
+        repositories: vec![hosted("npm-hosted", RepositoryFormat::Npm, Visibility::Public)],
+        ..Default::default()
+    })
+    .await;
+    let tap = upstream_tap::start(&b.base_url).await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            hosted("npm-local", RepositoryFormat::Npm, Visibility::Public),
+            proxy("npm-proxy", RepositoryFormat::Npm, &format!("{}/npm-hosted", tap.base_url)),
+            group("npm-group", RepositoryFormat::Npm, &["npm-local", "npm-proxy"]),
+        ],
+        ..Default::default()
+    })
+    .await;
+
+    let tmp = TempDir::new().expect("failed to create work temp dir");
+    let fake_home = tmp.path().join("home");
+    std::fs::create_dir_all(&fake_home).unwrap();
+    let pkg_dir = tmp.path().join("remote-pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::json!({"name": "@test/remote", "version": "1.0.0", "main": "index.js"}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), "module.exports = 'from B';").unwrap();
+    std::fs::write(
+        pkg_dir.join(".npmrc"),
+        format!(
+            "@test:registry=http://127.0.0.1:{}/npm-hosted/\n\
+             //127.0.0.1:{}/npm-hosted/:_authToken=test-token\n",
+            b.port, b.port
+        ),
+    )
+    .unwrap();
+    let (ok, stdout, stderr) =
+        run_in_home(pnpm, &["publish", "--no-git-checks"], &pkg_dir, &fake_home).await;
+    assert!(ok, "pnpm publish to B failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let consumer_dir = tmp.path().join("consumer");
+    std::fs::create_dir_all(&consumer_dir).unwrap();
+    std::fs::write(
+        consumer_dir.join("package.json"),
+        serde_json::json!({"name": "consumer", "version": "1.0.0", "dependencies": {"@test/remote": "1.0.0"}}).to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer_dir.join(".npmrc"),
+        format!("@test:registry=http://127.0.0.1:{}/npm-group/\nnode-linker=hoisted\n", a.port),
+    )
+    .unwrap();
+    let (ok, stdout, stderr) =
+        run_in_home(pnpm, &["install", "--no-lockfile"], &consumer_dir, &fake_home).await;
+    assert!(ok, "pnpm install through group failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let (ok, stdout, stderr) = run_in_home(
+        "node",
+        &["-e", "console.log(require('@test/remote'))"],
+        &consumer_dir,
+        &fake_home,
+    )
+    .await;
+    assert!(ok, "node execution failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+    assert_eq!(stdout.trim(), "from B");
+    assert_eq!(tap.count("/npm-hosted/@test/remote"), 1, "one packument fetch through the tap");
+    assert_eq!(tap.count("/npm-hosted/@test/remote/-/remote-1.0.0.tgz"), 1, "one tarball fetch");
 }
 
 // ---------------------------------------------------------------------------

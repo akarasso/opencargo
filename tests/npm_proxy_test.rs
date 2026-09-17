@@ -3,6 +3,7 @@ mod common;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 
+use common::fake_upstream::npm as fake_npm;
 use common::upstream_tap::{self, Tap};
 use common::{
     build_npm_publish_body, build_tarball, expire_entries, group, hosted, proxy, spawn_server,
@@ -38,7 +39,9 @@ impl Upstream {
 
 /// Publish one version of `name` into `repo` and return its tarball bytes.
 async fn publish(server: &TestServer, repo: &str, name: &str, description: &str) -> Vec<u8> {
-    let tarball = build_tarball(&format!(r#"{{"name":"{name}","version":"{VERSION}"}}"#));
+    let tarball = build_tarball(&format!(
+        r#"{{"name":"{name}","version":"{VERSION}","description":"{description}"}}"#
+    ));
     let body = build_npm_publish_body(name, VERSION, description, &tarball);
     let resp = reqwest::Client::new()
         .put(format!("{}/{repo}/{name}", server.base_url))
@@ -113,6 +116,22 @@ async fn cache_rows(server: &TestServer) -> Vec<(String, String, i64)> {
     .expect("failed to read cache rows");
     pool.close().await;
     rows
+}
+
+/// Cache rows whose TTL has not passed.
+async fn fresh_row_count(server: &TestServer) -> i64 {
+    let db_path = server.tmp.path().join("opencargo.db");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .expect("failed to open the server database");
+    let (count,): (i64,) = sqlx::query_as(
+        "SELECT COUNT(*) FROM proxy_cache_entries WHERE expires_at > datetime('now')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("failed to count fresh rows");
+    pool.close().await;
+    count
 }
 
 fn tarball_url(packument: &Value) -> &str {
@@ -368,4 +387,125 @@ async fn search_recurses_nested_groups() {
     assert_eq!(page["objects"][0]["package"]["name"], "@acme/gadget");
     assert_eq!(page["total"], 2);
     assert!(up.tap.hits.lock().unwrap().is_empty(), "search never asks the upstream");
+}
+
+#[tokio::test]
+async fn packument_etag_304_touches_row() {
+    let fake = fake_npm::start(
+        json!({
+            "name": PKG,
+            "dist-tags": { "latest": VERSION },
+            "versions": { VERSION: { "name": PKG, "version": VERSION, "dist": {} } },
+        }),
+        "\"v1\"",
+    )
+    .await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy("npm-proxy", RepositoryFormat::Npm, &fake.base_url)],
+        ..Default::default()
+    })
+    .await;
+    let url = format!("{}/npm-proxy/{PKG}", a.base_url);
+
+    let first = get_json(&url).await;
+    expire_entries(&a).await;
+    assert_eq!(fresh_row_count(&a).await, 0);
+
+    let resp = reqwest::get(&url).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers().get("warning").is_none(), "a revalidated row is not stale");
+    let revalidated: Value = resp.json().await.expect("invalid json");
+    assert_eq!(revalidated, first);
+
+    let hits = fake.hits();
+    assert_eq!(hits.len(), 2, "one fetch, one revalidation: {hits:?}");
+    assert_eq!(hits[0].if_none_match, None);
+    assert_eq!(hits[1].if_none_match.as_deref(), Some("\"v1\""));
+    assert_eq!(fresh_row_count(&a).await, 1, "the 304 extended the row's TTL");
+
+    get_json(&url).await;
+    assert_eq!(fake.hits().len(), 2, "a touched row is fresh again");
+}
+
+#[tokio::test]
+async fn group_serves_hosted_first() {
+    let up = seed_upstream().await;
+    let a = spawn_group(&up).await;
+    let local = publish(&a, "npm-local", PKG, "the local widget").await;
+    assert_ne!(local, up.tarball, "the two members hold different tarballs");
+
+    let packument = get_json(&format!("{}/npm-group/{PKG}", a.base_url)).await;
+    assert_eq!(packument["description"], "the local widget");
+
+    let bytes = get_bytes(&format!("{}/npm-group/{PKG}/-/{TARBALL}", a.base_url)).await;
+    assert_eq!(bytes, local, "the hosted member's tarball wins");
+    let tags = get_json(&format!("{}/npm-group/-/package/{PKG}/dist-tags", a.base_url)).await;
+    assert_eq!(tags, json!({ "latest": VERSION }));
+
+    assert!(up.tap.hits.lock().unwrap().is_empty(), "the proxy member is never consulted");
+    assert!(cache_rows(&a).await.is_empty());
+}
+
+#[tokio::test]
+async fn group_tarball_url_points_at_group() {
+    let up = seed_upstream().await;
+    let a = spawn_group(&up).await;
+
+    let packument = get_json(&format!("{}/npm-group/{PKG}", a.base_url)).await;
+    let versions = packument["versions"].as_object().expect("versions");
+    assert!(!versions.is_empty());
+    let prefix = format!("{}/npm-group/{PKG}/-/", a.base_url);
+    for (version, meta) in versions {
+        let url = meta["dist"]["tarball"].as_str().expect("dist.tarball");
+        assert!(url.starts_with(&prefix), "{version}: {url} should start with {prefix}");
+        assert!(!url.contains("npm-proxy"), "{version}: {url} names the member");
+        assert!(!url.contains(&up.tap.base_url), "{version}: {url} leaks the tap");
+    }
+
+    let bytes = get_bytes(tarball_url(&packument)).await;
+    assert_eq!(bytes, up.tarball);
+    assert_eq!(up.tap.count(&up.tarball_path()), 1);
+}
+
+#[tokio::test]
+async fn group_hides_private_member_returns_404() {
+    let up = seed_upstream().await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            hosted("npm-secret", RepositoryFormat::Npm, Visibility::Private),
+            proxy("npm-proxy", RepositoryFormat::Npm, &up.url()),
+            group("npm-group", RepositoryFormat::Npm, &["npm-secret", "npm-proxy"]),
+        ],
+        ..Default::default()
+    })
+    .await;
+    publish(&a, "npm-secret", "@acme/secret", "zzsecretword").await;
+    let client = reqwest::Client::new();
+    let urls = [
+        format!("{}/npm-group/@acme/secret", a.base_url),
+        format!("{}/npm-group/@acme/secret/-/secret-1.0.0.tgz", a.base_url),
+        format!("{}/npm-group/-/package/@acme/secret/dist-tags", a.base_url),
+    ];
+
+    for url in &urls {
+        let resp = client.get(url).send().await.expect("request failed");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "anonymous GET {url}");
+    }
+    let search = get_json(&format!("{}/npm-group/-/v1/search?text=zzsecretword", a.base_url)).await;
+    assert_eq!(search["total"], 0, "search does not list a private member's package");
+    assert_eq!(
+        up.tap.count(&format!("/{UPSTREAM_REPO}/@acme/secret")),
+        1,
+        "the walk skips the private member and still asks the proxy"
+    );
+
+    for url in &urls {
+        let resp = client
+            .get(url)
+            .bearer_auth(STATIC_TOKEN)
+            .send()
+            .await
+            .expect("request failed");
+        assert_eq!(resp.status(), StatusCode::OK, "authenticated GET {url}");
+    }
 }
