@@ -120,6 +120,7 @@ fn oci(fx: &Fx, name: &str, version: &str, body: &Cached) -> Pending {
         Source::Oci {
             body: body.clone(),
             served: None,
+            parsed: None,
         },
     );
     p.version = Some(version.into());

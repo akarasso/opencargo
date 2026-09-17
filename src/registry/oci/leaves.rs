@@ -153,9 +153,12 @@ impl Leaf for ManifestLeaf {
             let cached = fetch_cached(cx, member, up, &a).await?;
             if let Outcome::Found(c) = &cached {
                 let version = Some(self.reference.clone());
-                policy::record(cx, member, up, Format::Oci, &self.name, version, || Source::Oci {
-                    body: c.clone(),
-                    served: None,
+                policy::record(cx, member, up, Format::Oci, &self.name, version, || {
+                    Source::Oci {
+                        body: c.clone(),
+                        served: None,
+                        parsed: None,
+                    }
                 });
             }
             cached.into_payload()

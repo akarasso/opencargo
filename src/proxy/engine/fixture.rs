@@ -38,7 +38,14 @@ async fn serve(State(st): State<Shared>, req: Request) -> Response {
         let mut s = st.lock().unwrap();
         s.hits.push((method, path.clone(), headers.clone()));
         s.starts.push(Instant::now());
-        (s.fail, s.gone, s.status, s.body.clone(), s.etag.clone(), s.delay)
+        (
+            s.fail,
+            s.gone,
+            s.status,
+            s.body.clone(),
+            s.etag.clone(),
+            s.delay,
+        )
     };
     if fail {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();

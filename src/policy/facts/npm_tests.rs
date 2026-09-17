@@ -227,7 +227,11 @@ async fn refresh_floor_survives_a_rewritten_row() {
     assert_eq!(source, "refresh");
     assert!(fresh.unwrap().versions.contains_key("1.1.0"));
     assert_eq!(if_none_match_count(&fx), 1);
-    assert_eq!(fx.hits().len(), 2, "the refresh was answered 200: the row is rewritten");
+    assert_eq!(
+        fx.hits().len(),
+        2,
+        "the refresh was answered 200: the row is rewritten"
+    );
 
     for _ in 0..2 {
         let (facts, source) = facts_for(&shared, &fx, "widget-1.2.0.tgz").await;

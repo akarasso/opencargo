@@ -111,7 +111,9 @@ impl Actor {
 }
 
 /// Values copied from the served `Cached`, never the handle; `Oci.served`
-/// is the child row the writer attaches to a released index.
+/// is the child row the writer attaches to a released index and
+/// `Oci.parsed` the body the row is dated from, parsed once by the
+/// writer's classification so the gather never reads the file again.
 #[derive(Debug)]
 #[allow(clippy::large_enum_variant)]
 pub enum Source {
@@ -128,6 +130,7 @@ pub enum Source {
     Oci {
         body: Cached,
         served: Option<Cached>,
+        parsed: Option<serde_json::Value>,
     },
 }
 

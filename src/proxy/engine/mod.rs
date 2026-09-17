@@ -232,7 +232,11 @@ impl ProxyEngine {
             return Ok(Lookup::Cold);
         };
         if row.status != 200 {
-            return Ok(if fresh { Lookup::Negative } else { Lookup::Cold });
+            return Ok(if fresh {
+                Lookup::Negative
+            } else {
+                Lookup::Cold
+            });
         }
         let Some(target) = self.resolve_row(s, a, row.clone()).await else {
             return Ok(Lookup::Cold);
@@ -276,7 +280,8 @@ impl ProxyEngine {
                 stale: false,
             })),
             Ok(Reply::Miss(status)) if miss == Miss::Record => {
-                self.record_miss(member, &key, status, stale.as_ref()).await?;
+                self.record_miss(member, &key, status, stale.as_ref())
+                    .await?;
                 Ok(Outcome::NotFound)
             }
             Ok(Reply::Miss(_)) | Ok(Reply::Refused) => Ok(Outcome::NotFound),
@@ -479,7 +484,11 @@ impl ProxyEngine {
         a: &S::Artifact,
     ) -> AppResult<reqwest::Url> {
         let url = s.upstream_url(up, a)?;
-        if s.url_source(up, a) == (UrlSource::Content { allow_private: false }) {
+        if s.url_source(up, a)
+            == (UrlSource::Content {
+                allow_private: false,
+            })
+        {
             super::refuse_blocked_host(&url).await?;
         }
         Ok(url)

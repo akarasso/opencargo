@@ -167,7 +167,10 @@ mod tests {
             .await
             .unwrap();
         let stale = cache.totals(&fx.pool, &filter(), "k".into()).await.unwrap();
-        assert_eq!(stale.resolutions, 2, "a snapshot outlives a delete until told");
+        assert_eq!(
+            stale.resolutions, 2,
+            "a snapshot outlives a delete until told"
+        );
         cache.forget();
         let none = cache.totals(&fx.pool, &filter(), "k".into()).await.unwrap();
         assert_eq!(none.resolutions, 0);

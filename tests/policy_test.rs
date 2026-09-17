@@ -1698,7 +1698,10 @@ async fn me_policy_shows_only_own_rows() {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(entry_actors(&mine), ["alice", "dev-laptop"]);
         assert_eq!(totals(&mine), (2, 0, 0));
-        assert!(mine.get("process").is_none(), "the drop counter is admin-only");
+        assert!(
+            mine.get("process").is_none(),
+            "the drop counter is admin-only"
+        );
         assert!(entries(&mine)
             .iter()
             .all(|e| e["user_id"] == json!(alice_id)));

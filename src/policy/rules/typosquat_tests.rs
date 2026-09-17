@@ -116,14 +116,26 @@ fn family_markers_pass() {
     would_block(&families, Format::Npm, "gitxconfig");
     let real = shipped(Format::Npm).unwrap();
     for name in ["axois", "hasky", "kocha", "lodask", "lodahs"] {
-        assert_eq!(check(real, Format::Npm, name).0, Verdict::WouldBlock, "{name}");
+        assert_eq!(
+            check(real, Format::Npm, name).0,
+            Verdict::WouldBlock,
+            "{name}"
+        );
     }
     let crates = shipped(Format::Cargo).unwrap();
     for name in ["tokyo", "rustis"] {
-        assert_eq!(check(crates, Format::Cargo, name).0, Verdict::WouldBlock, "{name}");
+        assert_eq!(
+            check(crates, Format::Cargo, name).0,
+            Verdict::WouldBlock,
+            "{name}"
+        );
     }
     for name in ["sha3-asm", "gix-config", "wdk-sys", "bzip3", "jl-sys"] {
-        assert_eq!(check(crates, Format::Cargo, name).0, Verdict::Pass, "{name}");
+        assert_eq!(
+            check(crates, Format::Cargo, name).0,
+            Verdict::Pass,
+            "{name}"
+        );
     }
 }
 

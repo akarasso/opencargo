@@ -36,10 +36,14 @@ fn is_index(json: &Value) -> bool {
 
 /// The child digests of an index body, bare hex, attestations skipped.
 pub fn oci_children(body: &[u8]) -> Vec<String> {
-    let Ok(json) = serde_json::from_slice::<Value>(body) else {
-        return Vec::new();
-    };
-    if !is_index(&json) {
+    match serde_json::from_slice::<Value>(body) {
+        Ok(json) => children_of(&json),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn children_of(json: &Value) -> Vec<String> {
+    if !is_index(json) {
         return Vec::new();
     }
     json["manifests"]
@@ -60,15 +64,20 @@ pub fn oci_children(body: &[u8]) -> Vec<String> {
 /// Writer-inline, in arrival order: an index is parked, a manifest that
 /// spends a parked index's count releases it carrying the manifest as
 /// `served`, a sibling of an already released index is suppressed, and a
-/// manifest nobody parked records on its own.
-pub(crate) async fn oci_classify(shared: &Shared, p: Pending) -> Option<Pending> {
+/// manifest nobody parked records on its own. The body is read and
+/// parsed here once; the event leaves with the parsed body it is dated
+/// from.
+pub(crate) async fn oci_classify(shared: &Shared, mut p: Pending) -> Option<Pending> {
     let Source::Oci { body, .. } = &p.source else {
         return Some(p);
     };
     let Ok(bytes) = shared.proxy.bytes(body).await else {
         return Some(p);
     };
-    let children = oci_children(&bytes);
+    let Ok(json) = serde_json::from_slice::<Value>(&bytes) else {
+        return Some(p);
+    };
+    let children = children_of(&json);
     if !children.is_empty() {
         park(shared, p, children);
         return None;
@@ -78,8 +87,18 @@ pub(crate) async fn oci_classify(shared: &Shared, p: Pending) -> Option<Pending>
     };
     let served = body.clone();
     match pop_recent(shared, (p.member.id, p.name.clone(), hex)) {
-        None => Some(p),
-        Some(seq) => release(shared, seq, served),
+        None => {
+            attach(&mut p, None, json);
+            Some(p)
+        }
+        Some(seq) => release(shared, seq, served, json),
+    }
+}
+
+fn attach(p: &mut Pending, child: Option<Cached>, json: Value) {
+    if let Source::Oci { served, parsed, .. } = &mut p.source {
+        *served = child;
+        *parsed = Some(json);
     }
 }
 
@@ -119,12 +138,10 @@ fn pop_recent(shared: &Shared, key: super::super::ChildKey) -> Option<u64> {
     popped
 }
 
-fn release(shared: &Shared, seq: u64, served: Cached) -> Option<Pending> {
+fn release(shared: &Shared, seq: u64, served: Cached, json: Value) -> Option<Pending> {
     let (mut index, _) = shared.parked.lock().unwrap().remove(&seq)?;
     supersede(shared, index.member.id, &index.name, seq);
-    if let Source::Oci { served: slot, .. } = &mut index.source {
-        *slot = Some(served);
-    }
+    attach(&mut index, Some(served), json);
     Some(index)
 }
 
@@ -166,30 +183,39 @@ pub(crate) fn sweep_children(shared: &Shared) {
     });
 }
 
+/// The body a row is dated from: the parsed body the writer attached,
+/// else the file; an index is dated from the child the client pulled.
+pub(crate) async fn dated_body(
+    shared: &Shared,
+    body: &Cached,
+    served: Option<&Cached>,
+    parsed: Option<Value>,
+) -> Result<Value, &'static str> {
+    let json = match parsed {
+        Some(json) => json,
+        None => read_json(shared, body).await.ok_or("failed")?,
+    };
+    if !is_index(&json) {
+        return Ok(json);
+    }
+    let child = served.ok_or("index-unpulled")?;
+    read_json(shared, child).await.ok_or("failed")
+}
+
 /// The manifest's own `created` annotation, else its config blob's
-/// `created`; an index is dated from the child the client pulled, and
-/// anything before 2000-01-01 is a zeroed or forged stamp.
+/// `created`; anything before 2000-01-01 is a zeroed or forged stamp.
 pub(crate) async fn oci_published_at(
     shared: &Shared,
     cfg: &PolicyConfig,
     member: CacheRepo<'_>,
     up: &Upstream,
     name: &str,
-    body: &Cached,
-    served: Option<&Cached>,
+    dated: Result<Value, &'static str>,
 ) -> (Option<DateTime<Utc>>, &'static str) {
-    let Some(mut json) = read_json(shared, body).await else {
-        return (None, "failed");
+    let json = match dated {
+        Ok(json) => json,
+        Err(source) => return (None, source),
     };
-    if is_index(&json) {
-        let Some(child) = served else {
-            return (None, "index-unpulled");
-        };
-        let Some(child_json) = read_json(shared, child).await else {
-            return (None, "failed");
-        };
-        json = child_json;
-    }
     if let Some(created) = json["annotations"][CREATED].as_str() {
         return created_stamp(created, "annotation");
     }

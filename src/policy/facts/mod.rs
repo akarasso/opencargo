@@ -74,9 +74,14 @@ pub(crate) async fn gather(shared: &Shared, cfg: &PolicyConfig, p: Pending) -> R
             facts.date_source = source;
             (digest, version, at)
         }
-        Source::Oci { body, served } => {
+        Source::Oci {
+            body,
+            served,
+            parsed,
+        } => {
             let (at, source) = if cfg.min_release_age.is_some() {
-                oci_published_at(shared, cfg, repo, &upstream, &name, &body, served.as_ref()).await
+                let dated = oci::dated_body(shared, &body, served.as_ref(), parsed).await;
+                oci_published_at(shared, cfg, repo, &upstream, &name, dated).await
             } else {
                 (None, "none")
             };
@@ -310,6 +315,7 @@ mod tests {
                 Source::Oci {
                     body: cached("cc"),
                     served: None,
+                    parsed: None,
                 },
                 Some("sha256:cc"),
             ),
@@ -328,6 +334,57 @@ mod tests {
             assert_eq!(r.requested_repo, "requested");
         }
         assert!(fx.hits().is_empty(), "no rule on, no request");
+    }
+
+    #[tokio::test]
+    async fn oci_gather_dates_from_the_classified_body_without_a_read() {
+        let fx = Fx::new().await;
+        let (engine, _writer) = engine_over(&fx, PolicyConfig::default(), fast());
+        let shared = engine.shared();
+        let cfg = PolicyConfig {
+            min_release_age: Some("1h".parse().unwrap()),
+            ..Default::default()
+        };
+        let member = repo(fx.repo.id, "p", Format::Oci);
+        let manifest = serde_json::json!({
+            "mediaType": "application/vnd.oci.image.manifest.v1+json",
+            "config": { "digest": "sha256:ee" },
+            "annotations": { "org.opencontainers.image.created": "2026-01-01T00:00:00Z" }
+        });
+        let classified = pending(
+            &member,
+            &fx.up,
+            Format::Oci,
+            "app",
+            Source::Oci {
+                body: cached("cc"),
+                served: None,
+                parsed: Some(manifest),
+            },
+        );
+        let r = gather(shared, &cfg, classified).await;
+        assert_eq!(r.facts.date_source, "annotation");
+        assert_eq!(
+            r.published_at.unwrap().to_rfc3339(),
+            "2026-01-01T00:00:00+00:00"
+        );
+        let unclassified = pending(
+            &member,
+            &fx.up,
+            Format::Oci,
+            "app",
+            Source::Oci {
+                body: cached("cc"),
+                served: None,
+                parsed: None,
+            },
+        );
+        let r = gather(shared, &cfg, unclassified).await;
+        assert_eq!(
+            r.facts.date_source, "failed",
+            "the row's file is unreadable: nothing but the parsed body could date it"
+        );
+        assert!(fx.hits().is_empty());
     }
 
     #[tokio::test]
