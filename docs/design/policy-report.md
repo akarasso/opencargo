@@ -497,3 +497,94 @@ Rules of the road (proxy design, unchanged): no function over 80 lines, no new f
 - Lists age; `scripts/toplists.sh` regenerates both tiers, the headers record the date; a missing top name costs a false negative, a missing known name a false positive on a package below the
   top 20 k one edit from a top-5 k name, the residual section 5.4 measures on the holdout tier (~1 MB of `include_str!` for the three known lists; the holdout is test-only). Licences live in
   `policy/lists/NOTICE`; the crates.io dump is not committed until its licence is confirmed. A squat that *adds* a hyphen to a top name is missed (section 5.4), the price of never flagging `is-array`.
+
+## 13. As built
+
+Deviations accepted by review, per delivery-plan row, then the whole-feature review outcome. Where this section differs from sections 3 to 11, this section wins.
+
+### Row 1 (`2796186`)
+- Schema: policy_resolutions gains a `date_source TEXT NOT NULL DEFAULT ''` column (section 6 has none). The design's own HTTP-driven cases assert date_source (fetch / refresh / not-in-packument / rate-limited / index-unpulled / unset-created ...) and without a column those claims are unobservable from the DB; store::insert_batch writes it, the harness PolicyRow reads it.
+- OCI child-key semantics (section 4): a pure FIFO pop cannot satisfy the design's own case (20 amd64 pulls then one arm64 pull: the arm64 key's front entry is a released seq, so the 21st index would expire index-unpulled; and B's bare amd64 pull 1 s after A's pull would be swallowed by pull 20's leftover). Implemented instead: a child spends the first entry whose index is still parked (FIFO among parked), a key with none left is a sibling of a released pull (skopeo --all stays one pull), and releasing seq s supersedes every entry with seq < s for the same (member, name). Pinned by writer::sibling_of_released_pull_is_suppressed_until_a_later_release and the harness index case; the sentinel in that case is a plain OCI manifest, not an npm pull (same FIFO proof, one fewer upstream).
+- npm memo stamp is (row id, fetched_at, digest) instead of (id, fetched_at): fetched_at has second granularity, so a refresh landing in the same second as the fetch would keep stale parsed facts; the body digest changes iff the body did. PackageFacts::knows treats a version present but lacking time[version] as a miss (risk checklist: a peeked packument lacking time[version] falls through to a fetch).
+- date_source gains two values outside section 4's list: `not-found` (upstream 404 on a recorder fetch, e.g. a crates.io version the API does not know) and `failed` (transport/5xx/unreadable cache), logged at debug; the closed list had no honest name for either and `fetch` must never label an undated row.
+- PolicyEngine::new / new_tuned take no `scanner` argument in this commit: no code reads it until commit 2's osv_severity batch, and an unused field/parameter would be dead code; commit 2 adds it (one-line change in tests/common spawn_in). record_now is likewise not implemented: no commit-1 test drives it (the writer tests drive the real writer through `unspawned`).
+- policy/facts.rs is a directory module (facts/mod.rs, facts/npm.rs, facts/oci.rs) and the larger test modules live in sibling files via #[path] (policy/tests.rs, policy/testing.rs, writer_tests.rs, facts/npm_tests.rs) to keep every new source file under ~400 lines; module paths named by the design (facts::*, policy::writer::tests::*, facts::npm::tests) are unchanged. tests/policy_test.rs is 660 lines as the single home of the cases (same precedent as group_resolver_test.rs).
+- startup_notes already computes `inapplicable` (OCI member with typosquat/osv_severity on) and build_state warns on it; the design lists that under commit 2 but it is pure config with the flags already in PolicyConfig, and it lets the named test notes_name_recording_and_inapplicable_members exist now.
+- wait_for_policy_rows polls up to 10 s (design: 5 s): the paced cargo case needs 6 x (500 ms + 100 ms latency) before its rows exist. Makefile gains test-load (named in this row's proof column) and adds --test policy_test to test-quick (listed under commit 3).
+- VersionMeta's cache kind is `cargo-meta` (design: `meta`) to match the existing `cargo-*` naming; the fake cargo index's config.json now serves `api` = its own base URL instead of `""` (existing tests only assert the rewritten copy). Fixture (engine/fixture.rs) gains `starts` and `status` fields for the pacer tests instead of a packument route.
+- engine: refresh maps an exchange Err (cap/digest/integrity) to Ok(NotFound) with a warn, per 'everything else is NotFound'; fetch's metric calls are untouched, refresh records no cache hit/miss metric.
+
+### Row 2 (`7b773d5`)
+- all_rules(scanner: Arc<VulnScanner>, memo: Arc<OsvMemo>) takes two arguments (design: all_rules()): Rule::evaluate is sync and osv_severity needs the scanner (disabled check) and the shared memo for its hit; Shared holds the same Arcs (scanner, osv_memo) and PolicyEngine::new/new_tuned/unspawned gained the scanner parameter as section 3 specifies (server.rs and tests/common spawn_in pass state.vuln_scanner).
+- OsvFinding.at is a DateTime<Utc> checked against the rule's `now` argument (design: Instant): memo_hit_is_not_deferred proves expiry by passing now + 2h instead of subtracting an hour from a monotonic clock, which can underflow on a freshly booted CI host.
+- Tuning gained flush_period (default 100 ms, replacing the writer's TICK const) and the writer restarts its tick when it wakes from idle, so the first flush after idleness has a full period to fill instead of writing a one-row batch at once. The harness case osv_rule_uses_fake_osv_and_id_cache sets it to 2 s and asserts batches == [1, 64, 6]: with a fixed 100 ms tick the 70 concurrent pulls spread across ticks (SQLite serialises the 70 cache writes over ~200-300 ms) and produced 3-5 POSTs on every run, so the design's 'at most 2 POSTs' claim could not be made exact without the knob.
+- List sources differ from section 5.4's table where the named source was unreachable: crates.txt comes from the crates.io API (GET /api/v1/crates?sort=downloads, 50 pages paced at one request per second with an identifying User-Agent) instead of the 400 MB database dump (same data); go.txt and all three known/ and holdout/ tiers come from packages.ecosyste.ms dependents rankings (CC BY-SA 4.0) instead of the deps.dev BigQuery dataset, which needs a GCP account. npm.txt is npm-high-impact topDownload as designed (MIT). NOTICE records sources, licences and that crates.io publishes no explicit data licence; scripts/toplists.sh regenerates everything (--known writes the known and holdout tiers). Holdout sizes: npm 19 983, crates 20 000, go 17 774 (Go major-suffix dedupe over 40 000 ranks).
+- The typosquat top pool is bucketed by (length, first bigram) and (length, last bigram) rather than scanned linearly with a length prefilter: an edit touches at most two adjacent positions so a 5+ character name keeps one bigram; same verdicts, and it keeps the 60 000-name holdout and sibling sweeps under a second in debug builds. one_edit works on bytes.
+- Harness OSV case proves the memo as pull -> wait for the row -> two more pulls (osv.batches() == [1]) rather than three back-to-back pulls; a within-flush dedupe of the same triple is proven in-crate by batch_groups_by_ecosystem_and_dedupes (64 npm rows of 3 versions + 3 cargo rows = 2 POSTs of 3 queries).
+- cargo_row_dates_from_api_or_unknown now dates widget 30 minutes before now (was a fixed 2026-03-01) so the cargo case carries the would_block the row-2 proof asks for ('published 30m ago, threshold 1h'); the not-found crate is the unknown.
+- Rule::evaluate does not re-check enabled(): evaluate_all filters, as section 5 says; the *_not_applicable unit tests therefore do not assert None on a default config, and a new rules::tests::only_enabled_rules_leave_a_slot pins the filtering and the rule order.
+- Additions outside the design's listings: Age::approx(Duration) for the 'published 2h ago' reasons; RuleVerdict::new and PartialEq on RuleVerdict; Severity::as_str/Display; VulnScanner::enabled(); details_per_dep shared by assess and assess_batch in vulns/mod.rs; engine_with/scanner and an in-crate FakeOsv in policy/testing.rs (cfg(test)); policy_verdicts/verdict_of/rules_of and FakeOsv::batches in the harness.
+- Not in this row and untouched: policy/startup.rs already carried the inapplicable OCI notes and its test from commit 1; Makefile, docs/design/*, plan-*.md untouched.
+
+### Row 3 (`da387b2`)
+- Major (parse_since panic): fixed with `from_std(..).ok().and_then(|d| now.checked_sub_signed(d)).ok_or_else(400 'invalid since ..: age out of range')`; chose the explicit 400 over clamping to MIN_UTC so an absurd value is visibly rejected rather than silently meaning 'everything'.
+- Minor (sargable retention): delete_older_than now reads `created_at < datetime('now', '-' || ?1 || ' days')`; policy_sweep_deletes_old_rows unchanged and still green.
+- Minor (process counter): render() emits `process.dropped_since_start` only when subject.is_none(), i.e. on the admin report; /me/policy no longer carries it. docs/api.md sentence adjusted to say so and to document the 400 on an out-of-range age (docs/api.md is not a protected file; docs/design/* untouched).
+- Minor (rustfmt): only policy_days was reshaped; the new cleanup.rs test block was already fmt-clean, pre-existing hunks left alone as the review asked.
+- Commit body extended with the why of the three behaviour changes and names the new test; title kept verbatim. Nothing pushed.
+
+### Row 4 (`7cca4f0`)
+- Major (CSS specificity): fixed by naming `.stats-grid.cols-3` alongside `.stats-grid` inside both the 1080px and 480px media blocks in global.css; the earlier deviation claim was wrong and is now verified in-browser at 1400/1080/480/360px.
+- Minor (Older button): ReportTable now takes `size` from the report body (`d().size`) and disables Older when `entries.length < size`; the client constant PAGE_SIZE is removed (no other reader existed).
+- Minor (osv_enabled): `enabledRules` adds osv_severity only when a member sets it AND `rules.osv_enabled` is true, so the filter labels it '(off)' when the scanner is disabled; covered by the extended enabledRules test.
+- Minor (since in empty state): added pure `isFiltered({since, repo, rule})` in policy.ts (default since exposed as DEFAULT_SINCE) plus a `filtered()` accessor on the store; EmptyReport uses `store.filtered()`; tested at helper and store level.
+- Not addressed, pre-existing: `prettier --check frontend/src/styles/global.css` already fails on the committed file at the parent commit (unrelated to the two lines changed here), so it was left alone.
+- Scope gaps not re-attested: the section 10 manual run (steps 3-5, npm ci variant) was not re-run in this fix pass; the render-level banner test remains at the helper level since vitest has no solid JSX environment; the @acme/* scope on npm-hosted in examples/policy-demo.toml stays descriptive (no config key exists); the duplicated ws bus mock between live.test.ts and policy.test.ts stays (vi.mock hoisting is per file).
+
+### Whole-feature review (three lenses, double refutation)
+
+12 findings confirmed and fixed in follow-up commits:
+- high (false-positives): Family-prefix substitutions flag whole crate families as typosquats (sha1-asm, git-*/gix-*, fp-/sp-, wdk-sys)
+- medium (false-positives): Digit substitutions flag version-numbered siblings (bzip3 vs bzip2, soup2 vs soup3, murmur2 vs murmur3)
+- medium (false-positives): `-` <-> `.` substitution flags real npm sibling names although separator *insertion* is deliberately exempt
+- critical (cost): Report totals scan the whole `since` window uncapped, and the page refetches them ~2×/s
+- high (cost): Retention sweep is one DELETE with FK cascade: 85 s of held SQLite write lock, every other write fails
+- high (cost): npm `refresh_floor` never engages when the refresh itself rewrites the cache row: one full packument GET per tarball
+- medium (cost): Recorder-initiated `refresh` holds the client-facing singleflight guard on a fresh packument row
+- medium (cost): Writer receive loop head-of-line blocks on the INFLIGHT semaphore, stalling flushes, parked indexes and WS notifies
+- low (cost): Every OCI manifest body is read from disk and JSON-parsed twice, the first time on the writer's single receive loop
+- high (contract): Recorder-initiated fetches still write negative cache rows, so recording can 404 clients
+- medium (contract): The writer's receive loop awaits the inflight semaphore, so 64 slow gathers stall classification, flush, index release and the live event
+- low (contract): `osv_severity = "unknown"` is accepted and flags every advisory as would_block
+
+Fix report:
+
+Commits on `feat/policy-report` (all gated with `cargo clippy --all-targets --all-features -- -D warnings && cargo test`, plus `pnpm test`/`pnpm lint` for the page; each new test was verified to fail with the fix reverted):
+
+| commit | finding | proof |
+|---|---|---|
+| `e33c2e3 fix(policy): bound the report totals` | critical: totals scan + 2×/s refetch | `policy::totals::{refetches_between_flushes_never_rescan_the_window, erasure_forgets_the_snapshot}`; frontend `refetches at a floor rate under a stream of flushes`, `events during an in-flight refetch cost one more refetch after it lands` |
+| `c41c627 fix(policy): typosquat reads family markers as siblings` | high family prefix + medium digit + medium `-`/`.` | `distance::one_edit_table` (14 new rows), `typosquat::family_markers_pass`; holdout residual 82/138/5 → 67/101/5 (52 fewer, as measured), ceilings lowered to 75/110/10 |
+| `12989f4 fix(policy): recorder requests never write a negative row` | high | `facts::missing_fact_never_writes_a_negative_row` (npm + cargo), `tests/policy_test.rs::recorder_miss_never_404s_the_client` |
+| `f5c3edd fix(policy): npm refresh floor is per package, not per row` | high | `facts::npm::refresh_floor_survives_a_rewritten_row`; `npm_version_newer_than_cached_packument_refreshes` extended |
+| `a945d48 fix(policy): retention and erasure delete in chunks` | high | `store::{retention,erasure}_deletes_chunk_by_chunk_with_verdicts_explicit` (FK off, `DELETE_CHUNK + 1` rows) |
+| `2baf119 fix(policy): refresh locks its own singleflight namespace` | medium | `engine::tests::refresh_never_blocks_a_fresh_hit` |
+| `472c6d0 fix(policy): writer keeps receiving while every slot is held` | both medium writer findings | `writer::full_slots_never_stall_the_tick` |
+| `0c7af91 fix(policy): OCI body parsed once at classification` | low | `facts::oci_gather_dates_from_the_classified_body_without_a_read` |
+| `f151fc3 fix(policy): reject osv_severity = "unknown" at config load` | low | `rules::config_rejects_unknown_severity` |
+
+Design deviations (docs/design/policy-report.md untouched; to record there):
+- §6 store API: `report_totals(pool, f, IdRange)` + `store::max_id`; new `src/policy/totals.rs` (`TotalsCache`: snapshot per filter key, delta on `id > upto`, full scan no sooner than 5 s and 10× its own cost; `PolicyEngine::{totals, forget_totals}`). Migration 014: `idx_policy_res_created` dropped for covering `idx_policy_res_created_flags(created_at, would_block, unknown)`, new `idx_policy_verdicts_res(resolution_id, rule, verdict)`. `delete_older_than`/`delete_by_user` chunk at `DELETE_CHUNK = 5000`, verdicts deleted explicitly. Store tests live in `store_tests.rs`.
+- §3 engine: new `ProxyEngine::observe` (fetch's lookup/singleflight/exchange, `Miss::Ignore`); the cold packument, go `.info`, OCI blob and paced crates.io lookup use it; `refresh` locks under `refresh/…`; cache hit/miss metrics count client fetches only.
+- §3 writer: an event with no free slot waits in a local queue behind a permit branch of the `select!` instead of the recv arm awaiting the permit; the channel still bounds and drops.
+- §3/§4 `Source::Oci` gains `parsed: Option<Value>`; `oci_published_at` takes the dated body from `dated_body`.
+- §4 npm: the refresh floor is per `(member, name)` (carried across a rewritten row), so §9's `npm_version_newer_than_cached_packument_refreshes` is now "3 packument requests for 5 pulls" with `policy_tuning.refresh_floor = 300 ms` (absent stem inside the floor: no request; past it: one 304).
+- §5.4: digit substitutions, separator-for-separator swaps and a differing leading `-` token of ≤3 chars are family markers, never edits; `known_sibling_passes` proves `base65` passes on the digit rule alone and flags `basf64` instead (design named `base65` as a would_block).
+- §8 UI: debounce 1000 ms / maxWait 3000 ms (was 300/2000); `useLive` coalesces events arriving during an in-flight refetch.
+- `PolicyConfig.osv_severity` has a `deserialize_with` rejecting `unknown`; README lists the four levels.
+
+Deliberately not done:
+- A separate per-filename negative memo for absent npm stems: within the floor the carried refresh cell already answers without a request; past it one conditional request per package per floor is the design's own contract.
+- The retention sweep does not invalidate totals snapshots (`run_cleanup` has no engine handle): a snapshot can over-count for at most its TTL, and only for windows ≥ the 90-day retention bound; erasure does invalidate.
+- `verdict()` was not additionally guarded on `level > Unknown`: the threshold is refused at config load, which makes the `Some((id, Unknown)) => Pass` arm live.
+- `cargo fmt --check` fails on pre-existing files outside this series (e.g. `src/api/dashboard.rs`); only the files this series touched were formatted.
