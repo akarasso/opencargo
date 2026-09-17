@@ -116,7 +116,7 @@ upstream is `502`; an unknown image is `404`, also when the upstream answers
 `401`/`403` after issuing a token (a refusal is asked again on the next
 request, an upstream `404` is remembered for `proxy.negative_cache_ttl`).
 Push, upload and delete routes accept only
-`hosted` repositories (`400` otherwise). Upstream credentials are configured
+`hosted` repositories (`400` otherwise). Registry tokens are only valid under `/v2/`, are signed with a per-process key (a restart invalidates them and the client fetches a new one on its next 401; a horizontally scaled deployment would need a shared signing key), and a token bought with an API token stops working the moment that API token is revoked. Upstream credentials are configured
 in the file or the environment (`upstream_auth`, `token_realms`,
 `OPENCARGO_UPSTREAM_AUTH_<REPO>`), never through this API.
 

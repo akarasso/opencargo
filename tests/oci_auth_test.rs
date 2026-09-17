@@ -154,6 +154,77 @@ async fn assert_token_pushes(base_url: &str, authorization: &str) {
     );
 }
 
+/// A `trg_` API token and its id, created through the admin API.
+async fn api_token_with_id(base_url: &str, username: &str) -> (String, String) {
+    let resp = Client::new()
+        .post(format!("{base_url}/api/v1/users/{username}/tokens"))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&json!({ "name": "ci-revocable" }))
+        .send()
+        .await
+        .expect("create token request failed");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let body: Value = resp.json().await.expect("invalid json");
+    (
+        body["id"].as_str().expect("id").to_string(),
+        body["token"].as_str().expect("token").to_string(),
+    )
+}
+
+#[tokio::test]
+async fn registry_token_is_refused_outside_v2() {
+    let s = spawn(true).await;
+    publisher(&s.base_url).await;
+    let authorization = basic_auth_header(USER, PASSWORD);
+    let registry_token = token(&s.base_url, Some(&authorization), "").await;
+    assert_eq!(ping(&s.base_url, &registry_token).await.status(), StatusCode::OK);
+    for path in ["/api/v1/users", "/api/v1/me/permissions", "/npm-private/@acme/x"] {
+        let resp = Client::new()
+            .get(format!("{}{path}", s.base_url))
+            .bearer_auth(&registry_token)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{path}");
+    }
+}
+
+#[tokio::test]
+async fn registry_token_dies_with_the_api_token_it_was_bought_with() {
+    let s = spawn(true).await;
+    publisher(&s.base_url).await;
+    let (id, api) = api_token_with_id(&s.base_url, USER).await;
+    let registry_token = token(&s.base_url, Some(&format!("Bearer {api}")), "").await;
+    assert_eq!(
+        start_upload(&s.base_url, "oci-private/app", &registry_token).await.status(),
+        StatusCode::ACCEPTED
+    );
+    let resp = Client::new()
+        .delete(format!("{}/api/v1/users/{USER}/tokens/{id}", s.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert!(resp.status().is_success(), "{:?}", resp.status());
+    assert_eq!(ping(&s.base_url, &registry_token).await.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        start_upload(&s.base_url, "oci-private/app", &registry_token).await.status(),
+        StatusCode::UNAUTHORIZED
+    );
+}
+
+#[tokio::test]
+async fn v2_without_slash_is_a_json_404_and_private_ping_carries_api_version() {
+    let s = spawn(false).await;
+    let resp = reqwest::get(format!("{}/v2", s.base_url)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    assert!(header(&resp, "content-type").starts_with("application/json"));
+    let resp = reqwest::get(format!("{}/v2/", s.base_url)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(header(&resp, "docker-distribution-api-version"), "registry/2.0");
+    assert_eq!(header(&resp, "www-authenticate"), realm(&s.base_url));
+}
+
 #[tokio::test]
 async fn anonymous_ping_is_a_bearer_challenge() {
     let s = spawn(true).await;

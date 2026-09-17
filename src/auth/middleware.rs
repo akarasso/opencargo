@@ -120,6 +120,9 @@ async fn authenticate(state: &AuthState, request: Request<Body>, next: Next) -> 
                 Err(failure) => failure.into_response(),
             }
         }
+        Credentials::Registry(_) if !request.uri().path().starts_with("/v2/") => {
+            unauthorized_response(false)
+        }
         Credentials::Registry(raw) => run_registry_token(state, &raw, is_oci, request, next).await,
         Credentials::Bearer(raw) => match authenticate_bearer(state, &raw).await {
             Ok(Some(auth_user)) => run_as(auth_user, request, next).await,
@@ -210,6 +213,16 @@ async fn run_registry_token(
     let Some(claims) = state.registry_tokens.verify(raw) else {
         return unauthorized_response(is_oci);
     };
+    if let Some(id) = claims.api_token_id.as_deref() {
+        match api_token_is_live(&state.db, id).await {
+            Ok(true) => {}
+            Ok(false) => return unauthorized_response(is_oci),
+            Err(e) => {
+                tracing::warn!(error = %e, "database error during registry token authentication");
+                return service_unavailable_response();
+            }
+        }
+    }
     let subject = claims.sub.clone();
     let static_token = claims.static_token;
     request.extensions_mut().insert(claims);
@@ -278,6 +291,7 @@ fn unauthorized_response(is_oci: bool) -> Response {
     if is_oci {
         (
             StatusCode::UNAUTHORIZED,
+            [("Docker-Distribution-Api-Version", "registry/2.0")],
             Json(json!({
                 "errors": [{"code": "UNAUTHORIZED", "message": "authentication required"}]
             })),
@@ -390,32 +404,9 @@ async fn try_db_token_auth(
     db: &SqlitePool,
     raw_token: &str,
 ) -> Result<Option<AuthUser>, sqlx::Error> {
-    // The prefix stored in DB is the first 16 characters of the raw token.
-    if raw_token.len() < 16 {
-        return Ok(None);
-    }
-    let prefix = &raw_token[..16];
-
-    let Some(db_token) = crate::db::get_token_by_prefix(db, prefix).await? else {
+    let Some(db_token) = live_api_token(db, raw_token).await? else {
         return Ok(None);
     };
-
-    // Verify the token hash
-    if !tokens::verify_token(raw_token, &db_token.token_hash) {
-        return Ok(None);
-    }
-
-    // Check expiration. Fail CLOSED: an unparseable timestamp rejects the token
-    // rather than silently treating it as non-expiring (the previous behaviour).
-    if let Some(ref expires_at) = db_token.expires_at {
-        match chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S") {
-            Ok(exp) if exp < chrono::Utc::now().naive_utc() => return Ok(None), // expired
-            Ok(_) => {}                                                          // still valid
-            Err(_) => return Ok(None), // corrupt/unexpected format -> reject
-        }
-    }
-
-    // Load the user
     let Some(user) =
         sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
             .bind(db_token.user_id)
@@ -424,9 +415,42 @@ async fn try_db_token_auth(
     else {
         return Ok(None);
     };
-
-    // Update last_used_at (fire-and-forget)
     let _ = crate::db::update_token_last_used(db, &db_token.id).await;
-
     Ok(Some(AuthUser::from_user(user, raw_token)))
+}
+
+/// The API token row behind `raw_token`, if it exists, matches and has not expired.
+pub(crate) async fn live_api_token(
+    db: &SqlitePool,
+    raw_token: &str,
+) -> Result<Option<crate::db::ApiToken>, sqlx::Error> {
+    if raw_token.len() < 16 {
+        return Ok(None);
+    }
+    let Some(db_token) = crate::db::get_token_by_prefix(db, &raw_token[..16]).await? else {
+        return Ok(None);
+    };
+    if !tokens::verify_token(raw_token, &db_token.token_hash) || expired(db_token.expires_at.as_deref()) {
+        return Ok(None);
+    }
+    Ok(Some(db_token))
+}
+
+/// Whether the API token `id` still exists and has not expired.
+pub(crate) async fn api_token_is_live(db: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT expires_at FROM api_tokens WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+    Ok(matches!(row, Some((expires_at,)) if !expired(expires_at.as_deref())))
+}
+
+// Fail closed: an unparseable timestamp counts as expired.
+fn expired(expires_at: Option<&str>) -> bool {
+    match expires_at {
+        None => false,
+        Some(text) => chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+            .map(|exp| exp < chrono::Utc::now().naive_utc())
+            .unwrap_or(true),
+    }
 }

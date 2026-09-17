@@ -116,7 +116,7 @@ async fn not_found_or_spa(uri: Uri) -> axum::response::Response {
     let json = |body: &'static str| {
         (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "application/json")], body).into_response()
     };
-    if path.starts_with("/v2/") {
+    if path == "/v2" || path.starts_with("/v2/") {
         return json(r#"{"errors":[{"code":"NAME_UNKNOWN","message":"unknown route"}]}"#);
     }
     if path.starts_with("/api/") {

@@ -43,6 +43,9 @@ pub struct Claims {
     /// same synthetic admin instead of looking `sub` up in the database.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub static_token: bool,
+    /// The API token it was bought with: revoking that token revokes this one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub api_token_id: Option<String>,
 }
 
 /// Signs and verifies registry tokens with a key that lives for one process:
@@ -93,6 +96,18 @@ pub async fn issue_token(
     if user.is_none() && !state.auth.anonymous_read {
         return Err(unauthorized("authentication required"));
     }
+    let api_token_id = match user.as_ref().and(bearer_value(&headers)) {
+        Some(raw) if !raw.starts_with("ocr_") => {
+            crate::auth::middleware::live_api_token(&state.auth.db, raw)
+                .await
+                .map_err(|e| {
+                    tracing::warn!(error = %e, "database error during token endpoint authentication");
+                    AppError::ServiceUnavailable("authentication temporarily unavailable, try again".to_string()).into_response()
+                })?
+                .map(|t| t.id)
+        }
+        _ => None,
+    };
     let issued_at = chrono::Utc::now();
     let claims = Claims {
         sub: user.as_ref().map(|u| u.username.clone()),
@@ -104,6 +119,7 @@ pub async fn issue_token(
             .take(MAX_SCOPES)
             .collect(),
         static_token: user.as_ref().is_some_and(|u| u.user_id.is_none()),
+        api_token_id,
     };
     tracing::info!(
         subject = claims.sub.as_deref().unwrap_or("anonymous"),
@@ -118,6 +134,13 @@ pub async fn issue_token(
         "issued_at": issued_at.to_rfc3339_opts(SecondsFormat::Secs, true),
     }))
     .into_response())
+}
+
+fn bearer_value(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.strip_prefix("Bearer "))
 }
 
 /// The user behind the `Authorization` header, `None` when there is none;
@@ -204,6 +227,7 @@ mod tests {
             exp,
             scope: vec!["repository:r/app:pull".to_string()],
             static_token: false,
+            api_token_id: None,
         }
     }
 
@@ -220,6 +244,7 @@ mod tests {
             exp: i64::MAX,
             scope: Vec::new(),
             static_token: false,
+            api_token_id: None,
         });
         let verified = signer.verify(&anonymous).expect("valid");
         assert!(verified.sub.is_none() && !verified.static_token);
