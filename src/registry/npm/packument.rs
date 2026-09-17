@@ -75,22 +75,79 @@ pub fn strip_versions_to_abbreviated(packument: &mut Value) {
     }
 }
 
+/// The fields of npmjs's abbreviated version object, no fewer: `os`,
+/// `cpu`, `libc` and `deprecated` decide what npm installs.
+const ABBREVIATED_FIELDS: [&str; 20] = [
+    "name",
+    "version",
+    "dependencies",
+    "devDependencies",
+    "peerDependencies",
+    "peerDependenciesMeta",
+    "optionalDependencies",
+    "bundleDependencies",
+    "bundledDependencies",
+    "acceptDependencies",
+    "bin",
+    "directories",
+    "engines",
+    "dist",
+    "os",
+    "cpu",
+    "libc",
+    "deprecated",
+    "hasInstallScript",
+    "funding",
+];
+
 fn strip_to_abbreviated(meta: &mut Value) {
-    const KEEP: [&str; 12] = [
-        "name",
-        "version",
-        "dependencies",
-        "devDependencies",
-        "peerDependencies",
-        "optionalDependencies",
-        "bin",
-        "directories",
-        "engines",
-        "dist",
-        "bundleDependencies",
-        "peerDependenciesMeta",
-    ];
     if let Some(obj) = meta.as_object_mut() {
-        obj.retain(|key, _| KEEP.contains(&key.as_str()));
+        obj.retain(|key, _| ABBREVIATED_FIELDS.contains(&key.as_str()));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn abbreviated_keeps_platform_gates_and_drops_prose() {
+        let mut packument = json!({
+            "versions": {
+                "1.0.0": {
+                    "name": "esbuild-linux-64",
+                    "version": "1.0.0",
+                    "os": ["linux"],
+                    "cpu": ["x64"],
+                    "libc": ["glibc"],
+                    "deprecated": "use esbuild",
+                    "hasInstallScript": true,
+                    "optionalDependencies": {"a": "1"},
+                    "peerDependenciesMeta": {"b": {"optional": true}},
+                    "dist": {"tarball": "t"},
+                    "description": "prose",
+                    "readme": "prose",
+                    "scripts": {"postinstall": "x"},
+                    "_npmUser": {"name": "x"}
+                }
+            }
+        });
+        strip_versions_to_abbreviated(&mut packument);
+        let v = &packument["versions"]["1.0.0"];
+        for kept in [
+            "os",
+            "cpu",
+            "libc",
+            "deprecated",
+            "hasInstallScript",
+            "optionalDependencies",
+            "peerDependenciesMeta",
+            "dist",
+        ] {
+            assert!(v.get(kept).is_some(), "{kept} is part of install-v1");
+        }
+        for dropped in ["description", "readme", "scripts", "_npmUser"] {
+            assert!(v.get(dropped).is_none(), "{dropped} is not");
+        }
     }
 }
