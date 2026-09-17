@@ -139,7 +139,13 @@ pub async fn put_manifest(
         crate::registry::publish::PreScan::default(),
     )
     .await?;
-    info!(reference = %reference, digest = %digest, size = body.len(), image = %r.image_name(), "OCI manifest pushed");
+    info!(
+        reference = %reference,
+        digest = %digest,
+        size = body.len(),
+        image = %r.image_name(),
+        "OCI manifest pushed"
+    );
 
     Ok((
         StatusCode::CREATED,
@@ -184,7 +190,7 @@ async fn store_manifest(
         .bind(digest)
         .execute(&state.db)
         .await?;
-    for blob_digest in refs::extract_blob_digests(body) {
+    for blob_digest in refs::extract_refs(body) {
         let _ = sqlx::query(
             "INSERT OR IGNORE INTO oci_manifest_blobs (repository_id, manifest_digest, blob_digest)
              VALUES (?1, ?2, ?3)",

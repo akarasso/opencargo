@@ -7,8 +7,8 @@ use serde_json::{json, Value};
 
 use common::upstream_tap::{self, Tap};
 use common::{
-    expire_entries, hosted, proxy, push_blob, sha256_digest, spawn_server, SpawnOpts, TestServer,
-    STATIC_TOKEN,
+    expire_entries, group, hosted, proxy, push_blob, sha256_digest, spawn_server, SpawnOpts,
+    TestServer, STATIC_TOKEN,
 };
 use opencargo::config::{RepositoryFormat, Visibility};
 
@@ -354,4 +354,175 @@ async fn oci_proxy_purge_removes_rows_and_files_and_leaves_oci_tables_untouched(
     let resp = get(&format!("{base}/manifests/1.0")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(up.tap.count(&up.manifest_path("1.0")), 2, "purge forces a refetch");
+}
+
+/// A hosted member holding `team/app:local` beside a proxy member fronting
+/// the second instance, under one group.
+async fn spawn_group(up: &Upstream) -> (TestServer, Vec<u8>, Vec<u8>) {
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            hosted("oci-local", RepositoryFormat::Oci, Visibility::Public),
+            proxy("oci-proxy", RepositoryFormat::Oci, &up.url()),
+            group("oci-group", RepositoryFormat::Oci, &["oci-local", "oci-proxy"]),
+        ],
+        ..Default::default()
+    })
+    .await;
+    let (manifest, layer) =
+        seed_image(&a.base_url, &format!("oci-local/{IMAGE}"), "local", b"layer-local").await;
+    (a, manifest, layer)
+}
+
+async fn tags_via(base_url: &str, image: &str, query: &str) -> Value {
+    let resp = get(&format!("{base_url}/v2/{image}/tags/list{query}")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    resp.json().await.unwrap()
+}
+
+#[tokio::test]
+async fn group_manifest_blob_tags_through_group() {
+    let up = seed_upstream().await;
+    let (a, local_manifest, local_layer) = spawn_group(&up).await;
+    let base = format!("{}/v2/oci-group/{IMAGE}", a.base_url);
+
+    for (reference, manifest) in [("1.0", &up.manifest), ("local", &local_manifest)] {
+        let resp = get(&format!("{base}/manifests/{reference}")).await;
+        assert_eq!(resp.status(), StatusCode::OK, "{reference}");
+        assert_eq!(header(&resp, "docker-content-digest"), sha256_digest(manifest));
+        assert_eq!(resp.bytes().await.unwrap(), manifest.as_slice());
+    }
+    for layer in [&up.layer, &local_layer] {
+        let resp = get(&format!("{base}/blobs/{}", sha256_digest(layer))).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(resp.bytes().await.unwrap(), layer.as_slice());
+    }
+    assert_eq!(up.tap.count(&up.manifest_path("1.0")), 1);
+    assert_eq!(up.tap.count(&up.manifest_path("local")), 0, "the hosted member wins");
+
+    let image = format!("oci-group/{IMAGE}");
+    assert_eq!(
+        tags_via(&a.base_url, &image, "").await,
+        json!({ "name": image, "tags": ["1.0", "local"] })
+    );
+    assert_eq!(tags_via(&a.base_url, &image, "?n=1").await["tags"], json!(["1.0"]));
+    assert_eq!(tags_via(&a.base_url, &image, "?last=1.0").await["tags"], json!(["local"]));
+    assert_eq!(
+        tags_via(&a.base_url, "oci-group/team/unknown", "").await,
+        json!({ "name": "oci-group/team/unknown", "tags": [] })
+    );
+    assert_eq!(get(&format!("{base}/manifests/nope")).await.status(), StatusCode::NOT_FOUND);
+}
+
+#[tokio::test]
+async fn oci_group_location_and_digest_headers_use_group() {
+    let up = seed_upstream().await;
+    let (a, ..) = spawn_group(&up).await;
+    let base = format!("{}/v2/oci-group/{IMAGE}", a.base_url);
+
+    let resp = head(&format!("{base}/manifests/1.0")).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "docker-content-digest"), up.digest());
+    assert_eq!(header(&resp, "content-type"), MANIFEST_TYPE);
+    assert_eq!(header(&resp, "content-length"), up.manifest.len().to_string());
+
+    let resp = head(&format!("{base}/blobs/{}", up.layer_digest())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(header(&resp, "docker-content-digest"), up.layer_digest());
+
+    let tags = tags_via(&a.base_url, &format!("oci-group/{IMAGE}"), "").await;
+    assert_eq!(tags["name"], format!("oci-group/{IMAGE}"), "never a member name");
+    let body = tags.to_string();
+    assert!(!body.contains("oci-proxy") && !body.contains("oci-local"), "{body}");
+}
+
+#[tokio::test]
+async fn push_to_group_is_400() {
+    let up = seed_upstream().await;
+    let (a, local_manifest, _) = spawn_group(&up).await;
+    let client = reqwest::Client::new();
+    let base = format!("{}/v2/oci-group/{IMAGE}", a.base_url);
+
+    let resp = client
+        .post(format!("{base}/blobs/uploads/"))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = client
+        .put(format!("{base}/manifests/2.0"))
+        .bearer_auth(STATIC_TOKEN)
+        .header("content-type", MANIFEST_TYPE)
+        .body(local_manifest)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let resp = client
+        .delete(format!("{base}/manifests/local"))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(get(&format!("{base}/manifests/local")).await.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn group_hides_private_member() {
+    let repos = || {
+        vec![
+            hosted("oci-secret", RepositoryFormat::Oci, Visibility::Private),
+            hosted("oci-empty", RepositoryFormat::Oci, Visibility::Public),
+            group("oci-group", RepositoryFormat::Oci, &["oci-secret", "oci-empty"]),
+        ]
+    };
+    let a = spawn_server(SpawnOpts {
+        repositories: repos(),
+        ..Default::default()
+    })
+    .await;
+    seed_image(&a.base_url, &format!("oci-secret/{IMAGE}"), "1.0", b"secret-layer").await;
+    let via_group = format!("{}/v2/oci-group/{IMAGE}/manifests/1.0", a.base_url);
+
+    assert_eq!(get(&via_group).await.status(), StatusCode::NOT_FOUND, "hidden, not 403");
+    let direct = format!("{}/v2/oci-secret/{IMAGE}/manifests/1.0", a.base_url);
+    assert_eq!(get(&direct).await.status(), StatusCode::UNAUTHORIZED);
+    let resp = reqwest::Client::new()
+        .get(&via_group)
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "a reader sees the member");
+
+    let closed = spawn_server(SpawnOpts {
+        anonymous_read: false,
+        repositories: repos(),
+        ..Default::default()
+    })
+    .await;
+    let resp = get(&format!("{}/v2/oci-group/{IMAGE}/manifests/1.0", closed.base_url)).await;
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert!(header(&resp, "www-authenticate").starts_with("Basic"), "docker login shape");
+}
+
+#[tokio::test]
+async fn tags_list_ttl() {
+    let up = seed_upstream().await;
+    let a = spawn_proxy(&up).await;
+    let image = format!("oci-proxy/{IMAGE}");
+    let path = format!("/v2/{UPSTREAM_REPO}/{IMAGE}/tags/list");
+
+    for _ in 0..2 {
+        assert_eq!(tags_via(&a.base_url, &image, "").await["tags"], json!(["1.0"]));
+    }
+    assert_eq!(up.tap.count(&path), 1);
+
+    seed_image(&up.server.base_url, &format!("{UPSTREAM_REPO}/{IMAGE}"), "2.0", b"layer-2.0").await;
+    assert_eq!(tags_via(&a.base_url, &image, "").await["tags"], json!(["1.0"]), "fresh row");
+    expire_entries(&a).await;
+    assert_eq!(tags_via(&a.base_url, &image, "").await["tags"], json!(["1.0", "2.0"]));
+    assert_eq!(up.tap.count(&path), 2);
+    assert!(cache_rows(&a).await.iter().any(|(k, key, _)| k == "oci-tags" && key == IMAGE));
 }

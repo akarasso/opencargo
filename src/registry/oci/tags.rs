@@ -1,7 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 
 use axum::{
     extract::{Path, Query, State},
+    http::{header, HeaderValue},
     response::{IntoResponse, Response},
     Json,
 };
@@ -9,11 +10,14 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::oci::OciTag;
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
+use crate::registry::resolve::collect;
 use crate::server::AppState;
 
-use super::OciRef;
+use super::leaves::TagsLeaf;
+use super::{cx, OciRef};
+
+const MAX_TAGS: usize = 10_000;
 
 #[derive(Deserialize)]
 pub struct ListTagsQuery {
@@ -21,6 +25,8 @@ pub struct ListTagsQuery {
     last: Option<String>,
 }
 
+/// Union of every member's tags, sorted; `n`/`last` paginate the merged
+/// list locally so a group pages like one registry.
 pub async fn list_tags(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
@@ -29,37 +35,34 @@ pub async fn list_tags(
 ) -> AppResult<Response> {
     let r = OciRef::parse(&params)?;
     let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
-    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
+    let auth = auth.as_ref().map(|e| &e.0);
+    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
 
-    let limit = query.n.unwrap_or(100).min(10000);
-    let tags: Vec<OciTag> = match &query.last {
-        Some(last) => {
-            sqlx::query_as(
-                "SELECT * FROM oci_tags WHERE repository_id = ?1 AND name = ?2 AND tag > ?3 ORDER BY tag LIMIT ?4",
-            )
-            .bind(repo.id)
-            .bind(&r.name)
-            .bind(last)
-            .bind(limit)
-            .fetch_all(&state.db)
-            .await?
-        }
-        None => {
-            sqlx::query_as(
-                "SELECT * FROM oci_tags WHERE repository_id = ?1 AND name = ?2 ORDER BY tag LIMIT ?3",
-            )
-            .bind(repo.id)
-            .bind(&r.name)
-            .bind(limit)
-            .fetch_all(&state.db)
-            .await?
-        }
+    let leaf = TagsLeaf {
+        name: r.name.clone(),
     };
-    let tag_names: Vec<String> = tags.into_iter().map(|t| t.tag).collect();
+    let cx = cx(&state, auth, &repo);
+    let collected = collect(&cx, &repo, &leaf).await?;
+    let limit = query.n.unwrap_or(100).clamp(0, MAX_TAGS as i64) as usize;
+    let tags: Vec<String> = collected
+        .hits
+        .into_iter()
+        .flatten()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .filter(|tag| query.last.as_ref().is_none_or(|last| tag > last))
+        .take(limit)
+        .collect();
 
-    Ok(Json(json!({
-        "name": r.image_name(),
-        "tags": tag_names,
+    let mut response = Json(json!({
+        "name": format!("{}/{}", cx.url.0, r.name),
+        "tags": tags,
     }))
-    .into_response())
+    .into_response();
+    if let Some(why) = collected.degraded {
+        let warning = HeaderValue::from_str(&format!("199 - \"{}\"", why.replace('"', "'")))
+            .map_err(|_| AppError::Internal("invalid warning header".into()))?;
+        response.headers_mut().insert(header::WARNING, warning);
+    }
+    Ok(response)
 }

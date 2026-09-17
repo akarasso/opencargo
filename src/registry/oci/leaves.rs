@@ -1,4 +1,4 @@
-use crate::error::AppResult;
+use crate::error::{AppError, AppResult};
 use crate::proxy::Payload;
 use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
 
@@ -135,5 +135,53 @@ impl Leaf for ManifestLeaf {
             }
             Outcome::NotFound => Outcome::NotFound,
         })
+    }
+}
+
+pub struct TagsLeaf {
+    pub name: String,
+}
+
+/// A member is `Found` only when it holds at least one tag for the image,
+/// so an image no member knows stays an empty listing without a false hit.
+#[async_trait::async_trait]
+impl Leaf for TagsLeaf {
+    type Out = Vec<String>;
+
+    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Vec<String>>> {
+        let tags: Vec<String> = sqlx::query_scalar(
+            "SELECT tag FROM oci_tags WHERE repository_id = ?1 AND name = ?2 ORDER BY tag",
+        )
+        .bind(member.0.id)
+        .bind(&self.name)
+        .fetch_all(&cx.state.db)
+        .await?;
+        Ok(if tags.is_empty() {
+            Outcome::NotFound
+        } else {
+            Outcome::Found(tags)
+        })
+    }
+
+    async fn proxy(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+        up: &Upstream,
+    ) -> AppResult<Outcome<Vec<String>>> {
+        let a = OciArtifact::Tags {
+            name: upstream_name(up, &self.name),
+        };
+        let engine = &cx.state.proxy;
+        let Outcome::Found(cached) = engine.fetch(&OciUpstream, up, member, &a).await? else {
+            return Ok(Outcome::NotFound);
+        };
+        let body: serde_json::Value = serde_json::from_slice(&engine.bytes(&cached).await?)
+            .map_err(|e| AppError::BadGateway(format!("invalid tag list from upstream: {e}")))?;
+        let tags = body["tags"]
+            .as_array()
+            .map(|tags| tags.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        Ok(Outcome::Found(tags))
     }
 }

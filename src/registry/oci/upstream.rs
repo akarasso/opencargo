@@ -2,7 +2,9 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 
 use crate::error::{AppError, AppResult};
 use crate::proxy::auth::is_docker_hub_host;
-use crate::proxy::strategy::{CacheKey, CachePolicy, Classified, Transfer, Ttl, UpstreamStrategy};
+use crate::proxy::strategy::{
+    CacheKey, CachePolicy, Classified, Transfer, Ttl, UpstreamStrategy, DEFAULT_MAX_UPSTREAM_BYTES,
+};
 use crate::registry::resolve::Upstream;
 
 const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
@@ -11,6 +13,7 @@ const MANIFEST_ACCEPT: &str = "application/vnd.oci.image.manifest.v1+json, \
     application/vnd.docker.distribution.manifest.list.v2+json";
 const MAX_MANIFEST_BYTES: u64 = 10 * 1024 * 1024;
 const MAX_BLOB_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+const TAGS_TTL_SECS: u64 = 600;
 const HUB_REGISTRY: &str = "registry-1.docker.io";
 pub const DOCKER_CONTENT_DIGEST: HeaderName = HeaderName::from_static("docker-content-digest");
 
@@ -21,6 +24,7 @@ pub enum OciArtifact {
     Manifest { name: String, digest: String },
     Tag { name: String, tag: String },
     Blob { name: String, digest: String },
+    Tags { name: String },
 }
 
 impl OciArtifact {
@@ -29,12 +33,16 @@ impl OciArtifact {
             Self::Manifest { digest, .. } => format!("manifests/{digest}"),
             Self::Tag { tag, .. } => format!("manifests/{tag}"),
             Self::Blob { digest, .. } => format!("blobs/{digest}"),
+            Self::Tags { .. } => "tags/list".to_string(),
         }
     }
 
     fn name(&self) -> &str {
         match self {
-            Self::Manifest { name, .. } | Self::Tag { name, .. } | Self::Blob { name, .. } => name,
+            Self::Manifest { name, .. }
+            | Self::Tag { name, .. }
+            | Self::Blob { name, .. }
+            | Self::Tags { name } => name,
         }
     }
 
@@ -43,7 +51,7 @@ impl OciArtifact {
             Self::Manifest { digest, .. } | Self::Blob { digest, .. } => {
                 Some(digest.trim_start_matches("sha256:"))
             }
-            Self::Tag { .. } => None,
+            Self::Tag { .. } | Self::Tags { .. } => None,
         }
     }
 }
@@ -98,6 +106,10 @@ impl UpstreamStrategy for OciUpstream {
                 kind: "oci-blob",
                 key: format!("sha256/{}", digest.trim_start_matches("sha256:")),
             },
+            OciArtifact::Tags { name } => CacheKey {
+                kind: "oci-tags",
+                key: name.clone(),
+            },
         }
     }
 
@@ -125,6 +137,7 @@ impl UpstreamStrategy for OciUpstream {
         match a {
             OciArtifact::Manifest { .. } | OciArtifact::Blob { .. } => CachePolicy::Immutable,
             OciArtifact::Tag { .. } => CachePolicy::Ttl(Ttl::Default),
+            OciArtifact::Tags { .. } => CachePolicy::Ttl(Ttl::Secs(TAGS_TTL_SECS)),
         }
     }
 
@@ -138,7 +151,8 @@ impl UpstreamStrategy for OciUpstream {
     fn max_bytes(&self, a: &OciArtifact) -> u64 {
         match a {
             OciArtifact::Blob { .. } => MAX_BLOB_BYTES,
-            _ => MAX_MANIFEST_BYTES,
+            OciArtifact::Manifest { .. } | OciArtifact::Tag { .. } => MAX_MANIFEST_BYTES,
+            OciArtifact::Tags { .. } => DEFAULT_MAX_UPSTREAM_BYTES,
         }
     }
 
@@ -147,7 +161,7 @@ impl UpstreamStrategy for OciUpstream {
             OciArtifact::Manifest { .. } | OciArtifact::Tag { .. } => {
                 vec![(header::ACCEPT, HeaderValue::from_static(MANIFEST_ACCEPT))]
             }
-            OciArtifact::Blob { .. } => Vec::new(),
+            OciArtifact::Blob { .. } | OciArtifact::Tags { .. } => Vec::new(),
         }
     }
 
@@ -234,5 +248,11 @@ mod tests {
         assert_eq!(OciUpstream.bearer_scope(&a).unwrap(), "repository:alpine:pull");
         let key = OciUpstream.store_key(&tag(&second, "a"), "ff");
         assert_eq!((key.kind, key.key.as_str()), ("oci-manifest", "sha256/ff"));
+        let tags = OciArtifact::Tags { name: "a".into() };
+        assert_eq!(
+            OciUpstream.upstream_url(&second, &tags).unwrap().as_str(),
+            "http://127.0.0.1:5000/v2/oci-hosted/a/tags/list"
+        );
+        assert_eq!(OciUpstream.cache_policy(&tags), CachePolicy::Ttl(Ttl::Secs(600)));
     }
 }
