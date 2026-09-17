@@ -148,8 +148,15 @@ pub async fn init_repositories(
     pool: &SqlitePool,
     repos: &[crate::config::RepositoryConfig],
 ) -> anyhow::Result<()> {
-    let pending: Vec<(&str, kinds::Format)> =
-        repos.iter().map(|r| (r.name.as_str(), r.format)).collect();
+    let pending: Vec<kinds::Pending<'_>> = repos
+        .iter()
+        .map(|r| kinds::Pending {
+            name: &r.name,
+            kind: r.repo_type,
+            format: r.format,
+            members: r.members.as_deref().unwrap_or_default(),
+        })
+        .collect();
     for repo in repos {
         let spec = kinds::RepoSpec {
             name: &repo.name,

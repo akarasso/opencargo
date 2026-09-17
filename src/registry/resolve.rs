@@ -191,7 +191,8 @@ async fn walk_members<'a, L: Leaf + 'a>(
     depth: u32,
     w: &'a mut Walk<L::Out>,
 ) -> AppResult<()> {
-    if depth > MAX_GROUP_DEPTH {
+    // Only pre-validation rows can get here: writes refuse a deeper stack.
+    if depth >= MAX_GROUP_DEPTH {
         return Err(AppError::Internal(
             "group nesting depth exceeded".to_string(),
         ));
@@ -301,7 +302,8 @@ mod tests {
             group("g-fail-only", &["h-fail", "h-miss"]),
             group("g-nested", &["g-order"]),
         ];
-        for i in 0..7 {
+        // d2 -> d3 -> d4 -> d5 -> d6 -> h-found: the five levels a write allows.
+        for i in 2..7 {
             let next = if i == 6 { "h-found".to_string() } else { format!("d{}", i + 1) };
             repos.push(group(&format!("d{i}"), &[&next]));
         }
@@ -327,6 +329,8 @@ mod tests {
             ("g-empty", "[]"),
             ("g-cycle-a", r#"["g-cycle-b"]"#),
             ("g-cycle-b", r#"["g-cycle-a","p-found"]"#),
+            ("d1", r#"["d2"]"#),
+            ("d0", r#"["d1"]"#),
         ] {
             sqlx::query(
                 "INSERT INTO repositories (name, repo_type, format, visibility, config_json)
@@ -401,10 +405,12 @@ mod tests {
         assert_eq!(all(&st, "g-cycle-b").await.unwrap().hits, vec!["p-found"]);
         assert_eq!(first(&st, "g-nested").await.unwrap(), "h-found");
 
-        assert_eq!(first(&st, "d1").await.unwrap(), "h-found");
-        let Err(AppError::Internal(msg)) = first(&st, "d0").await else {
-            panic!("seven nested groups exceed the depth cap");
-        };
-        assert!(msg.contains("depth"), "{msg}");
+        assert_eq!(first(&st, "d2").await.unwrap(), "h-found");
+        for too_deep in ["d1", "d0"] {
+            let Err(AppError::Internal(msg)) = first(&st, too_deep).await else {
+                panic!("{too_deep}: a sixth nested group exceeds the depth cap");
+            };
+            assert!(msg.contains("depth"), "{msg}");
+        }
     }
 }

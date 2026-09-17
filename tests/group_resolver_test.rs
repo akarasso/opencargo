@@ -163,29 +163,55 @@ fn cache_dir(server: &TestServer, repo: &str) -> std::path::PathBuf {
 // Resolver
 // ---------------------------------------------------------------------------
 
-/// Seven nested groups exceed `MAX_GROUP_DEPTH` at read time; a member that
-/// reaches the group, or the group itself, is refused at write time.
-#[tokio::test]
-async fn depth_cap_and_cycle_detected() {
+/// `g{i}` -> `g{i+1}` -> ... -> `g6` -> `h`: `first` names the outermost group.
+fn chain(first: usize) -> Vec<RepositoryConfig> {
     let mut repositories = vec![hosted("h", RepositoryFormat::Npm, Visibility::Public)];
     repositories.push(group("g6", RepositoryFormat::Npm, &["h"]));
-    for i in (0..6).rev() {
+    for i in (first..6).rev() {
         let inner = format!("g{}", i + 1);
         repositories.push(group(&format!("g{i}"), RepositoryFormat::Npm, &[&inner]));
     }
+    repositories
+}
+
+/// Five nested groups are the limit on create, update and seed; a sixth
+/// only exists as a pre-upgrade row and fails at read time. A member that
+/// reaches the group, or the group itself, is refused at write time.
+#[tokio::test]
+async fn depth_cap_and_cycle_detected() {
+    let err = seed_error(chain(1)).await;
+    assert!(err.contains("6 groups deep"), "{err}");
+
     let server = spawn_server(SpawnOpts {
-        repositories,
+        repositories: chain(2),
         ..Default::default()
     })
     .await;
     let admin = Admin::of(&server);
-
     assert_eq!(
-        get_status(&format!("{}/g1/{PKG}", server.base_url)).await,
+        get_status(&format!("{}/g2/{PKG}", server.base_url)).await,
         StatusCode::NOT_FOUND,
-        "six nested groups resolve"
+        "five nested groups resolve"
     );
-    let resp = reqwest::get(format!("{}/g0/{PKG}", server.base_url))
+
+    let too_deep = with(create_body("g1", "group", "npm"), "members", json!(["g2"]));
+    let (status, body) = admin.create(too_deep).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("6 groups deep"), "{body}");
+    let shallow = with(create_body("g1", "group", "npm"), "members", json!(["h"]));
+    let (status, body) = admin.create(shallow).await;
+    assert_eq!(status, StatusCode::CREATED, "{body}");
+    let (status, body) = admin.update("g1", json!({ "members": ["g2"] })).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert!(body.contains("6 groups deep"), "{body}");
+
+    let pool = db(&server).await;
+    sqlx::query(r#"UPDATE repositories SET config_json = '{"members":["g2"]}' WHERE name = 'g1'"#)
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let resp = reqwest::get(format!("{}/g1/{PKG}", server.base_url))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::INTERNAL_SERVER_ERROR);
@@ -195,7 +221,7 @@ async fn depth_cap_and_cycle_detected() {
         .unwrap()
         .contains("group nesting depth exceeded"));
 
-    let (status, body) = admin.update("g6", json!({ "members": ["g0"] })).await;
+    let (status, body) = admin.update("g6", json!({ "members": ["g2"] })).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert!(body.contains("already contains 'g6'"), "{body}");
     let (status, body) = admin.update("g6", json!({ "members": ["g6"] })).await;

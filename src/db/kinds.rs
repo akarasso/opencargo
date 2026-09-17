@@ -8,6 +8,7 @@ use sqlx::SqlitePool;
 
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
+use crate::registry::resolve::MAX_GROUP_DEPTH;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -104,6 +105,15 @@ pub struct RepoSpec<'a> {
     pub members: &'a [String],
 }
 
+/// A config entry the seed has not inserted yet: members may be listed
+/// later in the file, so validation sees the whole list.
+pub struct Pending<'a> {
+    pub name: &'a str,
+    pub kind: RepoKind,
+    pub format: Format,
+    pub members: &'a [String],
+}
+
 impl RepoSpec<'_> {
     /// The `config_json` column: the member list for a group, nothing otherwise.
     pub fn config_json(&self) -> Option<String> {
@@ -152,11 +162,12 @@ fn validate_name(name: &str) -> AppResult<()> {
 /// Refuse a repository definition that could not be served or purged: name
 /// rule, kind supported by the format, upstream on proxies only, members on
 /// groups only, each member existing (in the DB or `pending`, the config list
-/// being seeded), of the same format, neither the group itself nor reaching it.
+/// being seeded), of the same format, neither the group itself nor reaching
+/// it, and the whole stack at most `MAX_GROUP_DEPTH` groups deep.
 pub async fn validate_spec(
     pool: &SqlitePool,
     spec: &RepoSpec<'_>,
-    pending: &[(&str, Format)],
+    pending: &[Pending<'_>],
 ) -> AppResult<()> {
     validate_name(spec.name)?;
     if !spec.format.supports_kind(spec.kind) {
@@ -188,14 +199,16 @@ pub async fn validate_spec(
 async fn validate_members(
     pool: &SqlitePool,
     spec: &RepoSpec<'_>,
-    pending: &[(&str, Format)],
+    pending: &[Pending<'_>],
 ) -> AppResult<()> {
     if spec.members.is_empty() {
         return Err(AppError::BadRequest(
             "group repositories need at least one member".to_string(),
         ));
     }
+    let mut deepest = 0;
     for member in spec.members {
+        deepest = deepest.max(nesting(pool, member, pending, &mut HashSet::new()).await?);
         if member == spec.name {
             return Err(AppError::BadRequest(format!(
                 "group '{member}' cannot be its own member"
@@ -213,8 +226,8 @@ async fn validate_members(
             }
             None => pending
                 .iter()
-                .find(|(name, _)| *name == member.as_str())
-                .map(|(_, format)| *format)
+                .find(|p| p.name == member.as_str())
+                .map(|p| p.format)
                 .ok_or_else(|| AppError::BadRequest(format!("group member not found: {member}")))?,
         };
         if format != spec.format {
@@ -225,7 +238,44 @@ async fn validate_members(
             )));
         }
     }
+    if deepest + 1 > MAX_GROUP_DEPTH {
+        return Err(AppError::BadRequest(format!(
+            "group '{}' would be {} groups deep, the limit is {MAX_GROUP_DEPTH}",
+            spec.name,
+            deepest + 1
+        )));
+    }
     Ok(())
+}
+
+/// Groups stacked below `name`, itself included: 0 for a hosted or proxy
+/// repository, 1 for a group of those. A row wins over a pending entry, as
+/// the seed's `INSERT OR IGNORE` does; a cycle counts once, `reaches`
+/// refuses it.
+fn nesting<'a>(
+    pool: &'a SqlitePool,
+    name: &'a str,
+    pending: &'a [Pending<'a>],
+    seen: &'a mut HashSet<String>,
+) -> Pin<Box<dyn Future<Output = AppResult<u32>> + Send + 'a>> {
+    Box::pin(async move {
+        if !seen.insert(name.to_string()) {
+            return Ok(0);
+        }
+        let members = match super::get_repository_by_name(pool, name).await? {
+            Some(row) if row.kind()? == RepoKind::Group => row.members(),
+            Some(_) => return Ok(0),
+            None => match pending.iter().find(|p| p.name == name) {
+                Some(p) if p.kind == RepoKind::Group => p.members.to_vec(),
+                _ => return Ok(0),
+            },
+        };
+        let mut deepest = 0;
+        for member in &members {
+            deepest = deepest.max(nesting(pool, member, pending, seen).await?);
+        }
+        Ok(deepest + 1)
+    })
 }
 
 /// Whether `target` is reachable through `group`'s members; `seen` bounds the
