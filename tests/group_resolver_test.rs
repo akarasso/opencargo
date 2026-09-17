@@ -522,6 +522,44 @@ async fn delete_then_recreate_never_serves_old_cache() {
 }
 
 #[tokio::test]
+async fn changing_the_upstream_purges_the_cache() {
+    let old = seed_upstream().await;
+    let new = seed_upstream().await;
+    let server = spawn_server(SpawnOpts {
+        repositories: vec![proxy("p", RepositoryFormat::Npm, &old.url())],
+        ..Default::default()
+    })
+    .await;
+    let admin = Admin::of(&server);
+    let url = format!("{}/p/{PKG}", server.base_url);
+
+    assert_eq!(get_status(&url).await, StatusCode::OK);
+    assert_eq!(old.packument_hits(), 1);
+    assert!(cache_dir(&server, "p").is_dir());
+
+    let (status, text) = admin.update("p", json!({ "visibility": "public" })).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(
+        cache_dir(&server, "p").is_dir(),
+        "a patch that keeps the upstream keeps the cache"
+    );
+
+    let (status, text) = admin.update("p", json!({ "upstream": new.url() })).await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(!cache_dir(&server, "p").exists(), "the old upstream's files are gone");
+    let pool = db(&server).await;
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await,
+        0
+    );
+    pool.close().await;
+
+    assert_eq!(get_status(&url).await, StatusCode::OK);
+    assert_eq!(new.packument_hits(), 1, "served by the new upstream");
+    assert_eq!(old.packument_hits(), 1, "never the old one");
+}
+
+#[tokio::test]
 async fn delete_proxy_with_legacy_proxy_cache_meta_row() {
     let server = spawn_server(SpawnOpts {
         repositories: vec![proxy("p", RepositoryFormat::Npm, LOOPBACK_UPSTREAM)],

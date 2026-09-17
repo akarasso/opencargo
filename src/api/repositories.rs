@@ -128,7 +128,8 @@ pub async fn get_repository(
 }
 
 /// PUT /api/v1/repositories/{name} -- Update repository (admin only). The
-/// patch is merged onto the stored row and validated like a create.
+/// patch is merged onto the stored row and validated like a create; a new
+/// upstream purges the cache first, since rows are not keyed by upstream.
 pub async fn update_repository(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -153,6 +154,9 @@ pub async fn update_repository(
         members: &members,
     };
     validate_spec(&state.db, &spec, &[]).await?;
+    if upstream_patch.is_some_and(|u| Some(u) != repo.upstream_url.as_deref()) {
+        purge_repository(&state, &repo).await?;
+    }
 
     let config_json = body
         .members
