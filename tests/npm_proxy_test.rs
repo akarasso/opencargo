@@ -389,6 +389,60 @@ async fn search_recurses_nested_groups() {
     assert!(up.tap.hits.lock().unwrap().is_empty(), "search never asks the upstream");
 }
 
+/// Names published before npm banned uppercase are still served by npmjs;
+/// reads validate for path safety only, publish keeps the strict rule.
+#[tokio::test]
+async fn legacy_uppercase_name_proxies_and_stays_unpublishable() {
+    let fake = fake_npm::start(
+        json!({
+            "name": "JSONStream",
+            "dist-tags": { "latest": VERSION },
+            "versions": { VERSION: { "name": "JSONStream", "version": VERSION, "dist": {
+                "tarball": "http://x/JSONStream/-/JSONStream-1.0.0.tgz"
+            } } },
+        }),
+        "\"v1\"",
+    )
+    .await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            hosted("npm-local", RepositoryFormat::Npm, Visibility::Public),
+            proxy("npm-proxy", RepositoryFormat::Npm, &fake.base_url),
+        ],
+        ..Default::default()
+    })
+    .await;
+
+    let packument = get_json(&format!("{}/npm-proxy/JSONStream", a.base_url)).await;
+    assert_eq!(packument["name"], "JSONStream");
+    assert_eq!(
+        packument["versions"][VERSION]["dist"]["tarball"],
+        format!("{}/npm-proxy/JSONStream/-/JSONStream-1.0.0.tgz", a.base_url)
+    );
+    let tags = get_json(&format!(
+        "{}/npm-proxy/-/package/JSONStream/dist-tags",
+        a.base_url
+    ))
+    .await;
+    assert_eq!(tags["latest"], VERSION);
+
+    for hostile in ["a%23b", "@scope/a%3fb"] {
+        let resp = reqwest::get(format!("{}/npm-proxy/{hostile}", a.base_url))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{hostile}");
+    }
+    let tarball = build_tarball(r#"{"name":"JSONStream","version":"1.0.0"}"#);
+    let resp = reqwest::Client::new()
+        .put(format!("{}/npm-local/JSONStream", a.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&build_npm_publish_body("JSONStream", VERSION, "legacy", &tarball))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "publish stays strict");
+}
+
 #[tokio::test]
 async fn packument_etag_304_touches_row() {
     let fake = fake_npm::start(

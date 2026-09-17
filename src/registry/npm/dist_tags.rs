@@ -27,7 +27,7 @@ pub async fn get_dist_tags(
     let repo_name = param(&params, "repo")?;
     let package_name = extract_package_name(&params);
 
-    crate::registry::validate_package_name("npm", &package_name)?;
+    crate::registry::validate_npm_read_name(&package_name)?;
 
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);

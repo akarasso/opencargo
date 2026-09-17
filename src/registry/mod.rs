@@ -258,6 +258,39 @@ pub fn validate_package_name(format: &str, name: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// One npm name part on a read: any legacy name npm still serves (uppercase,
+/// `~'!()*`) passes, only what would escape a path or break a URL is refused.
+fn is_safe_npm_read_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part.bytes().all(|b| {
+            b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'?' | b'#' | b'%')
+        })
+}
+
+/// The read-side npm rule: publish enforces npm's naming policy through
+/// [`validate_package_name`], reads only need the name to be one safe path
+/// segment (or `@scope/name`), so packages published before the lowercase
+/// rule (`JSONStream`, `Base64`) keep resolving through a proxy.
+pub fn validate_npm_read_name(name: &str) -> AppResult<()> {
+    let invalid = || AppError::BadRequest(format!("invalid npm package name: '{name}'"));
+    if name.len() > 214 {
+        return Err(invalid());
+    }
+    let safe = match name.strip_prefix('@') {
+        Some(rest) => rest
+            .split_once('/')
+            .is_some_and(|(scope, pkg)| is_safe_npm_read_part(scope) && is_safe_npm_read_part(pkg)),
+        None => is_safe_npm_read_part(name),
+    };
+    if safe {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
 /// Validate a version string: `[a-zA-Z0-9.+-]+`, at most 128 chars. Covers
 /// semver (npm/cargo) and Go pseudo-versions; blocks path separators and
 /// traversal sequences in storage paths like `{name}-{version}.crate`.
@@ -331,7 +364,48 @@ pub async fn emit_package_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_oci_tag, validate_package_name, validate_version};
+    use super::{
+        validate_npm_read_name, validate_oci_tag, validate_package_name, validate_version,
+    };
+
+    #[test]
+    fn npm_read_names_accept_legacy_case_and_refuse_path_escapes() {
+        for ok in [
+            "JSONStream",
+            "Base64",
+            "@Scope/CSSselect",
+            "react",
+            "@scope/pkg",
+            "lodash.merge",
+            "weird~name!(1)*",
+        ] {
+            assert!(validate_npm_read_name(ok).is_ok(), "{ok} should be readable");
+            assert!(
+                validate_package_name("npm", ok).is_err() || ok.to_lowercase() == ok,
+                "{ok}: publish stays strict"
+            );
+        }
+        for bad in [
+            "",
+            "..",
+            "a/b",
+            "../evil",
+            "@scope",
+            "@scope/a/b",
+            "@/pkg",
+            "@scope/",
+            "@scope/..",
+            "a b",
+            "a\\b",
+            "a?b",
+            "a#b",
+            "a%2fb",
+            "\u{1}",
+            &"x".repeat(215),
+        ] {
+            assert!(validate_npm_read_name(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
 
     #[test]
     fn npm_names() {
