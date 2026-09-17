@@ -43,6 +43,37 @@ fn is_digest(reference: &str) -> bool {
     reference.starts_with("sha256:")
 }
 
+fn param<'a>(params: &'a HashMap<String, String>, key: &str) -> AppResult<&'a str> {
+    params
+        .get(key)
+        .map(String::as_str)
+        .ok_or_else(|| AppError::BadRequest(format!("missing {key}")))
+}
+
+/// The `{repo}/{name}` every `/v2` route addresses; `name` may be nested
+/// (`team/app`) and is validated before any key, path or URL is built.
+pub struct OciRef {
+    pub repo: String,
+    pub name: String,
+}
+
+impl OciRef {
+    pub fn parse(params: &HashMap<String, String>) -> AppResult<Self> {
+        let repo = param(params, "repo")?;
+        let name = param(params, "name")?;
+        crate::registry::validate_package_name("oci", name)?;
+        Ok(Self {
+            repo: repo.to_string(),
+            name: name.to_string(),
+        })
+    }
+
+    /// `{repo}/{name}`, the key manifest paths and tag listings carry.
+    pub fn image_name(&self) -> String {
+        format!("{}/{}", self.repo, self.name)
+    }
+}
+
 // ---------------------------------------------------------------------------
 // GET /v2/ — API Version Check
 // ---------------------------------------------------------------------------
@@ -68,17 +99,10 @@ pub async fn head_blob(
     Path(params): Path<HashMap<String, String>>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
-    let image_name = paths::image_name(&params);
-    let digest = params
-        .get("digest")
-        .ok_or_else(|| AppError::BadRequest("missing digest".to_string()))?;
+    let r = OciRef::parse(&params)?;
+    let digest = param(&params, "digest")?;
 
-    // Look up the repository for this image
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -103,7 +127,7 @@ pub async fn head_blob(
         }
         None => Err(AppError::NotFound(format!(
             "blob not found: {} in {}",
-            digest, image_name
+            digest, r.image_name()
         ))),
     }
 }
@@ -117,16 +141,10 @@ pub async fn get_blob(
     Path(params): Path<HashMap<String, String>>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
-    let image_name = paths::image_name(&params);
-    let digest = params
-        .get("digest")
-        .ok_or_else(|| AppError::BadRequest("missing digest".to_string()))?;
+    let r = OciRef::parse(&params)?;
+    let digest = param(&params, "digest")?;
 
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -134,7 +152,7 @@ pub async fn get_blob(
     let blob = crate::db::oci::get_blob(&state.db, repo.id, digest).await?;
 
     let blob = blob.ok_or_else(|| {
-        AppError::NotFound(format!("blob not found: {} in {}", digest, image_name))
+        AppError::NotFound(format!("blob not found: {} in {}", digest, r.image_name()))
     })?;
 
     let data = state.storage.get(&paths::blob_path(&repo.name, digest)).await?;
@@ -163,6 +181,7 @@ pub async fn delete_blob(
     Path(params): Path<HashMap<String, String>>,
     request: axum::http::Request<axum::body::Body>,
 ) -> AppResult<Response> {
+    let r = OciRef::parse(&params)?;
     // Require authentication
     let auth_user = request
         .extensions()
@@ -170,16 +189,9 @@ pub async fn delete_blob(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    let image_name = paths::image_name(&params);
-    let digest = params
-        .get("digest")
-        .ok_or_else(|| AppError::BadRequest("missing digest".to_string()))?;
+    let digest = param(&params, "digest")?;
 
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
@@ -212,7 +224,7 @@ pub async fn delete_blob(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!(
             "blob not found: {} in {}",
-            digest, image_name
+            digest, r.image_name()
         )));
     }
 
@@ -230,6 +242,7 @@ pub async fn start_upload(
     Path(params): Path<HashMap<String, String>>,
     request: axum::http::Request<axum::body::Body>,
 ) -> AppResult<Response> {
+    let r = OciRef::parse(&params)?;
     // Require authentication
     let auth_user = request
         .extensions()
@@ -237,33 +250,25 @@ pub async fn start_upload(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
 
-    // Create upload record
     let upload_id = uuid::Uuid::new_v4().to_string();
-    let name = params.get("name").cloned().unwrap_or_default();
-    // Reject hostile image names at the very start of a push flow.
-    crate::registry::validate_package_name("oci", &name)?;
 
     sqlx::query(
         "INSERT INTO oci_uploads (id, repository_id, name) VALUES (?1, ?2, ?3)",
     )
     .bind(&upload_id)
     .bind(repo.id)
-    .bind(&name)
+    .bind(&r.name)
     .execute(&state.db)
     .await?;
 
-    let location = format!("/v2/{}/{}/blobs/uploads/{}", repo_name, name, upload_id);
+    let location = format!("/v2/{}/{}/blobs/uploads/{}", r.repo, r.name, upload_id);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -286,13 +291,8 @@ pub async fn upload_chunk(
     auth: Option<axum::Extension<AuthUser>>,
     body: Bytes,
 ) -> AppResult<Response> {
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-    let name = params.get("name").cloned().unwrap_or_default();
-    let upload_uuid = params
-        .get("uuid")
-        .ok_or_else(|| AppError::BadRequest("missing upload uuid".to_string()))?;
+    let r = OciRef::parse(&params)?;
+    let upload_uuid = param(&params, "uuid")?;
 
     // Authn + authz: this path was previously unauthenticated, allowing anyone
     // with a valid upload UUID to write into any repo. Require an authenticated
@@ -300,7 +300,7 @@ pub async fn upload_chunk(
     let auth_user = auth
         .map(|e| e.0)
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
     if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await?
@@ -325,7 +325,7 @@ pub async fn upload_chunk(
     let chunk_path = format!("oci/_uploads/{}/{}", upload_uuid, "data");
     let total_len = state.storage.append(&chunk_path, body).await?;
 
-    let location = format!("/v2/{}/{}/blobs/uploads/{}", repo_name, name, upload_uuid);
+    let location = format!("/v2/{}/{}/blobs/uploads/{}", r.repo, r.name, upload_uuid);
 
     Ok((
         StatusCode::ACCEPTED,
@@ -355,20 +355,15 @@ pub async fn complete_upload(
     auth: Option<axum::Extension<AuthUser>>,
     body: Bytes,
 ) -> AppResult<Response> {
-    let image_name = paths::image_name(&params);
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-    let upload_uuid = params
-        .get("uuid")
-        .ok_or_else(|| AppError::BadRequest("missing upload uuid".to_string()))?;
+    let r = OciRef::parse(&params)?;
+    let upload_uuid = param(&params, "uuid")?;
 
     // Authn + authz: require an authenticated user with write permission on the
     // hosted repo named in the URL (this path was previously unauthenticated).
     let auth_user = auth
         .map(|e| e.0)
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
     if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await?
@@ -445,7 +440,7 @@ pub async fn complete_upload(
     info!(
         digest = %query.digest,
         size = blob_data.len(),
-        image = %image_name,
+        image = %r.image_name(),
         "OCI blob uploaded"
     );
 
@@ -456,7 +451,7 @@ pub async fn complete_upload(
             ("Content-Length", "0".to_string()),
             (
                 "Location",
-                format!("/v2/{}/blobs/{}", image_name, query.digest),
+                format!("/v2/{}/blobs/{}", r.image_name(), query.digest),
             ),
         ],
     )
@@ -472,30 +467,23 @@ pub async fn get_manifest(
     Path(params): Path<HashMap<String, String>>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
-    let image_name = paths::image_name(&params);
-    let reference = params
-        .get("reference")
-        .ok_or_else(|| AppError::BadRequest("missing reference".to_string()))?;
+    let r = OciRef::parse(&params)?;
+    let reference = param(&params, "reference")?;
 
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-    let name = params.get("name").cloned().unwrap_or_default();
-
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     // Resolve the digest: if reference is a tag, look up the digest
     let digest = if is_digest(reference) {
-        reference.clone()
+        reference.to_string()
     } else {
         // Look up tag
         let tag: Option<OciTag> = sqlx::query_as(
             "SELECT * FROM oci_tags WHERE repository_id = ?1 AND name = ?2 AND tag = ?3",
         )
         .bind(repo.id)
-        .bind(&name)
+        .bind(&r.name)
         .bind(reference)
         .fetch_optional(&state.db)
         .await?;
@@ -503,25 +491,25 @@ pub async fn get_manifest(
         tag.ok_or_else(|| {
             AppError::NotFound(format!(
                 "manifest not found: {}:{} in {}",
-                name, reference, repo_name
+                r.name, reference, r.repo
             ))
         })?
         .manifest_digest
     };
 
     // Fetch manifest from DB
-    let manifest = crate::db::oci::get_manifest(&state.db, repo.id, &name, &digest).await?;
+    let manifest = crate::db::oci::get_manifest(&state.db, repo.id, &r.name, &digest).await?;
 
     let manifest = manifest.ok_or_else(|| {
         AppError::NotFound(format!(
             "manifest not found: {}@{} in {}",
-            name, digest, repo_name
+            r.name, digest, r.repo
         ))
     })?;
 
     let data = state
         .storage
-        .get(&paths::manifest_path(&image_name, &name, &digest))
+        .get(&paths::manifest_path(&r.image_name(), &r.name, &digest))
         .await?;
 
     Ok((
@@ -545,27 +533,22 @@ pub async fn head_manifest(
     Path(params): Path<HashMap<String, String>>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-    let name = params.get("name").cloned().unwrap_or_default();
-    let reference = params
-        .get("reference")
-        .ok_or_else(|| AppError::BadRequest("missing reference".to_string()))?;
+    let r = OciRef::parse(&params)?;
+    let reference = param(&params, "reference")?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
     // Resolve digest
     let digest = if is_digest(reference) {
-        reference.clone()
+        reference.to_string()
     } else {
         let tag: Option<OciTag> = sqlx::query_as(
             "SELECT * FROM oci_tags WHERE repository_id = ?1 AND name = ?2 AND tag = ?3",
         )
         .bind(repo.id)
-        .bind(&name)
+        .bind(&r.name)
         .bind(reference)
         .fetch_optional(&state.db)
         .await?;
@@ -573,18 +556,18 @@ pub async fn head_manifest(
         tag.ok_or_else(|| {
             AppError::NotFound(format!(
                 "manifest not found: {}:{} in {}",
-                name, reference, repo_name
+                r.name, reference, r.repo
             ))
         })?
         .manifest_digest
     };
 
-    let manifest = crate::db::oci::get_manifest(&state.db, repo.id, &name, &digest).await?;
+    let manifest = crate::db::oci::get_manifest(&state.db, repo.id, &r.name, &digest).await?;
 
     let manifest = manifest.ok_or_else(|| {
         AppError::NotFound(format!(
             "manifest not found: {}@{} in {}",
-            name, digest, repo_name
+            r.name, digest, r.repo
         ))
     })?;
 
@@ -609,6 +592,7 @@ pub async fn put_manifest(
     headers: HeaderMap,
     request: axum::http::Request<axum::body::Body>,
 ) -> AppResult<Response> {
+    let r = OciRef::parse(&params)?;
     // Require authentication
     let auth_user = request
         .extensions()
@@ -616,27 +600,15 @@ pub async fn put_manifest(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    let image_name = paths::image_name(&params);
-    let reference = params
-        .get("reference")
-        .ok_or_else(|| AppError::BadRequest("missing reference".to_string()))?
-        .clone();
+    let reference = param(&params, "reference")?;
 
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?
-        .clone();
-    let name = params.get("name").cloned().unwrap_or_default();
-
-    // The image name lands in DB rows and storage paths; the reference, when
-    // it is a tag, lands in oci_tags. Validate both before any write. A digest
-    // reference is checked against the computed content digest below.
-    crate::registry::validate_package_name("oci", &name)?;
-    if !is_digest(&reference) {
-        crate::registry::validate_oci_tag(&reference)?;
+    // A tag lands in oci_tags; a digest reference is checked against the
+    // computed content digest below.
+    if !is_digest(reference) {
+        crate::registry::validate_oci_tag(reference)?;
     }
 
-    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
@@ -660,7 +632,7 @@ pub async fn put_manifest(
     // If the client pushed by digest, the reference MUST equal the actual
     // content digest (OCI distribution spec). Reject a mismatch rather than
     // silently storing the manifest under its real digest.
-    if is_digest(&reference) && reference != digest {
+    if is_digest(reference) && reference != digest {
         return Err(AppError::BadRequest(format!(
             "manifest digest mismatch: reference '{reference}' != computed '{digest}'"
         )));
@@ -668,7 +640,7 @@ pub async fn put_manifest(
 
     state
         .storage
-        .put(&paths::manifest_path(&image_name, &name, &digest), body.clone())
+        .put(&paths::manifest_path(&r.image_name(), &r.name, &digest), body.clone())
         .await?;
 
     // Insert manifest record in DB
@@ -677,7 +649,7 @@ pub async fn put_manifest(
          VALUES (?1, ?2, ?3, ?4, ?5)",
     )
     .bind(repo.id)
-    .bind(&name)
+    .bind(&r.name)
     .bind(&digest)
     .bind(&content_type)
     .bind(body.len() as i64)
@@ -703,15 +675,15 @@ pub async fn put_manifest(
     }
 
     // If reference is a tag (not a digest), create/update the tag mapping
-    if !is_digest(&reference) {
+    if !is_digest(reference) {
         sqlx::query(
             "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(repository_id, name, tag) DO UPDATE SET manifest_digest = excluded.manifest_digest",
         )
         .bind(repo.id)
-        .bind(&name)
-        .bind(&reference)
+        .bind(&r.name)
+        .bind(reference)
         .bind(&digest)
         .execute(&state.db)
         .await?;
@@ -726,9 +698,9 @@ pub async fn put_manifest(
     crate::registry::publish::finalize_publish(
         &state,
         Format::Oci,
-        &repo_name,
-        &name,
-        &reference,
+        &r.repo,
+        &r.name,
+        reference,
         None,
         &String::from_utf8_lossy(&body),
         &auth_user.username,
@@ -740,7 +712,7 @@ pub async fn put_manifest(
         reference = %reference,
         digest = %digest,
         size = body.len(),
-        image = %image_name,
+        image = %r.image_name(),
         "OCI manifest pushed"
     );
 
@@ -751,7 +723,7 @@ pub async fn put_manifest(
             ("Content-Length", "0".to_string()),
             (
                 "Location",
-                format!("/v2/{}/manifests/{}", image_name, digest),
+                format!("/v2/{}/manifests/{}", r.image_name(), digest),
             ),
         ],
     )
@@ -767,6 +739,7 @@ pub async fn delete_manifest(
     Path(params): Path<HashMap<String, String>>,
     request: axum::http::Request<axum::body::Body>,
 ) -> AppResult<Response> {
+    let r = OciRef::parse(&params)?;
     // Require authentication
     let auth_user = request
         .extensions()
@@ -774,17 +747,9 @@ pub async fn delete_manifest(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    let image_name = paths::image_name(&params);
-    let reference = params
-        .get("reference")
-        .ok_or_else(|| AppError::BadRequest("missing reference".to_string()))?;
+    let reference = param(&params, "reference")?;
 
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-    let name = params.get("name").cloned().unwrap_or_default();
-
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
@@ -792,13 +757,13 @@ pub async fn delete_manifest(
 
     // Resolve digest
     let digest = if is_digest(reference) {
-        reference.clone()
+        reference.to_string()
     } else {
         let tag: Option<OciTag> = sqlx::query_as(
             "SELECT * FROM oci_tags WHERE repository_id = ?1 AND name = ?2 AND tag = ?3",
         )
         .bind(repo.id)
-        .bind(&name)
+        .bind(&r.name)
         .bind(reference)
         .fetch_optional(&state.db)
         .await?;
@@ -806,7 +771,7 @@ pub async fn delete_manifest(
         tag.ok_or_else(|| {
             AppError::NotFound(format!(
                 "manifest not found: {}:{} in {}",
-                name, reference, repo_name
+                r.name, reference, r.repo
             ))
         })?
         .manifest_digest
@@ -817,7 +782,7 @@ pub async fn delete_manifest(
         "DELETE FROM oci_manifests WHERE repository_id = ?1 AND name = ?2 AND digest = ?3",
     )
     .bind(repo.id)
-    .bind(&name)
+    .bind(&r.name)
     .bind(&digest)
     .execute(&state.db)
     .await?;
@@ -825,7 +790,7 @@ pub async fn delete_manifest(
     if result.rows_affected() == 0 {
         return Err(AppError::NotFound(format!(
             "manifest not found: {}@{} in {}",
-            name, digest, repo_name
+            r.name, digest, r.repo
         )));
     }
 
@@ -834,7 +799,7 @@ pub async fn delete_manifest(
         "DELETE FROM oci_tags WHERE repository_id = ?1 AND name = ?2 AND manifest_digest = ?3",
     )
     .bind(repo.id)
-    .bind(&name)
+    .bind(&r.name)
     .bind(&digest)
     .execute(&state.db)
     .await?;
@@ -880,7 +845,7 @@ pub async fn delete_manifest(
 
     let _ = state
         .storage
-        .delete(&paths::manifest_path(&image_name, &name, &digest))
+        .delete(&paths::manifest_path(&r.image_name(), &r.name, &digest))
         .await;
 
     Ok(StatusCode::ACCEPTED.into_response())
@@ -904,12 +869,9 @@ pub async fn list_tags(
     Query(query): Query<ListTagsQuery>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
-    let repo_name = params
-        .get("repo")
-        .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
-    let name = params.get("name").cloned().unwrap_or_default();
+    let r = OciRef::parse(&params)?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -921,7 +883,7 @@ pub async fn list_tags(
                 "SELECT * FROM oci_tags WHERE repository_id = ?1 AND name = ?2 AND tag > ?3 ORDER BY tag LIMIT ?4",
             )
             .bind(repo.id)
-            .bind(&name)
+            .bind(&r.name)
             .bind(last)
             .bind(limit)
             .fetch_all(&state.db)
@@ -932,7 +894,7 @@ pub async fn list_tags(
                 "SELECT * FROM oci_tags WHERE repository_id = ?1 AND name = ?2 ORDER BY tag LIMIT ?3",
             )
             .bind(repo.id)
-            .bind(&name)
+            .bind(&r.name)
             .bind(limit)
             .fetch_all(&state.db)
             .await?
@@ -940,7 +902,7 @@ pub async fn list_tags(
     };
 
     let tag_names: Vec<String> = tags.iter().map(|t| t.tag.clone()).collect();
-    let full_name = format!("{}/{}", repo_name, name);
+    let full_name = r.image_name();
 
     Ok(Json(json!({
         "name": full_name,
