@@ -103,8 +103,8 @@ GET    /{repo}/{module}/@v/{version}.zip
 PUT    /{repo}/{module}/@v/{version}               Publish (zip body)
 ```
 
-`{module}` arrives GOPROXY-escaped (`github.com/!burnt!sushi/toml`); the
-publish route takes the raw path. `.info` `Time` is RFC 3339. A `proxy`
+`{module}` and `{version}` arrive GOPROXY-escaped (`github.com/!burnt!sushi/toml`,
+`v1.0.0-!r!c1`); the publish route takes the raw path. `.info` `Time` is RFC 3339. A `proxy`
 (`upstream = "https://proxy.golang.org"` or another opencargo repository)
 caches canonical versions forever and `@v/list`, `@latest` and non-canonical
 queries (`master.info`) for ten minutes. A `group` answers `@v/list` with the

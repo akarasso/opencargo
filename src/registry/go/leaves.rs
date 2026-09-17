@@ -136,7 +136,9 @@ impl Leaf for FileLeaf {
         let Some(package) = hosted_package(cx, member, &self.module).await? else {
             return Ok(Outcome::NotFound);
         };
-        let Some(version) = crate::db::get_version(db, package.id, &self.version).await? else {
+        let Some(version) =
+            crate::db::get_version(db, package.id, &unescape(&self.version)).await?
+        else {
             return Ok(Outcome::NotFound);
         };
         let payload = match self.kind {

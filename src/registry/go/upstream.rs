@@ -4,7 +4,7 @@ use crate::proxy::strategy::{
 };
 use crate::registry::resolve::Upstream;
 
-use super::escape::is_canonical_version;
+use super::escape::{is_canonical_version, unescape};
 
 const MAX_ZIP_BYTES: u64 = 512 * 1024 * 1024;
 const MAX_MOD_BYTES: u64 = 16 * 1024 * 1024;
@@ -115,7 +115,7 @@ impl UpstreamStrategy for GoUpstream {
 
     fn cache_policy(&self, a: &GoArtifact) -> CachePolicy {
         match a {
-            GoArtifact::File { version, .. } if is_canonical_version(version) => {
+            GoArtifact::File { version, .. } if is_canonical_version(&unescape(version)) => {
                 CachePolicy::Immutable
             }
             _ => CachePolicy::Ttl(Ttl::Secs(QUERY_TTL_SECS)),

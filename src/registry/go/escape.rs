@@ -35,22 +35,40 @@ pub fn unescape(path: &str) -> String {
     out
 }
 
-/// The `go` name rule on the module with its escapes stripped, plus every
-/// `!` followed by `[a-z]` or `!`.
-pub fn validate_escaped_module(module: &str) -> AppResult<()> {
-    let invalid = || AppError::BadRequest(format!("invalid go module path: '{module}'"));
-    let bytes = module.as_bytes();
+/// Every `!` is followed by `[a-z]` or another `!`.
+fn escapes_well_formed(s: &str) -> bool {
+    let bytes = s.as_bytes();
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'!' {
             match bytes.get(i + 1) {
                 Some(b'a'..=b'z') | Some(b'!') => i += 1,
-                _ => return Err(invalid()),
+                _ => return false,
             }
         }
         i += 1;
     }
+    true
+}
+
+/// The `go` name rule on the module with its escapes stripped, plus every
+/// `!` followed by `[a-z]` or `!`.
+pub fn validate_escaped_module(module: &str) -> AppResult<()> {
+    let invalid = || AppError::BadRequest(format!("invalid go module path: '{module}'"));
+    if !escapes_well_formed(module) {
+        return Err(invalid());
+    }
     crate::registry::validate_package_name("go", &module.replace('!', "")).map_err(|_| invalid())
+}
+
+/// The version is case-encoded like the module (`v1.0.0-RC1` arrives as
+/// `v1.0.0-!r!c1`): the generic version rule applies to the unescaped form.
+pub fn validate_escaped_version(version: &str) -> AppResult<()> {
+    let invalid = || AppError::BadRequest(format!("invalid version: '{version}'"));
+    if !escapes_well_formed(version) {
+        return Err(invalid());
+    }
+    crate::registry::validate_version(&unescape(version)).map_err(|_| invalid())
 }
 
 /// `v` + semver core with optional pre-release/build; pseudo-versions
@@ -63,7 +81,10 @@ pub fn is_canonical_version(version: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{escape, is_canonical_version, unescape, validate_escaped_module};
+    use super::{
+        escape, is_canonical_version, unescape, validate_escaped_module,
+        validate_escaped_version,
+    };
 
     #[test]
     fn roundtrip_and_validation() {
@@ -97,6 +118,13 @@ mod tests {
                 validate_escaped_module(bad).is_err(),
                 "{bad} should be rejected"
             );
+        }
+
+        for ok in ["v1.0.0", "v1.0.0-!r!c1", "v0.0.0-20230101120000-abcdef123456"] {
+            assert!(validate_escaped_version(ok).is_ok(), "{ok}");
+        }
+        for bad in ["", "v1.0.0-!R", "v1!", "1.0.0/evil", "v1.0.0-!1"] {
+            assert!(validate_escaped_version(bad).is_err(), "{bad}");
         }
 
         for canonical in [

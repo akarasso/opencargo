@@ -359,6 +359,41 @@ async fn latest_is_max_semver() {
 
 /// 9. An unknown module lists as 404 so `GOPROXY=a,b,direct` moves on; an
 /// empty 200 would end resolution here.
+/// GOPROXY case-encodes the version like the module: `v1.0.0-RC1` is
+/// requested as `v1.0.0-!r!c1`.
+#[tokio::test]
+async fn escaped_uppercase_version_is_served() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    publish_go_module(&client, &base_url, "go-hosted", "example.com/lib", "v1.0.0-RC1").await;
+
+    let resp = client
+        .get(format!("{base_url}/go-hosted/example.com/lib/@v/v1.0.0-!r!c1.info"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info: Value = resp.json().await.unwrap();
+    assert_eq!(info["Version"], "v1.0.0-RC1");
+    let resp = client
+        .get(format!("{base_url}/go-hosted/example.com/lib/@v/v1.0.0-!r!c1.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.bytes().await.unwrap(),
+        build_go_module_zip("example.com/lib", "v1.0.0-RC1")
+    );
+
+    let resp = client
+        .get(format!("{base_url}/go-hosted/example.com/lib/@v/v1.0.0-!R.info"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "a malformed escape");
+}
+
 #[tokio::test]
 async fn unknown_module_list_is_404() {
     let (base_url, _handle, _tmp) = setup().await;

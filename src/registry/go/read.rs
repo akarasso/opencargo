@@ -15,7 +15,7 @@ use crate::registry::resolve::{collect, first_hit, Collected, Cx, UrlRepo};
 use crate::server::AppState;
 
 use super::compare_versions;
-use super::escape::validate_escaped_module;
+use super::escape::{validate_escaped_module, validate_escaped_version};
 use super::leaves::{FileLeaf, LatestLeaf, ListLeaf};
 use super::upstream::FileKind;
 
@@ -115,7 +115,7 @@ pub async fn version_dispatch(
             "unknown version file extension; expected .info, .mod, or .zip".to_string(),
         )
     })?;
-    crate::registry::validate_version(version)?;
+    validate_escaped_version(version)?;
     let auth = auth.as_ref().map(|e| &e.0);
     let repo = open(&state, &repo_name, &module, auth).await?;
     let leaf = FileLeaf {
