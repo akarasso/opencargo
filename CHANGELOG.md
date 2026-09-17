@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `proxy` and `group` repositories for every format. Cargo: sparse index
+  proxied and revalidated by ETag, crates fetched through the upstream `dl`
+  template and verified against the index checksum, group index as the
+  union of its members (`Warning: 199` when one is down), tokenless
+  `config.json` with `auth-required`. Go: GOPROXY proxy with escaped module
+  paths, group `@v/list` union and `@latest` by semver, upstream 410 as 404.
+  OCI: pull-through proxy with the Docker Hub Bearer token dance, `library/`
+  prefix, streamed blobs verified by digest, HEAD served from the cache,
+  group manifests, blobs and merged tag lists. npm: dist-tags and search
+  through proxies and nested groups. Every proxy caches immutable artifacts
+  forever, metadata for `proxy.default_ttl`, upstream 404s for
+  `proxy.negative_cache_ttl`, and serves a stale copy with `Warning: 110`
+  when the upstream is down. Concurrent misses are deduplicated in-process.
+- Nested OCI image names (`team/app`, `org/team/app`) on every `/v2` route,
+  including `Location` and `Docker-Content-Digest` headers.
+- Per-repository upstream credentials (`upstream_auth`, or
+  `OPENCARGO_UPSTREAM_AUTH_<REPO>` = `basic:user:pass` / `bearer:token`),
+  sent only to the upstream host and to `token_realms`; `dl_allow_private`
+  (or `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>=1`) to allow a Cargo `dl` or a token
+  realm on a private IP, which a proxy over a local opencargo needs.
+- Per-advisory vulnerability severity from the full OSV record
+  (`database_specific.severity`, else the highest CVSS 3.x/4.0 vector, `MAL-`
+  ids critical); `vuln_scan.block_on_critical` now refuses the publish with
+  `400` before anything is written, `vuln_scan.fail_closed` turns an OSV
+  outage into a `503`, `osv_base_url` / `--osv-base-url` / `max_concurrency`
+  are configurable, and advisories are fetched once per process. The UI
+  shows a severity chip per advisory.
+- `[cleanup] proxy_cache_older_than_days` (default 30) evicts idle proxy
+  cache entries and abandoned partial downloads, even with `enabled = false`.
+- Repository validation on create, update and config seed: names match
+  `[a-z0-9][a-z0-9._-]{0,63}` without `..`, a proxy needs an `http(s)`
+  upstream, a group needs non-empty members of its own format, nesting is
+  capped at 5 and cycles are refused. Deleting a member of a group is `409`;
+  `purge-cache` on a group purges its proxy members.
+- Real-client end-to-end tests for cargo, go and the docker CLI through a
+  group fronting a second instance; CI runs them with `OPENCARGO_E2E_REQUIRE=1`.
 - `LICENSE` (MIT) and `SECURITY.md` (private vulnerability reporting, scope,
   operator hardening checklist)
 - English `README.md` (benefits first, one-command install, honest comparison
@@ -24,6 +60,13 @@ All notable changes to this project will be documented in this file.
   command palette (Cmd+K), live dashboard manifest fed by the WebSocket
 
 ### Changed
+- Proxy cache storage moved to a `proxy_cache_entries` table (migration 013)
+  with streamed writes; the legacy npm cache layout and `proxy_cache_meta`
+  rows are removed on the next purge or delete of the repository.
+- Repository types and formats are typed end to end; `package.published`
+  events carry the format name (`cargo`, `go`) rather than the OSV ecosystem.
+- The `Go` `.info` `Time` is RFC 3339, `@latest` picks the highest semver and
+  an unknown module's `@v/list` is `404` instead of an empty `200`.
 - A `proxy` or `group` repository whose upstream is unreachable or answers
   anything other than 404/410 now returns 502 Bad Gateway instead of 404, so
   npm/pnpm report a fetch error rather than E404. An upstream 404/410 is
@@ -55,9 +98,9 @@ All notable changes to this project will be documented in this file.
   asked for.
 - `--base-url` / `OPENCARGO_BASE_URL` override the public URL; a warning is
   logged when listening on a non-loopback address with a `localhost` base URL.
-- Creating a `proxy` or `group` repository in a format other than npm is
-  refused (they answered 404 to everything); the phantom `pypi` format is gone
-  and a config-seeded one fails at startup instead of silently serving nothing.
+- The phantom `pypi` format is gone and a config-seeded repository that fails
+  validation stops startup instead of silently serving nothing.
+- A blob `HEAD` forwarded to an upstream answered `Content-Length: 0`.
 - reqwest moved to rustls with a single crypto provider; OpenSSL is out of the
   container build and the image binary shrank from 17 MB to 11 MB.
 - Container image: `/data` is pre-created and owned by the runtime user, the

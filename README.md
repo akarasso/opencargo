@@ -2,8 +2,9 @@
 
 **A self-hosted package registry for npm, Cargo, Docker/OCI and Go modules, in one 10 MB binary.**
 
-Host your private packages, proxy and cache npmjs.org, promote releases from
-dev to prod, one binary for the whole team.
+Host your private packages, proxy and cache npmjs.org, crates.io, the Go
+module proxy and Docker Hub, promote releases from dev to prod, one binary for
+the whole team.
 No JVM, no Postgres, no telemetry. SQLite inside, about 20 MB of RAM at rest.
 
 [![CI](https://github.com/akarasso/opencargo/actions/workflows/ci.yml/badge.svg)](https://github.com/akarasso/opencargo/actions/workflows/ci.yml)
@@ -89,8 +90,11 @@ the enterprise ones.
   Go modules (GOPROXY).
 - **Repository types**: `hosted` (you publish), `proxy` (transparent cache of
   an upstream) and `group` (one URL in front of several repos, ordered
-  resolution). Proxy and group exist for npm today; Cargo, Go and OCI are
-  hosted only.
+  resolution), for all four formats. Metadata is cached for a TTL and
+  revalidated with ETags, immutable artifacts (tarballs, crates, module zips,
+  blobs) forever; a stale copy is served with `Warning: 110` when the
+  upstream is down, and an unreachable upstream is a `502`, never a silent
+  `404`.
 - **Promotion**: move a version from `dev` to `prod` without re-uploading or
   changing lockfiles; full audit trail.
 - **Permissions**: roles plus a per-user × per-repository matrix, editable in
@@ -98,8 +102,8 @@ the enterprise ones.
 - **Dependency graph**: dependencies extracted at publish time; "who depends on
   this?" and impact analysis before you delete a version.
 - **Vulnerability scanning** through [OSV.dev](https://osv.dev) on every
-  publish (advisory IDs today; severity-based blocking is being fixed, see
-  known limitations).
+  publish, with a per-advisory severity (OSV label, else CVSS 3.x/4.0 score)
+  and an optional block of critical publishes before anything is written.
 - **Webhooks** with HMAC signatures, **WebSocket event stream**, **Prometheus
   metrics**, full-text search, rate limiting, native TLS.
 - **Web UI** embedded in the binary: live dashboard, package pages with
@@ -133,8 +137,8 @@ issue or write to the address in `SECURITY.md`.
 | | opencargo | Forgejo / Gitea Packages | Nexus Repository CE | Verdaccio | Harbor | JFrog Artifactory |
 |---|---|---|---|---|---|---|
 | Formats | npm, Cargo, OCI, Go | 20+ | 15+ | npm only | OCI, Helm | 30+ |
-| Upstream proxy + cache | npm (Cargo, Go, OCI planned) | no | yes | yes | yes | yes |
-| Group / virtual repos | npm (others planned) | no | yes | n/a | no | yes |
+| Upstream proxy + cache | npm, Cargo, Go, OCI | no | yes | yes | yes | yes |
+| Group / virtual repos | npm, Cargo, Go, OCI | no | yes | n/a | no | yes |
 | Promotion dev → prod | yes | no | paid | no | replication | yes |
 | Per-user × per-repo permissions | yes | per forge repo | yes | basic | project-level | yes |
 | Vulnerability scan | OSV, built in | no | paid (Firewall) | no | Trivy | paid (Xray) |
@@ -145,16 +149,27 @@ issue or write to the address in `SECURITY.md`.
 
 Read this before the comparison table sells you anything.
 
-- Upstream proxying, caching and groups work for npm only. Cargo, Go and OCI
-  repositories are `hosted` today, and the API refuses to create a proxy or a
-  group in those formats; pull-through proxies for crates.io, the Go module
-  proxy and Docker Hub are the next items on the roadmap.
-- OCI image names are a single path segment: `registry/oci-private/app`
-  works, `registry/oci-private/team/app` does not yet.
 - No PyPI, Maven or NuGet. If you need those today, Forgejo Packages or Nexus
   are better choices.
 - Storage is local disk (a volume or PVC), no S3 backend yet. No SSO; users
   and tokens are local.
+- The Go checksum database is not proxied: exclude private modules with
+  `GONOSUMDB` or run with `GOSUMDB=off`. `go` gets a `404` for an unknown
+  module and moves on to the next `GOPROXY` entry, but a `502` (upstream down)
+  stops it rather than falling back to `direct`.
+- Upstream credentials (`upstream_auth`, `OPENCARGO_UPSTREAM_AUTH_<REPO>`) are
+  sent to the upstream host and to the `token_realms` you list, nothing else;
+  a Cargo `dl` or a Bearer `realm` pointing at a private IP is refused unless
+  the repository opts in (`dl_allow_private`). DNS rebinding is not mitigated.
+- An OCI upstream that answers `401`/`403` after issuing a token is treated
+  as "image unknown" and negative-cached for `proxy.negative_cache_ttl`, so a
+  wrong pull credential looks like a missing image until the cache is purged.
+- A cold blob is written to disk in full before the first byte reaches the
+  client (bounded by the read timeout, not by size). Pushes are capped at
+  1 GiB per request, so a proxied 3 GiB layer pulls but cannot be re-pushed.
+- Deduplication of concurrent downloads, upstream tokens and OSV advisories
+  is per process: several replicas behind one load balancer each fetch their
+  own copy.
 - Vulnerability severity is read per advisory from the full OSV record: a
   `database_specific.severity` label wins, else the highest CVSS 3.x/4.0
   vector is scored, and `MAL-` ids are critical. `vuln_scan.block_on_critical`
@@ -304,17 +319,21 @@ static_tokens = []                 # break-glass admin tokens; keep empty
 username = "admin"                 # password: OPENCARGO_ADMIN_PASSWORD, or generated
 
 [proxy]
-default_ttl = "24h"
-negative_cache_ttl = "1h"
+default_ttl = "24h"                # metadata (packuments, index lines, tags, @v/list)
+negative_cache_ttl = "1h"          # how long an upstream 404 is remembered
+connect_timeout = "10s"
 
 [cleanup]                          # optional retention GC
 enabled = true
 prerelease_older_than_days = 90
-proxy_cache_older_than_days = 180
+proxy_cache_older_than_days = 30   # idle proxy cache entries; swept even with enabled = false
 
 [vuln_scan]
 enabled = true
-block_on_critical = false
+block_on_critical = false          # refuse a publish with a critical advisory (400)
+fail_closed = false                # with block_on_critical: OSV down = 503, not an unscanned publish
+osv_base_url = "https://api.osv.dev"
+max_concurrency = 8
 
 # Optional seed; managed via API afterwards
 [[repositories]]
@@ -322,6 +341,23 @@ name = "npm-private"
 type = "hosted"
 format = "npm"
 visibility = "private"
+
+[[repositories]]
+name = "hub-proxy"
+type = "proxy"
+format = "oci"
+visibility = "public"
+upstream = "https://registry-1.docker.io"
+upstream_auth = { type = "basic", username = "hubuser", password = "..." }  # or the env var below
+token_realms = ["https://auth.docker.io/token"]  # extra hosts allowed to see the credentials
+dl_allow_private = false           # allow a Cargo `dl` / token realm on a private IP (local upstreams)
+
+[[repositories]]
+name = "oci-all"
+type = "group"
+format = "oci"
+visibility = "public"
+members = ["oci-private", "hub-proxy"]   # same format, resolved in order, nesting up to 5 deep
 ```
 
 Pass it with `--config /path/config.toml` or `OPENCARGO_CONFIG`. Lookup order
@@ -332,6 +368,9 @@ without a flag: `./config.toml`, `~/.opencargo/config.toml`, built-in defaults.
 | `OPENCARGO_CONFIG` | Path to the config file |
 | `OPENCARGO_ADMIN_PASSWORD` | Initial admin password (no generated file, no forced change) |
 | `OPENCARGO_BASE_URL` | Public URL of the server, used in tarball and download URLs (also `--base-url`) |
+| `OPENCARGO_UPSTREAM_AUTH_<REPO>` | Upstream credentials for a proxy, `basic:user:pass` or `bearer:token`; overrides `upstream_auth`. `<REPO>` is the name uppercased, non-alphanumerics as `_` |
+| `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>` | `1` to allow that proxy's `dl`/token realm on a private IP (same as `dl_allow_private = true`) |
+| `OPENCARGO_OSV_BASE_URL` | OSV API base URL (also `--osv-base-url`) |
 | `RUST_LOG` | Log filter, default `opencargo=info,tower_http=info` |
 
 ---
@@ -378,13 +417,21 @@ cargo build --release
 ## Tests
 
 ```bash
-make test-quick     # no network
-make test           # everything, including proxy and OSV tests
+make test-quick     # offline: protocols, proxy/group, OSV against fakes
+make test           # everything; e2e suites skip when a client is missing
+make test-e2e       # real pnpm, cargo, go and docker clients, required
+make test-network   # live npmjs.org and osv.dev (OPENCARGO_NETWORK_TESTS=1)
 ```
 
-116 integration tests in `tests/` cover the four protocols over HTTP (npm
-also through a real `pnpm` client), auth, permissions, promotion, webhooks,
-TLS and the WebSocket stream.
+222 integration tests in `tests/` cover the four protocols over HTTP, proxy
+and group behaviour against a second opencargo instance and fake upstreams
+(Docker Hub token dance, crates.io `dl` templates, a GOPROXY answering 410,
+a deterministic OSV), auth, permissions, promotion, webhooks, TLS and the
+WebSocket stream. Real-client suites drive `pnpm install`, `cargo publish`
+and `cargo fetch`, `go build` and `docker push`/`docker pull` through a
+group whose proxy member fronts another instance; locally they print
+`skipped:` when the client is absent, and CI runs them with
+`OPENCARGO_E2E_REQUIRE=1` so a missing client fails the build.
 
 ---
 

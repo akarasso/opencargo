@@ -22,6 +22,13 @@ GET    /-/whoami                                   Current user
 
 Publishing targets a `hosted` repository. Installing usually goes through a
 `group` that lists the hosted repo first and a `proxy` to npmjs.org after.
+Through a proxy or a group, metadata and `dist-tags` come from the cached
+packument (`proxy.default_ttl`, revalidated with `If-None-Match`), tarballs
+are cached forever and their URLs point at the repository the client asked
+for; `search` walks nested groups. `PUT`/`DELETE dist-tags` and publish are
+`400` on a proxy or a group. An unknown package is `404` and remembered for
+`proxy.negative_cache_ttl`; an unreachable upstream is `502`, or the stale
+cached copy with `Warning: 110`.
 
 ## Cargo (sparse index)
 
@@ -33,6 +40,24 @@ GET    /{repo}/api/v1/crates/{name}/{ver}/download
 DELETE /{repo}/api/v1/crates/{name}/{ver}/yank
 PUT    /{repo}/api/v1/crates/{name}/{ver}/unyank
 ```
+
+`config.json` is served without a token even when `auth.anonymous_read =
+false` and carries `"auth-required": true` on a private repository, so cargo
+sends the token from `$CARGO_HOME/credentials.toml`; its `dl` always points at
+the requested repository. A `proxy` has `upstream` = a sparse index root
+(`https://index.crates.io/` or another opencargo's `.../cargo-hosted/index`):
+index lines are cached for `proxy.default_ttl` and revalidated by ETag,
+crates are fetched from the upstream `config.json`'s `dl` template
+(`{crate}`, `{version}`, `{prefix}`, `{lowerprefix}`, `{sha256-checksum}`,
+default `/{crate}/{version}/download`), verified against the index `cksum`
+(`502`, nothing stored, on a mismatch) and cached forever. A `dl` on a
+private IP literal is refused unless `dl_allow_private`; with `upstream_auth`
+a `dl` off the index host is refused unless listed in `token_realms`. A
+`group` unions the index lines of its members (first member wins on a
+version and on download); when a member is unreachable the merged index is
+served with `Warning: 199`. Publish, yank and unyank are `400` on a proxy or
+a group. Unknown crate: `404`, negative-cached; upstream down: `502`, or the
+stale index with `Warning: 110`.
 
 ## OCI Distribution v2
 
@@ -76,10 +101,20 @@ GET    /{repo}/{module}/@v/{version}.zip
 PUT    /{repo}/{module}/@v/{version}               Publish (zip body)
 ```
 
+`{module}` arrives GOPROXY-escaped (`github.com/!burnt!sushi/toml`); the
+publish route takes the raw path. `.info` `Time` is RFC 3339. A `proxy`
+(`upstream = "https://proxy.golang.org"` or another opencargo repository)
+caches canonical versions forever and `@v/list`, `@latest` and non-canonical
+queries (`master.info`) for ten minutes. A `group` answers `@v/list` with the
+union of its members, `@latest` with the highest semver, and `.info`/`.mod`/
+`.zip` from the first member that has the version. Unknown module or upstream
+`410`: `404` (negative-cached; an empty `@v/list` for a known module is
+`200`); upstream down: `502`. The checksum database is not proxied.
+
 ## Administration
 
 ```
-POST   /api/v1/repositories                        {name, type, format, visibility, upstream?, members?}
+POST   /api/v1/repositories                        {name, type, format, visibility, upstream?, members?, dl_allow_private?, token_realms?}
 GET    /api/v1/repositories
 GET    /api/v1/repositories/{name}
 PUT    /api/v1/repositories/{name}
@@ -108,6 +143,17 @@ POST   /api/v1/webhooks/{id}/test
 
 GET    /api/v1/system/audit?page=1&size=50
 ```
+
+Repository names match `[a-z0-9][a-z0-9._-]{0,63}` without `..`. `type` is
+`hosted`, `proxy` (requires `upstream`, an `http(s)` URL) or `group`
+(requires a non-empty `members` list of existing repositories of the same
+`format`; groups may nest up to 5 levels, cycles are refused); every format
+supports the three types. Violations are `400`, on create, update and on
+the config seed. `DELETE` on a member of a group is `409`; deleting a proxy
+or a group also drops its cache. `purge-cache` removes the cached rows and
+files of a proxy (a group purges its proxy members) and never touches
+hosted data. Upstream credentials are set in the config file or the
+environment, never through this API (see the README).
 
 Roles: `admin` (everything), `publisher` (read + write), `reader` (read).
 A per-user, per-repository grant overrides the role. Resolution order:
@@ -139,8 +185,29 @@ publish time (npm `dependencies`/`devDependencies`, Cargo deps, `go.mod`).
 
 ```
 GET    /api/v1/vulns/@{scope}/{name}/{version}
-POST   /api/v1/vulns/@{scope}/{name}/{version}/rescan
+POST   /api/v1/vulns/@{scope}/{name}/{version}/rescan     (authenticated)
 ```
+
+Unscoped variants drop the `@{scope}/` segment. Response:
+
+```json
+{"package": "left-pad", "version": "1.3.0", "scanned_at": "...",
+ "total_deps": 12, "vulnerable_deps": 1, "status": "critical",
+ "details": [{"dependency": "minimist", "version": "1.2.0",
+              "vuln_id": "GHSA-...", "summary": "...",
+              "severity": "critical", "score": 9.8}]}
+```
+
+`status` is `not_scanned`, `clean`, `warning` or `critical`. `severity` is
+per advisory: the OSV `database_specific.severity` label when present, else
+the highest CVSS 3.x/4.0 vector scored (`critical` ≥ 9.0, `high` ≥ 7.0,
+`medium` ≥ 4.0, `low`), `critical` for `MAL-` ids, `unknown` when only CVSS 2
+or no data exists (`score` null). Each advisory is fetched once and cached
+for the process. With `vuln_scan.block_on_critical`, a publish carrying a
+critical advisory is refused with `400` before anything is stored; with
+`fail_closed` too, an OSV outage answers `503` instead of publishing
+unscanned. `rescan` needs write access on the repository and is `400` for
+OCI (no OSV ecosystem).
 
 ## Frontend data
 
