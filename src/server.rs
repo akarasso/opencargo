@@ -72,6 +72,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let db = crate::db::connect(&config.database.url).await?;
     crate::db::migrate(&db).await?;
+    crate::db::kinds::check_repository_names(&db).await?;
     crate::db::init_repositories(&db, &config.repositories).await?;
 
     let storage = Arc::new(FilesystemStorage::new(&config.server.storage_path));

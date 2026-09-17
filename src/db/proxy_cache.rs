@@ -137,11 +137,7 @@ mod tests {
     use super::*;
 
     async fn pool() -> (tempfile::TempDir, SqlitePool) {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
-        let pool = SqlitePool::connect(&url).await.unwrap();
-        crate::db::migrate(&pool).await.unwrap();
-        crate::db::migrate(&pool).await.unwrap();
+        let (tmp, pool) = crate::db::testing::pool().await;
         sqlx::query("INSERT INTO repositories (name, repo_type, format, upstream_url) VALUES ('p', 'proxy', 'npm', 'https://registry.npmjs.org')")
             .execute(&pool)
             .await

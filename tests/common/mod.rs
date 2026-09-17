@@ -1,10 +1,18 @@
 #![allow(dead_code)]
 
+pub mod fake_osv;
+pub mod fake_upstream;
 pub mod upstream_tap;
+
+use std::ffi::OsStr;
+use std::io::Write;
+use std::path::Path;
 
 use axum::ServiceExt as _;
 use base64::Engine;
+use reqwest::StatusCode;
 use serde_json::{json, Value};
+use sha2::Digest;
 use tempfile::TempDir;
 use tower::ServiceExt as _;
 
@@ -43,27 +51,25 @@ pub struct TestServer {
     pub tmp: TempDir,
 }
 
-/// Start an opencargo on a random loopback port, ready to serve.
-pub async fn spawn_server(opts: SpawnOpts) -> TestServer {
-    let tmp = TempDir::new().expect("failed to create temp dir");
+/// The config every spawned server runs with: storage and database under `tmp`.
+fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
     let storage_path = tmp.path().join("storage");
     let db_path = tmp.path().join("opencargo.db");
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind to random port");
-    let addr = listener.local_addr().expect("no local addr");
-    let base_url = format!("http://{addr}");
-
-    let config = Config {
+    Config {
         server: ServerConfig {
-            bind: addr.to_string(),
-            base_url: base_url.clone(),
-            storage_path: storage_path.to_str().expect("non-utf8 temp path").to_string(),
+            bind: base_url.trim_start_matches("http://").to_string(),
+            base_url: base_url.to_string(),
+            storage_path: storage_path
+                .to_str()
+                .expect("non-utf8 temp path")
+                .to_string(),
             ..Default::default()
         },
         database: DatabaseConfig {
-            url: format!("sqlite:{}?mode=rwc", db_path.to_str().expect("non-utf8 temp path")),
+            url: format!(
+                "sqlite:{}?mode=rwc",
+                db_path.to_str().expect("non-utf8 temp path")
+            ),
         },
         auth: AuthConfig {
             anonymous_read: opts.anonymous_read,
@@ -74,8 +80,20 @@ pub async fn spawn_server(opts: SpawnOpts) -> TestServer {
         repositories: opts.repositories,
         vuln_scan: opts.vuln,
         ..Default::default()
-    };
+    }
+}
 
+/// Start an opencargo on a random loopback port, ready to serve.
+pub async fn spawn_server(opts: SpawnOpts) -> TestServer {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("failed to bind to random port");
+    let addr = listener.local_addr().expect("no local addr");
+    let base_url = format!("http://{addr}");
+
+    let config = test_config(&tmp, &base_url, opts);
     let state = server::build_state(&config)
         .await
         .expect("failed to build app state");
@@ -101,6 +119,21 @@ pub async fn spawn_server(opts: SpawnOpts) -> TestServer {
         handle,
         tmp,
     }
+}
+
+/// The error a server refuses to start with under this repository seed.
+pub async fn seed_error(repositories: Vec<RepositoryConfig>) -> String {
+    let tmp = TempDir::new().expect("failed to create temp dir");
+    let opts = SpawnOpts {
+        repositories,
+        ..Default::default()
+    };
+    let config = test_config(&tmp, "http://127.0.0.1:0", opts);
+    server::build_state(&config)
+        .await
+        .err()
+        .expect("the seed should be refused")
+        .to_string()
 }
 
 #[derive(Default)]
@@ -228,4 +261,195 @@ pub fn build_npm_publish_body(
             }
         }
     })
+}
+
+/// Build the binary body for Cargo publish requests: LE u32 metadata length,
+/// metadata JSON, LE u32 crate length, crate bytes.
+pub fn build_cargo_publish_body(metadata_json: &str, crate_data: &[u8]) -> Vec<u8> {
+    let json_bytes = metadata_json.as_bytes();
+    let mut body = Vec::new();
+    body.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
+    body.extend_from_slice(json_bytes);
+    body.extend_from_slice(&(crate_data.len() as u32).to_le_bytes());
+    body.extend_from_slice(crate_data);
+    body
+}
+
+/// Build a minimal .crate file (gzip compressed data).
+pub fn build_crate_data() -> Vec<u8> {
+    let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+    encoder.write_all(b"fake crate content").unwrap();
+    encoder.finish().unwrap()
+}
+
+/// Build a Go module zip archive in memory: a go.mod and one .go file.
+pub fn build_go_module_zip(module_name: &str, version: &str) -> Vec<u8> {
+    let mut buf = Vec::new();
+    {
+        let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored);
+
+        let go_mod_path = format!("{}@{}/go.mod", module_name, version);
+        zip_writer.start_file(&go_mod_path, options).unwrap();
+        let go_mod_content = format!("module {}\n\ngo 1.21\n", module_name);
+        zip_writer.write_all(go_mod_content.as_bytes()).unwrap();
+
+        let go_file_path = format!("{}@{}/main.go", module_name, version);
+        zip_writer.start_file(&go_file_path, options).unwrap();
+        let go_content = format!(
+            "package {}\n\nfunc Hello() string {{ return \"hello\" }}\n",
+            module_name.split('/').next_back().unwrap_or("main")
+        );
+        zip_writer.write_all(go_content.as_bytes()).unwrap();
+
+        zip_writer.finish().unwrap();
+    }
+    buf
+}
+
+/// Publish a Go module into `repo` with the static token.
+pub async fn publish_go_module(
+    client: &reqwest::Client,
+    base_url: &str,
+    repo: &str,
+    module_name: &str,
+    version: &str,
+) {
+    let zip_data = build_go_module_zip(module_name, version);
+    let resp = client
+        .put(format!("{base_url}/{repo}/{module_name}/@v/{version}"))
+        .bearer_auth(STATIC_TOKEN)
+        .header("content-type", "application/zip")
+        .body(zip_data)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "go publish failed: {:?}",
+        resp.text().await
+    );
+}
+
+/// Compute sha256 digest in the OCI format "sha256:hex..."
+pub fn sha256_digest(data: &[u8]) -> String {
+    let hash = sha2::Sha256::digest(data);
+    format!(
+        "sha256:{}",
+        hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
+    )
+}
+
+/// Upload a blob (monolithic PUT) into `image` (`{repo}/{name}`) and return its digest.
+pub async fn push_blob(
+    client: &reqwest::Client,
+    base_url: &str,
+    image: &str,
+    blob_data: &[u8],
+) -> String {
+    let digest = sha256_digest(blob_data);
+
+    let resp = client
+        .post(format!("{base_url}/v2/{image}/blobs/uploads/"))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .expect("start upload request failed");
+    assert_eq!(resp.status(), StatusCode::ACCEPTED, "start upload failed");
+
+    let location = resp
+        .headers()
+        .get("location")
+        .expect("missing Location header")
+        .to_str()
+        .expect("invalid location header")
+        .to_string();
+
+    let resp = client
+        .put(format!("{base_url}{location}?digest={digest}"))
+        .bearer_auth(STATIC_TOKEN)
+        .body(blob_data.to_vec())
+        .send()
+        .await
+        .expect("complete upload request failed");
+    assert_eq!(
+        resp.status(),
+        StatusCode::CREATED,
+        "complete upload failed: {:?}",
+        resp.text().await
+    );
+
+    digest
+}
+
+/// Encode username:password as a Basic auth header value.
+pub fn basic_auth_header(username: &str, password: &str) -> String {
+    let encoded =
+        base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+    format!("Basic {encoded}")
+}
+
+/// Create a user via the admin API and return the response JSON.
+pub async fn create_user(
+    client: &reqwest::Client,
+    base_url: &str,
+    admin_token: &str,
+    username: &str,
+    role: &str,
+) -> Value {
+    let resp = client
+        .post(format!("{base_url}/api/v1/users"))
+        .bearer_auth(admin_token)
+        .json(&json!({ "username": username, "role": role }))
+        .send()
+        .await
+        .expect("create user request failed");
+
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("invalid json from create user");
+    assert_eq!(status, StatusCode::CREATED, "create user failed: {body:?}");
+    body
+}
+
+/// Run a command, returning (exit_success, stdout, stderr).
+pub async fn run_cmd(
+    program: &str,
+    args: &[&str],
+    cwd: &Path,
+    env: &[(&str, &OsStr)],
+) -> (bool, String, String) {
+    let output = tokio::process::Command::new(program)
+        .args(args)
+        .current_dir(cwd)
+        .envs(env.iter().copied())
+        .output()
+        .await
+        .expect("failed to execute command");
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    (output.status.success(), stdout, stderr)
+}
+
+/// The client binary named by `var` (`PNPM_BIN`, `CARGO_BIN`, ...), defaulting
+/// to the lowercase name on PATH. An absent binary prints `skipped:` and yields
+/// `None`, unless `OPENCARGO_E2E_REQUIRE=1` makes the absence a failure.
+pub fn client_bin(var: &str) -> Option<String> {
+    let default = var.trim_end_matches("_BIN").to_ascii_lowercase();
+    let bin = std::env::var(var).unwrap_or(default);
+    if std::process::Command::new(&bin)
+        .arg("--version")
+        .output()
+        .is_ok()
+    {
+        return Some(bin);
+    }
+    assert!(
+        std::env::var("OPENCARGO_E2E_REQUIRE").as_deref() != Ok("1"),
+        "{bin} is required by OPENCARGO_E2E_REQUIRE=1 but was not found (set {var})"
+    );
+    println!("skipped: {bin} not found (install it or set {var})");
+    None
 }

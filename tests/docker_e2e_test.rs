@@ -1,136 +1,31 @@
+mod common;
+
 use reqwest::StatusCode;
 use serde_json::{json, Value};
-use sha2::Digest;
 use tempfile::TempDir;
 
-use opencargo::config::{
-    AuthConfig, Config, DatabaseConfig, RepositoryConfig, RepositoryFormat, RepositoryType,
-    ServerConfig, Visibility,
-};
-use opencargo::server;
+use common::{basic_auth_header, create_user, hosted, sha256_digest, spawn_server, SpawnOpts};
+use opencargo::config::{RepositoryFormat, Visibility};
 
 // ---------------------------------------------------------------------------
 // Setup helpers
 // ---------------------------------------------------------------------------
 
-/// Start a test server with an OCI hosted repository.
+/// Start a test server with a private OCI repository.
 /// `anonymous_read` controls whether unauthenticated GET/HEAD is allowed.
 async fn setup_with_anon(anonymous_read: bool) -> (String, tokio::task::JoinHandle<()>, TempDir) {
-    let tmp = TempDir::new().expect("failed to create temp dir");
-    let storage_path = tmp.path().join("storage");
-    let db_path = tmp.path().join("test.db");
-
-    let db_url = format!(
-        "sqlite:{}?mode=rwc",
-        db_path.to_str().expect("non-utf8 temp path")
-    );
-
-    let config = Config {
-        server: ServerConfig {
-            bind: "127.0.0.1:0".to_string(),
-            base_url: "http://127.0.0.1:0".to_string(),
-            storage_path: storage_path
-                .to_str()
-                .expect("non-utf8 temp path")
-                .to_string(),
-            ..Default::default()
-        },
-        database: DatabaseConfig { url: db_url },
-        auth: AuthConfig {
-            anonymous_read,
-            static_tokens: vec!["test-token".to_string()],
-            ..Default::default()
-        },
-        repositories: vec![RepositoryConfig {
-            name: "oci-private".to_string(),
-            repo_type: RepositoryType::Hosted,
-            format: RepositoryFormat::Oci,
-            visibility: Visibility::Private,
-            ..Default::default()
-        }],
+    let server = spawn_server(SpawnOpts {
+        anonymous_read,
+        repositories: vec![hosted("oci-private", RepositoryFormat::Oci, Visibility::Private)],
         ..Default::default()
-    };
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind to random port");
-    let addr = listener.local_addr().expect("no local addr");
-    let base_url = format!("http://{}", addr);
-
-    let mut config = config;
-    config.server.base_url = base_url.clone();
-
-    let state = server::build_state(&config)
-        .await
-        .expect("failed to build app state");
-    let router = server::build_router(state);
-
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, router).await.ok();
-    });
-
-    // Wait for the server to be ready
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        match client.get(format!("{}/health/live", &base_url)).send().await {
-            Ok(resp) if resp.status().is_success() => break,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-        }
-    }
-
-    (base_url, handle, tmp)
+    })
+    .await;
+    (server.base_url, server.handle, server.tmp)
 }
 
 /// Start a test server with anonymous_read = true.
 async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
     setup_with_anon(true).await
-}
-
-/// Compute sha256 digest in the OCI format "sha256:hex..."
-fn sha256_digest(data: &[u8]) -> String {
-    let hash = sha2::Sha256::digest(data);
-    format!(
-        "sha256:{}",
-        hash.iter().map(|b| format!("{b:02x}")).collect::<String>()
-    )
-}
-
-/// Encode username:password as a Basic auth header value.
-fn basic_auth_header(username: &str, password: &str) -> String {
-    use base64::Engine;
-    let encoded = base64::engine::general_purpose::STANDARD
-        .encode(format!("{}:{}", username, password));
-    format!("Basic {}", encoded)
-}
-
-/// Create a user via the admin API and return the response JSON.
-async fn create_user(
-    client: &reqwest::Client,
-    base_url: &str,
-    admin_token: &str,
-    username: &str,
-    role: &str,
-) -> Value {
-    let resp = client
-        .post(format!("{}/api/v1/users", base_url))
-        .bearer_auth(admin_token)
-        .json(&json!({
-            "username": username,
-            "role": role
-        }))
-        .send()
-        .await
-        .expect("create user request failed");
-
-    let status = resp.status();
-    let body: Value = resp.json().await.expect("invalid json from create user");
-    assert_eq!(
-        status,
-        StatusCode::CREATED,
-        "create user failed: {:?}",
-        body
-    );
-    body
 }
 
 /// Change a user's password via admin API.

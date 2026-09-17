@@ -299,10 +299,6 @@ mod tests {
             group("g-order", &["h-miss", "h-err404", "h-found", "p-found"]),
             group("g-fail-then-found", &["h-fail", "h-found"]),
             group("g-fail-only", &["h-fail", "h-miss"]),
-            group("g-skips", &["nope", "h-private", "cargo-found", "h-miss"]),
-            group("g-empty", &[]),
-            group("g-cycle-a", &["g-cycle-b"]),
-            group("g-cycle-b", &["g-cycle-a", "p-found"]),
             group("g-nested", &["g-order"]),
         ];
         for i in 0..7 {
@@ -324,7 +320,25 @@ mod tests {
             repositories: fixture(),
             ..Default::default()
         };
-        crate::server::build_state(&config).await.unwrap()
+        let state = crate::server::build_state(&config).await.unwrap();
+        // Rows the seed now refuses but the resolver must still tolerate.
+        for (name, members) in [
+            ("g-skips", r#"["nope","h-private","cargo-found","h-miss"]"#),
+            ("g-empty", "[]"),
+            ("g-cycle-a", r#"["g-cycle-b"]"#),
+            ("g-cycle-b", r#"["g-cycle-a","p-found"]"#),
+        ] {
+            sqlx::query(
+                "INSERT INTO repositories (name, repo_type, format, visibility, config_json)
+                 VALUES (?1, 'group', 'npm', 'public', ?2)",
+            )
+            .bind(name)
+            .bind(format!(r#"{{"members":{members}}}"#))
+            .execute(&state.db)
+            .await
+            .unwrap();
+        }
+        state
     }
 
     async fn repo(state: &AppState, name: &str) -> Repository {

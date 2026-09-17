@@ -616,19 +616,25 @@ async fn test_delete_non_empty_repository_conflicts() {
     );
 }
 
-/// Proxy and group repositories exist for npm only: creating one in another
-/// format is refused up front instead of producing a repository that answers 404.
+/// Proxy and group repositories exist for every format but pypi; a group's
+/// members must exist, share its format and not be empty. Hosted rows come
+/// first so the groups can name them.
 #[tokio::test]
-async fn test_create_repository_refuses_non_npm_proxy_and_group() {
+async fn test_create_repository_validates_kind_format_and_members() {
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
-    for (name, repo_type, format, expected) in [
-        ("cargo-group", "group", "cargo", StatusCode::BAD_REQUEST),
-        ("oci-proxy", "proxy", "oci", StatusCode::BAD_REQUEST),
-        ("go-proxy", "proxy", "go", StatusCode::BAD_REQUEST),
-        ("cargo-hosted-ok", "hosted", "cargo", StatusCode::CREATED),
-        ("npm-group-ok", "group", "npm", StatusCode::CREATED),
+    for (name, repo_type, format, members, expected) in [
+        ("cargo-hosted-ok", "hosted", "cargo", None, StatusCode::CREATED),
+        ("npm-hosted-ok", "hosted", "npm", None, StatusCode::CREATED),
+        ("cargo-group", "group", "cargo", Some(json!(["cargo-hosted-ok"])), StatusCode::CREATED),
+        ("oci-proxy", "proxy", "oci", None, StatusCode::CREATED),
+        ("go-proxy", "proxy", "go", None, StatusCode::CREATED),
+        ("npm-group-ok", "group", "npm", Some(json!(["npm-hosted-ok"])), StatusCode::CREATED),
+        ("pypi-proxy", "proxy", "pypi", None, StatusCode::BAD_REQUEST),
+        ("unknown-member", "group", "npm", Some(json!(["nope"])), StatusCode::BAD_REQUEST),
+        ("cross-format", "group", "npm", Some(json!(["cargo-hosted-ok"])), StatusCode::BAD_REQUEST),
+        ("empty-members", "group", "npm", Some(json!([])), StatusCode::BAD_REQUEST),
     ] {
         let mut body = json!({
             "name": name,
@@ -639,8 +645,8 @@ async fn test_create_repository_refuses_non_npm_proxy_and_group() {
         if repo_type == "proxy" {
             body["upstream"] = json!("https://example.com/");
         }
-        if repo_type == "group" {
-            body["members"] = json!([]);
+        if let Some(members) = members {
+            body["members"] = members;
         }
         let resp = client
             .post(format!("{}/api/v1/repositories", base_url))
@@ -649,7 +655,7 @@ async fn test_create_repository_refuses_non_npm_proxy_and_group() {
             .send()
             .await
             .expect("create repo request failed");
-        assert_eq!(resp.status(), expected, "{repo_type}/{format}: {:?}", resp.text().await);
+        assert_eq!(resp.status(), expected, "{name}: {:?}", resp.text().await);
     }
 }
 

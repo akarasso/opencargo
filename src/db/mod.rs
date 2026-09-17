@@ -141,26 +141,30 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 // Repository seeding
 // ---------------------------------------------------------------------------
 
-/// Insert pre-configured repositories if they do not already exist.
+/// Insert pre-configured repositories if they do not already exist; every
+/// entry is validated as an API write would be, with the whole list as
+/// `pending` so members may come later in the file.
 pub async fn init_repositories(
     pool: &SqlitePool,
     repos: &[crate::config::RepositoryConfig],
 ) -> anyhow::Result<()> {
+    let pending: Vec<(&str, kinds::Format)> =
+        repos.iter().map(|r| (r.name.as_str(), r.format)).collect();
     for repo in repos {
-        kinds::ensure_kind_supported(repo.repo_type, repo.format)
+        let spec = kinds::RepoSpec {
+            name: &repo.name,
+            kind: repo.repo_type,
+            format: repo.format,
+            upstream: repo.upstream.as_deref(),
+            members: repo.members.as_deref().unwrap_or_default(),
+        };
+        kinds::validate_spec(pool, &spec, &pending)
+            .await
             .map_err(|e| anyhow::anyhow!("repository {}: {e}", repo.name))?;
 
         let visibility = match repo.visibility {
             crate::config::Visibility::Public => "public",
             crate::config::Visibility::Private => "private",
-        };
-
-        let config_json = match repo.repo_type {
-            kinds::RepoKind::Group => {
-                let members = repo.members.clone().unwrap_or_default();
-                Some(serde_json::json!({ "members": members }).to_string())
-            }
-            _ => None,
         };
 
         sqlx::query(
@@ -172,7 +176,7 @@ pub async fn init_repositories(
         .bind(repo.format.as_str())
         .bind(visibility)
         .bind(repo.upstream.as_deref())
-        .bind(config_json.as_deref())
+        .bind(spec.config_json())
         .execute(pool)
         .await?;
     }
@@ -1132,4 +1136,17 @@ pub async fn seed_webhooks(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    /// A migrated (twice, proving idempotence) SQLite pool in a temp dir.
+    pub async fn pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
+        let pool = super::connect(&url).await.unwrap();
+        super::migrate(&pool).await.unwrap();
+        super::migrate(&pool).await.unwrap();
+        (tmp, pool)
+    }
 }

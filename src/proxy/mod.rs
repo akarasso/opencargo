@@ -33,8 +33,9 @@ pub(crate) fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
-/// Validate an upstream registry URL for proxy repositories: must be http(s)
-/// and must not be a literal private/loopback address.
+/// Validate an admin-chosen upstream URL: http(s) only, and no link-local or
+/// unspecified IP literal. Loopback and RFC 1918 stay allowed for local
+/// mirrors; redirect hops and upstream-chosen URLs are held to `is_blocked_ip`.
 pub fn validate_upstream_url(url: &str) -> Result<(), AppError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| AppError::BadRequest(format!("invalid upstream URL: {e}")))?;
@@ -43,10 +44,21 @@ pub fn validate_upstream_url(url: &str) -> Result<(), AppError> {
             "upstream URL scheme must be http or https".to_string(),
         ));
     }
-    // A literal private/loopback host is intentionally allowed here: upstream
-    // creation is admin-only and proxy setups legitimately target local mirrors.
-    // The real SSRF vector — an upstream that REDIRECTS to an internal address —
-    // is blocked by the client's redirect policy (see is_blocked_ip usage).
+    let literal = parsed
+        .host_str()
+        .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok());
+    let refused = match literal {
+        Some(std::net::IpAddr::V4(v4)) => v4.is_link_local() || v4.is_unspecified(),
+        Some(std::net::IpAddr::V6(v6)) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80 || v6.is_unspecified()
+        }
+        None => false,
+    };
+    if refused {
+        return Err(AppError::BadRequest(
+            "upstream URL must not point at a link-local or unspecified address".to_string(),
+        ));
+    }
     Ok(())
 }
 
