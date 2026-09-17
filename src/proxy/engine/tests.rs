@@ -544,3 +544,37 @@ async fn content_chosen_url_on_private_host_is_refused_before_any_request() {
     found(engine.fetch(&allowed, &fx.up, fx.member(), &art).await);
     assert_eq!(fx.hits().len(), 1);
 }
+
+#[tokio::test]
+async fn content_length_describes_the_streamed_file_not_the_row() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let cached = found(
+        engine
+            .fetch(&Strat::default(), &fx.up, fx.member(), &"art/x".to_string())
+            .await,
+    );
+    let path = cached.entry.storage_path.clone().unwrap();
+    assert_eq!(cached.entry.size, 14);
+    fx.storage
+        .put(&path, bytes::Bytes::from_static(b"short"))
+        .await
+        .unwrap();
+
+    let resp = engine
+        .stream_response(&cached.into_payload(), Vec::new())
+        .await
+        .unwrap();
+    assert_eq!(resp.headers().get(header::CONTENT_LENGTH).unwrap(), "5");
+    let body = axum::body::to_bytes(resp.into_body(), 64).await.unwrap();
+    assert_eq!(body.as_ref(), b"short");
+}
+
+#[tokio::test]
+async fn missing_stored_file_is_404_not_502() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let payload = Payload::file("npm/hosted/gone-1.0.0.tgz".into(), 3);
+    let res = engine.stream_response(&payload, Vec::new()).await;
+    assert!(matches!(res, Err(AppError::NotFound(_))), "{res:?}");
+}

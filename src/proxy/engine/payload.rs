@@ -94,14 +94,25 @@ impl Payload {
         }
     }
 
+    /// `Content-Length` describes the bytes actually streamed: the file is
+    /// opened once and its length taken from that handle, never from a row
+    /// that a refresh may have outrun.
     pub(super) async fn to_response(
         &self,
         storage: &FilesystemStorage,
         extra: Vec<(HeaderName, HeaderValue)>,
     ) -> AppResult<Response> {
+        let (length, body) = match &self.src {
+            Src::File(path) => {
+                let (len, reader) = storage.read_stream(path).await.map_err(unreadable)?;
+                (len, Body::from_stream(ReaderStream::new(reader)))
+            }
+            Src::Bytes(b) => (b.len() as u64, Body::from(b.clone())),
+            Src::HeadOnly => (self.size, Body::empty()),
+        };
         let mut builder = Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_LENGTH, self.size);
+            .header(header::CONTENT_LENGTH, length);
         if let Some(ct) = &self.content_type {
             builder = builder.header(header::CONTENT_TYPE, ct);
         }
@@ -111,20 +122,17 @@ impl Payload {
         for (name, value) in extra {
             builder = builder.header(name, value);
         }
-        let body = match &self.src {
-            Src::File(path) => {
-                let (_, reader) = storage
-                    .read_stream(path)
-                    .await
-                    .map_err(|e| AppError::BadGateway(format!("cached file unreadable: {e}")))?;
-                Body::from_stream(ReaderStream::new(reader))
-            }
-            Src::Bytes(b) => Body::from(b.clone()),
-            Src::HeadOnly => Body::empty(),
-        };
         builder
             .body(body)
             .map_err(|e| AppError::Internal(format!("response build failed: {e}")))
+    }
+}
+
+/// A missing file stays a 404; any other local fault is ours, not the upstream's.
+fn unreadable(e: AppError) -> AppError {
+    match e {
+        AppError::NotFound(_) => e,
+        other => AppError::Internal(format!("stored file unreadable: {other}")),
     }
 }
 
