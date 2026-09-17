@@ -18,6 +18,32 @@ use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::storage::StorageBackend;
 
+/// SQLite's `datetime('now')` is `YYYY-MM-DD HH:MM:SS` UTC; the go tool only
+/// accepts RFC 3339 in `Time`.
+pub(crate) fn rfc3339(published_at: &str) -> String {
+    chrono::NaiveDateTime::parse_from_str(published_at, "%Y-%m-%d %H:%M:%S")
+        .map(|t| t.and_utc().to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .unwrap_or_else(|_| published_at.to_string())
+}
+
+/// `v` stripped and parsed as semver (pseudo-versions are pre-releases);
+/// unparseable versions rank below every parseable one and compare lexically.
+pub(crate) fn compare_versions(a: &str, b: &str) -> std::cmp::Ordering {
+    let parse = |v: &str| semver::Version::parse(v.strip_prefix('v').unwrap_or(v)).ok();
+    match (parse(a), parse(b)) {
+        (Some(x), Some(y)) => x.cmp(&y),
+        (Some(_), None) => std::cmp::Ordering::Greater,
+        (None, Some(_)) => std::cmp::Ordering::Less,
+        (None, None) => a.cmp(b),
+    }
+}
+
+pub(crate) fn latest_of(versions: &[crate::db::Version]) -> Option<&crate::db::Version> {
+    versions
+        .iter()
+        .max_by(|a, b| compare_versions(&a.version, &b.version))
+}
+
 // ---------------------------------------------------------------------------
 // List versions — GET /{repo}/{module}/@v/list
 // ---------------------------------------------------------------------------
@@ -31,13 +57,10 @@ pub async fn list_versions(
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
-    let package = match crate::db::get_package(&state.db, repo.id, &module_name).await? {
-        Some(p) => p,
-        None => {
-            // Return empty list if module not found
-            return Ok((StatusCode::OK, "".to_string()).into_response());
-        }
-    };
+    // Under `GOPROXY=a,b,direct` an empty 200 ends resolution; only 404 moves on.
+    let package = crate::db::get_package(&state.db, repo.id, &module_name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("module not found: {module_name}")))?;
 
     let versions = crate::db::get_versions(&state.db, package.id).await?;
 
@@ -62,9 +85,7 @@ pub async fn list_versions(
 // Latest version — GET /{repo}/{module}/@latest
 // ---------------------------------------------------------------------------
 
-/// GOPROXY `@latest`: JSON info about the most recently published version.
-/// Reached through the wildcard Go dispatcher in `server.rs` (the module path
-/// may span multiple URL segments).
+/// GOPROXY `@latest`: JSON info about the highest version by semver.
 pub async fn latest_version(
     State(state): State<AppState>,
     Path((repo_name, module_name)): Path<(String, String)>,
@@ -79,15 +100,12 @@ pub async fn latest_version(
         .ok_or_else(|| AppError::NotFound(format!("module not found: {module_name}")))?;
 
     let versions = crate::db::get_versions(&state.db, package.id).await?;
-    // get_versions is ordered by insertion (id): the last row is the most
-    // recently published version.
-    let latest = versions
-        .last()
+    let latest = latest_of(&versions)
         .ok_or_else(|| AppError::NotFound(format!("no versions for module: {module_name}")))?;
 
     Ok(Json(json!({
         "Version": latest.version,
-        "Time": latest.published_at,
+        "Time": rfc3339(&latest.published_at),
     })))
 }
 
@@ -125,10 +143,9 @@ pub async fn version_info(
             ))
         })?;
 
-    // Try to parse stored info from metadata, or build a basic one
     let info = json!({
         "Version": version.version,
-        "Time": version.published_at,
+        "Time": rfc3339(&version.published_at),
     });
 
     Ok(Json(info))
@@ -416,4 +433,28 @@ fn extract_go_mod_from_zip(
 
     // If no go.mod found, create a minimal one
     Ok(format!("module {_module_name}\n\ngo 1.21\n"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{compare_versions, rfc3339};
+    use std::cmp::Ordering;
+
+    #[test]
+    fn time_is_rfc3339_utc() {
+        assert_eq!(rfc3339("2026-09-17 10:02:03"), "2026-09-17T10:02:03Z");
+        assert_eq!(rfc3339("2026-09-17T10:02:03Z"), "2026-09-17T10:02:03Z");
+    }
+
+    #[test]
+    fn versions_order_by_semver_then_lexically() {
+        assert_eq!(compare_versions("v1.10.0", "v1.9.0"), Ordering::Greater);
+        assert_eq!(compare_versions("v1.0.0", "v1.0.0-rc1"), Ordering::Greater);
+        assert_eq!(
+            compare_versions("v0.0.0-20230101120000-abcdef123456", "v0.1.0"),
+            Ordering::Less
+        );
+        assert_eq!(compare_versions("v1.0.0", "master"), Ordering::Greater);
+        assert_eq!(compare_versions("dev", "master"), Ordering::Less);
+    }
 }
