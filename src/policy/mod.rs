@@ -256,6 +256,8 @@ pub(crate) struct Shared {
     pub dropped: AtomicU64,
     pub totals: TotalsCache,
     warned_at: Mutex<Option<Instant>>,
+    #[cfg(test)]
+    pub npm_parses: AtomicU64,
 }
 
 impl Shared {
@@ -345,6 +347,8 @@ impl PolicyEngine {
             dropped: AtomicU64::new(0),
             totals: TotalsCache::default(),
             warned_at: Mutex::new(None),
+            #[cfg(test)]
+            npm_parses: AtomicU64::new(0),
         });
         let writer = writer::run_writer(rx, shared.clone());
         (Self { tx, shared }, writer)

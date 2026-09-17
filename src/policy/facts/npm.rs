@@ -19,9 +19,6 @@ use super::{fetch_missing, parse_time};
 
 const INSTALL_HOOKS: [&str; 3] = ["preinstall", "install", "postinstall"];
 
-#[cfg(test)]
-pub(crate) static PARSES: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-
 #[derive(Debug, Clone)]
 pub struct VersionFacts {
     pub published_at: Option<DateTime<Utc>>,
@@ -37,8 +34,6 @@ pub struct PackageFacts {
 
 impl PackageFacts {
     pub fn parse(json: &Value) -> Self {
-        #[cfg(test)]
-        PARSES.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let versions = json["versions"]
             .as_object()
             .map(|versions| {
@@ -219,7 +214,8 @@ fn stamp(cached: &Cached) -> (i64, String, Option<String>) {
     )
 }
 
-/// The slot for `cached`'s row, replaced when the row was re-fetched.
+/// The slot for `cached`'s row, replaced when the row was re-fetched;
+/// the refresh floor is the package's, so it carries over to the new row.
 fn slot_cell(
     shared: &Shared,
     member: CacheRepo<'_>,
@@ -229,20 +225,21 @@ fn slot_cell(
     let mut memo = shared.npm_facts.lock().unwrap();
     let key = (member.0.id, name.to_string());
     let stamp = stamp(cached);
-    match memo.get_mut(&key) {
-        Some(slot) if slot.stamp == stamp => slot.cell.clone(),
-        _ => memo
-            .insert(
-                key,
-                NpmSlot {
-                    stamp,
-                    cell: Arc::new(OnceCell::new()),
-                    refresh: None,
-                },
-            )
-            .cell
-            .clone(),
-    }
+    let refresh = match memo.get_mut(&key) {
+        Some(slot) if slot.stamp == stamp => return slot.cell.clone(),
+        Some(slot) => slot.refresh.take(),
+        None => None,
+    };
+    memo.insert(
+        key,
+        NpmSlot {
+            stamp,
+            cell: Arc::new(OnceCell::new()),
+            refresh,
+        },
+    )
+    .cell
+    .clone()
 }
 
 /// The refresh every waiter of this row shares: installed when none is
@@ -283,6 +280,10 @@ async fn memo_facts(
             .await
             .map_err(|e| AppError::Internal(format!("packument parse task failed: {e}")))?
             .map_err(|e| AppError::BadGateway(format!("invalid cached packument: {e}")))?;
+            #[cfg(test)]
+            shared
+                .npm_parses
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             Ok::<_, AppError>(Arc::new(facts))
         })
         .await;

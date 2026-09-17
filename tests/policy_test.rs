@@ -440,7 +440,15 @@ async fn recorder_miss_never_404s_the_client() {
 #[tokio::test]
 async fn npm_version_newer_than_cached_packument_refreshes() {
     let fake = fake_widget(&[("1.0.0", "widget-1.0.0.tgz", "2026-01-01T00:00:00Z")]).await;
-    let a = spawn_server(npm_proxy(&fake.base_url, aged("48h"))).await;
+    let floor = Duration::from_millis(300);
+    let a = spawn_server(SpawnOpts {
+        policy_tuning: Some(Tuning {
+            refresh_floor: floor,
+            ..Tuning::default()
+        }),
+        ..npm_proxy(&fake.base_url, aged("48h"))
+    })
+    .await;
     get_ok(
         &tarball_url(&a, "npm-proxy", "widget", "widget-1.0.0.tgz"),
         None,
@@ -490,8 +498,22 @@ async fn npm_version_newer_than_cached_packument_refreshes() {
         verdict_of(&verdicts, rows[1].id, "min_release_age").0,
         "pass"
     );
+    assert_eq!(
+        fake.packument_hits().len(),
+        2,
+        "the 200 refresh rewrote the row; inside refresh_floor it asks nothing more"
+    );
+
+    tokio::time::sleep(floor + Duration::from_millis(50)).await;
+    get_ok(
+        &tarball_url(&a, "npm-proxy", "widget", "widget-1.2.0.tgz"),
+        None,
+    )
+    .await;
+    let rows = wait_for_policy_rows(&a, 4).await;
+    assert_eq!(rows[3].date_source, "not-in-packument");
     let hits = fake.packument_hits();
-    assert_eq!(hits.len(), 3);
+    assert_eq!(hits.len(), 3, "past the floor: one conditional request");
     assert_eq!(
         hits[2].if_none_match.as_deref(),
         Some(fake.etag().as_str()),
@@ -503,12 +525,12 @@ async fn npm_version_newer_than_cached_packument_refreshes() {
         None,
     )
     .await;
-    let rows = wait_for_policy_rows(&a, 4).await;
-    assert_eq!(rows[3].date_source, "not-in-packument");
+    let rows = wait_for_policy_rows(&a, 5).await;
+    assert_eq!(rows[4].date_source, "not-in-packument");
     assert_eq!(
         fake.packument_hits().len(),
         3,
-        "inside refresh_floor: 3 requests for 4 pulls"
+        "inside refresh_floor: 3 requests for 5 pulls"
     );
 }
 

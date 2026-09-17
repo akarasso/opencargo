@@ -137,7 +137,7 @@ async fn package_facts_parses_once_per_row() {
     };
     let (engine, _writer) = engine_over(&fx, cfg(), tuning);
     let shared = engine.shared().clone();
-    let before = PARSES.load(Ordering::SeqCst);
+    let parses = || shared.npm_parses.load(Ordering::SeqCst);
 
     let calls = (0..64).map(|_| facts_for(&shared, &fx, "widget-1.0.0.tgz"));
     let results = futures_util::future::join_all(calls).await;
@@ -145,17 +145,13 @@ async fn package_facts_parses_once_per_row() {
     assert!(results.iter().all(|(f, source)| {
         Arc::ptr_eq(f.as_ref().unwrap(), &first) && matches!(*source, "fetch" | "cache")
     }));
-    assert_eq!(
-        PARSES.load(Ordering::SeqCst) - before,
-        1,
-        "one parse for 64 cold callers"
-    );
+    assert_eq!(parses(), 1, "one parse for 64 cold callers");
     assert_eq!(fx.hits().len(), 1, "one fetch, singleflighted");
 
     let (again, source) = facts_for(&shared, &fx, "widget-1.0.0.tgz").await;
     assert!(Arc::ptr_eq(&again.unwrap(), &first));
     assert_eq!(source, "cache");
-    assert_eq!(PARSES.load(Ordering::SeqCst) - before, 1);
+    assert_eq!(parses(), 1);
 
     sqlx::query("UPDATE proxy_cache_entries SET fetched_at = datetime('now', '+1 second'), digest = 'bumped'")
         .execute(&fx.pool)
@@ -166,7 +162,7 @@ async fn package_facts_parses_once_per_row() {
         !Arc::ptr_eq(&bumped.unwrap(), &first),
         "a bumped row re-parses"
     );
-    assert_eq!(PARSES.load(Ordering::SeqCst) - before, 2);
+    assert_eq!(parses(), 2);
 
     let misses = (0..64).map(|_| facts_for(&shared, &fx, "widget-1.1.0.tgz"));
     let results = futures_util::future::join_all(misses).await;
@@ -183,11 +179,7 @@ async fn package_facts_parses_once_per_row() {
         "one conditional request for 64 concurrent misses"
     );
     assert_eq!(fx.hits().len(), 2);
-    assert_eq!(
-        PARSES.load(Ordering::SeqCst) - before,
-        2,
-        "a 304 keeps the parsed facts"
-    );
+    assert_eq!(parses(), 2, "a 304 keeps the parsed facts");
 
     let (_, source) = facts_for(&shared, &fx, "widget-1.1.0.tgz").await;
     assert_eq!(source, "not-in-packument");
@@ -208,9 +200,43 @@ async fn package_facts_parses_once_per_row() {
     assert_eq!(source, "refresh");
     assert!(fresh.unwrap().versions.contains_key("1.1.0"));
     assert_eq!(if_none_match_count(&fx), 2);
+    assert_eq!(parses(), 3, "a new body parses once more");
+}
+
+#[tokio::test]
+async fn refresh_floor_survives_a_rewritten_row() {
+    let fx = Fx::new().await;
+    fx.set(|s| {
+        s.body = packument(&[("1.0.0", "widget-1.0.0.tgz")])
+            .to_string()
+            .into_bytes();
+        s.etag = Some("\"v1\"".into());
+    });
+    let (engine, _writer) = engine_over(&fx, cfg(), fast());
+    let shared = engine.shared().clone();
+    let (_, source) = facts_for(&shared, &fx, "widget-1.0.0.tgz").await;
+    assert_eq!(source, "fetch");
+
+    fx.set(|s| {
+        s.body = packument(&[("1.0.0", "widget-1.0.0.tgz"), ("1.1.0", "widget-1.1.0.tgz")])
+            .to_string()
+            .into_bytes();
+        s.etag = Some("\"v2\"".into());
+    });
+    let (fresh, source) = facts_for(&shared, &fx, "widget-1.1.0.tgz").await;
+    assert_eq!(source, "refresh");
+    assert!(fresh.unwrap().versions.contains_key("1.1.0"));
+    assert_eq!(if_none_match_count(&fx), 1);
+    assert_eq!(fx.hits().len(), 2, "the refresh was answered 200: the row is rewritten");
+
+    for _ in 0..2 {
+        let (facts, source) = facts_for(&shared, &fx, "widget-1.2.0.tgz").await;
+        assert_eq!(source, "not-in-packument");
+        assert!(facts.unwrap().versions.contains_key("1.1.0"));
+    }
     assert_eq!(
-        PARSES.load(Ordering::SeqCst) - before,
-        3,
-        "a new body parses once more"
+        fx.hits().len(),
+        2,
+        "inside refresh_floor the rewritten row asks nothing more"
     );
 }
