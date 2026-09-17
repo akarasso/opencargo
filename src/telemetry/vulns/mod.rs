@@ -1,6 +1,9 @@
+use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tracing::{info, warn};
+use tracing::info;
+
+use crate::config::VulnScanConfig;
 
 // ---------------------------------------------------------------------------
 // OSV.dev API types
@@ -55,9 +58,18 @@ struct OsvSeverity {
 // Scanner
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, thiserror::Error)]
+pub enum ScanError {
+    #[error("OSV query failed: {0}")]
+    Upstream(String),
+    #[error(transparent)]
+    Db(#[from] sqlx::Error),
+}
+
 #[derive(Clone)]
 pub struct VulnScanner {
     client: reqwest::Client,
+    base: reqwest::Url,
     enabled: bool,
 }
 
@@ -67,6 +79,17 @@ pub struct ScanResult {
     pub vulnerable_deps: usize,
     pub status: String,
     pub details: Vec<VulnDetail>,
+}
+
+impl ScanResult {
+    fn clean() -> Self {
+        Self {
+            total_deps: 0,
+            vulnerable_deps: 0,
+            status: "clean".to_string(),
+            details: vec![],
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,58 +102,29 @@ pub struct VulnDetail {
 }
 
 impl VulnScanner {
-    pub fn new(enabled: bool) -> Self {
-        Self {
+    pub fn new(cfg: &VulnScanConfig) -> anyhow::Result<Self> {
+        let base = reqwest::Url::parse(&cfg.osv_base_url)
+            .with_context(|| format!("invalid vuln_scan.osv_base_url: {}", cfg.osv_base_url))?;
+        Ok(Self {
             client: reqwest::Client::new(),
-            enabled,
-        }
+            base,
+            enabled: cfg.enabled,
+        })
     }
 
-    /// Scan dependencies of a published package version.
-    /// Extracts deps from metadata_json, queries OSV.dev, stores results.
-    pub async fn scan_version(
+    /// Query OSV for the dependencies of `metadata_json`; pure, no DB.
+    pub async fn assess(
         &self,
-        db: &SqlitePool,
-        version_id: i64,
         metadata_json: &str,
         ecosystem: &str,
-    ) -> Result<ScanResult, anyhow::Error> {
+    ) -> Result<ScanResult, ScanError> {
         if !self.enabled {
-            let result = ScanResult {
-                total_deps: 0,
-                vulnerable_deps: 0,
-                status: "clean".to_string(),
-                details: vec![],
-            };
-            return Ok(result);
+            return Ok(ScanResult::clean());
         }
-
-        // Extract dependencies from the metadata JSON
         let deps = extract_dependencies(metadata_json, ecosystem);
-
         if deps.is_empty() {
-            let result = ScanResult {
-                total_deps: 0,
-                vulnerable_deps: 0,
-                status: "clean".to_string(),
-                details: vec![],
-            };
-
-            let results_json = serde_json::to_string(&result)?;
-            crate::db::insert_vulnerability_scan(
-                db,
-                version_id,
-                0,
-                0,
-                Some(&results_json),
-                "clean",
-            )
-            .await?;
-
-            return Ok(result);
+            return Ok(ScanResult::clean());
         }
-
-        // Build OSV queries
         let queries: Vec<OsvQuery> = deps
             .iter()
             .map(|(name, version)| OsvQuery {
@@ -141,124 +135,109 @@ impl VulnScanner {
                 version: version.clone(),
             })
             .collect();
-
-        let total_deps = queries.len();
-
-        // Query OSV.dev API
-        let osv_result = self
+        let url = format!("{}/v1/querybatch", self.base.as_str().trim_end_matches('/'));
+        let response = self
             .client
-            .post("https://api.osv.dev/v1/querybatch")
+            .post(url)
             .json(&OsvQueryBatch { queries })
             .timeout(std::time::Duration::from_secs(30))
             .send()
-            .await;
+            .await
+            .map_err(|e| ScanError::Upstream(format!("request failed: {e}")))?
+            .json::<OsvBatchResponse>()
+            .await
+            .map_err(|e| ScanError::Upstream(format!("invalid response: {e}")))?;
+        Ok(summarize(&deps, &response))
+    }
 
-        let response = match osv_result {
-            Ok(resp) => match resp.json::<OsvBatchResponse>().await {
-                Ok(parsed) => parsed,
-                Err(e) => {
-                    warn!(error = %e, "Failed to parse OSV.dev response");
-                    // Do NOT persist a "clean" scan on failure — that would
-                    // falsely report the version as scanned-and-safe. Return the
-                    // error status without writing a misleading record.
-                    return Ok(ScanResult {
-                        total_deps,
-                        vulnerable_deps: 0,
-                        status: "error".to_string(),
-                        details: vec![],
-                    });
-                }
-            },
-            Err(e) => {
-                warn!(error = %e, "Failed to query OSV.dev");
-                // Do NOT persist a "clean" scan on failure (see above).
-                return Ok(ScanResult {
-                    total_deps,
-                    vulnerable_deps: 0,
-                    status: "error".to_string(),
-                    details: vec![],
-                });
-            }
-        };
-
-        // Process results
-        let mut details = Vec::new();
-        let mut has_critical = false;
-
-        for (i, osv_result) in response.results.iter().enumerate() {
-            if !osv_result.vulns.is_empty() {
-                // The OSV response is attacker/3rd-party controlled; never index
-                // `deps` with its length (would panic if results.len() > deps.len()).
-                let Some((dep_name, dep_version)) = deps.get(i) else {
-                    continue;
-                };
-                for vuln in &osv_result.vulns {
-                    let severity = vuln
-                        .severity
-                        .first()
-                        .and_then(|s| s.score.clone());
-
-                    // Check if any severity score is >= 9.0 (critical)
-                    if let Some(ref score_str) = severity {
-                        if let Ok(score) = score_str.parse::<f64>() {
-                            if score >= 9.0 {
-                                has_critical = true;
-                            }
-                        }
-                    }
-
-                    details.push(VulnDetail {
-                        dependency: dep_name.clone(),
-                        version: dep_version.clone(),
-                        vuln_id: vuln.id.clone(),
-                        summary: vuln.summary.clone().unwrap_or_default(),
-                        severity,
-                    });
-                }
-            }
-        }
-
-        let vulnerable_deps = details
-            .iter()
-            .map(|d| d.dependency.clone())
-            .collect::<std::collections::HashSet<_>>()
-            .len();
-
-        let status = if has_critical {
-            "critical".to_string()
-        } else if vulnerable_deps > 0 {
-            "warning".to_string()
-        } else {
-            "clean".to_string()
-        };
-
-        let result = ScanResult {
-            total_deps,
-            vulnerable_deps,
-            status: status.clone(),
-            details,
-        };
-
-        let results_json = serde_json::to_string(&result)?;
+    /// Record a scan result against a version row.
+    pub async fn persist(
+        &self,
+        db: &SqlitePool,
+        version_id: i64,
+        r: &ScanResult,
+    ) -> Result<(), sqlx::Error> {
+        let results_json =
+            serde_json::to_string(r).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
         crate::db::insert_vulnerability_scan(
             db,
             version_id,
-            total_deps as i64,
-            vulnerable_deps as i64,
+            r.total_deps as i64,
+            r.vulnerable_deps as i64,
             Some(&results_json),
-            &status,
+            &r.status,
         )
         .await?;
-
         info!(
-            version_id = version_id,
-            total_deps = total_deps,
-            vulnerable_deps = vulnerable_deps,
-            status = %status,
+            version_id,
+            total_deps = r.total_deps,
+            vulnerable_deps = r.vulnerable_deps,
+            status = %r.status,
             "Vulnerability scan completed"
         );
+        Ok(())
+    }
 
+    /// `assess` then `persist`; a disabled scanner reports clean and records nothing.
+    pub async fn scan_version(
+        &self,
+        db: &SqlitePool,
+        version_id: i64,
+        metadata_json: &str,
+        ecosystem: &str,
+    ) -> Result<ScanResult, ScanError> {
+        let result = self.assess(metadata_json, ecosystem).await?;
+        if self.enabled {
+            self.persist(db, version_id, &result).await?;
+        }
         Ok(result)
+    }
+}
+
+/// Fold the OSV batch response into a result; a score of 9.0 or more is critical.
+fn summarize(deps: &[(String, String)], response: &OsvBatchResponse) -> ScanResult {
+    let mut details = Vec::new();
+    let mut has_critical = false;
+
+    for (i, osv_result) in response.results.iter().enumerate() {
+        // The OSV response is third-party controlled; never index `deps` by its length.
+        let Some((dep_name, dep_version)) = deps.get(i) else {
+            continue;
+        };
+        for vuln in &osv_result.vulns {
+            let severity = vuln.severity.first().and_then(|s| s.score.clone());
+            if let Some(score) = severity.as_deref().and_then(|s| s.parse::<f64>().ok()) {
+                if score >= 9.0 {
+                    has_critical = true;
+                }
+            }
+            details.push(VulnDetail {
+                dependency: dep_name.clone(),
+                version: dep_version.clone(),
+                vuln_id: vuln.id.clone(),
+                summary: vuln.summary.clone().unwrap_or_default(),
+                severity,
+            });
+        }
+    }
+
+    let vulnerable_deps = details
+        .iter()
+        .map(|d| d.dependency.as_str())
+        .collect::<std::collections::HashSet<_>>()
+        .len();
+    let status = if has_critical {
+        "critical"
+    } else if vulnerable_deps > 0 {
+        "warning"
+    } else {
+        "clean"
+    };
+    ScanResult {
+        total_deps: deps.len(),
+        vulnerable_deps,
+        status: status.to_string(),
+        details,
     }
 }
 

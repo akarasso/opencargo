@@ -723,7 +723,7 @@ pub async fn put_manifest(
     // reference — the tag when pushed by tag, otherwise the digest.
     // `version_id: None`: OCI has no row in the `versions` table, so the
     // vulnerability-scan step does not apply.
-    crate::registry::finalize_publish(
+    crate::registry::publish::finalize_publish(
         &state,
         Format::Oci,
         &repo_name,
@@ -732,6 +732,7 @@ pub async fn put_manifest(
         None,
         &String::from_utf8_lossy(&body),
         &auth_user.username,
+        crate::registry::publish::PreScan::default(),
     )
     .await?;
 

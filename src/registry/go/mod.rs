@@ -295,6 +295,9 @@ pub async fn publish_module(
         .map_err(|e| AppError::Internal(format!("go.mod extraction task failed: {e}")))??
     };
 
+    let pre_scan =
+        crate::registry::publish::publish_gate(&state, Format::Go, &go_mod_content).await?;
+
     // Get or create the package
     let package = match crate::db::get_package(&state.db, repo.id, module_name).await? {
         Some(p) => p,
@@ -352,7 +355,7 @@ pub async fn publish_module(
     )
     .await?;
 
-    crate::registry::finalize_publish(
+    crate::registry::publish::finalize_publish(
         &state,
         Format::Go,
         repo_name,
@@ -361,6 +364,7 @@ pub async fn publish_module(
         Some(version_id),
         &go_mod_content,
         &auth_user.username,
+        pre_scan,
     )
     .await?;
 

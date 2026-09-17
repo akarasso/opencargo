@@ -20,7 +20,7 @@ use tracing::{info, warn};
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig};
-use crate::proxy::{ProxyClient, ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
+use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
 use crate::storage::FilesystemStorage;
 use crate::telemetry;
 use crate::telemetry::vulns::VulnScanner;
@@ -42,7 +42,6 @@ pub struct AppState {
     pub db: SqlitePool,
     pub storage: Arc<FilesystemStorage>,
     pub auth: Arc<AuthState>,
-    pub proxy_client: ProxyClient,
     pub proxy: ProxyEngine,
     /// Per-repository upstream credentials, keyed by name; a missing key is the default.
     pub upstream_auth: Arc<HashMap<String, UpstreamCreds>>,
@@ -54,8 +53,6 @@ pub struct AppState {
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
     pub vuln_scanner: Arc<VulnScanner>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
-    /// Parsed from config.proxy.default_ttl; TTL for cached upstream metadata.
-    pub proxy_default_ttl_secs: u64,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
     pub events: Arc<crate::events::EventBus>,
 }
@@ -154,7 +151,6 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     }
 
     let connect_timeout_secs = parse_duration_secs(&config.proxy.connect_timeout);
-    let proxy_client = ProxyClient::new(storage.clone(), db.clone(), connect_timeout_secs);
     let ttl = TtlConfig {
         default_secs: parse_duration_secs(&config.proxy.default_ttl),
         negative_secs: parse_duration_secs(&config.proxy.negative_cache_ttl),
@@ -177,7 +173,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let webhook_dispatcher = Arc::new(WebhookDispatcher::new(db.clone()));
 
     // Initialize vulnerability scanner
-    let vuln_scanner = Arc::new(VulnScanner::new(config.vuln_scan.enabled));
+    let vuln_scanner = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
     info!(
         storage_path = %config.server.storage_path,
@@ -190,7 +186,6 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         db,
         storage,
         auth,
-        proxy_client,
         proxy,
         upstream_auth,
         base_url: config.server.base_url.clone(),
@@ -201,7 +196,6 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         webhook_dispatcher,
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
-        proxy_default_ttl_secs: parse_duration_secs(&config.proxy.default_ttl),
         events: Arc::new(crate::events::EventBus::new()),
     })
 }

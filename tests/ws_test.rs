@@ -94,6 +94,7 @@ async fn setup(anonymous_read: bool) -> (String, tokio::task::JoinHandle<()>, Te
         vuln_scan: VulnScanConfig {
             enabled: false,
             block_on_critical: false,
+            ..Default::default()
         },
         ..Default::default()
     };

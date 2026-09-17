@@ -202,7 +202,7 @@ async fn rescan_impl(
         .vuln_scanner
         .scan_version(&state.db, version.id, &version.metadata_json, ecosystem)
         .await
-        .map_err(|e| AppError::Internal(format!("scan failed: {e}")))?;
+        .map_err(|e| AppError::ServiceUnavailable(format!("scan failed: {e}")))?;
 
     Ok(Json(json!({
         "package": name,

@@ -21,6 +21,10 @@ struct Cli {
     #[arg(long, env = "OPENCARGO_BASE_URL")]
     base_url: Option<String>,
 
+    /// OSV API base URL for vulnerability scanning (overrides config)
+    #[arg(long, env = "OPENCARGO_OSV_BASE_URL")]
+    osv_base_url: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -53,6 +57,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(base_url) = cli.base_url {
         cfg.server.base_url = base_url.trim_end_matches('/').to_string();
     }
+    if let Some(osv_base_url) = cli.osv_base_url {
+        cfg.vuln_scan.osv_base_url = osv_base_url.trim_end_matches('/').to_string();
+    }
 
     match cli.command.unwrap_or(Commands::Serve) {
         Commands::Serve => {
@@ -69,8 +76,8 @@ async fn main() -> anyhow::Result<()> {
             let app_state = server::build_state(&cfg).await?;
 
             // Spawn the periodic cleanup/GC task before the router consumes
-            // app_state. It is a no-op unless cleanup.enabled and the retention
-            // thresholds are configured, so wiring it is safe by default.
+            // app_state: the pre-release sweep needs cleanup.enabled, the proxy
+            // cache sweep runs whenever proxy_cache_older_than_days is set.
             let cleanup_storage: std::sync::Arc<dyn opencargo::storage::StorageBackend> =
                 app_state.storage.clone();
             tokio::spawn(opencargo::telemetry::cleanup::start_cleanup_task(

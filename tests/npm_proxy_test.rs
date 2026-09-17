@@ -80,6 +80,22 @@ async fn get_bytes(url: &str) -> Vec<u8> {
     resp.bytes().await.expect("failed to read body").to_vec()
 }
 
+/// `(kind, cache_key, status)` of every cache row the server holds.
+async fn cache_rows(server: &TestServer) -> Vec<(String, String, i64)> {
+    let db_path = server.tmp.path().join("opencargo.db");
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+        .await
+        .expect("failed to open the server database");
+    let rows = sqlx::query_as::<_, (String, String, i64)>(
+        "SELECT kind, cache_key, status FROM proxy_cache_entries ORDER BY id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("failed to read cache rows");
+    pool.close().await;
+    rows
+}
+
 fn tarball_url(packument: &Value) -> &str {
     packument["versions"][VERSION]["dist"]["tarball"]
         .as_str()
@@ -165,4 +181,69 @@ async fn group_falls_through_to_proxy() {
 
     assert_eq!(up.tap.count(&up.packument_path()), 1);
     assert_eq!(up.tap.count(&up.tarball_path()), 1);
+}
+
+#[tokio::test]
+async fn missing_package_negative_cached_one_hit() {
+    let up = seed_upstream().await;
+    let a = spawn_proxy(&up).await;
+    let url = format!("{}/npm-proxy/@acme/nope", a.base_url);
+
+    for _ in 0..2 {
+        let resp = reqwest::get(&url).await.expect("request failed");
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    }
+
+    assert_eq!(
+        up.tap.count(&format!("/{UPSTREAM_REPO}/@acme/nope")),
+        1,
+        "the second miss is answered from the negative entry"
+    );
+    let rows = cache_rows(&a).await;
+    assert_eq!(
+        rows,
+        vec![("npm-metadata".to_string(), "@acme/nope".to_string(), 404)]
+    );
+}
+
+#[tokio::test]
+async fn packument_ttl_expiry_refetches() {
+    let up = seed_upstream().await;
+    let a = spawn_proxy(&up).await;
+    let url = format!("{}/npm-proxy/{PKG}", a.base_url);
+
+    let first = get_json(&url).await;
+    get_json(&url).await;
+    assert_eq!(up.tap.count(&up.packument_path()), 1, "a fresh row never hits upstream");
+
+    expire_entries(&a).await;
+    let refreshed = get_json(&url).await;
+    assert_eq!(up.tap.count(&up.packument_path()), 2, "an expired row is refetched once");
+    assert_eq!(refreshed, first);
+    let rows = cache_rows(&a).await;
+    assert_eq!(rows, vec![("npm-metadata".to_string(), PKG.to_string(), 200)]);
+}
+
+#[tokio::test]
+async fn upstream_503_serves_stale_metadata() {
+    let up = seed_upstream().await;
+    let a = spawn_proxy(&up).await;
+    let url = format!("{}/npm-proxy/{PKG}", a.base_url);
+
+    let fresh = get_json(&url).await;
+    expire_entries(&a).await;
+    up.tap.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    let resp = reqwest::get(&url).await.expect("request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "a stale packument beats a 503");
+    let warning = resp
+        .headers()
+        .get("warning")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    assert!(warning.starts_with("110"), "stale response must carry Warning 110, got {warning:?}");
+    let stale: Value = resp.json().await.expect("invalid json");
+    assert_eq!(stale, fresh);
+    assert_eq!(up.tap.count(&up.packument_path()), 2, "the refresh was attempted once");
 }

@@ -170,6 +170,15 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
     (base_url, handle, tmp)
 }
 
+/// These cases reach the live npmjs.org registry; CI runs offline.
+fn network_tests_enabled() -> bool {
+    if std::env::var("OPENCARGO_NETWORK_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set OPENCARGO_NETWORK_TESTS=1 to run live npmjs.org proxy tests");
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -180,6 +189,9 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
 /// and that the tarball URLs have been rewritten to point to our server.
 #[tokio::test]
 async fn test_proxy_fetches_from_upstream() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -247,6 +259,9 @@ async fn test_proxy_fetches_from_upstream() {
 /// cache and both responses should be identical.
 #[tokio::test]
 async fn test_proxy_caches_metadata() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -296,6 +311,9 @@ async fn test_proxy_caches_metadata() {
 /// gzip magic bytes (0x1f 0x8b).
 #[tokio::test]
 async fn test_proxy_download_tarball() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -364,6 +382,9 @@ async fn test_proxy_download_tarball() {
 /// should be returned.
 #[tokio::test]
 async fn test_group_repo_serves_hosted_first() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -415,6 +436,9 @@ async fn test_group_repo_serves_hosted_first() {
 ///   to npm-proxy and return metadata from the upstream registry.
 #[tokio::test]
 async fn test_group_repo_falls_through_to_proxy() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -452,6 +476,9 @@ async fn test_group_repo_falls_through_to_proxy() {
 /// should propagate that as a 404.
 #[tokio::test]
 async fn test_proxy_handles_nonexistent_package() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 

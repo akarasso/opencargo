@@ -2,6 +2,7 @@ pub mod cargo;
 pub mod go;
 pub mod npm;
 pub mod oci;
+pub mod publish;
 pub mod resolve;
 
 use std::collections::HashMap;
@@ -292,84 +293,6 @@ pub fn validate_oci_tag(tag: &str) -> AppResult<()> {
         .all(|&b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
     {
         return Err(invalid());
-    }
-    Ok(())
-}
-
-/// Shared post-publish side effects, factored out of the per-format publish
-/// handlers where they were duplicated verbatim: fire the `package.published`
-/// webhook, emit the real-time event, then run the vulnerability scan. With
-/// `block_on_critical`, a critical finding aborts the publish (returns Err);
-/// otherwise the scan runs in the background.
-///
-/// `version_id` is `None` for ecosystems that do not record rows in the
-/// `versions` table (OCI stores manifests/tags in dedicated tables); the scan
-/// step is skipped in that case since `vulnerability_scans.version_id` has a
-/// foreign key on `versions(id)`.
-#[allow(clippy::too_many_arguments)]
-pub async fn finalize_publish(
-    state: &AppState,
-    format: Format,
-    repo_name: &str,
-    package_name: &str,
-    version_str: &str,
-    version_id: Option<i64>,
-    metadata_json: &str,
-    published_by: &str,
-) -> AppResult<()> {
-    state
-        .webhook_dispatcher
-        .dispatch(
-            "package.published",
-            &serde_json::json!({
-                "package": package_name,
-                "version": version_str,
-                "repository": repo_name,
-                "published_by": published_by,
-            }),
-        )
-        .await;
-
-    emit_package_event(
-        state,
-        "package.published",
-        repo_name,
-        serde_json::json!({
-            "package": package_name,
-            "version": version_str,
-            "repository": repo_name,
-            "format": format.as_str(),
-            "published_by": published_by,
-        }),
-    )
-    .await;
-
-    let (Some(version_id), Some(ecosystem)) = (version_id, format.osv_ecosystem()) else {
-        return Ok(());
-    };
-
-    if state.vuln_scan_config.block_on_critical {
-        let scan_result = state
-            .vuln_scanner
-            .scan_version(&state.db, version_id, metadata_json, ecosystem)
-            .await;
-        if let Ok(ref result) = scan_result {
-            if result.status == "critical" {
-                return Err(AppError::BadRequest(
-                    "publish blocked: critical vulnerabilities found in dependencies".to_string(),
-                ));
-            }
-        }
-    } else {
-        let scanner = state.vuln_scanner.clone();
-        let db = state.db.clone();
-        let meta_json = metadata_json.to_string();
-        let eco = ecosystem.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = scanner.scan_version(&db, version_id, &meta_json, &eco).await {
-                tracing::warn!(error = %e, "Background vulnerability scan failed");
-            }
-        });
     }
     Ok(())
 }

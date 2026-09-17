@@ -274,6 +274,11 @@ pub async fn publish_crate(
     let crate_name = &meta.name;
     let version_str = &meta.vers;
 
+    // The full cargo metadata is what the DB stores and what the scan reads.
+    let metadata_json = serde_json::to_string(&meta)?;
+    let pre_scan =
+        crate::registry::publish::publish_gate(&state, Format::Cargo, &metadata_json).await?;
+
     // Get or create the package
     let package = match crate::db::get_package(&state.db, repo.id, crate_name).await? {
         Some(p) => p,
@@ -315,8 +320,6 @@ pub async fn publish_crate(
         .put(&storage_path, crate_data.clone())
         .await?;
 
-    // Build the metadata JSON to store in the DB (the full cargo metadata)
-    let metadata_json = serde_json::to_string(&meta)?;
     let size = crate_data.len() as i64;
 
     // Insert version in DB
@@ -364,7 +367,7 @@ pub async fn publish_crate(
         }
     }
 
-    crate::registry::finalize_publish(
+    crate::registry::publish::finalize_publish(
         &state,
         Format::Cargo,
         &repo_name,
@@ -373,6 +376,7 @@ pub async fn publish_crate(
         Some(_version_id),
         &metadata_json,
         &user.username,
+        pre_scan,
     )
     .await?;
 

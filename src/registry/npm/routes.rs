@@ -3,10 +3,9 @@ use axum::{
     Router,
 };
 
-use super::{
-    delete_dist_tag, download_tarball, get_dist_tags, get_package, publish_package, put_dist_tag,
-    search,
-};
+use super::dist_tags::{delete_dist_tag, get_dist_tags, put_dist_tag};
+use super::publish::publish_package;
+use super::read::{download_tarball, get_package, search};
 use crate::server::AppState;
 
 pub fn routes() -> Router<AppState> {

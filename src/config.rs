@@ -29,11 +29,28 @@ pub struct Config {
 // Vulnerability scanning
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct VulnScanConfig {
     pub enabled: bool,
     pub block_on_critical: bool,
+    pub osv_base_url: String,
+    /// With `block_on_critical`, an OSV outage refuses the publish (503)
+    /// instead of letting it through unscanned.
+    pub fail_closed: bool,
+    pub max_concurrency: usize,
+}
+
+impl Default for VulnScanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            block_on_critical: false,
+            osv_base_url: "https://api.osv.dev".to_string(),
+            fail_closed: false,
+            max_concurrency: 8,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -163,12 +180,23 @@ impl Default for ProxyConfig {
 // Cleanup
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CleanupConfig {
     pub enabled: bool,
     pub prerelease_older_than_days: Option<u64>,
+    /// Proxy cache rows idle this long are evicted; runs regardless of `enabled`.
     pub proxy_cache_older_than_days: Option<u64>,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prerelease_older_than_days: None,
+            proxy_cache_older_than_days: Some(30),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

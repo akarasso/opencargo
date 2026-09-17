@@ -134,6 +134,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
         vuln_scan: VulnScanConfig {
             enabled: false,
             block_on_critical: false,
+            ..Default::default()
         },
         ..Default::default()
     };

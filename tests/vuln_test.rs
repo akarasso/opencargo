@@ -165,6 +165,7 @@ async fn test_vuln_scan_on_publish() {
     let (base_url, _handle, _tmp) = setup_with_vuln_scan(VulnScanConfig {
         enabled: true,
         block_on_critical: false,
+        ..Default::default()
     })
     .await;
 
@@ -229,6 +230,7 @@ async fn test_vuln_scan_clean_package() {
     let (base_url, _handle, _tmp) = setup_with_vuln_scan(VulnScanConfig {
         enabled: true,
         block_on_critical: false,
+        ..Default::default()
     })
     .await;
 
@@ -271,4 +273,16 @@ async fn test_vuln_scan_clean_package() {
     assert_eq!(body["total_deps"], 0);
     assert_eq!(body["vulnerable_deps"], 0);
     assert_eq!(body["status"], "clean");
+}
+
+/// A config without a `[vuln_scan]` table must still point at OSV and allow
+/// concurrent advisory fetches; a derived `Default` gave "" and 0.
+#[test]
+fn default_config_has_osv_url_and_concurrency() {
+    let cfg: Config = toml::from_str("").expect("empty config parses");
+    assert_eq!(cfg.vuln_scan.osv_base_url, "https://api.osv.dev");
+    assert_eq!(cfg.vuln_scan.max_concurrency, 8);
+    assert!(!cfg.vuln_scan.enabled);
+    assert!(!cfg.vuln_scan.block_on_critical);
+    assert!(!cfg.vuln_scan.fail_closed);
 }

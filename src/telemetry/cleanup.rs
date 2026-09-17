@@ -5,60 +5,81 @@ use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::config::CleanupConfig;
+use crate::db::proxy_cache;
 use crate::storage::StorageBackend;
 
-/// Start a background cleanup task that runs every 24 hours.
-///
-/// The task cleans up:
-/// - Pre-release versions older than the configured number of days
-/// - Proxy cache entries older than the configured number of days
+/// Abandoned `*.part-*` files older than this are reclaimed by the sweep.
+const STALE_PART_AGE: Duration = Duration::from_secs(3600);
+
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct SweepStats {
+    pub rows: u64,
+    pub files: u64,
+    pub parts: u64,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct CleanupStats {
+    pub prereleases: Option<u64>,
+    pub proxy: Option<SweepStats>,
+}
+
+fn proxy_idle_days(config: &CleanupConfig) -> Option<u64> {
+    config.proxy_cache_older_than_days.filter(|days| *days > 0)
+}
+
+/// Start a background cleanup task that runs every 24 hours: the pre-release
+/// sweep when `enabled`, the proxy cache sweep whenever an idle bound is set.
 pub async fn start_cleanup_task(
     db: SqlitePool,
     storage: Arc<dyn StorageBackend>,
     config: CleanupConfig,
 ) {
-    if !config.enabled {
+    if !config.enabled && proxy_idle_days(&config).is_none() {
         info!("Cleanup task is disabled");
         return;
     }
 
     info!("Cleanup task started (runs every 24h)");
     loop {
-        // Run first, THEN sleep: sleeping first meant the initial sweep only
-        // happened after 24h of uptime, so a service restarted more often than
-        // daily (common under k8s) would never clean up at all.
+        // Run first, THEN sleep: a service restarted more often than daily
+        // (common under k8s) would otherwise never clean up at all.
         run_cleanup(&db, &storage, &config).await;
         tokio::time::sleep(Duration::from_secs(86400)).await;
     }
 }
 
-async fn run_cleanup(
+pub(crate) async fn run_cleanup(
     db: &SqlitePool,
     storage: &Arc<dyn StorageBackend>,
     config: &CleanupConfig,
-) {
+) -> CleanupStats {
     info!("Running scheduled cleanup");
+    let mut stats = CleanupStats::default();
 
-    if let Some(days) = config.prerelease_older_than_days {
-        if let Err(e) = cleanup_old_prereleases(db, storage, days).await {
-            error!(error = %e, "Failed to clean up old pre-release versions");
+    if let Some(days) = config.prerelease_older_than_days.filter(|_| config.enabled) {
+        match cleanup_old_prereleases(db, storage, days).await {
+            Ok(deleted) => stats.prereleases = Some(deleted),
+            Err(e) => error!(error = %e, "Failed to clean up old pre-release versions"),
         }
     }
 
-    if let Some(days) = config.proxy_cache_older_than_days {
-        if let Err(e) = cleanup_proxy_cache(db, days).await {
-            error!(error = %e, "Failed to clean up proxy cache entries");
+    if let Some(days) = proxy_idle_days(config) {
+        match sweep_proxy_cache(db, storage, days).await {
+            Ok(sweep) => stats.proxy = Some(sweep),
+            Err(e) => error!(error = %e, "Failed to sweep the proxy cache"),
         }
     }
+    stats
 }
 
 /// Delete pre-release versions (versions containing '-') that were published
-/// more than `older_than_days` days ago.
+/// more than `older_than_days` days ago; returns how many went.
 async fn cleanup_old_prereleases(
     db: &SqlitePool,
     storage: &Arc<dyn StorageBackend>,
     older_than_days: u64,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<u64> {
     // Find pre-release versions older than the threshold. In semver a '-'
     // introduces a pre-release (e.g. 1.0.0-beta.1), but that only holds for
     // formats whose versions ARE semver. Go pseudo-versions
@@ -81,7 +102,7 @@ async fn cleanup_old_prereleases(
 
     if rows.is_empty() {
         info!("No old pre-release versions to clean up");
-        return Ok(());
+        return Ok(0);
     }
 
     info!(count = rows.len(), "Cleaning up old pre-release versions");
@@ -127,27 +148,40 @@ async fn cleanup_old_prereleases(
         );
     }
 
-    Ok(())
+    Ok(rows.len() as u64)
 }
 
-/// Delete proxy cache metadata entries that were fetched more than
-/// `older_than_days` days ago.
-async fn cleanup_proxy_cache(db: &SqlitePool, older_than_days: u64) -> anyhow::Result<()> {
-    let result = sqlx::query(
-        "DELETE FROM proxy_cache_meta
-         WHERE datetime(fetched_at, '+' || ?1 || ' days') < datetime('now')",
-    )
-    .bind(older_than_days as i64)
-    .execute(db)
-    .await?;
-
-    let deleted = result.rows_affected();
+/// Evict expired negative entries and every row idle for `idle_days`, file
+/// first, then row; then reclaim abandoned part files.
+pub(crate) async fn sweep_proxy_cache(
+    db: &SqlitePool,
+    storage: &Arc<dyn StorageBackend>,
+    idle_days: u64,
+) -> anyhow::Result<SweepStats> {
+    let mut stats = SweepStats::default();
+    for row in proxy_cache::evictable_entries(db, idle_days).await? {
+        if let Some(path) = &row.storage_path {
+            match storage.delete(path).await {
+                Ok(()) => stats.files += 1,
+                Err(e) => warn!(path, error = %e, "Failed to delete an evicted cache file"),
+            }
+        }
+        sqlx::query("DELETE FROM proxy_cache_entries WHERE id = ?1")
+            .bind(row.id)
+            .execute(db)
+            .await?;
+        stats.rows += 1;
+    }
+    stats.parts = storage
+        .remove_stale_parts("_proxy_cache", STALE_PART_AGE)
+        .await?;
     info!(
-        deleted_entries = deleted,
-        "Proxy cache cleanup complete"
+        rows = stats.rows,
+        files = stats.files,
+        parts = stats.parts,
+        "Proxy cache sweep complete"
     );
-
-    Ok(())
+    Ok(stats)
 }
 
 #[derive(Debug, sqlx::FromRow)]
@@ -161,27 +195,101 @@ struct PrereleaseRow {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::proxy_cache::NewEntry;
     use crate::storage::FilesystemStorage;
+
+    struct Fx {
+        _tmp: tempfile::TempDir,
+        pool: SqlitePool,
+        storage: Arc<dyn StorageBackend>,
+        fs: Arc<FilesystemStorage>,
+    }
+
+    async fn fixture() -> Fx {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
+        let pool = SqlitePool::connect(&url).await.unwrap();
+        crate::db::migrate(&pool).await.unwrap();
+        sqlx::query(
+            "INSERT INTO repositories (name, repo_type, format, upstream_url) VALUES
+             ('npmrepo','hosted','npm',NULL), ('gorepo','hosted','go',NULL),
+             ('p','proxy','npm','https://registry.npmjs.org')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        let fs = Arc::new(FilesystemStorage::new(tmp.path().join("storage")));
+        Fx {
+            _tmp: tmp,
+            pool,
+            storage: fs.clone(),
+            fs,
+        }
+    }
+
+    impl Fx {
+        async fn put(&self, path: &str) {
+            self.storage
+                .put(path, bytes::Bytes::from_static(b"cached"))
+                .await
+                .unwrap();
+        }
+
+        async fn entry(&self, kind: &str, key: &str, status: i64, ttl: Option<u64>) -> i64 {
+            let path = format!("_proxy_cache/p/{kind}/{key}");
+            if status == 200 {
+                self.put(&path).await;
+            }
+            proxy_cache::upsert_entry(
+                &self.pool,
+                &NewEntry {
+                    repository_id: 3,
+                    kind,
+                    cache_key: key,
+                    status,
+                    storage_path: (status == 200).then_some(path.as_str()),
+                    content_type: None,
+                    etag: None,
+                    digest: None,
+                    size: 6,
+                    ttl_secs: ttl,
+                },
+            )
+            .await
+            .unwrap();
+            proxy_cache::get_entry(&self.pool, 3, kind, key)
+                .await
+                .unwrap()
+                .unwrap()
+                .0
+                .id
+        }
+
+        async fn set(&self, id: i64, column: &str, value: &str) {
+            sqlx::query(&format!(
+                "UPDATE proxy_cache_entries SET {column} = {value} WHERE id = ?1"
+            ))
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        }
+
+        async fn keys(&self) -> Vec<String> {
+            sqlx::query_scalar("SELECT cache_key FROM proxy_cache_entries ORDER BY id")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap()
+        }
+    }
 
     /// The pre-release sweep must delete npm/cargo pre-releases but spare Go
     /// pseudo-versions (which always carry a '-' yet are permanent artifacts).
     #[tokio::test]
     async fn cleanup_spares_go_pseudo_versions() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let db_path = tmp.path().join("test.db");
-        let url = format!("sqlite:{}?mode=rwc", db_path.display());
-        let pool = SqlitePool::connect(&url).await.unwrap();
-        crate::db::migrate(&pool).await.unwrap();
-
-        sqlx::query(
-            "INSERT INTO repositories (name, repo_type, format) VALUES
-             ('npmrepo','hosted','npm'), ('gorepo','hosted','go')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
+        let fx = fixture().await;
         sqlx::query("INSERT INTO packages (repository_id, name) VALUES (1,'npmpkg'), (2,'gomod')")
-            .execute(&pool)
+            .execute(&fx.pool)
             .await
             .unwrap();
         sqlx::query(
@@ -189,23 +297,21 @@ mod tests {
              (1,'1.0.0-beta','{}','npm/npmrepo/npmpkg/x.tgz', datetime('now','-10 days')),
              (2,'v0.0.0-20200101000000-abcdef','{}','go/gorepo/gomod/x.zip', datetime('now','-10 days'))",
         )
-        .execute(&pool)
+        .execute(&fx.pool)
         .await
         .unwrap();
 
-        let storage: Arc<dyn StorageBackend> =
-            Arc::new(FilesystemStorage::new(tmp.path().join("storage")));
-
-        cleanup_old_prereleases(&pool, &storage, 0).await.unwrap();
+        let deleted = cleanup_old_prereleases(&fx.pool, &fx.storage, 0).await.unwrap();
+        assert_eq!(deleted, 1);
 
         let npm_left: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM versions WHERE version = '1.0.0-beta'")
-                .fetch_one(&pool)
+                .fetch_one(&fx.pool)
                 .await
                 .unwrap();
         let go_left: i64 =
             sqlx::query_scalar("SELECT COUNT(*) FROM versions WHERE version LIKE 'v0.0.0-%'")
-                .fetch_one(&pool)
+                .fetch_one(&fx.pool)
                 .await
                 .unwrap();
 
@@ -214,5 +320,95 @@ mod tests {
             go_left, 1,
             "go pseudo-version must be spared (cross-format data-loss guard)"
         );
+    }
+
+    #[tokio::test]
+    async fn sweep_evicts_idle_immutable_and_expired_negatives_keeps_stale_positive() {
+        let fx = fixture().await;
+        let idle = fx.entry("npm-tarball", "idle", 200, None).await;
+        fx.set(idle, "last_used_at", "datetime('now', '-31 days')").await;
+        let negative = fx.entry("npm-metadata", "gone", 404, Some(60)).await;
+        fx.set(negative, "expires_at", "datetime('now', '-1 second')").await;
+        let stale = fx.entry("npm-metadata", "stale", 200, Some(60)).await;
+        fx.set(stale, "expires_at", "datetime('now', '-1 second')").await;
+        fx.entry("npm-metadata", "fresh-negative", 404, Some(60)).await;
+
+        let stats = sweep_proxy_cache(&fx.pool, &fx.storage, 30).await.unwrap();
+
+        assert_eq!(
+            stats,
+            SweepStats {
+                rows: 2,
+                files: 1,
+                parts: 0
+            }
+        );
+        assert_eq!(fx.keys().await, vec!["stale", "fresh-negative"]);
+        assert!(!fx.storage.exists("_proxy_cache/p/npm-tarball/idle").await.unwrap());
+        assert!(fx.storage.exists("_proxy_cache/p/npm-metadata/stale").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn sweep_reclaims_abandoned_part_file() {
+        let fx = fixture().await;
+        fx.put("_proxy_cache/p/npm-tarball/ab/abc.part-old").await;
+        fx.put("_proxy_cache/p/npm-tarball/ab/abc.part-new").await;
+        fx.put("_proxy_cache/p/npm-tarball/ab/abc").await;
+        let old = fx.fs.resolve("_proxy_cache/p/npm-tarball/ab/abc.part-old").unwrap();
+        let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(7200);
+        std::fs::File::options()
+            .write(true)
+            .open(&old)
+            .unwrap()
+            .set_modified(two_hours_ago)
+            .unwrap();
+
+        let stats = sweep_proxy_cache(&fx.pool, &fx.storage, 30).await.unwrap();
+
+        assert_eq!(stats.parts, 1);
+        assert!(!old.exists(), "an hour-old part is reclaimed");
+        assert!(fx.storage.exists("_proxy_cache/p/npm-tarball/ab/abc.part-new").await.unwrap());
+        assert!(fx.storage.exists("_proxy_cache/p/npm-tarball/ab/abc").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn run_cleanup_with_enabled_false_still_sweeps_proxy() {
+        let fx = fixture().await;
+        let idle = fx.entry("npm-tarball", "idle", 200, None).await;
+        fx.set(idle, "last_used_at", "datetime('now', '-31 days')").await;
+        sqlx::query("INSERT INTO packages (repository_id, name) VALUES (1,'npmpkg')")
+            .execute(&fx.pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO versions (package_id, version, metadata_json, tarball_path, published_at)
+             VALUES (1,'1.0.0-beta','{}','npm/npmrepo/npmpkg/x.tgz', datetime('now','-10 days'))",
+        )
+        .execute(&fx.pool)
+        .await
+        .unwrap();
+        let config = CleanupConfig {
+            enabled: false,
+            prerelease_older_than_days: Some(0),
+            proxy_cache_older_than_days: Some(30),
+        };
+
+        let stats = run_cleanup(&fx.pool, &fx.storage, &config).await;
+
+        assert_eq!(stats.prereleases, None, "pre-release sweep needs enabled");
+        assert_eq!(stats.proxy.map(|s| s.rows), Some(1));
+        assert!(fx.keys().await.is_empty());
+        let versions_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM versions")
+            .fetch_one(&fx.pool)
+            .await
+            .unwrap();
+        assert_eq!(versions_left, 1);
+
+        let disabled = CleanupConfig {
+            proxy_cache_older_than_days: Some(0),
+            ..config
+        };
+        let stats = run_cleanup(&fx.pool, &fx.storage, &disabled).await;
+        assert!(stats.prereleases.is_none() && stats.proxy.is_none());
     }
 }
