@@ -63,6 +63,9 @@ version=${tag#v}
 head=$(git rev-parse 'HEAD^{commit}')
 tagged=$(git rev-parse "refs/tags/$tag^{commit}" 2>/dev/null) || die "tag '$tag' not found locally"
 [[ $tagged == "$head" ]] || die "tag '$tag' points at $tagged, checkout is $head"
+if [[ -n ${GITHUB_SHA:-} && $GITHUB_SHA != "$head" ]]; then
+  die "checkout is $head, the run was triggered for $GITHUB_SHA"
+fi
 
 git fetch --quiet --no-tags origin main
 git merge-base --is-ancestor "$head" refs/remotes/origin/main || die "commit $head is not on origin/main"

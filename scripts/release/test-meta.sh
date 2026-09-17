@@ -6,7 +6,7 @@ root=$(mktemp -d)
 trap 'rm -rf "$root"' EXIT
 export GIT_AUTHOR_NAME=t GIT_AUTHOR_EMAIL=t@t GIT_COMMITTER_NAME=t GIT_COMMITTER_EMAIL=t@t
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
-unset GITHUB_OUTPUT
+unset GITHUB_OUTPUT GITHUB_SHA
 
 printf '#!/bin/sh\necho sha256:%s\n' "$(printf 'a%.0s' {1..64})" > "$root/found"
 printf '#!/bin/sh\necho MANIFEST_UNKNOWN >&2\nexit 1\n' > "$root/missing"

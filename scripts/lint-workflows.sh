@@ -18,5 +18,5 @@ export PATH=$bin:$PATH
 shellcheck --version | grep '^version:'
 # actionlint 1.7.12 does not know concurrency.queue yet.
 actionlint -ignore 'unexpected key "queue" for "concurrency" section'
-shellcheck scripts/*.sh scripts/release/*.sh
+shellcheck -x scripts/*.sh scripts/release/*.sh
 echo "workflows and scripts: clean"
