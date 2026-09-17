@@ -299,7 +299,13 @@ impl ProxyEngine {
                 .get(header::CONTENT_TYPE)
                 .and_then(|v| v.to_str().ok())
                 .map(String::from);
-            let size = resp.content_length().unwrap_or(0);
+            // Not `resp.content_length()`: that is the body size hint, 0 for a HEAD.
+            let size = resp
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             return Ok(Outcome::Found(Payload::head_only(
                 size,
                 content_type,

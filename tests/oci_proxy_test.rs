@@ -986,8 +986,7 @@ async fn head_blob_miss_forwards_head_without_download() {
     ))
     .await;
     assert_eq!(resp.status(), StatusCode::OK);
-    // Content-Length is not asserted: the frozen forward_head reads reqwest's
-    // body size hint, which is 0 for a HEAD; the header fix is reported upstream.
+    assert_eq!(header(&resp, "content-length"), fake.layer.len().to_string());
     assert_eq!(header(&resp, "docker-content-digest"), fake.layer_digest());
     assert_eq!(
         fake.reg.count(reqwest::Method::HEAD, &path),
