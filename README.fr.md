@@ -345,7 +345,11 @@ curl -X POST http://localhost:6789/api/v1/repositories \
 docker login localhost:6789 -u mon-user -p mon-password
 ```
 
-Docker utilise Basic Auth — opencargo le supporte nativement avec les memes users/passwords que le reste.
+Docker utilise les memes users/passwords que le reste : `docker login` les
+echange contre un token de registre d'une heure sur `/v2/token` (un pull
+anonyme obtient un token anonyme quand `anonymous_read` est actif), ce dont
+Docker jusqu'en 28.x a besoin avant d'envoyer ses identifiants sur un push ;
+Basic Auth et les tokens API marchent aussi directement.
 
 ### Push une image
 

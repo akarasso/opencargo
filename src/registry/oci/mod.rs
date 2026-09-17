@@ -6,6 +6,7 @@ pub mod refs;
 pub mod routes;
 pub mod routing;
 pub mod tags;
+pub mod token;
 pub mod uploads;
 pub mod upstream;
 
@@ -101,10 +102,24 @@ async fn respond(state: &AppState, payload: Payload) -> AppResult<Response> {
     state.proxy.stream_response(&payload, extra).await
 }
 
-pub async fn api_version_check() -> impl IntoResponse {
+/// `GET /v2/`: 200 for any caller the middleware identified, including an
+/// anonymous registry token; a request without credentials is 401 so classic
+/// Docker clients learn the token realm from the challenge before pushing.
+pub async fn api_version_check(
+    auth: Option<axum::Extension<AuthUser>>,
+    claims: Option<axum::Extension<token::Claims>>,
+) -> impl IntoResponse {
+    let (status, body) = if auth.is_some() || claims.is_some() {
+        (StatusCode::OK, json!({}))
+    } else {
+        (
+            StatusCode::UNAUTHORIZED,
+            json!({"errors": [{"code": "UNAUTHORIZED", "message": "authentication required"}]}),
+        )
+    };
     (
-        StatusCode::OK,
+        status,
         [("Docker-Distribution-Api-Version", "registry/2.0")],
-        Json(json!({})),
+        Json(body),
     )
 }

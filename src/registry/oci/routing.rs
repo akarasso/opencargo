@@ -38,7 +38,7 @@ pub fn rewrite_nested_name<B>(mut req: Request<B>) -> Request<B> {
 /// on `/` (`segs[0]` is the repository). The endpoint marker is matched from
 /// the right with its exact arity, so a name segment literally called `blobs`
 /// or `manifests` never shifts the split.
-fn split_v2_path(segs: &[&str]) -> Option<(usize, usize)> {
+pub(super) fn split_v2_path(segs: &[&str]) -> Option<(usize, usize)> {
     let n = segs.len();
     let marker = if n >= 2 && segs[n - 2..] == ["tags", "list"] {
         n - 2

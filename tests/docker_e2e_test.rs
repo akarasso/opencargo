@@ -285,15 +285,10 @@ async fn test_docker_auth_required() {
         .get("www-authenticate")
         .expect("missing Www-Authenticate header on 401 response");
     let www_auth_str = www_auth.to_str().expect("invalid Www-Authenticate header");
-    assert!(
-        www_auth_str.contains("Basic"),
-        "Www-Authenticate should mention Basic: got {}",
-        www_auth_str
-    );
-    assert!(
-        www_auth_str.contains("opencargo"),
-        "Www-Authenticate should mention opencargo realm: got {}",
-        www_auth_str
+    assert_eq!(
+        www_auth_str,
+        format!("Bearer realm=\"{base_url}/v2/token\",service=\"opencargo\""),
+        "Www-Authenticate should point at the token endpoint"
     );
 }
 

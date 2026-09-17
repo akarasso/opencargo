@@ -67,6 +67,7 @@ stale index with `Warning: 110`.
 
 ```
 GET    /v2/
+GET    /v2/token?service=opencargo&scope=repository:{repo}/{name}:pull
 HEAD   /v2/{repo}/{name}/blobs/{digest}
 GET    /v2/{repo}/{name}/blobs/{digest}
 DELETE /v2/{repo}/{name}/blobs/{digest}
@@ -79,6 +80,24 @@ PUT    /v2/{repo}/{name}/manifests/{reference}
 DELETE /v2/{repo}/{name}/manifests/{reference}
 GET    /v2/{repo}/{name}/tags/list
 ```
+
+Authentication follows the Docker token model. `GET /v2/` without
+credentials, and every `401` on a registry route under `/v2/`, carries
+`WWW-Authenticate: Bearer realm="{base_url}/v2/token",service="opencargo"`,
+with `scope="repository:{repo}/{name}:pull"` (or `:push`) when the route
+names an image. `GET /v2/token` answers `{"token", "access_token",
+"expires_in": 3600, "issued_at"}`: with Basic credentials it checks the
+user's password (throttled like any Basic login), an API token is accepted
+too; without credentials it issues an anonymous token when
+`auth.anonymous_read` is on, else `401`. The token endpoint's own `401`
+carries no challenge, only the `{"errors": [...]}` body Docker shows.
+`scope` may repeat and is only recorded in the token; rights are checked per
+request against the user's permissions, so a token never grants more than
+its user has, and an anonymous token only what an anonymous caller has. Tokens
+are signed with a key generated at startup, expire after one hour and live in
+no table; a restart invalidates them and the client fetches a new one on the
+next `401`. `Authorization: Basic` and API tokens are still accepted on every
+`/v2/` route, so curl and older tooling need no token dance.
 
 `{name}` may span several segments (`team/app`, `org/team/app`). Reads work
 on `hosted`, `proxy` and `group` repositories: a proxy fetches from

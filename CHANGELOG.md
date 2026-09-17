@@ -23,6 +23,16 @@ All notable changes to this project will be documented in this file.
   misses are deduplicated in-process; every body is streamed to disk.
 - Nested OCI image names (`team/app`, `org/team/app`) on every `/v2` route,
   including `Location` and `Docker-Content-Digest` headers.
+- OCI Bearer token auth: `GET /v2/` without credentials and every `401` on
+  a registry route under `/v2/` carry `WWW-Authenticate: Bearer
+  realm=".../v2/token",service="opencargo"` (plus the image's `scope`; the
+  token endpoint's own `401` carries none), and `GET /v2/token`
+  exchanges Basic credentials for a one-hour signed token, or issues an
+  anonymous one when `anonymous_read` is on. Docker daemons up to 28.x only
+  send credentials after such a challenge, so `docker push` after
+  `docker login` failed with `unauthorized` on those clients; answering
+  `Basic` on the ping would have broken their anonymous pulls instead. Basic
+  auth and API tokens are still accepted on every `/v2/` route.
 - Per-repository upstream credentials (`upstream_auth`, or
   `OPENCARGO_UPSTREAM_AUTH_<REPO>` = `basic:user:pass` / `bearer:token`,
   read at startup for every repository, API-created ones included), sent

@@ -253,6 +253,11 @@ docker push registry.example.com/oci-private/team/myapp:latest
 docker pull registry.example.com/oci-all/library/alpine:3.20
 ```
 
+`docker login` credentials are exchanged for a one-hour registry token at
+`/v2/token` (anonymous pulls get an anonymous token when `anonymous_read` is
+on), which is what Docker up to 28.x needs before it sends credentials on a
+push; Basic auth and API tokens keep working directly.
+
 Image names may be nested (`team/myapp`, `org/team/myapp`). A `proxy`
 repository fronts another registry (`upstream = "https://registry-1.docker.io"`,
 `https://ghcr.io`, or another opencargo as `http://host:6789/oci-hosted`);

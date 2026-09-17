@@ -85,6 +85,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         anonymous_read: config.auth.anonymous_read,
         db: db.clone(),
         login_rate_limiter: login_rate_limiter.clone(),
+        base_url: config.server.base_url.clone(),
+        registry_tokens: crate::registry::oci::token::TokenSigner::random(),
     });
 
     // Create admin user from config if it doesn't exist
@@ -351,6 +353,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/events/ws", get(crate::api::ws::ws_handler))
         .with_state(state.clone());
 
+    // OCI token endpoint — outside the auth middleware, it checks Basic
+    // credentials itself and issues anonymous tokens.
+    let oci_token_route = crate::registry::oci::routes::token_routes().with_state(state.clone());
+
     let router = Router::new()
         // Health checks (no auth)
         .route("/health/live", get(health_live))
@@ -376,6 +382,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(npm_login_route)
         // Real-time WebSocket (outside auth middleware — first-frame auth)
         .merge(ws_route)
+        .merge(oci_token_route)
         // Web UI (outside auth middleware)
         .merge(web_routes)
         // Metrics endpoint (outside auth middleware)

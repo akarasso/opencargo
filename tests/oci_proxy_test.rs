@@ -639,7 +639,7 @@ async fn group_hides_private_member() {
     .await;
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert!(
-        header(&resp, "www-authenticate").starts_with("Basic"),
+        header(&resp, "www-authenticate").starts_with("Bearer realm="),
         "docker login shape"
     );
 }

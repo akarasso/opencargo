@@ -230,12 +230,26 @@ async fn test_oci_blob_refcount_and_gc() {
 async fn test_oci_version_check() {
     let (base_url, _handle, _tmp) = setup().await;
 
+    // Without credentials the ping is a Bearer challenge, so classic Docker
+    // clients fetch a token before their first push; with a token it is 200.
     let resp = reqwest::get(format!("{}/v2/", base_url))
         .await
         .expect("request failed");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        resp.headers()["www-authenticate"],
+        format!("Bearer realm=\"{base_url}/v2/token\",service=\"opencargo\"")
+    );
+    assert_eq!(resp.headers()["docker-distribution-api-version"], "registry/2.0");
 
+    let resp = reqwest::Client::new()
+        .get(format!("{}/v2/", base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("request failed");
     assert_eq!(resp.status(), StatusCode::OK);
-
+    assert_eq!(resp.headers()["docker-distribution-api-version"], "registry/2.0");
     let body: Value = resp.json().await.expect("invalid json");
     assert_eq!(body, json!({}));
 }
