@@ -191,6 +191,80 @@ export interface AuditResponse {
   size: number;
 }
 
+// --- Policy report -------------------------------------------------------------
+
+export type PolicyVerdictKind = 'pass' | 'would_block' | 'unknown' | 'not_applicable';
+
+export interface PolicyVerdict {
+  rule: string;
+  verdict: PolicyVerdictKind;
+  reason: string;
+}
+
+export interface PolicyEntry {
+  id: number;
+  created_at: string;
+  requested_repo: string;
+  member_repo: string;
+  format: string;
+  name: string;
+  version: string | null;
+  digest: string | null;
+  actor: string;
+  actor_kind: 'token' | 'user' | 'static' | 'anonymous';
+  user_id: number | null;
+  published_at: string | null;
+  would_block: boolean;
+  unknown: boolean;
+  verdicts: PolicyVerdict[];
+}
+
+export interface PolicyRuleTotals {
+  would_block: number;
+  unknown: number;
+  pass: number;
+  not_applicable: number;
+}
+
+export interface PolicyTotals {
+  resolutions: number;
+  would_block: number;
+  unknown: number;
+  by_rule: Record<string, PolicyRuleTotals>;
+}
+
+export interface PolicyReport {
+  since: string;
+  page: number;
+  size: number;
+  /** Admin view only: the process-lifetime queue-drop counter, outside `totals` on purpose. */
+  process?: { dropped_since_start: number };
+  totals: PolicyTotals;
+  entries: PolicyEntry[];
+}
+
+export interface PolicyQuery {
+  since?: string;
+  repo?: string;
+  rule?: string;
+  page?: number;
+  size?: number;
+}
+
+export interface PolicyRuleConfig {
+  min_release_age: string | null;
+  osv_severity: string | null;
+  install_scripts: boolean;
+  typosquat: boolean;
+  fetch_missing_facts: boolean;
+}
+
+export interface PolicyRules {
+  osv_enabled: boolean;
+  recording: string[];
+  repositories: Record<string, PolicyRuleConfig>;
+}
+
 // --- Webhooks ----------------------------------------------------------------
 
 export interface Webhook {

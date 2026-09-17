@@ -8,6 +8,12 @@ import { onEvent } from '../ws.ts';
 interface LiveOpts {
   debounce?: number;
   /**
+   * Deadline armed by the first event of a burst: refetch by then even if
+   * events keep re-arming the debounce (a stream faster than `debounce`
+   * would otherwise never fire).
+   */
+  maxWait?: number;
+  /**
    * Refetch every `pollMs` milliseconds — for data no WS event covers
    * (Prometheus metrics, health probes). Skipped while the tab is hidden.
    */
@@ -26,13 +32,20 @@ export function useLive(
 ): void {
   const wait = opts.debounce ?? 350;
   let timer: ReturnType<typeof setTimeout> | null = null;
+  let deadline: ReturnType<typeof setTimeout> | null = null;
+
+  const fire = () => {
+    if (timer) clearTimeout(timer);
+    if (deadline) clearTimeout(deadline);
+    timer = null;
+    deadline = null;
+    void refetch();
+  };
 
   const trigger = () => {
     if (timer) clearTimeout(timer);
-    timer = setTimeout(() => {
-      timer = null;
-      void refetch();
-    }, wait);
+    timer = setTimeout(fire, wait);
+    if (opts.maxWait !== undefined && !deadline) deadline = setTimeout(fire, opts.maxWait);
   };
 
   const unsubs = [...events, '$connected', '$resync'].map((e) => onEvent(e, trigger));
@@ -46,6 +59,7 @@ export function useLive(
 
   onCleanup(() => {
     if (timer) clearTimeout(timer);
+    if (deadline) clearTimeout(deadline);
     if (poll) clearInterval(poll);
     unsubs.forEach((u) => u());
   });
