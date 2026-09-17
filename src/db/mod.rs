@@ -4,6 +4,7 @@ use tracing::info;
 // Re-export serde_json for convenience in this module
 use serde_json;
 
+pub mod kinds;
 pub mod oci;
 
 // ---------------------------------------------------------------------------
@@ -142,27 +143,8 @@ pub async fn init_repositories(
     repos: &[crate::config::RepositoryConfig],
 ) -> anyhow::Result<()> {
     for repo in repos {
-        let repo_type = match repo.repo_type {
-            crate::config::RepositoryType::Hosted => "hosted",
-            crate::config::RepositoryType::Proxy => "proxy",
-            crate::config::RepositoryType::Group => "group",
-        };
-
-        let format = match repo.format {
-            crate::config::RepositoryFormat::Npm => "npm",
-            crate::config::RepositoryFormat::Cargo => "cargo",
-            crate::config::RepositoryFormat::Oci => "oci",
-            crate::config::RepositoryFormat::Go => "go",
-            crate::config::RepositoryFormat::Pypi => "pypi",
-        };
-        if repo_type != "hosted" && format != "npm" {
-            anyhow::bail!(
-                "repository {}: {} repositories are only supported for npm today ({} must be hosted)",
-                repo.name,
-                repo_type,
-                format
-            );
-        }
+        kinds::ensure_kind_supported(repo.repo_type, repo.format)
+            .map_err(|e| anyhow::anyhow!("repository {}: {e}", repo.name))?;
 
         let visibility = match repo.visibility {
             crate::config::Visibility::Public => "public",
@@ -170,7 +152,7 @@ pub async fn init_repositories(
         };
 
         let config_json = match repo.repo_type {
-            crate::config::RepositoryType::Group => {
+            kinds::RepoKind::Group => {
                 let members = repo.members.clone().unwrap_or_default();
                 Some(serde_json::json!({ "members": members }).to_string())
             }
@@ -182,8 +164,8 @@ pub async fn init_repositories(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(&repo.name)
-        .bind(repo_type)
-        .bind(format)
+        .bind(repo.repo_type.as_str())
+        .bind(repo.format.as_str())
         .bind(visibility)
         .bind(repo.upstream.as_deref())
         .bind(config_json.as_deref())
@@ -915,8 +897,8 @@ pub async fn get_all_repositories(pool: &SqlitePool) -> Result<Vec<Repository>, 
 pub async fn create_repository(
     pool: &SqlitePool,
     name: &str,
-    repo_type: &str,
-    format: &str,
+    kind: kinds::RepoKind,
+    format: kinds::Format,
     visibility: &str,
     upstream_url: Option<&str>,
     config_json: Option<&str>,
@@ -926,8 +908,8 @@ pub async fn create_repository(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(name)
-    .bind(repo_type)
-    .bind(format)
+    .bind(kind.as_str())
+    .bind(format.as_str())
     .bind(visibility)
     .bind(upstream_url)
     .bind(config_json)

@@ -689,3 +689,63 @@ async fn test_npm_publish_rejects_body_name_mismatch() {
         "a body/URL package-name mismatch must be rejected with 400"
     );
 }
+
+/// `npm dist-tag ls|add|rm <pkg>` on an unscoped package addresses
+/// `/{repo}/-/package/{name}/dist-tags[/{tag}]`; only the scoped pair used to
+/// be routed, so every one of these 404'd on hosted repos.
+#[tokio::test]
+async fn unscoped_dist_tags_get_put_delete() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for version in ["1.0.0", "1.1.0"] {
+        let pkg_json = format!(r#"{{"name":"tagpkg","version":"{version}","main":"index.js"}}"#);
+        let tarball = build_tarball(&pkg_json);
+        let body = build_publish_body("tagpkg", version, "Tagged package", &tarball);
+        let resp = client
+            .put(format!("{}/test-npm/tagpkg", base_url))
+            .bearer_auth("test-token")
+            .json(&body)
+            .send()
+            .await
+            .expect("publish request failed");
+        assert_eq!(resp.status(), StatusCode::OK, "publish {version} failed");
+    }
+
+    let dist_tags_url = format!("{}/test-npm/-/package/tagpkg/dist-tags", base_url);
+    let resp = client.get(&dist_tags_url).send().await.expect("get dist-tags failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tags: Value = resp.json().await.expect("invalid json");
+    assert_eq!(tags, json!({"latest": "1.1.0"}));
+
+    let resp = client
+        .put(format!("{dist_tags_url}/beta"))
+        .bearer_auth("test-token")
+        .json(&json!("1.0.0"))
+        .send()
+        .await
+        .expect("put dist-tag failed");
+    assert_eq!(resp.status(), StatusCode::OK, "{:?}", resp.text().await);
+
+    let tags: Value = client.get(&dist_tags_url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(tags, json!({"latest": "1.1.0", "beta": "1.0.0"}));
+
+    let resp = client
+        .delete(format!("{dist_tags_url}/beta"))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("delete dist-tag failed");
+    assert_eq!(resp.status(), StatusCode::OK, "{:?}", resp.text().await);
+
+    let tags: Value = client.get(&dist_tags_url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(tags, json!({"latest": "1.1.0"}));
+
+    let resp = client
+        .put(format!("{dist_tags_url}/beta"))
+        .json(&json!("1.0.0"))
+        .send()
+        .await
+        .expect("anonymous put dist-tag failed");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "dist-tag writes need a token");
+}

@@ -186,13 +186,13 @@ async fn rescan_impl(
             AppError::NotFound(format!("version not found: {name}@{version_str}"))
         })?;
 
-    // Determine ecosystem from the repository format
-    let ecosystem = match repo.format.as_str() {
-        "npm" => "npm",
-        "cargo" => "crates.io",
-        "go" => "Go",
-        _ => "npm",
-    };
+    let format = repo.fmt()?;
+    let ecosystem = format.osv_ecosystem().ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "vulnerability scanning is not available for {} repositories",
+            format.as_str()
+        ))
+    })?;
 
     // Delete old scan results
     crate::db::delete_vulnerability_scans(&state.db, version.id).await?;

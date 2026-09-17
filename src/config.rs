@@ -185,27 +185,10 @@ pub struct RepositoryConfig {
     pub members: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RepositoryType {
-    Hosted,
-    Proxy,
-    Group,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RepositoryFormat {
-    Npm,
-    Cargo,
-    Oci,
-    Go,
-    /// NOT IMPLEMENTED: there is no `registry/pypi` module, so a repository
-    /// created with format=pypi is inert (no publish/serve routes). Kept in the
-    /// enum and CHECK constraint for forward-compat — implement or remove before
-    /// exposing it as a usable option.
-    Pypi,
-}
+/// Aliases kept so existing config and test code keep compiling; the enums
+/// themselves live next to the rows they are round-tripped from.
+pub type RepositoryType = crate::db::kinds::RepoKind;
+pub type RepositoryFormat = crate::db::kinds::Format;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

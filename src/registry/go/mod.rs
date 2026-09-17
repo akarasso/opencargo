@@ -1,3 +1,5 @@
+pub mod routes;
+
 use std::collections::HashMap;
 use std::io::Read as _;
 
@@ -11,6 +13,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
+use crate::db::kinds::Format;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::storage::StorageBackend;
@@ -24,9 +27,7 @@ pub async fn list_versions(
     Path((repo_name, module_name)): Path<(String, String)>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -69,9 +70,7 @@ pub async fn latest_version(
     Path((repo_name, module_name)): Path<(String, String)>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -112,9 +111,7 @@ pub async fn version_info(
     // Strip ".info" suffix if present (from route matching)
     let version_str = version_raw.strip_suffix(".info").unwrap_or(version_raw);
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, module_name)
         .await?
@@ -156,9 +153,7 @@ pub async fn get_mod(
     })?;
     let version_str = version_raw.strip_suffix(".mod").unwrap_or(version_raw);
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, module_name)
         .await?
@@ -204,9 +199,7 @@ pub async fn get_zip(
     })?;
     let version_str = version_raw.strip_suffix(".zip").unwrap_or(version_raw);
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, module_name)
         .await?
@@ -276,14 +269,12 @@ pub async fn publish_module(
     crate::registry::validate_version(version_str)?;
 
     // Validate repo exists and is hosted
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_format(&repo, "go")?;
+    crate::registry::ensure_format(&repo, Format::Go)?;
 
     // Read the zip body
     let zip_data = axum::body::to_bytes(request.into_body(), 100 * 1024 * 1024)
@@ -361,12 +352,9 @@ pub async fn publish_module(
     )
     .await?;
 
-    // Shared post-publish side effects: `package.published` webhook, real-time
-    // event, vulnerability scan — same as npm/cargo. "Go" is the OSV.dev
-    // ecosystem name (like "crates.io" for cargo).
     crate::registry::finalize_publish(
         &state,
-        "Go",
+        Format::Go,
         repo_name,
         module_name,
         version_str,

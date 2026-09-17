@@ -7,6 +7,7 @@ use std::collections::HashMap;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
+use crate::db::kinds::{Format, RepoKind};
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
@@ -21,6 +22,13 @@ pub fn extract_package_name(params: &HashMap<String, String>) -> String {
         Some(scope) => format!("@{}/{}", scope, params.get("name").unwrap_or(&String::new())),
         None => params.get("name").cloned().unwrap_or_default(),
     }
+}
+
+/// Load a repository by name; a missing one is a 404 naming it.
+pub async fn load_repo(db: &sqlx::SqlitePool, name: &str) -> AppResult<Repository> {
+    crate::db::get_repository_by_name(db, name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))
 }
 
 /// Enforce read access on a repository before serving any of its content.
@@ -84,13 +92,16 @@ pub async fn ensure_can_write(
 /// Without this guard a payload of one format could be published into a repo of
 /// another (e.g. an npm tarball into a `cargo` repo), silently corrupting it
 /// since the underlying tables are shared.
-pub fn ensure_format(repo: &Repository, expected: &str) -> AppResult<()> {
-    if repo.format == expected {
+pub fn ensure_format(repo: &Repository, expected: Format) -> AppResult<()> {
+    let format = repo.fmt()?;
+    if format == expected {
         Ok(())
     } else {
         Err(AppError::BadRequest(format!(
             "repository '{}' is a '{}' repository, not '{}'",
-            repo.name, repo.format, expected
+            repo.name,
+            format.as_str(),
+            expected.as_str()
         )))
     }
 }
@@ -99,7 +110,7 @@ pub fn ensure_format(repo: &Repository, expected: &str) -> AppResult<()> {
 /// Factored out of the per-format publish handlers where the check was
 /// duplicated verbatim.
 pub fn ensure_hosted(repo: &Repository) -> AppResult<()> {
-    if repo.repo_type == "hosted" {
+    if repo.kind()? == RepoKind::Hosted {
         Ok(())
     } else {
         Err(AppError::BadRequest(
@@ -297,7 +308,7 @@ pub fn validate_oci_tag(tag: &str) -> AppResult<()> {
 #[allow(clippy::too_many_arguments)]
 pub async fn finalize_publish(
     state: &AppState,
-    ecosystem: &str,
+    format: Format,
     repo_name: &str,
     package_name: &str,
     version_str: &str,
@@ -326,13 +337,13 @@ pub async fn finalize_publish(
             "package": package_name,
             "version": version_str,
             "repository": repo_name,
-            "format": ecosystem,
+            "format": format.as_str(),
             "published_by": published_by,
         }),
     )
     .await;
 
-    let Some(version_id) = version_id else {
+    let (Some(version_id), Some(ecosystem)) = (version_id, format.osv_ecosystem()) else {
         return Ok(());
     };
 

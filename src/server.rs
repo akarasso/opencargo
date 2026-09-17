@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+pub mod rewrite;
+
 use std::sync::Arc;
 
 use axum::{
@@ -6,7 +7,7 @@ use axum::{
     extract::{DefaultBodyLimit, Path},
     http::StatusCode,
     response::IntoResponse,
-    routing::{delete, get, head, post, put},
+    routing::{delete, get, post, put},
     Json, Router,
 };
 use metrics_exporter_prometheus::PrometheusHandle;
@@ -192,135 +193,6 @@ pub fn build_router(state: AppState) -> Router {
     let auth_state = state.auth.clone();
     let metrics_handle = state.metrics_handle.clone();
 
-    let npm_routes = Router::new()
-        // Scoped packages: @scope/name
-        .route(
-            "/{repo}/@{scope}/{name}",
-            get(crate::registry::npm::get_package)
-                .put(crate::registry::npm::publish_package),
-        )
-        .route(
-            "/{repo}/@{scope}/{name}/-/{filename}",
-            get(crate::registry::npm::download_tarball),
-        )
-        // Unscoped packages
-        .route(
-            "/{repo}/{name}",
-            get(crate::registry::npm::get_package)
-                .put(crate::registry::npm::publish_package),
-        )
-        .route(
-            "/{repo}/{name}/-/{filename}",
-            get(crate::registry::npm::download_tarball),
-        )
-        // Search
-        .route(
-            "/{repo}/-/v1/search",
-            get(crate::registry::npm::search),
-        )
-        // Dist-tags for scoped packages
-        .route(
-            "/{repo}/-/package/@{scope}/{name}/dist-tags",
-            get(crate::registry::npm::get_dist_tags),
-        )
-        .route(
-            "/{repo}/-/package/@{scope}/{name}/dist-tags/{tag}",
-            put(crate::registry::npm::put_dist_tag)
-                .delete(crate::registry::npm::delete_dist_tag),
-        );
-
-    let cargo_routes = Router::new()
-        // Cargo sparse registry index
-        .route(
-            "/{repo}/index/config.json",
-            get(crate::registry::cargo::config_json),
-        )
-        .route(
-            "/{repo}/index/1/{name}",
-            get(crate::registry::cargo::get_index_entry),
-        )
-        .route(
-            "/{repo}/index/2/{name}",
-            get(crate::registry::cargo::get_index_entry),
-        )
-        .route(
-            "/{repo}/index/3/{first}/{name}",
-            get(crate::registry::cargo::get_index_entry),
-        )
-        .route(
-            "/{repo}/index/{first_two}/{next_two}/{name}",
-            get(crate::registry::cargo::get_index_entry),
-        )
-        // Cargo API
-        .route(
-            "/{repo}/api/v1/crates/new",
-            put(crate::registry::cargo::publish_crate),
-        )
-        .route(
-            "/{repo}/api/v1/crates/{name}/{version}/download",
-            get(crate::registry::cargo::download_crate),
-        )
-        .route(
-            "/{repo}/api/v1/crates/{name}/{version}/yank",
-            delete(crate::registry::cargo::yank),
-        )
-        .route(
-            "/{repo}/api/v1/crates/{name}/{version}/unyank",
-            put(crate::registry::cargo::unyank),
-        );
-
-    // Go module routes. Real module paths span several URL segments
-    // (github.com/org/repo) while `{module}` matches exactly one; a
-    // `/{repo}/{*rest}` catch-all is rejected by axum's matchit because it
-    // conflicts with the npm/cargo routes sharing the `/{repo}/` prefix.
-    // Instead, `rewrite_go_module_path` (applied before routing, see the end
-    // of this function) percent-encodes the slashes inside multi-segment
-    // module paths so they match these single-segment routes; axum decodes
-    // path params, so the handlers receive the real module path.
-    let go_routes = Router::new()
-        .route(
-            "/{repo}/{module}/@v/list",
-            get(crate::registry::go::list_versions),
-        )
-        .route(
-            "/{repo}/{module}/@v/{version}",
-            get(go_version_dispatch).put(crate::registry::go::publish_module),
-        )
-        .route(
-            "/{repo}/{module}/@latest",
-            get(crate::registry::go::latest_version),
-        );
-
-    // OCI / Docker container registry routes
-    let oci_routes = Router::new()
-        .route("/v2/", get(crate::registry::oci::api_version_check))
-        .route(
-            "/v2/{repo}/{name}/blobs/{digest}",
-            head(crate::registry::oci::head_blob)
-                .get(crate::registry::oci::get_blob)
-                .delete(crate::registry::oci::delete_blob),
-        )
-        .route(
-            "/v2/{repo}/{name}/blobs/uploads/",
-            post(crate::registry::oci::start_upload),
-        )
-        .route(
-            "/v2/{repo}/{name}/blobs/uploads/{uuid}",
-            put(crate::registry::oci::complete_upload)
-                .patch(crate::registry::oci::upload_chunk),
-        )
-        .route(
-            "/v2/{repo}/{name}/manifests/{reference}",
-            get(crate::registry::oci::get_manifest)
-                .head(crate::registry::oci::head_manifest)
-                .put(crate::registry::oci::put_manifest)
-                .delete(crate::registry::oci::delete_manifest),
-        )
-        .route(
-            "/v2/{repo}/{name}/tags/list",
-            get(crate::registry::oci::list_tags),
-        );
-
     // Metrics endpoint served on a separate nested router (no auth required)
     let metrics_routes = Router::new()
         .route("/metrics", get(telemetry::metrics_endpoint))
@@ -475,14 +347,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/-/whoami", get(whoami))
         // Admin API routes
         .merge(api_routes)
-        // npm protocol routes
-        .merge(npm_routes)
-        // Cargo sparse registry routes
-        .merge(cargo_routes)
-        // Go module registry routes
-        .merge(go_routes)
-        // OCI container registry routes
-        .merge(oci_routes)
+        .merge(crate::registry::npm::routes::routes())
+        .merge(crate::registry::cargo::routes::routes())
+        .merge(crate::registry::go::routes::routes())
+        .merge(crate::registry::oci::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
         .merge(dashboard_routes)
@@ -511,83 +379,15 @@ pub fn build_router(state: AppState) -> Router {
         // Security response headers on every response (defense in depth).
         .layer(axum::middleware::from_fn(security_headers_middleware));
 
-    // Multi-segment Go module support. The rewrite must run BEFORE route
-    // matching, and `Router::layer` runs after it, so the finished router is
-    // wrapped in a `map_request` service and re-exposed as the fallback of a
-    // fresh route-less Router. This keeps the return type (`Router`) so both
+    // The pre-route rewrites must run BEFORE route matching, and
+    // `Router::layer` runs after it, so the finished router is wrapped in a
+    // `map_request` service and re-exposed as the fallback of a fresh
+    // route-less Router. This keeps the return type (`Router`) so both
     // `main.rs` and the integration tests get the rewrite for free.
-    Router::new().fallback_service(
-        tower::Layer::layer(
-            &tower::util::MapRequestLayer::new(rewrite_go_module_path),
-            router,
-        ),
-    )
-}
-
-/// Rewrite multi-segment Go module paths so the router can match them.
-///
-/// The GOPROXY protocol addresses a module as `{base}/{module}/@v/...` or
-/// `{base}/{module}/@latest`, where the module path usually spans several URL
-/// segments (`github.com/org/repo`). axum's `{module}` param matches exactly
-/// one segment, and a `/{repo}/{*rest}` catch-all is rejected at router build
-/// time (matchit forbids a catch-all overlapping the npm/cargo param routes
-/// under `/{repo}/`). So, before routing, the slashes INSIDE the module part
-/// of GOPROXY-shaped paths are percent-encoded; the module then fits in a
-/// single segment, the existing `/{repo}/{module}/@v/...` routes match, and
-/// axum's percent-decoding of path params hands the handlers the real module
-/// path.
-///
-/// The rewrite only applies when the path has a GOPROXY marker — `/@v/`
-/// followed by a final single segment (`list`, `{version}`, `{version}.info`,
-/// ...) or an `/@latest` suffix — with at least two module segments before
-/// it, and never under `/api/` or `/v2/` (admin API and OCI namespaces; an
-/// npm scope named `@v` never has a single trailing segment after it, but the
-/// guards keep the reasoning local). Everything else passes through untouched.
-fn rewrite_go_module_path(
-    mut req: axum::http::Request<axum::body::Body>,
-) -> axum::http::Request<axum::body::Body> {
-    let path = req.uri().path();
-    if path.starts_with("/api/") || path.starts_with("/v2/") {
-        return req;
-    }
-
-    let (prefix, suffix) = if let Some(idx) = path.rfind("/@v/") {
-        // GOPROXY paths have exactly one segment after /@v/; npm/dist-tags
-        // paths that can contain "/@v/" (scope named "v") always have more.
-        if path[idx + 4..].contains('/') {
-            return req;
-        }
-        (&path[..idx], &path[idx..])
-    } else if let Some(prefix) = path.strip_suffix("/@latest") {
-        (prefix, "/@latest")
-    } else {
-        return req;
-    };
-
-    // prefix is "/{repo}/{module...}" — rewrite only when the module part
-    // spans at least two segments (single-segment modules already match).
-    let mut parts = prefix.splitn(3, '/');
-    let (Some(""), Some(repo), Some(module)) = (parts.next(), parts.next(), parts.next())
-    else {
-        return req;
-    };
-    if repo.is_empty() || module.is_empty() || !module.contains('/') {
-        return req;
-    }
-
-    let encoded_module = module.replace('/', "%2F");
-    let new_path = format!("/{repo}/{encoded_module}{suffix}");
-    let new_uri_str = match req.uri().query() {
-        Some(q) => format!("{new_path}?{q}"),
-        None => new_path,
-    };
-    match new_uri_str.parse() {
-        Ok(new_uri) => *req.uri_mut() = new_uri,
-        Err(e) => {
-            tracing::warn!(uri = %req.uri(), error = %e, "re-parse of rewritten Go module URI failed; keeping original");
-        }
-    }
-    req
+    Router::new().fallback_service(tower::Layer::layer(
+        &tower::util::MapRequestLayer::new(rewrite::pre_route),
+        router,
+    ))
 }
 
 /// Add hardening response headers to every response.
@@ -619,39 +419,6 @@ async fn security_headers_middleware(
         ),
     );
     response
-}
-
-/// Dispatch Go module version requests based on file extension.
-///
-/// The GOPROXY protocol uses URL suffixes like `.info`, `.mod`, `.zip` to
-/// distinguish the type of response. We route them all through a single
-/// `/{repo}/{module}/@v/{version}` pattern and dispatch here.
-async fn go_version_dispatch(
-    state: axum::extract::State<AppState>,
-    path: Path<HashMap<String, String>>,
-    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
-) -> crate::error::AppResult<axum::response::Response> {
-    // Enforce read access once for all three dispatch targets (.info/.mod/.zip).
-    let repo_name = path.get("repo").cloned().unwrap_or_default();
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| {
-            crate::error::AppError::NotFound(format!("repository not found: {repo_name}"))
-        })?;
-    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
-
-    let version = path.get("version").cloned().unwrap_or_default();
-    if version.ends_with(".info") {
-        Ok(crate::registry::go::version_info(state, path).await?.into_response())
-    } else if version.ends_with(".mod") {
-        Ok(crate::registry::go::get_mod(state, path).await?.into_response())
-    } else if version.ends_with(".zip") {
-        Ok(crate::registry::go::get_zip(state, path).await?.into_response())
-    } else {
-        Err(crate::error::AppError::BadRequest(
-            "unknown version file extension; expected .info, .mod, or .zip".to_string(),
-        ))
-    }
 }
 
 async fn health_live() -> impl IntoResponse {
@@ -841,71 +608,13 @@ pub fn decode_percent_encoded_slashes<B>(
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_percent_encoded_slashes, rewrite_go_module_path};
+    use super::decode_percent_encoded_slashes;
 
     fn req(uri: &str) -> axum::http::Request<()> {
         axum::http::Request::builder()
             .uri(uri)
             .body(())
             .expect("test URI should build")
-    }
-
-    fn body_req(uri: &str) -> axum::http::Request<axum::body::Body> {
-        axum::http::Request::builder()
-            .uri(uri)
-            .body(axum::body::Body::empty())
-            .expect("test URI should build")
-    }
-
-    /// Multi-segment module paths get their inner slashes percent-encoded so
-    /// the single-segment `/{repo}/{module}/...` routes match.
-    #[test]
-    fn rewrites_multi_segment_go_paths() {
-        for (input, expected) in [
-            (
-                "/go-hosted/github.com/org/repo/@v/list",
-                "/go-hosted/github.com%2Forg%2Frepo/@v/list",
-            ),
-            (
-                "/go-hosted/github.com/org/repo/@v/v1.0.0.info",
-                "/go-hosted/github.com%2Forg%2Frepo/@v/v1.0.0.info",
-            ),
-            (
-                "/go-hosted/example.com/mod/@latest",
-                "/go-hosted/example.com%2Fmod/@latest",
-            ),
-        ] {
-            let out = rewrite_go_module_path(body_req(input));
-            assert_eq!(out.uri().path(), expected, "for {input}");
-        }
-
-        // Query strings survive.
-        let out = rewrite_go_module_path(body_req("/go-hosted/a/b/@v/list?x=1"));
-        assert_eq!(out.uri().path(), "/go-hosted/a%2Fb/@v/list");
-        assert_eq!(out.uri().query(), Some("x=1"));
-    }
-
-    /// Paths that are not multi-segment GOPROXY calls pass through untouched:
-    /// single-segment modules, npm routes (including a scope named "@v"),
-    /// cargo, admin API, and OCI namespaces.
-    #[test]
-    fn leaves_non_go_paths_untouched() {
-        for uri in [
-            "/go-hosted/mymodule/@v/list",          // single-segment module
-            "/go-hosted/mymodule/@v/v1.0.0",        // single-segment module
-            "/go-hosted/mymodule/@latest",          // single-segment module
-            "/npm-dev/@scope/pkg",                  // npm scoped metadata
-            "/npm-dev/@v/pkg",                      // npm scope named "v"
-            "/npm-dev/@v/pkg/-/pkg-1.0.0.tgz",      // npm tarball, scope "v"
-            "/npm-dev/-/package/@v/pkg/dist-tags",  // npm dist-tags, scope "v"
-            "/cargo-repo/api/v1/crates/new",        // cargo publish
-            "/api/v1/packages",                     // admin API guard
-            "/v2/oci-repo/img/manifests/latest",    // OCI guard
-            "/health/live",
-        ] {
-            let out = rewrite_go_module_path(body_req(uri));
-            assert_eq!(out.uri().path(), uri, "{uri} must not be rewritten");
-        }
     }
 
     /// Nominal npm/pnpm case: scoped package names arrive with `%2f`-encoded

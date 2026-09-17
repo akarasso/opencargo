@@ -8,6 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::{require_admin, require_auth};
+use crate::db::kinds::{ensure_kind_supported, Format, RepoKind};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 
@@ -57,28 +58,16 @@ pub async fn create_repository(
         serde_json::from_slice(&bytes)?
     };
 
-    // Validate repo_type
-    if !matches!(body.repo_type.as_str(), "hosted" | "proxy" | "group") {
-        return Err(AppError::BadRequest(format!(
-            "invalid repository type: {}",
-            body.repo_type
-        )));
-    }
-
-    // Validate format
-    if !matches!(body.format.as_str(), "npm" | "cargo" | "oci" | "go") {
+    let kind: RepoKind = body.repo_type.parse()?;
+    let format: Format = body.format.parse()?;
+    // The API never exposes pypi: there is no registry module behind it.
+    if format == Format::Pypi {
         return Err(AppError::BadRequest(format!(
             "invalid repository format: {}",
             body.format
         )));
     }
-
-    if body.repo_type != "hosted" && body.format != "npm" {
-        return Err(AppError::BadRequest(format!(
-            "{} repositories are only supported for npm today; {} repositories must be hosted",
-            body.repo_type, body.format
-        )));
-    }
+    ensure_kind_supported(kind, format)?;
 
     // Validate visibility
     if !matches!(body.visibility.as_str(), "public" | "private") {
@@ -107,7 +96,7 @@ pub async fn create_repository(
     }
 
     // Build config_json for group repos
-    let config_json = if body.repo_type == "group" {
+    let config_json = if kind == RepoKind::Group {
         let members = body.members.unwrap_or_default();
         Some(serde_json::json!({ "members": members }).to_string())
     } else {
@@ -117,8 +106,8 @@ pub async fn create_repository(
     let _id = crate::db::create_repository(
         &state.db,
         &body.name,
-        &body.repo_type,
-        &body.format,
+        kind,
+        format,
         &body.visibility,
         body.upstream.as_deref(),
         config_json.as_deref(),
@@ -305,7 +294,7 @@ pub async fn purge_cache(
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))?;
 
-    if repo.repo_type != "proxy" {
+    if repo.kind()? != RepoKind::Proxy {
         return Err(AppError::BadRequest(
             "can only purge cache on proxy repositories".to_string(),
         ));

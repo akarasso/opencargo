@@ -56,6 +56,7 @@ pub async fn auth_middleware(
 ) -> Response {
     let is_read = request.method() == axum::http::Method::GET
         || request.method() == axum::http::Method::HEAD;
+    let is_cargo_config = is_read && is_cargo_config_path(request.uri().path());
 
     // Detect if this is an OCI request (Docker client) for proper Www-Authenticate headers
     let is_oci = request.uri().path().starts_with("/v2");
@@ -180,13 +181,30 @@ pub async fn auth_middleware(
         }
         None => {
             // No token. Allow anonymous GET if configured.
-            if state.anonymous_read && is_read {
+            if (state.anonymous_read && is_read) || is_cargo_config {
                 next.run(request).await
             } else {
                 unauthorized_response(is_oci)
             }
         }
     }
+}
+
+/// `/{repo}/index/config.json`: cargo reads it before it knows whether to send
+/// a token and learns to from `auth-required`, so a tokenless read passes the
+/// anonymous gate; the handler discloses only existence and format.
+fn is_cargo_config_path(path: &str) -> bool {
+    let mut segments = path.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some(""), Some(repo), Some("index"), Some("config.json"), None) if !repo.is_empty()
+    )
 }
 
 /// Build an unauthorized response. For OCI/Docker requests, include the

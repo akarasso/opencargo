@@ -132,6 +132,10 @@ async fn publish_npm_package(
 
 /// Start a test server on a random port with both npm and cargo repositories.
 async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
+    setup_with(true).await
+}
+
+async fn setup_with(anonymous_read: bool) -> (String, tokio::task::JoinHandle<()>, TempDir) {
     let tmp = TempDir::new().expect("failed to create temp dir");
     let storage_path = tmp.path().join("storage");
     let db_path = tmp.path().join("test.db");
@@ -153,7 +157,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
         },
         database: DatabaseConfig { url: db_url },
         auth: AuthConfig {
-            anonymous_read: true,
+            anonymous_read,
             static_tokens: vec!["test-token".to_string()],
             ..Default::default()
         },
@@ -705,6 +709,76 @@ async fn test_cargo_config_json() {
         "dl URL should contain 'cargo-private': {}",
         dl
     );
+}
+
+/// cargo reads `config.json` before it knows whether to send a token and
+/// learns to from `auth-required`, so the tokenless read must pass the
+/// `anonymous_read = false` gate while disclosing only existence and format;
+/// a sent token must still hold read, and the index stays gated.
+#[tokio::test]
+async fn config_json_tokenless_gate() {
+    let (base_url, _handle, _tmp) = setup_with(false).await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{}/cargo-private/index/config.json", base_url))
+        .send()
+        .await
+        .expect("config.json request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "{:?}", resp.text().await);
+    let config: Value = resp.json().await.expect("invalid JSON");
+    assert_eq!(config["dl"], format!("{}/cargo-private/api/v1/crates", base_url));
+    assert_eq!(config["api"], format!("{}/cargo-private", base_url));
+    assert_eq!(config["auth-required"], true);
+
+    let resp = client
+        .get(format!("{}/test-npm/index/config.json", base_url))
+        .send()
+        .await
+        .expect("npm config.json request failed");
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    let resp = client
+        .get(format!("{}/cargo-private/index/1/a", base_url))
+        .send()
+        .await
+        .expect("index request failed");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "the index stays gated");
+
+    let resp = client
+        .post(format!("{}/api/v1/users", base_url))
+        .bearer_auth("test-token")
+        .json(&json!({"username": "no-read", "role": "reader"}))
+        .send()
+        .await
+        .expect("create user failed");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let resp = client
+        .post(format!("{}/api/v1/users/no-read/tokens", base_url))
+        .bearer_auth("test-token")
+        .json(&json!({"name": "t"}))
+        .send()
+        .await
+        .expect("create token failed");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let token: Value = resp.json().await.expect("invalid JSON");
+    let token = token["token"].as_str().expect("token should be returned");
+    let resp = client
+        .put(format!("{}/api/v1/users/no-read/permissions/cargo-private", base_url))
+        .bearer_auth("test-token")
+        .json(&json!({"can_read": false, "can_write": false, "can_delete": false, "can_admin": false}))
+        .send()
+        .await
+        .expect("set permission failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = client
+        .get(format!("{}/cargo-private/index/config.json", base_url))
+        .bearer_auth(token)
+        .send()
+        .await
+        .expect("config.json request failed");
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{:?}", resp.text().await);
 }
 
 #[tokio::test]

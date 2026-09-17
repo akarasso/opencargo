@@ -1,3 +1,5 @@
+pub mod routes;
+
 use std::collections::HashMap;
 
 use axum::{
@@ -14,6 +16,7 @@ use sha1::Digest;
 use tracing::{info, warn};
 
 use crate::auth::middleware::AuthUser;
+use crate::db::kinds::{Format, RepoKind};
 use crate::error::{AppError, AppResult};
 use crate::proxy;
 use crate::registry::extract_package_name;
@@ -121,12 +124,10 @@ pub async fn publish_package(
     }
 
     // Validate repo exists and is hosted
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_format(&repo, "npm")?;
+    crate::registry::ensure_format(&repo, Format::Npm)?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
@@ -330,7 +331,7 @@ pub async fn publish_package(
 
         crate::registry::finalize_publish(
             &state,
-            "npm",
+            Format::Npm,
             repo_name,
             &package_name,
             version_str,
@@ -367,9 +368,7 @@ pub async fn get_package(
     })?;
     let package_name = extract_package_name(&params);
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -379,15 +378,14 @@ pub async fn get_package(
         .map(|v| v.contains("application/vnd.npm.install-v1+json"))
         .unwrap_or(false);
 
-    match repo.repo_type.as_str() {
-        "proxy" => {
+    match repo.kind()? {
+        RepoKind::Proxy => {
             get_package_proxy(&state, &repo, &package_name, repo_name, repo_name, abbreviated).await
         }
-        "group" => {
+        RepoKind::Group => {
             get_package_group(&state, &repo, &package_name, repo_name, repo_name, auth.as_ref().map(|e| &e.0), abbreviated, 0).await
         }
-        _ => {
-            // "hosted" — original logic
+        RepoKind::Hosted => {
             get_package_hosted(&state, &repo, &package_name, repo_name, abbreviated).await
         }
     }
@@ -526,7 +524,7 @@ fn get_package_group<'a>(
             ));
         }
 
-        let members = crate::db::parse_group_members(repo.config_json.as_deref());
+        let members = repo.members();
 
         if members.is_empty() {
             return Err(AppError::Internal(format!(
@@ -551,20 +549,18 @@ fn get_package_group<'a>(
             if crate::registry::ensure_can_read(&state.db, &member_repo, auth).await.is_err() {
                 continue;
             }
-            let result = match member_repo.repo_type.as_str() {
-                "proxy" => {
+            let result = match member_repo.kind()? {
+                RepoKind::Proxy => {
                     get_package_proxy(state, &member_repo, package_name, member_name, url_repo_name, abbreviated)
                         .await
                 }
-                "hosted" => {
+                RepoKind::Hosted => {
                     get_package_hosted(state, &member_repo, package_name, url_repo_name, abbreviated).await
                 }
-                "group" => {
-                    // Nested groups — recurse (boxed)
+                RepoKind::Group => {
                     get_package_group(state, &member_repo, package_name, member_name, url_repo_name, auth, abbreviated, depth + 1)
                         .await
                 }
-                _ => continue,
             };
 
             match result {
@@ -631,21 +627,18 @@ pub async fn download_tarball(
         AppError::BadRequest("missing filename".to_string())
     })?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
-    match repo.repo_type.as_str() {
-        "proxy" => {
+    match repo.kind()? {
+        RepoKind::Proxy => {
             download_tarball_proxy(&state, &repo, &package_name, filename, repo_name).await
         }
-        "group" => {
+        RepoKind::Group => {
             download_tarball_group(&state, &repo, &package_name, filename, repo_name, auth.as_ref().map(|e| &e.0), 0).await
         }
-        _ => {
-            // "hosted"
+        RepoKind::Hosted => {
             download_tarball_hosted(&state, &repo, &package_name, filename).await
         }
     }
@@ -753,7 +746,7 @@ fn download_tarball_group<'a>(
             ));
         }
 
-        let members = crate::db::parse_group_members(repo.config_json.as_deref());
+        let members = repo.members();
 
         if members.is_empty() {
             return Err(AppError::Internal(format!(
@@ -771,8 +764,8 @@ fn download_tarball_group<'a>(
             if crate::registry::ensure_can_read(&state.db, &member_repo, auth).await.is_err() {
                 continue;
             }
-            let result = match member_repo.repo_type.as_str() {
-                "proxy" => {
+            let result = match member_repo.kind()? {
+                RepoKind::Proxy => {
                     download_tarball_proxy(
                         state,
                         &member_repo,
@@ -782,10 +775,10 @@ fn download_tarball_group<'a>(
                     )
                     .await
                 }
-                "hosted" => {
+                RepoKind::Hosted => {
                     download_tarball_hosted(state, &member_repo, package_name, filename).await
                 }
-                "group" => {
+                RepoKind::Group => {
                     download_tarball_group(
                         state,
                         &member_repo,
@@ -797,7 +790,6 @@ fn download_tarball_group<'a>(
                     )
                     .await
                 }
-                _ => continue,
             };
 
             match result {
@@ -838,9 +830,7 @@ pub async fn search(
     Query(query): Query<SearchQuery>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -851,10 +841,10 @@ pub async fn search(
     let size = query.size.unwrap_or(20).clamp(0, 250);
     let from = query.from.unwrap_or(0).max(0);
 
-    match repo.repo_type.as_str() {
-        "group" => {
+    match repo.kind()? {
+        RepoKind::Group => {
             // Merge search results from all member repos
-            let members = crate::db::parse_group_members(repo.config_json.as_deref());
+            let members = repo.members();
             let mut all_objects = Vec::new();
             let mut seen_names = std::collections::HashSet::new();
 
@@ -903,8 +893,7 @@ pub async fn search(
                 "time": "0ms",
             })))
         }
-        _ => {
-            // "hosted" or "proxy" — search local DB
+        RepoKind::Hosted | RepoKind::Proxy => {
             let objects = search_in_repo(&state, repo.id, &search_text, size, from).await?;
             let total = objects.len();
 
@@ -1019,9 +1008,7 @@ pub async fn get_dist_tags(
     })?;
     let package_name = extract_package_name(&params);
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -1065,9 +1052,7 @@ pub async fn put_dist_tag(
     let version_str: String = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("invalid version string".to_string()))?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     // Check granular write permission on this repository
     crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
@@ -1105,9 +1090,7 @@ pub async fn delete_dist_tag(
         AppError::BadRequest("missing tag".to_string())
     })?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     // Check granular write permission on this repository
     crate::registry::ensure_can_write(&state.db, &repo, &user).await?;

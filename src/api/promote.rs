@@ -11,6 +11,7 @@ use tracing::info;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::can_admin;
+use crate::db::kinds::RepoKind;
 use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;
 use crate::storage::StorageBackend;
@@ -127,24 +128,26 @@ async fn promote_impl(
             AppError::NotFound(format!("target repository not found: {}", body.to))
         })?;
 
-    if from_repo.repo_type != "hosted" {
+    if from_repo.kind()? != RepoKind::Hosted {
         return Err(AppError::BadRequest(format!(
             "source repository '{}' is not a hosted repository",
             body.from
         )));
     }
 
-    if to_repo.repo_type != "hosted" {
+    if to_repo.kind()? != RepoKind::Hosted {
         return Err(AppError::BadRequest(format!(
             "target repository '{}' is not a hosted repository",
             body.to
         )));
     }
 
-    if from_repo.format != to_repo.format {
+    let (from_format, to_format) = (from_repo.fmt()?, to_repo.fmt()?);
+    if from_format != to_format {
         return Err(AppError::BadRequest(format!(
             "cannot promote across formats: source is '{}', target is '{}'",
-            from_repo.format, to_repo.format
+            from_format.as_str(),
+            to_format.as_str()
         )));
     }
 

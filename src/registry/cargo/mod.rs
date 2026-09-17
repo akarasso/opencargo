@@ -1,3 +1,5 @@
+pub mod routes;
+
 use std::collections::HashMap;
 
 use axum::{
@@ -13,6 +15,7 @@ use sha2::Digest;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
+use crate::db::kinds::Format;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::storage::StorageBackend;
@@ -81,19 +84,28 @@ fn build_index_line(
 // config.json — GET /{repo}/index/config.json
 // ---------------------------------------------------------------------------
 
+/// Readable without a token (the auth middleware lets it through): cargo
+/// fetches it before knowing whether to authenticate and learns to from
+/// `auth-required`. A sent token must still hold read; a tokenless caller
+/// learns only that the repository exists and is a cargo one.
 pub async fn config_json(
     State(state): State<AppState>,
     Path(repo_name): Path<String>,
+    auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    // Verify the repository exists
-    let _repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
+    crate::registry::ensure_format(&repo, Format::Cargo)?;
+    if let Some(user) = auth.as_ref() {
+        crate::registry::ensure_can_read(&state.db, &repo, Some(&user.0)).await?;
+    }
 
-    let config = json!({
+    let mut config = json!({
         "dl": format!("{}/{}/api/v1/crates", state.base_url, repo_name),
         "api": format!("{}/{}", state.base_url, repo_name),
     });
+    if repo.visibility != "public" {
+        config["auth-required"] = json!(true);
+    }
 
     Ok(Json(config))
 }
@@ -116,9 +128,7 @@ pub async fn get_index_entry(
         AppError::BadRequest("missing crate name".to_string())
     })?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -197,12 +207,10 @@ pub async fn publish_crate(
         .0;
 
     // Validate repo exists and is hosted
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
 
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_format(&repo, "cargo")?;
+    crate::registry::ensure_format(&repo, Format::Cargo)?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
@@ -358,7 +366,7 @@ pub async fn publish_crate(
 
     crate::registry::finalize_publish(
         &state,
-        "crates.io",
+        Format::Cargo,
         &repo_name,
         crate_name,
         version_str,
@@ -397,9 +405,7 @@ pub async fn download_crate(
     Path((repo_name, crate_name, version_str)): Path<(String, String, String)>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -452,18 +458,12 @@ pub async fn yank(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?
         .0;
 
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only yank on hosted repositories".to_string(),
-        ));
-    }
-    crate::registry::ensure_format(&repo, "cargo")?;
+    crate::registry::ensure_hosted(&repo)?;
+    crate::registry::ensure_format(&repo, Format::Cargo)?;
 
     let package = crate::db::get_package(&state.db, repo.id, &crate_name)
         .await?
@@ -503,18 +503,12 @@ pub async fn unyank(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?
         .0;
 
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only unyank on hosted repositories".to_string(),
-        ));
-    }
-    crate::registry::ensure_format(&repo, "cargo")?;
+    crate::registry::ensure_hosted(&repo)?;
+    crate::registry::ensure_format(&repo, Format::Cargo)?;
 
     let package = crate::db::get_package(&state.db, repo.id, &crate_name)
         .await?

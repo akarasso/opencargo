@@ -1,3 +1,8 @@
+pub mod paths;
+pub mod refs;
+pub mod routes;
+pub mod routing;
+
 use std::collections::HashMap;
 
 use axum::{
@@ -14,6 +19,7 @@ use tracing::info;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
+use crate::db::kinds::Format;
 use crate::db::oci::OciTag;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
@@ -35,13 +41,6 @@ fn sha256_digest(data: &[u8]) -> String {
 /// Check whether a reference looks like a digest (e.g., "sha256:abc123...").
 fn is_digest(reference: &str) -> bool {
     reference.starts_with("sha256:")
-}
-
-/// Build the image name from path params (repo/name).
-fn extract_image_name(params: &HashMap<String, String>) -> String {
-    let repo = params.get("repo").cloned().unwrap_or_default();
-    let name = params.get("name").cloned().unwrap_or_default();
-    format!("{}/{}", repo, name)
 }
 
 // ---------------------------------------------------------------------------
@@ -69,7 +68,7 @@ pub async fn head_blob(
     Path(params): Path<HashMap<String, String>>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
-    let image_name = extract_image_name(&params);
+    let image_name = paths::image_name(&params);
     let digest = params
         .get("digest")
         .ok_or_else(|| AppError::BadRequest("missing digest".to_string()))?;
@@ -79,9 +78,7 @@ pub async fn head_blob(
         .get("repo")
         .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -120,7 +117,7 @@ pub async fn get_blob(
     Path(params): Path<HashMap<String, String>>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
-    let image_name = extract_image_name(&params);
+    let image_name = paths::image_name(&params);
     let digest = params
         .get("digest")
         .ok_or_else(|| AppError::BadRequest("missing digest".to_string()))?;
@@ -129,9 +126,7 @@ pub async fn get_blob(
         .get("repo")
         .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -142,19 +137,7 @@ pub async fn get_blob(
         AppError::NotFound(format!("blob not found: {} in {}", digest, image_name))
     })?;
 
-    // Read blob from storage
-    let hex_digest = digest
-        .strip_prefix("sha256:")
-        .unwrap_or(digest);
-    // Blobs are content-addressed and shared at the REPOSITORY level (dedup is
-    // UNIQUE(repository_id, digest)), so the storage path must be scoped to the
-    // repo, not the image name. Scoping by image name made two images in the
-    // same repo that share a layer collide: the HEAD dedup would report the
-    // layer present (so the client skipped the upload) while the blob was never
-    // written under the second image's path — breaking the pull.
-    let storage_path = format!("oci/{}/_blobs/sha256/{}", repo.name, hex_digest);
-
-    let data = state.storage.get(&storage_path).await?;
+    let data = state.storage.get(&paths::blob_path(&repo.name, digest)).await?;
     let content_type = blob
         .content_type
         .unwrap_or_else(|| "application/octet-stream".to_string());
@@ -187,7 +170,7 @@ pub async fn delete_blob(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    let image_name = extract_image_name(&params);
+    let image_name = paths::image_name(&params);
     let digest = params
         .get("digest")
         .ok_or_else(|| AppError::BadRequest("missing digest".to_string()))?;
@@ -196,11 +179,11 @@ pub async fn delete_blob(
         .get("repo")
         .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
+    crate::registry::ensure_hosted(&repo)?;
+    crate::registry::ensure_format(&repo, Format::Oci)?;
 
     // Refuse to delete a blob still referenced by a manifest — that would break
     // a live image. (Only manifests pushed since migration 012 are tracked.)
@@ -233,16 +216,7 @@ pub async fn delete_blob(
         )));
     }
 
-    // Delete from storage
-    let hex_digest = digest.strip_prefix("sha256:").unwrap_or(digest);
-    // Blobs are content-addressed and shared at the REPOSITORY level (dedup is
-    // UNIQUE(repository_id, digest)), so the storage path must be scoped to the
-    // repo, not the image name. Scoping by image name made two images in the
-    // same repo that share a layer collide: the HEAD dedup would report the
-    // layer present (so the client skipped the upload) while the blob was never
-    // written under the second image's path — breaking the pull.
-    let storage_path = format!("oci/{}/_blobs/sha256/{}", repo.name, hex_digest);
-    let _ = state.storage.delete(&storage_path).await;
+    let _ = state.storage.delete(&paths::blob_path(&repo.name, digest)).await;
 
     Ok(StatusCode::ACCEPTED.into_response())
 }
@@ -267,14 +241,12 @@ pub async fn start_upload(
         .get("repo")
         .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_format(&repo, "oci")?;
+    crate::registry::ensure_format(&repo, Format::Oci)?;
 
     // Create upload record
     let upload_id = uuid::Uuid::new_v4().to_string();
@@ -328,14 +300,9 @@ pub async fn upload_chunk(
     let auth_user = auth
         .map(|e| e.0)
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only push to hosted repositories".to_string(),
-        ));
-    }
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    crate::registry::ensure_hosted(&repo)?;
+    crate::registry::ensure_format(&repo, Format::Oci)?;
     if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await?
     {
         return Err(AppError::Forbidden("insufficient permissions".to_string()));
@@ -388,7 +355,7 @@ pub async fn complete_upload(
     auth: Option<axum::Extension<AuthUser>>,
     body: Bytes,
 ) -> AppResult<Response> {
-    let image_name = extract_image_name(&params);
+    let image_name = paths::image_name(&params);
     let repo_name = params
         .get("repo")
         .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
@@ -401,14 +368,9 @@ pub async fn complete_upload(
     let auth_user = auth
         .map(|e| e.0)
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
-    if repo.repo_type != "hosted" {
-        return Err(AppError::BadRequest(
-            "can only push to hosted repositories".to_string(),
-        ));
-    }
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    crate::registry::ensure_hosted(&repo)?;
+    crate::registry::ensure_format(&repo, Format::Oci)?;
     if !check_repo_permission(&state.db, auth_user.user_id, &auth_user.role, repo.id, "write").await?
     {
         return Err(AppError::Forbidden("insufficient permissions".to_string()));
@@ -456,21 +418,9 @@ pub async fn complete_upload(
         )));
     }
 
-    // Store the blob
-    let hex_digest = query
-        .digest
-        .strip_prefix("sha256:")
-        .unwrap_or(&query.digest);
-    // Blobs are content-addressed and shared at the REPOSITORY level (dedup is
-    // UNIQUE(repository_id, digest)), so the storage path must be scoped to the
-    // repo, not the image name. Scoping by image name made two images in the
-    // same repo that share a layer collide: the HEAD dedup would report the
-    // layer present (so the client skipped the upload) while the blob was never
-    // written under the second image's path — breaking the pull.
-    let storage_path = format!("oci/{}/_blobs/sha256/{}", repo.name, hex_digest);
     state
         .storage
-        .put(&storage_path, blob_data.clone())
+        .put(&paths::blob_path(&repo.name, &query.digest), blob_data.clone())
         .await?;
 
     // Insert blob record in DB
@@ -522,7 +472,7 @@ pub async fn get_manifest(
     Path(params): Path<HashMap<String, String>>,
     auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
 ) -> AppResult<Response> {
-    let image_name = extract_image_name(&params);
+    let image_name = paths::image_name(&params);
     let reference = params
         .get("reference")
         .ok_or_else(|| AppError::BadRequest("missing reference".to_string()))?;
@@ -532,9 +482,7 @@ pub async fn get_manifest(
         .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
     let name = params.get("name").cloned().unwrap_or_default();
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -571,13 +519,10 @@ pub async fn get_manifest(
         ))
     })?;
 
-    // Read manifest from storage
-    let hex_digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
-    let storage_path = format!(
-        "oci/{}/manifests/{}/sha256/{}",
-        image_name, name, hex_digest
-    );
-    let data = state.storage.get(&storage_path).await?;
+    let data = state
+        .storage
+        .get(&paths::manifest_path(&image_name, &name, &digest))
+        .await?;
 
     Ok((
         StatusCode::OK,
@@ -608,9 +553,7 @@ pub async fn head_manifest(
         .get("reference")
         .ok_or_else(|| AppError::BadRequest("missing reference".to_string()))?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
@@ -660,29 +603,6 @@ pub async fn head_manifest(
 // PUT /v2/{repo}/{name}/manifests/{reference} — Push manifest
 // ---------------------------------------------------------------------------
 
-/// Extract the blob digests an image manifest references: its config blob and
-/// every layer. Best-effort — a manifest list / unknown shape yields none.
-fn extract_blob_digests(manifest_json: &[u8]) -> Vec<String> {
-    let mut digests = Vec::new();
-    if let Ok(v) = serde_json::from_slice::<serde_json::Value>(manifest_json) {
-        if let Some(d) = v
-            .get("config")
-            .and_then(|c| c.get("digest"))
-            .and_then(|d| d.as_str())
-        {
-            digests.push(d.to_string());
-        }
-        if let Some(layers) = v.get("layers").and_then(|l| l.as_array()) {
-            for layer in layers {
-                if let Some(d) = layer.get("digest").and_then(|d| d.as_str()) {
-                    digests.push(d.to_string());
-                }
-            }
-        }
-    }
-    digests
-}
-
 pub async fn put_manifest(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
@@ -696,7 +616,7 @@ pub async fn put_manifest(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    let image_name = extract_image_name(&params);
+    let image_name = paths::image_name(&params);
     let reference = params
         .get("reference")
         .ok_or_else(|| AppError::BadRequest("missing reference".to_string()))?
@@ -716,13 +636,12 @@ pub async fn put_manifest(
         crate::registry::validate_oci_tag(&reference)?;
     }
 
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
 
     crate::registry::ensure_hosted(&repo)?;
+    crate::registry::ensure_format(&repo, Format::Oci)?;
 
     // Read the manifest body
     let body = axum::body::to_bytes(request.into_body(), 10 * 1024 * 1024)
@@ -747,15 +666,9 @@ pub async fn put_manifest(
         )));
     }
 
-    // Store manifest
-    let hex_digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
-    let storage_path = format!(
-        "oci/{}/manifests/{}/sha256/{}",
-        image_name, name, hex_digest
-    );
     state
         .storage
-        .put(&storage_path, body.clone())
+        .put(&paths::manifest_path(&image_name, &name, &digest), body.clone())
         .await?;
 
     // Insert manifest record in DB
@@ -777,7 +690,7 @@ pub async fn put_manifest(
         .bind(&digest)
         .execute(&state.db)
         .await?;
-    for blob_digest in extract_blob_digests(&body) {
+    for blob_digest in refs::extract_blob_digests(&body) {
         let _ = sqlx::query(
             "INSERT OR IGNORE INTO oci_manifest_blobs (repository_id, manifest_digest, blob_digest)
              VALUES (?1, ?2, ?3)",
@@ -812,7 +725,7 @@ pub async fn put_manifest(
     // vulnerability-scan step does not apply.
     crate::registry::finalize_publish(
         &state,
-        "oci",
+        Format::Oci,
         &repo_name,
         &name,
         &reference,
@@ -860,7 +773,7 @@ pub async fn delete_manifest(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    let image_name = extract_image_name(&params);
+    let image_name = paths::image_name(&params);
     let reference = params
         .get("reference")
         .ok_or_else(|| AppError::BadRequest("missing reference".to_string()))?;
@@ -870,11 +783,11 @@ pub async fn delete_manifest(
         .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
     let name = params.get("name").cloned().unwrap_or_default();
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
+    crate::registry::ensure_hosted(&repo)?;
+    crate::registry::ensure_format(&repo, Format::Oci)?;
 
     // Resolve digest
     let digest = if is_digest(reference) {
@@ -957,21 +870,17 @@ pub async fn delete_manifest(
                 .bind(&blob_digest)
                 .execute(&state.db)
                 .await;
-            let hex = blob_digest.strip_prefix("sha256:").unwrap_or(&blob_digest);
             let _ = state
                 .storage
-                .delete(&format!("oci/{}/_blobs/sha256/{}", repo.name, hex))
+                .delete(&paths::blob_path(&repo.name, &blob_digest))
                 .await;
         }
     }
 
-    // Delete from storage
-    let hex_digest = digest.strip_prefix("sha256:").unwrap_or(&digest);
-    let storage_path = format!(
-        "oci/{}/manifests/{}/sha256/{}",
-        image_name, name, hex_digest
-    );
-    let _ = state.storage.delete(&storage_path).await;
+    let _ = state
+        .storage
+        .delete(&paths::manifest_path(&image_name, &name, &digest))
+        .await;
 
     Ok(StatusCode::ACCEPTED.into_response())
 }
@@ -999,9 +908,7 @@ pub async fn list_tags(
         .ok_or_else(|| AppError::BadRequest("missing repository".to_string()))?;
     let name = params.get("name").cloned().unwrap_or_default();
 
-    let repo = crate::db::get_repository_by_name(&state.db, repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
+    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
 
     crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
 
