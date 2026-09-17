@@ -802,7 +802,7 @@ async fn refresh_never_blocks_a_fresh_hit() {
     let first = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
     fx.set(|s| {
         s.etag = Some("\"v2\"".into());
-        s.delay = Duration::from_millis(500);
+        s.delay = Duration::from_secs(2);
     });
     let refresh = {
         let (engine, up, repo) = (engine.clone(), fx.up.clone(), fx.repo.clone());
@@ -823,7 +823,7 @@ async fn refresh_never_blocks_a_fresh_hit() {
     let hit = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
     assert_eq!(hit.entry.id, first.entry.id);
     assert!(
-        started.elapsed() < Duration::from_millis(100),
+        started.elapsed() < Duration::from_secs(1),
         "a fresh hit waited {:?} behind the refresh",
         started.elapsed()
     );

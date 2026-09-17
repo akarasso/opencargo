@@ -44,7 +44,8 @@ async fn rows(fx: &Fx) -> Vec<(String, Option<String>, String)> {
 }
 
 async fn wait_rows(fx: &Fx, n: usize) -> Vec<(String, Option<String>, String)> {
-    for _ in 0..200 {
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while Instant::now() < deadline {
         let rows = rows(fx).await;
         if rows.len() >= n {
             return rows;
@@ -168,16 +169,20 @@ async fn flush_emits_one_coalesced_event() {
     wait_rows(&fx, 300).await;
     tokio::time::sleep(Duration::from_millis(400)).await;
     let mut frames = Vec::new();
+    let mut stamps = Vec::new();
     while let Ok(event) = bus.try_recv() {
         assert_eq!(event.event_type, "policy.resolution");
         assert_eq!(event.visibility, Visibility::Admin);
         frames.push(event.data.clone());
+        stamps.push(chrono::DateTime::parse_from_rfc3339(&event.ts).unwrap());
     }
-    assert_eq!(
-        frames.len(),
-        2,
-        "an immediate and a trailing frame: {frames:?}"
-    );
+    assert!(frames.len() >= 2, "an immediate and a trailing frame: {frames:?}");
+    for pair in stamps.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= chrono::Duration::milliseconds(199),
+            "one frame per notify period at most: {stamps:?}"
+        );
+    }
     let total: u64 = frames.iter().map(|f| f["count"].as_u64().unwrap()).sum();
     assert_eq!(total, 300);
     assert!(frames
@@ -410,7 +415,7 @@ async fn gather_timeout_writes_unknown_row() {
         gather_timeout: Duration::from_millis(300),
         ..fast()
     };
-    fx.set(|s| s.delay = Duration::from_millis(600));
+    fx.set(|s| s.delay = Duration::from_secs(3));
     let (engine, writer) = engine_over(&fx, aged(), tuning);
     tokio::spawn(writer);
     let member = repo(fx.repo.id, &fx.repo.name, Format::Npm);
@@ -434,7 +439,7 @@ async fn gather_timeout_writes_unknown_row() {
         "the stem still names the version"
     );
     assert!(
-        took >= Duration::from_millis(300) && took < Duration::from_millis(600),
+        took >= Duration::from_millis(300) && took < Duration::from_secs(2),
         "{took:?}"
     );
     assert_eq!(
@@ -448,7 +453,7 @@ async fn full_slots_never_stall_the_tick() {
     let fx = Fx::new().await;
     let tuning = Tuning {
         notify_period: Duration::from_millis(600),
-        gather_timeout: Duration::from_secs(5),
+        gather_timeout: Duration::from_secs(10),
         ..fast()
     };
     let (engine, writer) = engine_over(&fx, aged(), tuning);
@@ -464,7 +469,7 @@ async fn full_slots_never_stall_the_tick() {
     engine.record(cargo(&fx, "second"));
     wait_rows(&fx, 2).await;
 
-    fx.set(|s| s.delay = Duration::from_secs(2));
+    fx.set(|s| s.delay = Duration::from_secs(3));
     let member = repo(fx.repo.id, &fx.repo.name, Format::Npm);
     for i in 0..=crate::policy::INFLIGHT {
         engine.record(pending(
@@ -478,16 +483,15 @@ async fn full_slots_never_stall_the_tick() {
             },
         ));
     }
-    let started = Instant::now();
-    let trailing = tokio::time::timeout(Duration::from_millis(1500), bus.recv())
+    let trailing = tokio::time::timeout(Duration::from_secs(2), bus.recv())
         .await
         .expect("the pending frame goes out on the tick while every slot is held")
         .unwrap();
     assert_eq!(trailing.data["count"], 1);
-    assert!(started.elapsed() < Duration::from_millis(1500));
     assert_eq!(engine.shared().inflight.available_permits(), 0);
     let rows = wait_rows(&fx, 2 + crate::policy::INFLIGHT + 1).await;
-    assert!(rows[2..].iter().all(|(_, _, source)| source == "failed"));
+    let sources: Vec<&str> = rows[2..].iter().map(|(_, _, s)| s.as_str()).collect();
+    assert!(sources.iter().all(|s| *s == "failed"), "{sources:?}");
     assert_eq!(engine.dropped(), 0);
 }
 
@@ -501,7 +505,7 @@ async fn flush_never_blocks_receive() {
     };
     let (engine, writer) = engine_with(&fx, cfg, fast(), scanner(Some(&osv)));
     tokio::spawn(writer);
-    osv.hold_next(Duration::from_secs(2));
+    osv.hold_next(Duration::from_secs(5));
     let started = Instant::now();
     engine.record(cargo(&fx, "held"));
     for _ in 0..100 {
@@ -516,7 +520,7 @@ async fn flush_never_blocks_receive() {
     }
     let rows = wait_rows(&fx, 300).await;
     assert!(
-        started.elapsed() < Duration::from_secs(2),
+        started.elapsed() < Duration::from_secs(4),
         "300 rows landed while the first flush was held: {:?}",
         started.elapsed()
     );

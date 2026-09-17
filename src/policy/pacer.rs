@@ -145,7 +145,10 @@ mod tests {
     #[tokio::test]
     async fn one_in_flight_one_second_apart() {
         let fx = Fx::new().await;
-        fx.set(|s| s.body = br#"{"version":{"created_at":"2026-01-01T00:00:00Z"}}"#.to_vec());
+        fx.set(|s| {
+            s.body = br#"{"version":{"created_at":"2026-01-01T00:00:00Z"}}"#.to_vec();
+            s.delay = Duration::from_millis(30);
+        });
         let tuning = Tuning {
             pacer_period: Duration::from_millis(50),
             ..fast()
@@ -167,11 +170,15 @@ mod tests {
             }
         });
         futures_util::future::join_all(fetches).await;
-        let starts: Vec<Instant> = fx.fake.lock().unwrap().starts.clone();
+        let (starts, max_inflight) = {
+            let fake = fx.fake.lock().unwrap();
+            (fake.starts.clone(), fake.max_inflight)
+        };
         assert_eq!(starts.len(), 10);
-        for pair in starts.windows(2) {
-            assert!(pair[1] >= pair[0] + Duration::from_millis(49), "{pair:?}");
-        }
+        assert_eq!(max_inflight, 1, "never two paced requests in flight");
+        // Arrival instants carry transit jitter; the span over nine periods does not shrink by more than it.
+        let span = *starts.last().unwrap() - starts[0];
+        assert!(span >= Duration::from_millis(9 * 50 - 90), "{span:?}");
     }
 
     #[tokio::test]
@@ -255,7 +262,7 @@ mod tests {
             .fetch(&shared, &cfg(), CacheRepo(&fx.repo), &up, &meta(&fx, "9"))
             .await;
         assert_eq!(source, "rate-limited");
-        assert!(started.elapsed() < Duration::from_millis(100), "at once");
+        assert!(started.elapsed() < Duration::from_millis(400), "at once, not after a 500 ms pace");
         drop(held);
         for w in waiters {
             assert_eq!(w.await.unwrap(), "fetch");

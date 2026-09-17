@@ -18,6 +18,8 @@ use crate::storage::FilesystemStorage;
 pub(crate) struct FakeState {
     pub hits: Vec<(Method, String, HeaderMap)>,
     pub starts: Vec<Instant>,
+    pub inflight: usize,
+    pub max_inflight: usize,
     pub fail: bool,
     pub gone: bool,
     pub status: Option<StatusCode>,
@@ -29,6 +31,17 @@ pub(crate) struct FakeState {
 pub(crate) type Shared = Arc<Mutex<FakeState>>;
 
 async fn serve(State(st): State<Shared>, req: Request) -> Response {
+    {
+        let mut s = st.lock().unwrap();
+        s.inflight += 1;
+        s.max_inflight = s.max_inflight.max(s.inflight);
+    }
+    let response = respond(st.clone(), req).await;
+    st.lock().unwrap().inflight -= 1;
+    response
+}
+
+async fn respond(st: Shared, req: Request) -> Response {
     let (method, path, headers) = (
         req.method().clone(),
         req.uri().path().to_string(),
