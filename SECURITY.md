@@ -18,9 +18,15 @@ in the changelog unless they prefer otherwise.
 
 ## Supported versions
 
-Only the latest release and the `main` branch receive security fixes.
-Until the first tagged release, the `latest` container image on GHCR tracks
-`main`.
+| Version | Supported |
+|---|---|
+| `0.1.x` final releases | yes, the latest patch |
+| latest `0.1.0-rc.N` | until the next rc or the final release |
+| `main`, `latest` and `sha-<commit>` images | best effort |
+| anything older | no |
+
+Releases and images are signed and attested; see
+[Verifying a release](README.md#verifying-a-release).
 
 ## Scope
 
@@ -44,7 +50,8 @@ compromised admin token.
   one is generated and must be changed at first login.
 - Container runs as an unprivileged user (uid 10001); only `/data` needs to
   be writable, so `readOnlyRootFilesystem` can be enabled in Kubernetes.
-- `cargo audit` and a Trivy image scan run in CI.
+- `cargo audit` and a Trivy image scan run in CI; the Trivy scan runs again on
+  the release digest before any release tag moves.
 
 ## Hardening checklist for operators
 

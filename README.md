@@ -434,6 +434,66 @@ Health: `GET /health/live`, `GET /health/ready`. Metrics: `GET /metrics`.
 
 ---
 
+## Verifying a release
+
+Every tag `vX.Y.Z` or `vX.Y.Z-rc.N` publishes, on the GitHub release, static
+`x86_64` and `aarch64` musl binaries, a CycloneDX SBOM per binary,
+`SHA256SUMS`, and one Sigstore bundle (`<asset>.sigstore.json`) per file. The
+container image `ghcr.io/akarasso/opencargo:X.Y.Z[-rc.N]` (plus `X.Y` and `X`
+for a final release) is the image main CI built and scanned for that commit,
+copied by digest, never rebuilt. Everything is signed keyless by GitHub
+Actions; the certificate identity names this repository, the workflow file
+and the tag, so one command per artifact proves where it came from.
+
+Requires cosign >= v3.0 (tested v3.1.3; v2 cannot read the v3 blob bundles)
+and gh >= 2.101.0 with `GH_TOKEN` set (`gh attestation verify` stops at
+`gh auth login` otherwise).
+
+```bash
+V=0.1.0-rc.1; ISS=https://token.actions.githubusercontent.com
+ID=https://github.com/akarasso/opencargo/.github/workflows/release.yml@refs/tags/v$V
+gh release download v$V -R akarasso/opencargo && sha256sum -c SHA256SUMS
+
+# Signature of a downloaded file (same for the .cdx.json SBOMs and SHA256SUMS)
+cosign verify-blob --bundle opencargo-$V-x86_64-unknown-linux-musl.sigstore.json \
+  --certificate-identity "$ID" --certificate-oidc-issuer "$ISS" opencargo-$V-x86_64-unknown-linux-musl
+
+# Build provenance, then the SBOM attestation, of a binary
+gh attestation verify opencargo-$V-x86_64-unknown-linux-musl -R akarasso/opencargo --cert-identity "$ID" --cert-oidc-issuer "$ISS"
+gh attestation verify opencargo-$V-x86_64-unknown-linux-musl -R akarasso/opencargo \
+  --predicate-type https://cyclonedx.org/bom --cert-identity "$ID" --cert-oidc-issuer "$ISS"
+
+# Container image signature, then its two SBOM attestations (Alpine layer, opencargo binary)
+cosign verify --new-bundle-format=false ghcr.io/akarasso/opencargo:$V --certificate-identity "$ID" --certificate-oidc-issuer "$ISS"
+gh attestation verify oci://ghcr.io/akarasso/opencargo:$V -R akarasso/opencargo \
+  --predicate-type https://cyclonedx.org/bom --cert-identity "$ID" --cert-oidc-issuer "$ISS"
+```
+
+`--new-bundle-format=false` is required on every image `cosign verify`: GHCR
+has no referrers API, so image signatures are stored as classic
+`sha256-<digest>.sig` tags, and without the flag cosign v3 accepts any
+attestation bundle signed by the same identity as a signature.
+
+Images built on `main` (`sha-<commit>` and `latest`) are signed by `ci.yml`
+and carry its build provenance. For a commit `C`:
+
+```bash
+C=<full commit sha>; CI=https://github.com/akarasso/opencargo/.github/workflows/ci.yml@refs/heads/main
+cosign verify --new-bundle-format=false ghcr.io/akarasso/opencargo:sha-$C \
+  --certificate-identity "$CI" --certificate-oidc-issuer "$ISS" --certificate-github-workflow-sha "$C"
+gh attestation verify oci://ghcr.io/akarasso/opencargo:sha-$C -R akarasso/opencargo \
+  --cert-identity "$CI" --cert-oidc-issuer "$ISS" --source-digest "$C"
+```
+
+`latest` can only be checked for identity (drop `--certificate-github-workflow-sha`
+and `--source-digest`), not for a given commit. In production, pin the image by
+digest. [`scripts/release/verify-release.sh`](scripts/release/verify-release.sh) `<version>`
+replays all of the above. Known gap: the SBOMs list Rust crates and Alpine
+packages, not the npm packages (`solid-js`, `@solidjs/router`) embedded in the
+web UI.
+
+---
+
 ## Build from source
 
 ```bash
