@@ -223,12 +223,33 @@ follow a `dl` elsewhere; list that host in `token_realms` to allow it.
 
 ```bash
 docker login registry.example.com -u dev1
-docker tag myapp:latest registry.example.com/oci-private/myapp:latest
-docker push registry.example.com/oci-private/myapp:latest
+docker tag myapp:latest registry.example.com/oci-private/team/myapp:latest
+docker push registry.example.com/oci-private/team/myapp:latest
+docker pull registry.example.com/oci-all/library/alpine:3.20
 ```
 
-Over plain HTTP, add the host to `insecure-registries` in Docker's
-`daemon.json`. Use TLS in production.
+Image names may be nested (`team/myapp`, `org/team/myapp`). A `proxy`
+repository fronts another registry (`upstream = "https://registry-1.docker.io"`,
+`https://ghcr.io`, or another opencargo as `http://host:6789/oci-hosted`);
+one-segment names on Docker Hub get the `library/` prefix automatically. A
+`group` lists hosted and proxy members and serves the first one that knows the
+image; pushes go to the hosted repository. Manifests, blobs and tag lists are
+cached under the proxy member and served on later pulls without upstream
+traffic. Upstream credentials stay out of the API:
+
+```toml
+[[repositories]]
+name = "hub-proxy"
+type = "proxy"
+format = "oci"
+upstream = "https://registry-1.docker.io"
+upstream_auth = { type = "basic", username = "hubuser", password = "..." }
+```
+
+or `OPENCARGO_UPSTREAM_AUTH_HUB_PROXY=basic:hubuser:...`. The credentials
+are only sent to the upstream host and to `token_realms` (Hub's
+`https://auth.docker.io/token` is listed by default). Over plain HTTP, add the
+host to `insecure-registries` in Docker's `daemon.json`. Use TLS in production.
 
 ### Go modules
 

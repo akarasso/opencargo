@@ -51,6 +51,21 @@ DELETE /v2/{repo}/{name}/manifests/{reference}
 GET    /v2/{repo}/{name}/tags/list
 ```
 
+`{name}` may span several segments (`team/app`, `org/team/app`). Reads work
+on `hosted`, `proxy` and `group` repositories: a proxy fetches from
+`upstream` (a registry root such as `https://registry-1.docker.io` or
+`https://ghcr.io`, or another opencargo repository as
+`http://host:6789/oci-hosted`), answers the upstream's Bearer challenge, and
+caches manifests and blobs by digest, tags for `proxy.default_ttl` and tag
+lists for ten minutes; a group serves the first member that knows the image
+and merges `tags/list` (`n` and `last` apply to the merged list).
+`Docker-Content-Digest` is always derived from the content. An unreachable
+upstream is `502`; an unknown image is `404`, also when the upstream answers
+`401`/`403` after issuing a token. Push, upload and delete routes accept only
+`hosted` repositories (`400` otherwise). Upstream credentials are configured
+in the file or the environment (`upstream_auth`, `token_realms`,
+`OPENCARGO_UPSTREAM_AUTH_<REPO>`), never through this API.
+
 ## Go modules (GOPROXY)
 
 ```

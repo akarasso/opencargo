@@ -1,12 +1,3 @@
-use std::collections::HashMap;
-
-/// `{repo}/{name}` from the path params, the key used by manifest paths.
-pub fn image_name(params: &HashMap<String, String>) -> String {
-    let repo = params.get("repo").cloned().unwrap_or_default();
-    let name = params.get("name").cloned().unwrap_or_default();
-    format!("{}/{}", repo, name)
-}
-
 fn digest_hex(digest: &str) -> &str {
     digest.strip_prefix("sha256:").unwrap_or(digest)
 }
