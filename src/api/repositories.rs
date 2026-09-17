@@ -180,8 +180,9 @@ pub async fn update_repository(
 }
 
 /// DELETE /api/v1/repositories/{name} -- Delete repository (admin only):
-/// refused while packages or a group membership remain, the proxy cache
-/// purged first so the row can go.
+/// refused while packages or a group membership remain, a proxy's cache
+/// purged first so the row can go. A group owns no cache: its members keep
+/// theirs.
 pub async fn delete_repository(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -211,7 +212,7 @@ pub async fn delete_repository(
         )));
     }
 
-    if repo.kind()? != RepoKind::Hosted {
+    if repo.kind()? == RepoKind::Proxy {
         purge_repository(&state, &repo).await?;
     }
     crate::db::delete_repository(&state.db, &name).await?;

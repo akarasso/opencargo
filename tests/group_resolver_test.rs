@@ -585,6 +585,29 @@ async fn changing_the_upstream_purges_the_cache() {
     assert_eq!(old.packument_hits(), 1, "never the old one");
 }
 
+/// A group owns no cache rows or files; deleting it leaves its proxy
+/// members' caches alone (`purge-cache` is the way to fan out).
+#[tokio::test]
+async fn delete_group_keeps_member_caches() {
+    let up = seed_upstream().await;
+    let server = spawn_server(SpawnOpts {
+        repositories: vec![
+            proxy("p", RepositoryFormat::Npm, &up.url()),
+            group("g", RepositoryFormat::Npm, &["p"]),
+        ],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(get_status(&format!("{}/g/{PKG}", server.base_url)).await, StatusCode::OK);
+    assert!(cache_dir(&server, "p").is_dir());
+
+    let (status, text) = Admin::of(&server).delete("g").await;
+    assert_eq!(status, StatusCode::OK, "{text}");
+    assert!(cache_dir(&server, "p").is_dir(), "the member's files survive");
+    assert_eq!(get_status(&format!("{}/p/{PKG}", server.base_url)).await, StatusCode::OK);
+    assert_eq!(up.packument_hits(), 1, "served from the surviving cache");
+}
+
 #[tokio::test]
 async fn delete_proxy_with_legacy_proxy_cache_meta_row() {
     let server = spawn_server(SpawnOpts {
