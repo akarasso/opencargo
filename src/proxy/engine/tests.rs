@@ -407,6 +407,24 @@ async fn buffered_bodies_land_on_disk_as_they_arrive() {
 }
 
 #[tokio::test]
+async fn body_shorter_than_content_length_is_never_recorded() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    for transfer in [Transfer::Buffered, Transfer::Streamed] {
+        let strat = Strat {
+            transfer,
+            ..Default::default()
+        };
+        let res = engine
+            .fetch(&strat, &fx.up, fx.member(), &"art/lying".to_string())
+            .await;
+        assert!(matches!(res, Err(AppError::BadGateway(_))), "{transfer:?}: {res:?}");
+    }
+    assert!(fx.row("t-item", "art/lying").await.is_none());
+    assert!(fx.files().is_empty(), "{:?}", fx.files());
+}
+
+#[tokio::test]
 async fn buffered_total_timeout_is_502() {
     let fx = Fx::new().await;
     let engine = fx.engine(Timeouts {

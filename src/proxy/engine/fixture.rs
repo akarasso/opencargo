@@ -43,6 +43,12 @@ async fn serve(State(st): State<Shared>, req: Request) -> Response {
     if gone || path.ends_with("/missing") {
         return StatusCode::NOT_FOUND.into_response();
     }
+    if path.ends_with("/lying") {
+        return Response::builder()
+            .header(header::CONTENT_LENGTH, "100")
+            .body(Body::from("five!"))
+            .unwrap();
+    }
     if path.ends_with("/drip") {
         let stream = futures_util::stream::unfold(0u8, |n| async move {
             tokio::time::sleep(Duration::from_millis(200)).await;
