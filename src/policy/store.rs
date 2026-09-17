@@ -1,5 +1,8 @@
-use chrono::SecondsFormat;
-use sqlx::SqlitePool;
+use std::collections::BTreeMap;
+
+use chrono::{DateTime, SecondsFormat, Utc};
+use serde::Serialize;
+use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use super::{Resolution, RuleVerdict, Verdict};
 
@@ -54,4 +57,224 @@ pub async fn insert_batch(
     }
     tx.commit().await?;
     Ok(ids)
+}
+
+/// Whose rows `/me/policy` shows: a DB user's, or the config token's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Subject {
+    User(i64),
+    Static,
+}
+
+/// `repo` matches the requested or the member repository; `rule` narrows
+/// every number and verdict to that rule's own row.
+#[derive(Debug, Clone, Copy)]
+pub struct ReportFilter<'a> {
+    pub since: DateTime<Utc>,
+    pub repo: Option<&'a str>,
+    pub rule: Option<&'a str>,
+    pub subject: Option<Subject>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct RuleTotals {
+    pub would_block: u64,
+    pub unknown: u64,
+    pub pass: u64,
+    pub not_applicable: u64,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+pub struct Totals {
+    pub resolutions: u64,
+    pub would_block: u64,
+    pub unknown: u64,
+    pub by_rule: BTreeMap<String, RuleTotals>,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct ResolutionRow {
+    pub id: i64,
+    pub created_at: String,
+    pub requested_repo: String,
+    pub member_repo: String,
+    pub format: String,
+    pub name: String,
+    pub version: Option<String>,
+    pub digest: Option<String>,
+    pub actor: String,
+    pub actor_kind: String,
+    pub user_id: Option<i64>,
+    pub published_at: Option<String>,
+    pub would_block: bool,
+    pub unknown: bool,
+}
+
+#[derive(Debug, Clone, sqlx::FromRow, Serialize)]
+pub struct VerdictRow {
+    #[serde(skip)]
+    pub resolution_id: i64,
+    pub rule: String,
+    pub verdict: String,
+    pub reason: String,
+}
+
+#[derive(sqlx::FromRow)]
+struct TotalsRow {
+    resolutions: i64,
+    would_block: i64,
+    unknown: i64,
+}
+
+#[derive(sqlx::FromRow)]
+struct RuleCountRow {
+    rule: String,
+    verdict: String,
+    count: i64,
+}
+
+fn sqlite_time(t: DateTime<Utc>) -> String {
+    t.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// `FROM policy_resolutions r [JOIN that rule's verdict v] WHERE ..`, the
+/// scan every report query shares.
+fn scope<'a>(q: &mut QueryBuilder<'a, Sqlite>, f: &ReportFilter<'a>) {
+    q.push(" FROM policy_resolutions r");
+    if let Some(rule) = f.rule {
+        q.push(" JOIN policy_verdicts v ON v.resolution_id = r.id AND v.rule = ");
+        q.push_bind(rule);
+    }
+    q.push(" WHERE r.created_at >= ");
+    q.push_bind(sqlite_time(f.since));
+    if let Some(repo) = f.repo {
+        q.push(" AND (r.requested_repo = ");
+        q.push_bind(repo);
+        q.push(" OR r.member_repo = ");
+        q.push_bind(repo);
+        q.push(")");
+    }
+    match f.subject {
+        Some(Subject::User(id)) => {
+            q.push(" AND r.user_id = ");
+            q.push_bind(id);
+        }
+        Some(Subject::Static) => {
+            q.push(" AND r.actor_kind = 'static'");
+        }
+        None => {}
+    }
+}
+
+fn flags(f: &ReportFilter<'_>) -> &'static str {
+    match f.rule {
+        Some(_) => "v.verdict = 'would_block' AS would_block, v.verdict = 'unknown' AS unknown",
+        None => "r.would_block, r.unknown",
+    }
+}
+
+pub async fn report_totals(pool: &SqlitePool, f: &ReportFilter<'_>) -> Result<Totals, sqlx::Error> {
+    let mut q = QueryBuilder::new("SELECT COUNT(*) AS resolutions, ");
+    q.push(match f.rule {
+        Some(_) => "COALESCE(SUM(v.verdict = 'would_block'), 0) AS would_block, COALESCE(SUM(v.verdict = 'unknown'), 0) AS unknown",
+        None => "COALESCE(SUM(r.would_block), 0) AS would_block, COALESCE(SUM(r.unknown), 0) AS unknown",
+    });
+    scope(&mut q, f);
+    let head: TotalsRow = q.build_query_as().fetch_one(pool).await?;
+
+    let mut q = QueryBuilder::new(
+        "SELECT pv.rule, pv.verdict, COUNT(*) AS count FROM policy_verdicts pv WHERE pv.resolution_id IN (SELECT r.id",
+    );
+    scope(&mut q, f);
+    q.push(")");
+    if let Some(rule) = f.rule {
+        q.push(" AND pv.rule = ");
+        q.push_bind(rule);
+    }
+    q.push(" GROUP BY pv.rule, pv.verdict");
+    let counts: Vec<RuleCountRow> = q.build_query_as().fetch_all(pool).await?;
+
+    let mut by_rule: BTreeMap<String, RuleTotals> = BTreeMap::new();
+    for c in counts {
+        let entry = by_rule.entry(c.rule).or_default();
+        let n = c.count as u64;
+        match c.verdict.as_str() {
+            "would_block" => entry.would_block += n,
+            "unknown" => entry.unknown += n,
+            "pass" => entry.pass += n,
+            _ => entry.not_applicable += n,
+        }
+    }
+    Ok(Totals {
+        resolutions: head.resolutions as u64,
+        would_block: head.would_block as u64,
+        unknown: head.unknown as u64,
+        by_rule,
+    })
+}
+
+/// Newest first; `created_at` comes back as RFC 3339.
+pub async fn list_resolutions(
+    pool: &SqlitePool,
+    f: &ReportFilter<'_>,
+    page: i64,
+    size: i64,
+) -> Result<Vec<ResolutionRow>, sqlx::Error> {
+    let mut q = QueryBuilder::new(
+        "SELECT r.id, strftime('%Y-%m-%dT%H:%M:%SZ', r.created_at) AS created_at, r.requested_repo, r.member_repo,
+                r.format, r.name, r.version, r.digest, r.actor, r.actor_kind, r.user_id, r.published_at, ",
+    );
+    q.push(flags(f));
+    scope(&mut q, f);
+    q.push(" ORDER BY r.id DESC LIMIT ");
+    q.push_bind(size);
+    q.push(" OFFSET ");
+    q.push_bind(page.saturating_sub(1).max(0).saturating_mul(size.max(0)));
+    q.build_query_as().fetch_all(pool).await
+}
+
+/// The verdicts of the page's rows, that rule's alone when `rule` is set.
+pub async fn verdicts_for(
+    pool: &SqlitePool,
+    ids: &[i64],
+    rule: Option<&str>,
+) -> Result<Vec<VerdictRow>, sqlx::Error> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut q = QueryBuilder::new(
+        "SELECT resolution_id, rule, verdict, reason FROM policy_verdicts WHERE resolution_id IN (",
+    );
+    let mut list = q.separated(", ");
+    for id in ids {
+        list.push_bind(*id);
+    }
+    q.push(")");
+    if let Some(rule) = rule {
+        q.push(" AND rule = ");
+        q.push_bind(rule);
+    }
+    q.push(" ORDER BY resolution_id, rule");
+    q.build_query_as().fetch_all(pool).await
+}
+
+/// Retention: rows older than `days` go, verdicts cascade.
+pub async fn delete_older_than(pool: &SqlitePool, days: u64) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query(
+        "DELETE FROM policy_resolutions WHERE created_at < datetime('now', '-' || ?1 || ' days')",
+    )
+    .bind(days as i64)
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected())
+}
+
+/// Erasure by identity, never by label: a homonymous token of another
+/// user keeps its rows.
+pub async fn delete_by_user(pool: &SqlitePool, user_id: i64) -> Result<u64, sqlx::Error> {
+    let done = sqlx::query("DELETE FROM policy_resolutions WHERE user_id = ?1")
+        .bind(user_id)
+        .execute(pool)
+        .await?;
+    Ok(done.rows_affected())
 }

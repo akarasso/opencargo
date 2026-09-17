@@ -3,6 +3,7 @@ pub mod dashboard;
 pub mod deps;
 pub mod me;
 pub mod permissions;
+pub mod policy;
 pub mod promote;
 pub mod repositories;
 pub mod tokens;

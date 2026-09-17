@@ -306,6 +306,12 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::api::webhooks::test_webhook),
         )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
+        .route(
+            "/api/v1/policy/report",
+            get(crate::api::policy::report).delete(crate::api::policy::erase),
+        )
+        .route("/api/v1/policy/rules", get(crate::api::policy::rules))
+        .route("/api/v1/me/policy", get(crate::api::policy::me_policy))
         // Promote routes — scoped packages (@scope/name)
         .route(
             "/api/v1/promote/@{scope}/{name}/{version}",

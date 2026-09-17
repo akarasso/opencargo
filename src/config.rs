@@ -192,6 +192,8 @@ pub struct CleanupConfig {
     pub prerelease_older_than_days: Option<u64>,
     /// Proxy cache rows idle this long are evicted; runs regardless of `enabled`.
     pub proxy_cache_older_than_days: Option<u64>,
+    /// Policy report rows older than this are purged; runs regardless of `enabled`.
+    pub policy_report_older_than_days: Option<u64>,
 }
 
 impl Default for CleanupConfig {
@@ -200,6 +202,7 @@ impl Default for CleanupConfig {
             enabled: false,
             prerelease_older_than_days: None,
             proxy_cache_older_than_days: Some(30),
+            policy_report_older_than_days: Some(90),
         }
     }
 }

@@ -296,6 +296,18 @@ pub async fn user_id(server: &TestServer, username: &str) -> i64 {
     id
 }
 
+/// `GET /api/v1/policy/report?{query}` as the static admin token.
+pub async fn report(server: &TestServer, query: &str) -> Value {
+    let resp = reqwest::Client::new()
+        .get(format!("{}/api/v1/policy/report?{query}", server.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .expect("report request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "report?{query}");
+    resp.json().await.expect("report is json")
+}
+
 /// A user created through the admin API plus one API token named `name`.
 pub async fn named_token(
     client: &reqwest::Client,
@@ -304,6 +316,16 @@ pub async fn named_token(
     name: &str,
 ) -> String {
     create_user(client, base_url, STATIC_TOKEN, username, "reader").await;
+    add_token(client, base_url, username, name).await
+}
+
+/// One more API token named `name` for an existing user.
+pub async fn add_token(
+    client: &reqwest::Client,
+    base_url: &str,
+    username: &str,
+    name: &str,
+) -> String {
     let resp = client
         .post(format!("{base_url}/api/v1/users/{username}/tokens"))
         .bearer_auth(STATIC_TOKEN)

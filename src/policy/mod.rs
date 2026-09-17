@@ -370,6 +370,11 @@ impl PolicyEngine {
         self.shared.dropped.load(Ordering::Relaxed)
     }
 
+    /// The strategies' names in report order, the report's `rule` filter domain.
+    pub fn rule_names(&self) -> Vec<&'static str> {
+        self.shared.rules.iter().map(|r| r.name()).collect()
+    }
+
     #[cfg(test)]
     pub(crate) fn shared(&self) -> &Arc<Shared> {
         &self.shared
