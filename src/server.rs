@@ -162,16 +162,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         Timeouts::from_connect_secs(connect_timeout_secs),
         ttl,
     );
-    let known: Vec<String> = crate::db::get_all_repositories(&db)
-        .await?
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
-    let upstream_auth = Arc::new(load_upstream_creds(
-        &config.repositories,
-        &known,
-        std::env::vars(),
-    )?);
+    let upstream_auth = Arc::new(upstream_creds(&db, config).await?);
 
     // Initialize Prometheus metrics
     let metrics_handle = telemetry::init_metrics();
@@ -594,6 +585,19 @@ pub(crate) fn env_repo_key(name: &str) -> String {
             }
         })
         .collect()
+}
+
+/// The credentials of every repository row, seeded or API-created.
+async fn upstream_creds(
+    db: &SqlitePool,
+    config: &Config,
+) -> anyhow::Result<HashMap<String, UpstreamCreds>> {
+    let known: Vec<String> = crate::db::get_all_repositories(db)
+        .await?
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    load_upstream_creds(&config.repositories, &known, std::env::vars())
 }
 
 /// Config credentials per repository, then the environment on top (env
