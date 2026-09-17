@@ -9,12 +9,15 @@ use axum::{
 use serde_json::json;
 
 use crate::auth::middleware::AuthUser;
+use crate::db::kinds::Format;
 use crate::db::Package;
 use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;
+use crate::registry::resolve::first_hit;
 use crate::server::AppState;
 
-use super::param;
+use super::leaves::DistTagsLeaf;
+use super::{cx, param};
 
 pub async fn get_dist_tags(
     State(state): State<AppState>,
@@ -24,25 +27,15 @@ pub async fn get_dist_tags(
     let repo_name = param(&params, "repo")?;
     let package_name = extract_package_name(&params);
 
+    crate::registry::validate_package_name("npm", &package_name)?;
+
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let auth = auth.as_ref().map(|e| &e.0);
+    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
 
-    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
-
-    let package = crate::db::get_package(&state.db, repo.id, &package_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("package not found: {package_name}")))?;
-
-    let dist_tags = crate::db::get_dist_tags(&state.db, package.id).await?;
-    let versions = crate::db::get_versions(&state.db, package.id).await?;
-
-    let mut tags_map: HashMap<String, String> = HashMap::new();
-    for dt in &dist_tags {
-        if let Some(v) = versions.iter().find(|v| v.id == dt.version_id) {
-            tags_map.insert(dt.tag.clone(), v.version.clone());
-        }
-    }
-
-    Ok(Json(json!(tags_map)))
+    let leaf = DistTagsLeaf { name: package_name };
+    let tags = first_hit(&cx(&state, auth, &repo), &repo, &leaf).await?;
+    Ok(Json(tags))
 }
 
 struct TagTarget {
@@ -63,6 +56,8 @@ async fn writable_tag_target(
     let tag = param(params, "tag")?;
 
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    crate::registry::ensure_hosted(&repo)?;
+    crate::registry::ensure_format(&repo, Format::Npm)?;
     crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, &package_name)

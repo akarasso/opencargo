@@ -174,6 +174,11 @@ Read this before the comparison table sells you anything.
 
 `npm login --registry http://registry.example.com/npm-all/` also works.
 
+A `group` such as `npm-all` answers `npm install`, `npm dist-tag ls` and
+`npm search` from its hosted members first, then from its proxies (dist-tags
+come from the cached packument, search walks nested groups); `npm publish` and
+`npm dist-tag add|rm` are accepted on hosted repositories only.
+
 ### Cargo
 
 ```toml

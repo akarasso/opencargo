@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
+use crate::db::Version;
 use crate::error::AppResult;
 use crate::registry::resolve::{CacheRepo, Outcome};
 
@@ -24,14 +25,7 @@ pub async fn hosted_packument(
         return Ok(Outcome::NotFound);
     };
     let versions = crate::db::get_versions(db, package.id).await?;
-    let dist_tags = crate::db::get_dist_tags(db, package.id).await?;
-
-    let mut dist_tags_map: HashMap<String, String> = HashMap::new();
-    for dt in &dist_tags {
-        if let Some(v) = versions.iter().find(|v| v.id == dt.version_id) {
-            dist_tags_map.insert(dt.tag.clone(), v.version.clone());
-        }
-    }
+    let dist_tags_map = dist_tags_map(db, package.id, &versions).await?;
 
     let mut versions_map: HashMap<String, Value> = HashMap::new();
     let mut time_map: HashMap<String, String> = HashMap::new();
@@ -54,6 +48,22 @@ pub async fn hosted_packument(
         "versions": versions_map,
         "time": time_map,
     })))
+}
+
+/// `tag -> version` from the `dist_tags` rows of a hosted package.
+pub async fn dist_tags_map(
+    db: &SqlitePool,
+    package_id: i64,
+    versions: &[Version],
+) -> AppResult<HashMap<String, String>> {
+    let dist_tags = crate::db::get_dist_tags(db, package_id).await?;
+    Ok(dist_tags
+        .iter()
+        .filter_map(|dt| {
+            let v = versions.iter().find(|v| v.id == dt.version_id)?;
+            Some((dt.tag.clone(), v.version.clone()))
+        })
+        .collect())
 }
 
 /// Strip every version of a packument down to the install-v1 fields.
