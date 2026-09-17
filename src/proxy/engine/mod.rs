@@ -152,7 +152,7 @@ impl ProxyEngine {
         miss: Miss,
     ) -> AppResult<Outcome<Cached>> {
         let key = s.cache_key(a);
-        let _guard = self.lock(member, &key).await;
+        let _guard = self.lock(member, &key, force_stale).await;
         let counted = miss == Miss::Record;
         let stale = match self.lookup(s, member, a, &key, force_stale).await? {
             Lookup::Fresh(cached) => {
@@ -200,8 +200,17 @@ impl ProxyEngine {
         }))
     }
 
-    async fn lock(&self, member: CacheRepo<'_>, key: &CacheKey) -> Option<super::singleflight::Guard> {
-        let lock_key = format!("{}/{}/{}", member.0.id, key.kind, key.key);
+    /// Refreshes coalesce among themselves in their own namespace: a
+    /// client's hit on a fresh row never waits behind a recorder's
+    /// conditional request.
+    async fn lock(
+        &self,
+        member: CacheRepo<'_>,
+        key: &CacheKey,
+        refresh: bool,
+    ) -> Option<super::singleflight::Guard> {
+        let space = if refresh { "refresh/" } else { "" };
+        let lock_key = format!("{space}{}/{}/{}", member.0.id, key.kind, key.key);
         self.inflight
             .acquire(&lock_key, self.timeouts.singleflight_wait)
             .await

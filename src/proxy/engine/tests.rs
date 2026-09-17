@@ -715,6 +715,40 @@ async fn peek_never_hits_upstream() {
 }
 
 #[tokio::test]
+async fn refresh_never_blocks_a_fresh_hit() {
+    let fx = Fx::new().await;
+    fx.set(|s| s.etag = Some("\"v1\"".into()));
+    let engine = fx.engine(timeouts());
+    let (strat, art) = (Strat::default(), "art/x".to_string());
+    let first = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    fx.set(|s| {
+        s.etag = Some("\"v2\"".into());
+        s.delay = Duration::from_millis(500);
+    });
+    let refresh = {
+        let (engine, up, repo) = (engine.clone(), fx.up.clone(), fx.repo.clone());
+        tokio::spawn(async move {
+            engine
+                .refresh(&Strat::default(), &up, CacheRepo(&repo), &"art/x".to_string())
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(fx.hits().len(), 2, "the refresh is in flight");
+    let started = std::time::Instant::now();
+    let hit = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    assert_eq!(hit.entry.id, first.entry.id);
+    assert!(
+        started.elapsed() < Duration::from_millis(100),
+        "a fresh hit waited {:?} behind the refresh",
+        started.elapsed()
+    );
+    assert_eq!(fx.hits().len(), 2, "the hit made no request");
+    found(refresh.await.unwrap());
+    assert_eq!(fx.hits().len(), 2);
+}
+
+#[tokio::test]
 async fn refresh_never_records_a_miss() {
     let fx = Fx::new().await;
     fx.set(|s| s.etag = Some("\"v1\"".into()));
