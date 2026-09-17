@@ -48,3 +48,6 @@ excalidraw.log
 # Private business documents (never publish)
 plan-produit.md
 plan-lancement.md
+
+# Release assets built locally by scripts/release
+/dist
