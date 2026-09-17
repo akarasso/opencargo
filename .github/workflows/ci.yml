@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [main]
   pull_request:
-    branches: [main, master]
+    branches: [main]
 
 # Least privilege for the automatically-provided token. Jobs that need more
 # must opt in explicitly.
@@ -14,30 +14,33 @@ permissions:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@1.93.0
+        uses: dtolnay/rust-toolchain@283fb51ee3c8a49cd7c8ff30102f3fcf3cfbe0e1 # 1.93.0
         with:
           components: clippy
 
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
 
       - name: Install pnpm
-        uses: pnpm/action-setup@v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 10
 
       - name: Install Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 22
 
       # The go e2e suite shells out to `go` (tests/go_e2e_test.rs).
       - name: Install Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
           go-version: '1.22'
           cache: false
@@ -69,13 +72,34 @@ jobs:
           OPENCARGO_E2E_REQUIRE: '1'
         run: cargo test
 
+  workflow-lint:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version: '1.25'
+          cache: false
+      - name: actionlint and shellcheck
+        run: scripts/lint-workflows.sh
+      - name: Release tag guards
+        run: scripts/release/test-meta.sh
+
   audit:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@1.93.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@283fb51ee3c8a49cd7c8ff30102f3fcf3cfbe0e1 # 1.93.0
       - name: Cache Rust
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
       # RUSTSEC-2023-0071 (rsa "Marvin" timing side-channel) has NO fixed upstream
@@ -85,30 +109,26 @@ jobs:
       - name: Security audit (RustSec advisory DB)
         run: cargo audit --ignore RUSTSEC-2023-0071
 
-  docker:
+  image-scan:
     runs-on: ubuntu-latest
     needs: [test, audit]
-    if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    # GITHUB_TOKEN needs packages:write to push the image to GHCR.
+    if: github.ref == 'refs/heads/main'
+    timeout-minutes: 45
+    # Build and third-party scan hold no packages or id-token permission; the signer gets the image as a file.
     permissions:
       contents: read
-      packages: write
-      id-token: write
+    outputs:
+      image-id: ${{ steps.id.outputs.image-id }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Build image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
@@ -116,18 +136,84 @@ jobs:
           provenance: false
           tags: opencargo:ci
 
+      - name: Record the image ID before the scanner runs
+        id: id
+        run: echo "image-id=$(docker image inspect --format '{{.Id}}' opencargo:ci)" >> "$GITHUB_OUTPUT"
+
       - name: Scan image for vulnerabilities (Trivy)
-        uses: aquasecurity/trivy-action@0.35.0
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
         with:
           image-ref: opencargo:ci
           format: table
           exit-code: '1'
           ignore-unfixed: true
           severity: HIGH,CRITICAL
+          cache: 'false'
 
-      - name: Push the scanned image
-        run: |
-          docker tag opencargo:ci ghcr.io/akarasso/opencargo:latest
-          docker tag opencargo:ci ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
-          docker push ghcr.io/akarasso/opencargo:latest
-          docker push ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
+      - run: docker save opencargo:ci -o opencargo-ci.tar
+
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: image-tar
+          path: opencargo-ci.tar
+          if-no-files-found: error
+          retention-days: 7
+
+  docker:
+    runs-on: ubuntu-latest
+    needs: [image-scan]
+    timeout-minutes: 30
+    # Serialized in arrival order: a cancelled pending run would leave its commit without sha-<commit>.
+    concurrency:
+      group: ghcr-main
+      cancel-in-progress: false
+      queue: max
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: image-tar
+
+      - name: Load the scanned image and check its ID
+        run: scripts/release/load-image.sh opencargo-ci.tar opencargo:ci "$IMAGE_ID"
+        env:
+          IMAGE_ID: ${{ needs.image-scan.outputs.image-id }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - uses: sigstore/cosign-installer@6f9f17788090df1f26f669e9d70d6ae9567deba6 # v4.1.2
+        with:
+          cosign-release: v3.1.3
+
+      - name: Push sha-<commit> and sign the digest that push returned
+        id: sign
+        run: scripts/release/sign-image.sh opencargo:ci "ghcr.io/akarasso/opencargo:sha-$GITHUB_SHA"
+
+      - name: Attest build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ghcr.io/akarasso/opencargo
+          subject-digest: ${{ steps.sign.outputs.digest }}
+          push-to-registry: true
+          create-storage-record: false
+
+      - name: Move latest if this commit is still main's head
+        run: scripts/release/push-latest.sh opencargo:ci ghcr.io/akarasso/opencargo:latest "$DIGEST"
+        env:
+          DIGEST: ${{ steps.sign.outputs.digest }}

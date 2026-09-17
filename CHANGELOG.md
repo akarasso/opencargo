@@ -4,7 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.1.0-rc.1] - 2026-09-17
+
+First tagged release candidate.
+
 ### Added
+- Signed, attested releases: a tag `vX.Y.Z` or `vX.Y.Z-rc.N` publishes static
+  `x86_64` and `aarch64` musl binaries, a CycloneDX SBOM per binary and
+  `SHA256SUMS`, each with a Sigstore keyless bundle, plus GitHub build
+  provenance and SBOM attestations. The container image `X.Y.Z[-rc.N]` is the
+  image main CI built and scanned for that commit, re-scanned by Trivy,
+  signed and copied by digest, never rebuilt. See "Verifying a release" in
+  the README.
 - `proxy` and `group` repositories for every format. Cargo: sparse index
   proxied and revalidated by ETag, crates fetched through the upstream `dl`
   template and verified against the index checksum, group index as the
@@ -81,6 +92,9 @@ All notable changes to this project will be documented in this file.
   command palette (Cmd+K), live dashboard manifest fed by the WebSocket
 
 ### Changed
+- Images pushed by main CI (`sha-<commit>`, `latest`) are signed keyless by
+  digest and carry a build provenance attestation; `latest` only moves when
+  the commit is still main's head. Every GitHub Action is pinned by commit SHA.
 - Proxy cache storage moved to a `proxy_cache_entries` table (migration 013)
   with streamed writes; the legacy npm cache layout and `proxy_cache_meta`
   rows are removed on the next purge or delete of the repository.

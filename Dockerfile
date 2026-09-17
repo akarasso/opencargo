@@ -15,7 +15,7 @@ COPY Cargo.toml Cargo.lock ./
 RUN mkdir -p src frontend/dist && echo "fn main() {}" > src/main.rs && cargo build --release 2>/dev/null || true && rm -rf src
 COPY src ./src
 COPY --from=frontend /app/frontend/dist ./frontend/dist
-RUN touch src/main.rs && cargo build --release
+RUN touch src/main.rs && cargo build --release --locked
 
 # Stage 3: Runtime
 FROM alpine:3.21
