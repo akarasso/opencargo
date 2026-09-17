@@ -162,8 +162,9 @@ Read this before the comparison table sells you anything.
   a Cargo `dl` or a Bearer `realm` pointing at a private IP is refused unless
   the repository opts in (`dl_allow_private`). DNS rebinding is not mitigated.
 - An OCI upstream that answers `401`/`403` after issuing a token is treated
-  as "image unknown" and negative-cached for `proxy.negative_cache_ttl`, so a
-  wrong pull credential looks like a missing image until the cache is purged.
+  as "image unknown": the client gets a `404`, so a wrong pull credential
+  looks like a missing image. The refusal is not cached, so it clears as soon
+  as the credential does.
 - A cold blob is written to disk in full before the first byte reaches the
   client (bounded by the read timeout, not by size). Pushes are capped at
   1 GiB per request, so a proxied 3 GiB layer pulls but cannot be re-pushed.

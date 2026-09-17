@@ -29,9 +29,13 @@ pub struct CacheKey {
     pub key: String,
 }
 
+/// `Miss` is an authoritative "does not exist" worth a negative row;
+/// `Refused` is a 404 to the client too, but asked again next time, since a
+/// credential or rate-limit problem looks the same as an unknown artifact.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Classified {
     Miss,
+    Refused,
     Fail,
 }
 

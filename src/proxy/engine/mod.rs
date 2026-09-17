@@ -144,6 +144,7 @@ impl ProxyEngine {
                 self.record_miss(member, &key, status, stale.as_ref()).await?;
                 Ok(Outcome::NotFound)
             }
+            Ok(Reply::Refused) => Ok(Outcome::NotFound),
             Ok(Reply::Failed(why)) => match stale {
                 Some(Stale { target, .. }) => {
                     warn!(key = %lock_key, error = %why, "upstream failed; serving stale cache");
@@ -322,7 +323,7 @@ impl ProxyEngine {
             )));
         }
         match s.classify_status(a, status) {
-            Classified::Miss => Ok(Outcome::NotFound),
+            Classified::Miss | Classified::Refused => Ok(Outcome::NotFound),
             Classified::Fail => Err(AppError::BadGateway(format!(
                 "upstream HEAD answered {status}"
             ))),

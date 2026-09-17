@@ -1049,8 +1049,11 @@ async fn head_blob_miss_forwards_head_without_download() {
     assert!(cache_rows(&a).await.is_empty() && cache_files(&a).is_empty());
 }
 
+/// Hub answers 401 after a token for an unknown or private image: a 404 to
+/// the client, never a negative row, so the image is visible as soon as
+/// access is (a fixed credential, a made-public image).
 #[tokio::test]
-async fn unknown_repository_401_after_token_is_404_negative_cached() {
+async fn unknown_repository_401_after_token_is_404_and_asked_again() {
     let fake = fake_with_image(Options {
         challenge: true,
         hub_shape: true,
@@ -1062,17 +1065,21 @@ async fn unknown_repository_401_after_token_is_404_negative_cached() {
 
     assert_eq!(get(&url).await.status(), StatusCode::NOT_FOUND);
     assert_eq!(fake.reg.tokens_issued(), 1);
-    assert_eq!(
-        cache_rows(&a).await,
-        vec![("oci-tag".to_string(), "team/ghost/1.0".to_string(), 401)]
-    );
-    let hits = fake.reg.hits().len();
-    assert_eq!(get(&url).await.status(), StatusCode::NOT_FOUND);
-    assert_eq!(
-        fake.reg.hits().len(),
-        hits,
-        "the negative row answers alone"
-    );
+    assert!(cache_rows(&a).await.is_empty(), "a refusal is not remembered");
+    assert_eq!(head(&url).await.status(), StatusCode::NOT_FOUND);
+
+    let layer = b"ghost-layer".to_vec();
+    let config = b"{}".to_vec();
+    fake.reg.add_blob("team/ghost", Blob::Bytes(layer.clone()));
+    fake.reg.add_blob("team/ghost", Blob::Bytes(config.clone()));
+    let manifest = manifest_for(&config, &layer);
+    fake.reg
+        .add_manifest("team/ghost", Some("1.0"), &manifest, MANIFEST_TYPE);
+
+    let resp = get(&url).await;
+    assert_eq!(resp.status(), StatusCode::OK, "visible as soon as access is");
+    assert_eq!(resp.bytes().await.unwrap(), manifest.as_slice());
+    assert_eq!(fake.reg.tokens_issued(), 1, "the cached token was reused");
 }
 
 #[tokio::test]

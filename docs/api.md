@@ -86,7 +86,9 @@ lists for ten minutes; a group serves the first member that knows the image
 and merges `tags/list` (`n` and `last` apply to the merged list).
 `Docker-Content-Digest` is always derived from the content. An unreachable
 upstream is `502`; an unknown image is `404`, also when the upstream answers
-`401`/`403` after issuing a token. Push, upload and delete routes accept only
+`401`/`403` after issuing a token (a refusal is asked again on the next
+request, an upstream `404` is remembered for `proxy.negative_cache_ttl`).
+Push, upload and delete routes accept only
 `hosted` repositories (`400` otherwise). Upstream credentials are configured
 in the file or the environment (`upstream_auth`, `token_realms`,
 `OPENCARGO_UPSTREAM_AUTH_<REPO>`), never through this API.

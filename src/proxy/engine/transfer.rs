@@ -18,6 +18,7 @@ pub(super) enum Reply {
     NotModified,
     Stored(Box<CacheEntry>),
     Miss(StatusCode),
+    Refused,
     Failed(String),
 }
 
@@ -107,6 +108,7 @@ impl ProxyEngine {
         if !status.is_success() {
             return Ok(match s.classify_status(a, status) {
                 Classified::Miss => Reply::Miss(status),
+                Classified::Refused => Reply::Refused,
                 Classified::Fail => Reply::Failed(format!("upstream answered {status}")),
             });
         }

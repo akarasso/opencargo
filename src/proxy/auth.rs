@@ -169,26 +169,27 @@ pub(crate) async fn send_with_auth(
         None => up.auth.iter().fold(req, |r, a| a.apply(r)),
     };
     let resp = first.send().await.map_err(transport)?;
-    if resp.status() != StatusCode::UNAUTHORIZED {
+    // Only a challenge is answered here; any other 401 (Hub's refusal of an
+    // unknown image, a format without bearer scope) is the strategy's to classify.
+    let (Some(scope), Some(challenge)) = (scope, bearer_challenge(&resp)) else {
         return Ok(resp);
-    }
-    let scope = scope.ok_or_else(|| {
-        AppError::BadGateway("upstream answered 401 for an artifact without bearer scope".into())
-    })?;
-    let challenge = resp
-        .headers()
-        .get(header::WWW_AUTHENTICATE)
-        .and_then(|h| h.to_str().ok())
-        .and_then(parse_bearer_challenge)
-        .ok_or_else(|| {
-            AppError::BadGateway("upstream answered 401 without a Bearer challenge".into())
-        })?;
+    };
     let challenge = BearerChallenge {
         scope: challenge.scope.or_else(|| Some(scope.to_string())),
         ..challenge
     };
     let token = acquire_token(http, cache, member, &challenge, up).await?;
     retry.bearer_auth(token).send().await.map_err(transport)
+}
+
+fn bearer_challenge(resp: &Response) -> Option<BearerChallenge> {
+    if resp.status() != StatusCode::UNAUTHORIZED {
+        return None;
+    }
+    resp.headers()
+        .get(header::WWW_AUTHENTICATE)
+        .and_then(|h| h.to_str().ok())
+        .and_then(parse_bearer_challenge)
 }
 
 pub(crate) async fn acquire_token(

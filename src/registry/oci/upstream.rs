@@ -180,13 +180,14 @@ impl UpstreamStrategy for OciUpstream {
     }
 
     /// Hub, GHCR and Quay never 404 a repository: after a token they answer
-    /// 401/403 for an unknown or private one, which is a miss, not an outage.
-    fn classify_status(&self, a: &OciArtifact, s: StatusCode) -> Classified {
-        let post_token_refusal = matches!(s.as_u16(), 401 | 403) && self.bearer_scope(a).is_some();
-        if matches!(s.as_u16(), 404 | 410) || post_token_refusal {
-            Classified::Miss
-        } else {
-            Classified::Fail
+    /// 401/403 for an unknown or private one, which the client sees as 404
+    /// but which is never remembered, so a fixed credential takes effect at
+    /// once.
+    fn classify_status(&self, _a: &OciArtifact, s: StatusCode) -> Classified {
+        match s.as_u16() {
+            404 | 410 => Classified::Miss,
+            401 | 403 => Classified::Refused,
+            _ => Classified::Fail,
         }
     }
 }
@@ -212,16 +213,17 @@ mod tests {
     }
 
     #[test]
-    fn classify_status_post_token_401_is_miss() {
+    fn classify_status_401_is_refused_404_is_miss() {
         let up = upstream("https://ghcr.io");
         let a = tag(&up, "org/app");
-        for status in [401, 403, 404, 410] {
+        for (status, expected) in [
+            (401, Classified::Refused),
+            (403, Classified::Refused),
+            (404, Classified::Miss),
+            (410, Classified::Miss),
+        ] {
             let s = StatusCode::from_u16(status).unwrap();
-            assert_eq!(
-                OciUpstream.classify_status(&a, s),
-                Classified::Miss,
-                "{status}"
-            );
+            assert_eq!(OciUpstream.classify_status(&a, s), expected, "{status}");
         }
         for status in [429, 500, 502, 503] {
             let s = StatusCode::from_u16(status).unwrap();
