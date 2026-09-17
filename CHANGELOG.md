@@ -15,16 +15,23 @@ All notable changes to this project will be documented in this file.
   prefix, streamed blobs verified by digest, HEAD served from the cache,
   group manifests, blobs and merged tag lists. npm: dist-tags and search
   through proxies and nested groups. Every proxy caches immutable artifacts
-  forever, metadata for `proxy.default_ttl`, upstream 404s for
-  `proxy.negative_cache_ttl`, and serves a stale copy with `Warning: 110`
-  when the upstream is down. Concurrent misses are deduplicated in-process.
+  forever (npm tarballs and crates up to 100 MiB, Go zips 512 MiB, OCI blobs
+  4 GiB), npm packuments, cargo `config.json` and OCI tags for
+  `proxy.default_ttl`, cargo index lines, Go queries and OCI tag lists for
+  ten minutes, upstream 404s for `proxy.negative_cache_ttl`, and serves a
+  stale copy with `Warning: 110` when the upstream is down. Concurrent
+  misses are deduplicated in-process; every body is streamed to disk.
 - Nested OCI image names (`team/app`, `org/team/app`) on every `/v2` route,
   including `Location` and `Docker-Content-Digest` headers.
 - Per-repository upstream credentials (`upstream_auth`, or
-  `OPENCARGO_UPSTREAM_AUTH_<REPO>` = `basic:user:pass` / `bearer:token`),
-  sent only to the upstream host and to `token_realms`; `dl_allow_private`
-  (or `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>=1`) to allow a Cargo `dl` or a token
-  realm on a private IP, which a proxy over a local opencargo needs.
+  `OPENCARGO_UPSTREAM_AUTH_<REPO>` = `basic:user:pass` / `bearer:token`,
+  read at startup for every repository, API-created ones included), sent
+  only to the upstream host and to `token_realms`; upstream bearer tokens
+  are cached per repository. `dl_allow_private` (or
+  `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>=1`) allows a Cargo `dl` or a token realm
+  whose host is, or resolves to, a private address, which a proxy over a
+  local opencargo needs; otherwise such hosts, and redirect hops off the
+  upstream's origin, are refused.
 - Per-advisory vulnerability severity from the full OSV record
   (`database_specific.severity`, else the highest CVSS 3.x/4.0 vector, `MAL-`
   ids critical); `vuln_scan.block_on_critical` now refuses the publish with
@@ -37,8 +44,12 @@ All notable changes to this project will be documented in this file.
 - Repository validation on create, update and config seed: names match
   `[a-z0-9][a-z0-9._-]{0,63}` without `..`, a proxy needs an `http(s)`
   upstream, a group needs non-empty members of its own format, nesting is
-  capped at 5 and cycles are refused. Deleting a member of a group is `409`;
-  `purge-cache` on a group purges its proxy members.
+  capped at 5 and cycles are refused. Changing a proxy's upstream purges its
+  cache. Deleting a member of a group is `409`; `purge-cache` on a group
+  purges its proxy members, deleting a group leaves them alone.
+- `tags/list` answers a partial page with `Link: <...>; rel="next"`.
+- Prometheus counters `opencargo_downloads_total`, `opencargo_publishes_total`,
+  `opencargo_cache_hits_total` and `opencargo_cache_misses_total` are emitted.
 - Real-client end-to-end tests for cargo, go and the docker CLI through a
   group fronting a second instance; CI runs them with `OPENCARGO_E2E_REQUIRE=1`.
 - `LICENSE` (MIT) and `SECURITY.md` (private vulnerability reporting, scope,
@@ -65,6 +76,15 @@ All notable changes to this project will be documented in this file.
   rows are removed on the next purge or delete of the repository.
 - Repository types and formats are typed end to end; `package.published`
   events carry the format name (`cargo`, `go`) rather than the OSV ecosystem.
+- An OCI upstream's `401`/`403` after a token is a `404` that is asked again
+  on the next request, never a negative cache row.
+- npm reads accept legacy uppercase names (`JSONStream`); publish keeps the
+  lowercase rule. Cargo index lines carry the sparse-index dependency shape
+  (`req`, `package`) and hosted crates resolve regardless of case. Go reads
+  accept case-escaped versions (`v1.0.0-!r!c1`).
+- Hosted files are written through a part file and renamed, so a re-push
+  never truncates a reader; `Content-Length` always describes the file
+  being streamed.
 - The `Go` `.info` `Time` is RFC 3339, `@latest` picks the highest semver and
   an unknown module's `@v/list` is `404` instead of an empty `200`.
 - A `proxy` or `group` repository whose upstream is unreachable or answers

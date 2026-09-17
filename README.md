@@ -102,8 +102,9 @@ the enterprise ones.
 - **Dependency graph**: dependencies extracted at publish time; "who depends on
   this?" and impact analysis before you delete a version.
 - **Vulnerability scanning** through [OSV.dev](https://osv.dev) on every
-  publish, with a per-advisory severity (OSV label, else CVSS 3.x/4.0 score)
-  and an optional block of critical publishes before anything is written.
+  publish once enabled (`[vuln_scan] enabled = true`, off by default), with
+  a per-advisory severity (OSV label, else CVSS 3.x/4.0 score) and an
+  optional block of critical publishes before anything is written.
 - **Webhooks** with HMAC signatures, **WebSocket event stream**, **Prometheus
   metrics**, full-text search, rate limiting, native TLS.
 - **Web UI** embedded in the binary: live dashboard, package pages with
@@ -159,8 +160,12 @@ Read this before the comparison table sells you anything.
   stops it rather than falling back to `direct`.
 - Upstream credentials (`upstream_auth`, `OPENCARGO_UPSTREAM_AUTH_<REPO>`) are
   sent to the upstream host and to the `token_realms` you list, nothing else;
-  a Cargo `dl` or a Bearer `realm` pointing at a private IP is refused unless
-  the repository opts in (`dl_allow_private`). DNS rebinding is not mitigated.
+  a Cargo `dl` or a Bearer `realm` whose host is, or resolves to, a private
+  address is refused unless the repository opts in (`dl_allow_private`).
+  Names are resolved once before the request: DNS rebinding is not mitigated.
+- A proxied npm tarball or crate larger than 100 MiB is refused with `502`
+  (Go zips are capped at 512 MiB, OCI blobs at 4 GiB); nothing stale is
+  served in that case.
 - An OCI upstream that answers `401`/`403` after issuing a token is treated
   as "image unknown": the client gets a `404`, so a wrong pull credential
   looks like a missing image. The refusal is not cached, so it clears as soon
@@ -193,9 +198,10 @@ Read this before the comparison table sells you anything.
 
 `npm login --registry http://registry.example.com/npm-all/` also works.
 
-A `group` such as `npm-all` answers `npm install`, `npm dist-tag ls` and
-`npm search` from its hosted members first, then from its proxies (dist-tags
-come from the cached packument, search walks nested groups); `npm publish` and
+A `group` such as `npm-all` answers `npm install` and `npm dist-tag ls` from
+its hosted members first, then from its proxies (dist-tags come from the
+cached packument); `npm search` covers hosted members only, nested groups
+included, so proxied packages are not searchable. `npm publish` and
 `npm dist-tag add|rm` are accepted on hosted repositories only.
 
 ### Cargo
@@ -297,11 +303,12 @@ path); see [docs/api.md](docs/api.md).
 
 opencargo starts with sane defaults and no config file. Everything below is
 optional, and repositories, users, permissions and webhooks are normally
-managed through the API or the UI rather than the file.
+managed through the API or the UI rather than the file. Values marked
+`# default: ...` differ from the built-in default.
 
 ```toml
 [server]
-bind = "0.0.0.0:6789"
+bind = "0.0.0.0:6789"                # default: 127.0.0.1:6789
 base_url = "https://registry.example.com"
 storage_path = "/data/storage"
 
@@ -320,17 +327,18 @@ static_tokens = []                 # break-glass admin tokens; keep empty
 username = "admin"                 # password: OPENCARGO_ADMIN_PASSWORD, or generated
 
 [proxy]
-default_ttl = "24h"                # metadata (packuments, index lines, tags, @v/list)
+default_ttl = "24h"                # npm packuments, cargo config.json, OCI tags
+                                   # (cargo index lines, Go queries and OCI tag lists: 10 min)
 negative_cache_ttl = "1h"          # how long an upstream 404 is remembered
 connect_timeout = "10s"
 
 [cleanup]                          # optional retention GC
-enabled = true
+enabled = true                     # default: false
 prerelease_older_than_days = 90
 proxy_cache_older_than_days = 30   # idle proxy cache entries; swept even with enabled = false
 
 [vuln_scan]
-enabled = true
+enabled = true                     # default: false
 block_on_critical = false          # refuse a publish with a critical advisory (400)
 fail_closed = false                # with block_on_critical: OSV down = 503, not an unscanned publish
 osv_base_url = "https://api.osv.dev"

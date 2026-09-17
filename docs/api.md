@@ -8,8 +8,7 @@ for curl). Anonymous read is allowed on public repositories when
 ## npm
 
 ```
-GET    /{repo}/{name}                              Package metadata
-GET    /{repo}/@{scope}/{name}                     Package metadata (scoped)
+GET    /{repo}/@{scope}/{name}                     Package metadata
 GET    /{repo}/@{scope}/{name}/-/{file}.tgz        Tarball
 PUT    /{repo}/@{scope}/{name}                     Publish
 GET    /{repo}/-/v1/search?text=                   Search
@@ -20,13 +19,16 @@ PUT    /-/user/org.couchdb.user:{username}         npm login (returns a token)
 GET    /-/whoami                                   Current user
 ```
 
+Unscoped variants drop the `@{scope}/` segment. Reads accept any name npm
+still serves (`JSONStream`, `Base64`); publish enforces npm's lowercase rule.
 Publishing targets a `hosted` repository. Installing usually goes through a
 `group` that lists the hosted repo first and a `proxy` to npmjs.org after.
 Through a proxy or a group, metadata and `dist-tags` come from the cached
 packument (`proxy.default_ttl`, revalidated with `If-None-Match`), tarballs
-are cached forever and their URLs point at the repository the client asked
-for; `search` walks nested groups. `PUT`/`DELETE dist-tags` and publish are
-`400` on a proxy or a group. An unknown package is `404` and remembered for
+are cached forever (a tarball over 100 MiB is refused with `502`) and their
+URLs point at the repository the client asked for; `search` covers hosted
+members only, nested groups included: proxied packages are not searchable.
+`PUT`/`DELETE dist-tags` and publish are `400` on a proxy or a group. An unknown package is `404` and remembered for
 `proxy.negative_cache_ttl`; an unreachable upstream is `502`, or the stale
 cached copy with `Warning: 110`.
 
@@ -46,13 +48,15 @@ false` and carries `"auth-required": true` on a private repository, so cargo
 sends the token from `$CARGO_HOME/credentials.toml`; its `dl` always points at
 the requested repository. A `proxy` has `upstream` = a sparse index root
 (`https://index.crates.io/` or another opencargo's `.../cargo-hosted/index`):
-index lines are cached for `proxy.default_ttl` and revalidated by ETag,
-crates are fetched from the upstream `config.json`'s `dl` template
-(`{crate}`, `{version}`, `{prefix}`, `{lowerprefix}`, `{sha256-checksum}`,
-default `/{crate}/{version}/download`), verified against the index `cksum`
-(`502`, nothing stored, on a mismatch) and cached forever. A `dl` on a
-private IP literal is refused unless `dl_allow_private`; with `upstream_auth`
-a `dl` off the index host is refused unless listed in `token_realms`. A
+index lines are cached for ten minutes and revalidated by ETag (its
+`config.json` for `proxy.default_ttl`), crates are fetched from the upstream
+`config.json`'s `dl` template (`{crate}`, `{version}`, `{prefix}`,
+`{lowerprefix}`, `{sha256-checksum}`, default `/{crate}/{version}/download`),
+verified against the index `cksum` (`502`, nothing stored, on a mismatch),
+capped at 100 MiB and cached forever. A `dl` whose host is, or resolves to,
+a private address is refused unless `dl_allow_private`; with `upstream_auth`
+a `dl` off the index host is refused unless listed in `token_realms`. Crate
+names are matched regardless of case, as cargo lowercases the index path. A
 `group` unions the index lines of its members (first member wins on a
 version and on download); when a member is unreachable the merged index is
 served with `Warning: 199`. Publish, yank and unyank are `400` on a proxy or
@@ -80,10 +84,14 @@ GET    /v2/{repo}/{name}/tags/list
 on `hosted`, `proxy` and `group` repositories: a proxy fetches from
 `upstream` (a registry root such as `https://registry-1.docker.io` or
 `https://ghcr.io`, or another opencargo repository as
-`http://host:6789/oci-hosted`), answers the upstream's Bearer challenge, and
-caches manifests and blobs by digest, tags for `proxy.default_ttl` and tag
-lists for ten minutes; a group serves the first member that knows the image
-and merges `tags/list` (`n` and `last` apply to the merged list).
+`http://host:6789/oci-hosted`), answers the upstream's Bearer challenge (a
+realm whose host is, or resolves to, a private address is refused unless it
+is the upstream's own endpoint, listed in `token_realms` or allowed by
+`dl_allow_private`), and caches manifests and blobs (up to 4 GiB) by digest,
+tags for `proxy.default_ttl` and tag lists for ten minutes; a group serves
+the first member that knows the image and merges `tags/list` (`n`, default
+100, and `last` apply to the merged list; a partial page carries
+`Link: <...>; rel="next"`).
 `Docker-Content-Digest` is always derived from the content. An unreachable
 upstream is `502`; an unknown image is `404`, also when the upstream answers
 `401`/`403` after issuing a token (a refusal is asked again on the next
@@ -97,6 +105,7 @@ in the file or the environment (`upstream_auth`, `token_realms`,
 
 ```
 GET    /{repo}/{module}/@v/list
+GET    /{repo}/{module}/@latest
 GET    /{repo}/{module}/@v/{version}.info
 GET    /{repo}/{module}/@v/{version}.mod
 GET    /{repo}/{module}/@v/{version}.zip
@@ -106,8 +115,8 @@ PUT    /{repo}/{module}/@v/{version}               Publish (zip body)
 `{module}` and `{version}` arrive GOPROXY-escaped (`github.com/!burnt!sushi/toml`,
 `v1.0.0-!r!c1`); the publish route takes the raw path. `.info` `Time` is RFC 3339. A `proxy`
 (`upstream = "https://proxy.golang.org"` or another opencargo repository)
-caches canonical versions forever and `@v/list`, `@latest` and non-canonical
-queries (`master.info`) for ten minutes. A `group` answers `@v/list` with the
+caches canonical versions forever (zips up to 512 MiB) and `@v/list`,
+`@latest` and non-canonical queries (`master.info`) for ten minutes. A `group` answers `@v/list` with the
 union of its members, `@latest` with the highest semver, and `.info`/`.mod`/
 `.zip` from the first member that has the version. Unknown module or upstream
 `410`: `404` (negative-cached; an empty `@v/list` for a known module is
@@ -116,7 +125,7 @@ union of its members, `@latest` with the highest semver, and `.info`/`.mod`/
 ## Administration
 
 ```
-POST   /api/v1/repositories                        {name, type, format, visibility, upstream?, members?, dl_allow_private?, token_realms?}
+POST   /api/v1/repositories                        {name, type, format, visibility, upstream?, members?}
 GET    /api/v1/repositories
 GET    /api/v1/repositories/{name}
 PUT    /api/v1/repositories/{name}
@@ -151,13 +160,16 @@ Repository names match `[a-z0-9][a-z0-9._-]{0,63}` without `..`. `type` is
 (requires a non-empty `members` list of existing repositories of the same
 `format`; groups may nest up to 5 levels, cycles are refused); every format
 supports the three types. Violations are `400`, on create, update and on
-the config seed. `DELETE` on a member of a group is `409`; deleting a proxy
-or a group also drops its cache. `purge-cache` removes the cached rows and
-files of a proxy (a group purges its proxy members) and never touches
-hosted data. Upstream credentials are set in the config file or the
-environment, never through this API: `OPENCARGO_UPSTREAM_AUTH_<REPO>` is
-read at startup for every repository, so a proxy created here takes its
-credentials at the next restart (see the README).
+the config seed. `PUT` with another `upstream` purges the proxy's cache
+first. `DELETE` on a member of a group is `409`; deleting a proxy also
+drops its cache, deleting a group leaves its members' caches alone.
+`purge-cache` removes the cached rows and files of a proxy (a group purges
+its proxy members) and never touches hosted data. Upstream credentials,
+`token_realms` and `dl_allow_private` are set in the config file or the
+environment (`OPENCARGO_UPSTREAM_AUTH_<REPO>`, `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>`),
+never through this API; the environment is read at startup for every
+repository, so a proxy created here takes its credentials at the next
+restart (see the README).
 
 Roles: `admin` (everything), `publisher` (read + write), `reader` (read).
 A per-user, per-repository grant overrides the role. Resolution order:
@@ -210,8 +222,8 @@ or no data exists (`score` null). Each advisory is fetched once and cached
 for the process. With `vuln_scan.block_on_critical`, a publish carrying a
 critical advisory is refused with `400` before anything is stored; with
 `fail_closed` too, an OSV outage answers `503` instead of publishing
-unscanned. `rescan` needs write access on the repository and is `400` for
-OCI (no OSV ecosystem).
+unscanned. `rescan` needs write access on the repository; an OCI image is
+not a package, so both routes answer `404` for one.
 
 ## Frontend data
 
