@@ -88,7 +88,10 @@ pub async fn get_index_entry(
     let collected = collect(&cx, &repo, &leaf).await?;
     let merged = merge_index_lines(collected.hits);
     if merged.lines.is_empty() {
-        return Err(AppError::NotFound(format!("crate not found: {name}")));
+        return Err(match collected.degraded {
+            Some(why) => AppError::BadGateway(format!("group {}: {why}", cx.url.0)),
+            None => AppError::NotFound(format!("crate not found: {name}")),
+        });
     }
     let body = merged.lines.join("\n");
     let etag = format!("\"{:x}\"", Sha256::digest(body.as_bytes()));

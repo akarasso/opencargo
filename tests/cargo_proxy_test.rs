@@ -369,6 +369,42 @@ async fn group_index_degraded_member_warns_199() {
     );
 }
 
+/// An empty merged index beside a failing member is not "crate not found":
+/// the failure is reported, as the go handler does.
+#[tokio::test]
+async fn group_empty_index_with_failed_member_is_502() {
+    let empty = fake_index::start().await;
+    empty.add_empty_index(CRATE);
+    let down = fake_index::start().await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            proxy("cargo-empty", RepositoryFormat::Cargo, &empty.index_url()),
+            proxy("cargo-down", RepositoryFormat::Cargo, &down.index_url()),
+            group("cargo-all", RepositoryFormat::Cargo, &["cargo-empty", "cargo-down"]),
+        ],
+        ..Default::default()
+    })
+    .await;
+    assert_eq!(
+        get(&index_url(&a, "cargo-all", CRATE)).await.status(),
+        StatusCode::NOT_FOUND,
+        "two members that know nothing is a plain miss"
+    );
+
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            proxy("cargo-empty", RepositoryFormat::Cargo, &empty.index_url()),
+            proxy("cargo-down", RepositoryFormat::Cargo, "http://127.0.0.1:9/index"),
+            group("cargo-all", RepositoryFormat::Cargo, &["cargo-empty", "cargo-down"]),
+        ],
+        ..Default::default()
+    })
+    .await;
+    let resp = get(&index_url(&a, "cargo-all", CRATE)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(resp.text().await.unwrap().contains("cargo-down"));
+}
+
 #[tokio::test]
 async fn group_hides_private_member() {
     let up = spawn_upstream().await;
@@ -489,10 +525,12 @@ async fn proxy_index_and_download_from_second_instance() {
         1,
         "a fresh index row never hits upstream"
     );
+    expire_entries(&a).await;
+    assert_eq!(download(&dl).await, bytes);
     assert_eq!(
         upstream_downloads(&up).await,
         1,
-        "an immutable crate is downloaded once"
+        "an immutable crate is downloaded once, expiry or not"
     );
 
     let mut rows = cache_rows(&a).await;

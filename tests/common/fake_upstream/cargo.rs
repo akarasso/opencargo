@@ -94,6 +94,17 @@ impl FakeIndex {
             .push((name.to_string(), version.to_string(), bytes.to_vec()));
     }
 
+    /// An index file for `name` that lists no version at all.
+    pub fn add_empty_index(&self, name: &str) {
+        self.shared
+            .script
+            .lock()
+            .unwrap()
+            .lines
+            .entry(name.to_lowercase())
+            .or_default();
+    }
+
     pub fn count(&self, path: &str) -> usize {
         self.hits().filter(|h| h.path == path).count()
     }
