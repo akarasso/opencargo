@@ -5,7 +5,8 @@ use axum::{
 
 use super::dist_tags::{delete_dist_tag, get_dist_tags, put_dist_tag};
 use super::publish::publish_package;
-use super::read::{download_tarball, get_package, search};
+use super::read::{download_tarball, get_package};
+use super::search::search;
 use crate::server::AppState;
 
 pub fn routes() -> Router<AppState> {
