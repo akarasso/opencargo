@@ -141,7 +141,8 @@ fn build_marked_zip(module: &str, version: &str, marker: &str) -> Vec<u8> {
     {
         let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
         let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
         zip_writer
             .start_file(format!("{module}@{version}/go.mod"), options)
             .unwrap();

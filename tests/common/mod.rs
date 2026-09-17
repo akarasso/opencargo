@@ -287,8 +287,11 @@ pub fn build_go_module_zip(module_name: &str, version: &str) -> Vec<u8> {
     let mut buf = Vec::new();
     {
         let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        // Pinned mtime: the default is "now" at DOS 2 s granularity, which made
+        // byte-exact comparisons of two builds flaky across a boundary.
         let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
 
         let go_mod_path = format!("{}@{}/go.mod", module_name, version);
         zip_writer.start_file(&go_mod_path, options).unwrap();
