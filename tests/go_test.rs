@@ -311,3 +311,63 @@ async fn test_go_oversized_gomod_rejected() {
         "400 body should mention the go.mod is too large, got: {text}"
     );
 }
+
+/// 7. `Time` is RFC 3339 in `.info` and `@latest`: the go tool rejects the
+/// `YYYY-MM-DD HH:MM:SS` shape SQLite stores.
+#[tokio::test]
+async fn info_time_is_rfc3339() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    publish_go_module(&client, &base_url, "go-hosted", "timemod", "v1.0.0").await;
+
+    for path in ["timemod/@v/v1.0.0.info", "timemod/@latest"] {
+        let resp = client
+            .get(format!("{base_url}/go-hosted/{path}"))
+            .send()
+            .await
+            .expect("request failed");
+        assert_eq!(resp.status(), StatusCode::OK, "GET {path}");
+        let info: Value = resp.json().await.expect("invalid json");
+        let time = info["Time"].as_str().expect("Time should be a string");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(time).is_ok(),
+            "{path}: Time {time:?} is not RFC 3339"
+        );
+        assert!(time.ends_with('Z'), "{path}: Time {time:?} should be UTC");
+    }
+}
+
+/// 8. `@latest` is the highest version by semver, not the last published
+/// one and not the lexical maximum (`v1.9.0` > `v1.10.0` lexically).
+#[tokio::test]
+async fn latest_is_max_semver() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    for version in ["v1.9.0", "v1.10.0", "v1.2.0"] {
+        publish_go_module(&client, &base_url, "go-hosted", "semvermod", version).await;
+    }
+
+    let resp = client
+        .get(format!("{base_url}/go-hosted/semvermod/@latest"))
+        .send()
+        .await
+        .expect("latest request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let latest: Value = resp.json().await.expect("invalid json");
+    assert_eq!(latest["Version"], "v1.10.0");
+}
+
+/// 9. An unknown module lists as 404 so `GOPROXY=a,b,direct` moves on; an
+/// empty 200 would end resolution here.
+#[tokio::test]
+async fn unknown_module_list_is_404() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/go-hosted/example.com/nope/@v/list"))
+        .send()
+        .await
+        .expect("list request failed");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}

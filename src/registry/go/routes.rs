@@ -1,16 +1,7 @@
-use std::collections::HashMap;
+use axum::{http::Request, routing::get, Router};
 
-use axum::{
-    extract::{Path, State},
-    http::Request,
-    response::{IntoResponse, Response},
-    routing::get,
-    Router,
-};
-
-use super::{get_mod, get_zip, latest_version, list_versions, publish_module, version_info};
-use crate::auth::middleware::AuthUser;
-use crate::error::{AppError, AppResult};
+use super::publish::publish_module;
+use super::read::{latest_version, list_versions, version_dispatch};
 use crate::server::AppState;
 
 /// Real module paths span several URL segments (`github.com/org/repo`) while
@@ -26,31 +17,6 @@ pub fn routes() -> Router<AppState> {
             get(version_dispatch).put(publish_module),
         )
         .route("/{repo}/{module}/@latest", get(latest_version))
-}
-
-/// GOPROXY distinguishes `.info`, `.mod` and `.zip` by URL suffix under one
-/// `/{repo}/{module}/@v/{version}` pattern; read access is enforced once here.
-async fn version_dispatch(
-    state: State<AppState>,
-    path: Path<HashMap<String, String>>,
-    auth: Option<axum::Extension<AuthUser>>,
-) -> AppResult<Response> {
-    let repo_name = path.get("repo").cloned().unwrap_or_default();
-    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
-    crate::registry::ensure_can_read(&state.db, &repo, auth.as_ref().map(|e| &e.0)).await?;
-
-    let version = path.get("version").cloned().unwrap_or_default();
-    if version.ends_with(".info") {
-        Ok(version_info(state, path).await?.into_response())
-    } else if version.ends_with(".mod") {
-        Ok(get_mod(state, path).await?.into_response())
-    } else if version.ends_with(".zip") {
-        Ok(get_zip(state, path).await?.into_response())
-    } else {
-        Err(AppError::BadRequest(
-            "unknown version file extension; expected .info, .mod, or .zip".to_string(),
-        ))
-    }
 }
 
 /// Percent-encode the slashes inside the module part of GOPROXY-shaped paths

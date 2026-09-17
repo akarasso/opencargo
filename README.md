@@ -233,12 +233,23 @@ Over plain HTTP, add the host to `insecure-registries` in Docker's
 ### Go modules
 
 ```bash
-export GOPROXY=http://registry.example.com/go-private,direct
-export GONOSUMCHECK=example.com/*
+export GOPROXY=http://registry.example.com/go-all,direct
+export GONOSUMDB=example.com/*
 ```
 
-Publish with `PUT /go-private/{module}/@v/{version}` (zip body); see
-[docs/api.md](docs/api.md).
+`go-all` can be a hosted repository, a proxy (`upstream = "https://proxy.golang.org"`)
+or a group whose members are searched in order: `@v/list` is the union of every
+member, `@latest` the highest version by semver, `.info`/`.mod`/`.zip` the first
+member that has them. Module paths arrive GOPROXY-escaped
+(`github.com/!burnt!sushi/toml`) and are unescaped for hosted lookups. An unknown
+module answers 404, so `go` moves on to the next `GOPROXY` entry; an unreachable
+upstream answers 502, so it stops instead of silently falling back to `direct`.
+Canonical versions are cached forever, queries such as `master.info` for ten
+minutes. The checksum database is not proxied: exclude private modules with
+`GONOSUMDB` or run with `GOSUMDB=off`.
+
+Publish with `PUT /go-private/{module}/@v/{version}` (zip body, raw module
+path); see [docs/api.md](docs/api.md).
 
 ---
 
