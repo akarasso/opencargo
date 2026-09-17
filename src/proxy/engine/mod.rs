@@ -17,7 +17,7 @@ use crate::storage::{FilesystemStorage, StorageBackend};
 
 use super::auth::{send_with_auth, TokenCache};
 use super::singleflight::Singleflight;
-use super::strategy::{CacheKey, CachePolicy, Classified, Ttl, UpstreamStrategy};
+use super::strategy::{CacheKey, CachePolicy, Classified, Ttl, UpstreamStrategy, UrlSource};
 
 pub use payload::{cache_path, Cached, PartFile, Payload, Src};
 use transfer::Reply;
@@ -280,7 +280,7 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Payload>> {
-        let url = s.upstream_url(up, a)?;
+        let url = self.guarded_url(s, up, a).await?;
         let mut req = self.http.head(url);
         for (name, value) in s.request_headers(a) {
             req = req.header(name, value);
@@ -320,6 +320,21 @@ impl ProxyEngine {
                 "upstream HEAD answered {status}"
             ))),
         }
+    }
+
+    /// The upstream URL of an artifact, refused when upstream content chose
+    /// a host the proxy must not reach.
+    pub(super) async fn guarded_url<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        a: &S::Artifact,
+    ) -> AppResult<reqwest::Url> {
+        let url = s.upstream_url(up, a)?;
+        if s.url_source(up, a) == (UrlSource::Content { allow_private: false }) {
+            super::refuse_blocked_host(&url).await?;
+        }
+        Ok(url)
     }
 
     fn ttl_secs(&self, policy: CachePolicy) -> Option<u64> {

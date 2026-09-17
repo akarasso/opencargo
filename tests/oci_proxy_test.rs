@@ -1091,7 +1091,50 @@ async fn token_realm_on_link_local_is_refused() {
     ))
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    let body = resp.text().await.unwrap();
+    assert!(
+        body.contains("upstream token realm refused"),
+        "the guard, not another failure, answered: {body}"
+    );
     assert!(cache_rows(&a).await.is_empty());
+}
+
+/// A realm on a loopback host other than the upstream's own endpoint is
+/// upstream-chosen: never contacted without the private opt-in.
+#[tokio::test]
+async fn token_realm_on_private_host_is_refused_without_optin() {
+    let realm = fake_oci::start(Options::default()).await;
+    let realm_url = format!("{}/token", realm.base_url);
+    let fake = fake_with_image(Options {
+        challenge: true,
+        realm: Some(realm_url.clone()),
+        ..Default::default()
+    })
+    .await;
+    let url_for = |a: &TestServer| format!("{}/v2/oci-proxy/{IMAGE}/manifests/1.0", a.base_url);
+
+    let strict = spawn_fake_proxy(&fake.reg, ProxyOpts::default(), "10s").await;
+    let resp = get(&url_for(&strict)).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(resp
+        .text()
+        .await
+        .unwrap()
+        .contains("upstream token realm refused"));
+    assert!(realm.hits().is_empty(), "the realm was never contacted");
+    assert!(cache_rows(&strict).await.is_empty());
+
+    let lenient = spawn_fake_proxy(
+        &fake.reg,
+        ProxyOpts {
+            dl_allow_private: true,
+            ..Default::default()
+        },
+        "10s",
+    )
+    .await;
+    assert_eq!(get(&url_for(&lenient)).await.status(), StatusCode::OK);
+    assert_eq!(realm.tokens_issued(), 1);
 }
 
 #[tokio::test]
@@ -1110,7 +1153,15 @@ async fn token_realm_off_upstream_host_gets_no_credentials() {
     .await;
     let url_for = |a: &TestServer| format!("{}/v2/oci-proxy/{IMAGE}/manifests/1.0", a.base_url);
 
-    let a = spawn_fake_proxy(&fake.reg, basic("u", "p"), "10s").await;
+    let a = spawn_fake_proxy(
+        &fake.reg,
+        ProxyOpts {
+            dl_allow_private: true,
+            ..basic("u", "p")
+        },
+        "10s",
+    )
+    .await;
     assert_eq!(get(&url_for(&a)).await.status(), StatusCode::BAD_GATEWAY);
     let token_hits: Vec<_> = realm
         .hits()

@@ -9,7 +9,9 @@ use sqlx::SqlitePool;
 
 use super::*;
 use crate::db::Repository;
-use crate::proxy::strategy::{CacheKey, CachePolicy, Transfer, Ttl, DEFAULT_MAX_UPSTREAM_BYTES};
+use crate::proxy::strategy::{
+    CacheKey, CachePolicy, Transfer, Ttl, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
+};
 use crate::storage::FilesystemStorage;
 
 #[derive(Default)]
@@ -79,6 +81,7 @@ pub(super) struct Strat {
     pub pointer: bool,
     pub max: u64,
     pub via_get: bool,
+    pub source: UrlSource,
 }
 
 impl Default for Strat {
@@ -89,6 +92,7 @@ impl Default for Strat {
             pointer: false,
             max: DEFAULT_MAX_UPSTREAM_BYTES,
             via_get: true,
+            source: UrlSource::Admin,
         }
     }
 }
@@ -98,6 +102,10 @@ impl UpstreamStrategy for Strat {
 
     fn upstream_url(&self, up: &Upstream, a: &String) -> AppResult<reqwest::Url> {
         Ok(up.base.join(a).unwrap())
+    }
+
+    fn url_source(&self, _up: &Upstream, _a: &String) -> UrlSource {
+        self.source
     }
 
     fn cache_key(&self, a: &String) -> CacheKey {

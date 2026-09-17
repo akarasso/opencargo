@@ -198,8 +198,7 @@ pub(crate) async fn acquire_token(
     ch: &BearerChallenge,
     up: &Upstream,
 ) -> AppResult<String> {
-    super::validate_upstream_url(ch.realm.as_str())
-        .map_err(|e| AppError::BadGateway(format!("upstream token realm refused: {e}")))?;
+    check_realm(&ch.realm, up).await?;
     let mut req = http.get(ch.realm.clone());
     if let Some(service) = &ch.service {
         req = req.query(&[("service", service)]);
@@ -236,11 +235,24 @@ pub(crate) async fn acquire_token(
     Ok(token)
 }
 
+/// The realm is chosen by the upstream: only the admin's own endpoints (the
+/// upstream, `token_realms`, or any with `dl_allow_private`) may be private.
+async fn check_realm(realm: &Url, up: &Upstream) -> AppResult<()> {
+    let refused = |e: AppError| AppError::BadGateway(format!("upstream token realm refused: {e}"));
+    super::validate_upstream_url(realm.as_str()).map_err(refused)?;
+    if up.dl_allow_private || admin_endpoint(realm, up) {
+        return Ok(());
+    }
+    super::refuse_blocked_host(realm).await.map_err(refused)
+}
+
+fn admin_endpoint(realm: &Url, up: &Upstream) -> bool {
+    super::same_endpoint(realm, &up.base) || up.token_realms.iter().any(|r| r == realm)
+}
+
 // A hostile realm would otherwise collect the upstream credentials.
 fn realm_may_see_credentials(realm: &Url, up: &Upstream) -> bool {
-    let same_host = realm.host_str() == up.base.host_str()
-        && realm.port_or_known_default() == up.base.port_or_known_default();
-    if same_host || up.token_realms.iter().any(|r| r == realm) {
+    if admin_endpoint(realm, up) {
         return true;
     }
     warn!(realm = %realm, upstream = %up.base, "token realm is off the upstream host; querying it anonymously");

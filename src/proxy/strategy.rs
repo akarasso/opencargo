@@ -35,12 +35,26 @@ pub enum Classified {
     Fail,
 }
 
+/// Who chose the host of an upstream URL: the admin (the configured
+/// upstream, trusted as is) or upstream content (held to `is_blocked_ip`
+/// unless the member opted in).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum UrlSource {
+    Admin,
+    Content { allow_private: bool },
+}
+
 /// Per-format upstream behaviour; every hook is a pure function of the
 /// artifact, so the engine never names a format.
 pub trait UpstreamStrategy: Send + Sync {
     type Artifact: std::fmt::Debug + Send + Sync;
 
     fn upstream_url(&self, up: &Upstream, a: &Self::Artifact) -> AppResult<reqwest::Url>;
+
+    fn url_source(&self, _up: &Upstream, _a: &Self::Artifact) -> UrlSource {
+        UrlSource::Admin
+    }
+
     fn cache_key(&self, a: &Self::Artifact) -> CacheKey;
     fn cache_policy(&self, a: &Self::Artifact) -> CachePolicy;
 

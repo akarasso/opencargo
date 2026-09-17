@@ -1,5 +1,7 @@
 use crate::error::{AppError, AppResult};
-use crate::proxy::strategy::{CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy};
+use crate::proxy::strategy::{
+    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource,
+};
 use crate::registry::resolve::Upstream;
 
 use super::{compute_prefix, prefix_of};
@@ -47,6 +49,15 @@ impl UpstreamStrategy for CargoUpstream {
             } => return download_url(dl, name, version, cksum, up),
         };
         parse_url(&url)
+    }
+
+    fn url_source(&self, up: &Upstream, a: &CargoArtifact) -> UrlSource {
+        match a {
+            CargoArtifact::Crate { .. } => UrlSource::Content {
+                allow_private: up.dl_allow_private,
+            },
+            CargoArtifact::Config | CargoArtifact::Index { .. } => UrlSource::Admin,
+        }
     }
 
     fn cache_key(&self, a: &CargoArtifact) -> CacheKey {
@@ -102,7 +113,8 @@ pub fn expand_dl_template(dl: &str, name: &str, version: &str, cksum: &str) -> S
         .replace("{sha256-checksum}", cksum)
 }
 
-// The dl host is chosen by upstream content, not by the admin.
+// The dl host is chosen by upstream content, not by the admin; the engine
+// holds it to `is_blocked_ip` through `url_source`.
 fn download_url(
     dl: &str,
     name: &str,
@@ -114,14 +126,6 @@ fn download_url(
     crate::proxy::validate_upstream_url(&expanded)
         .map_err(|e| AppError::BadGateway(format!("upstream dl {expanded} refused: {e}")))?;
     let url = parse_url(&expanded)?;
-    let literal = url
-        .host_str()
-        .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok());
-    if !up.dl_allow_private && literal.is_some_and(|ip| crate::proxy::is_blocked_ip(&ip)) {
-        return Err(AppError::BadGateway(format!(
-            "upstream dl {expanded} points at a private address (set dl_allow_private to allow it)"
-        )));
-    }
     if up.auth.is_some() && !may_see_credentials(&url, up) {
         return Err(AppError::BadGateway(format!(
             "upstream dl {expanded} is off the index host {}; upstream_auth stays on that host (list the dl host in token_realms to allow it)",
@@ -199,24 +203,24 @@ mod tests {
     }
 
     #[test]
-    fn dl_private_literal_refused_unless_allowed() {
+    fn dl_is_upstream_content_held_to_the_private_optin() {
         let s = CargoUpstream;
         let private = crate_at("http://127.0.0.1:1/dl");
-        let err = s.upstream_url(&upstream(false), &private).unwrap_err();
-        assert!(
-            matches!(err, AppError::BadGateway(ref m) if m.contains("private")),
-            "{err}"
-        );
-        assert_eq!(
-            s.upstream_url(&upstream(true), &private).unwrap().as_str(),
-            "http://127.0.0.1:1/dl/Serde/1.0.0/download"
-        );
-        assert!(s
-            .upstream_url(
-                &upstream(false),
-                &crate_at("https://static.crates.io/crates")
-            )
-            .is_ok());
+        for allow in [false, true] {
+            assert_eq!(
+                s.url_source(&upstream(allow), &private),
+                UrlSource::Content {
+                    allow_private: allow
+                }
+            );
+            assert_eq!(
+                s.upstream_url(&upstream(allow), &private).unwrap().as_str(),
+                "http://127.0.0.1:1/dl/Serde/1.0.0/download"
+            );
+        }
+        for admin_chosen in [CargoArtifact::Config, CargoArtifact::Index { name: "a".into() }] {
+            assert_eq!(s.url_source(&upstream(false), &admin_chosen), UrlSource::Admin);
+        }
         let link_local = crate_at("http://169.254.169.254/latest");
         assert!(
             matches!(

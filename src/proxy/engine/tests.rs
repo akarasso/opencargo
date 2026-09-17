@@ -6,7 +6,7 @@ use tokio::io::AsyncReadExt;
 use super::fixture::*;
 use super::*;
 use crate::db::Repository;
-use crate::proxy::strategy::{CacheKey, Transfer};
+use crate::proxy::strategy::{CacheKey, Transfer, UrlSource};
 
 fn found(o: AppResult<Outcome<Cached>>) -> Cached {
     match o {
@@ -508,4 +508,39 @@ async fn head_on_negative_row_is_404() {
         1,
         "a fresh negative row answers HEAD without upstream"
     );
+}
+
+#[tokio::test]
+async fn content_chosen_url_on_private_host_is_refused_before_any_request() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/x".to_string();
+    for (source, via_get) in [
+        (UrlSource::Content { allow_private: false }, true),
+        (UrlSource::Content { allow_private: false }, false),
+    ] {
+        let strat = Strat {
+            source,
+            via_get,
+            ..Default::default()
+        };
+        let fetched = engine.fetch(&strat, &fx.up, fx.member(), &art).await;
+        assert!(
+            matches!(fetched, Err(AppError::BadGateway(ref m)) if m.contains("private address")),
+            "{fetched:?}"
+        );
+        let headed = engine.head(&strat, &fx.up, fx.member(), &art).await;
+        assert!(matches!(headed, Err(AppError::BadGateway(_))), "{headed:?}");
+    }
+    assert!(fx.hits().is_empty(), "the loopback fake was never contacted");
+    assert!(fx.row("t-item", "art/x").await.is_none());
+
+    let allowed = Strat {
+        source: UrlSource::Content {
+            allow_private: true,
+        },
+        ..Default::default()
+    };
+    found(engine.fetch(&allowed, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 1);
 }

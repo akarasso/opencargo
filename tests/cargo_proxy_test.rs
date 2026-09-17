@@ -839,6 +839,28 @@ async fn dl_host_on_private_literal_is_refused_without_optin() {
     );
 }
 
+/// The guard resolves names: `localhost` is as private as `127.0.0.1`.
+#[tokio::test]
+async fn dl_host_resolving_to_private_address_is_refused_without_optin() {
+    let fake = fake_index::start().await;
+    let bytes = crate_bytes("w");
+    fake.add_crate(CRATE, "1.0.0", &bytes);
+    let port = fake.base_url.rsplit(':').next().unwrap();
+    fake.set_dl_absolute(&format!("http://localhost:{port}/dl"));
+    let strict = spawn_proxy_over_fake(&fake, ProxyOpts::default()).await;
+
+    let resp = get(&download_url(&strict, "cargo-proxy", CRATE, "1.0.0")).await;
+    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    assert!(resp.text().await.unwrap().contains("private address"));
+    assert!(fake.downloads().is_empty(), "never contacted through its name");
+
+    let lenient = spawn_proxy_over_fake(&fake, allow_private()).await;
+    assert_eq!(
+        download(&download_url(&lenient, "cargo-proxy", CRATE, "1.0.0")).await,
+        bytes
+    );
+}
+
 #[tokio::test]
 async fn dl_off_host_never_sees_upstream_credentials() {
     let index = fake_index::start().await;

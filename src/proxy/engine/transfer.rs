@@ -54,7 +54,7 @@ impl ProxyEngine {
         a: &S::Artifact,
         stale: Option<&Stale>,
     ) -> AppResult<Reply> {
-        let url = s.upstream_url(up, a)?;
+        let url = self.guarded_url(s, up, a).await?;
         let mut req = self.http.get(url.clone());
         for (name, value) in s.request_headers(a) {
             req = req.header(name, value);
