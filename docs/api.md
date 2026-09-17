@@ -92,7 +92,7 @@ tags for `proxy.default_ttl` and tag lists for ten minutes; a group serves
 the first member that knows the image and merges `tags/list` (`n`, default
 100, and `last` apply to the merged list; a partial page carries
 `Link: <...>; rel="next"`).
-`Docker-Content-Digest` is always derived from the content. An unreachable
+`Docker-Content-Digest` is always derived from the content. Routes the registry does not implement (`referrers`, anything else under `/v2/`) answer `404` with a JSON error body, which clients such as Docker 29 treat as "no referrers". An unreachable
 upstream is `502`; an unknown image is `404`, also when the upstream answers
 `401`/`403` after issuing a token (a refusal is asked again on the next
 request, an upstream `404` is remembered for `proxy.negative_cache_ttl`).

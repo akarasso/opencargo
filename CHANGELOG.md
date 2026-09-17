@@ -109,6 +109,9 @@ All notable changes to this project will be documented in this file.
   Rust 1.93.0 and Trivy blocks the image push on fixable HIGH/CRITICAL findings.
 
 ### Fixed
+- Unknown routes under `/v2/` and `/api/` answer a JSON `404` instead of the
+  web UI's HTML; Docker 29's referrers probe made every pull through opencargo
+  fail with "failed to decode referrers index".
 - Unscoped npm packages (`lodash`) had no metadata route and fell through to
   the web UI, so installing a public package through a proxy never worked with
   a real client.

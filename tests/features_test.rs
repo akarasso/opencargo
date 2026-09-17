@@ -63,6 +63,26 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
 // ===========================================================================
 
 #[tokio::test]
+async fn test_unknown_v2_and_api_routes_are_json_404_not_spa() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    let digest = format!("sha256:{}", "0".repeat(64));
+    for path in [
+        format!("/v2/oci/team/app/referrers/{digest}"),
+        "/v2/nope/nothing".to_string(),
+        "/api/v1/nope".to_string(),
+    ] {
+        let resp = client.get(format!("{base_url}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        let ct = resp.headers()[reqwest::header::CONTENT_TYPE].to_str().unwrap().to_string();
+        assert!(ct.starts_with("application/json"), "{path}: {ct}");
+    }
+    let resp = client.get(format!("{base_url}/packages/anything")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()[reqwest::header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
+}
+
+#[tokio::test]
 async fn test_dashboard_page() {
     let (base_url, _handle, _tmp) = setup().await;
 
