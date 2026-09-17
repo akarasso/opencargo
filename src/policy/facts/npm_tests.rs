@@ -141,7 +141,7 @@ async fn package_facts_parses_once_per_row() {
 
     let calls = (0..64).map(|_| facts_for(&shared, &fx, "widget-1.0.0.tgz"));
     let results = futures_util::future::join_all(calls).await;
-    let first = results[0].0.clone().unwrap();
+    let first = results[0].0.clone().unwrap_or_else(|| panic!("no facts, source {:?}", results[0].1));
     assert!(results.iter().all(|(f, source)| {
         Arc::ptr_eq(f.as_ref().unwrap(), &first) && matches!(*source, "fetch" | "cache")
     }));
