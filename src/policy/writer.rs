@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use serde_json::json;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::error;
@@ -77,14 +77,19 @@ impl Notify {
     }
 }
 
-/// A `select!` over the channel, the gather tasks, a tick that runs only
-/// while there is timed work, and the spawned flushes: an idle writer holds
-/// no timer and is woken by the channel alone; waking restarts the tick so
-/// the first flush after idleness has a full period to fill.
+/// A `select!` over the channel, the gather tasks, the next permit for
+/// an event waiting on a full `inflight`, a tick that runs only while
+/// there is timed work, and the spawned flushes: an idle writer holds no
+/// timer and is woken by the channel alone; waking restarts the tick so
+/// the first flush after idleness has a full period to fill. While an
+/// event waits for a slot the channel buffers, but the tick, the joins
+/// and the flushes are still served: a slow upstream stalls one slot,
+/// never the loop.
 pub(crate) async fn run_writer(mut rx: mpsc::Receiver<Pending>, shared: Arc<Shared>) {
     let mut tasks: JoinSet<Done> = JoinSet::new();
     let mut flushes: JoinSet<()> = JoinSet::new();
     let mut ready: Vec<Done> = Vec::new();
+    let mut waiting: VecDeque<Pending> = VecDeque::new();
     let mut tick = tokio::time::interval(shared.tuning.flush_period);
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
     let mut was_awake = false;
@@ -97,10 +102,19 @@ pub(crate) async fn run_writer(mut rx: mpsc::Receiver<Pending>, shared: Arc<Shar
         }
         was_awake = awake;
         tokio::select! {
-            received = rx.recv() => match received {
-                Some(p) => next_event(&shared, p, &mut tasks).await,
+            received = rx.recv(), if waiting.is_empty() => match received {
+                Some(p) => {
+                    if let Some(p) = classify(&shared, p).await {
+                        admit(&shared, p, &mut tasks, &mut waiting);
+                    }
+                }
                 None => break,
             },
+            permit = shared.inflight.clone().acquire_owned(), if !waiting.is_empty() => {
+                if let (Ok(permit), Some(p)) = (permit, waiting.pop_front()) {
+                    spawn_work(&shared, p, permit, &mut tasks);
+                }
+            }
             Some(done) = tasks.join_next(), if !tasks.is_empty() => {
                 if let Ok(done) = done {
                     ready.push(done);
@@ -112,7 +126,7 @@ pub(crate) async fn run_writer(mut rx: mpsc::Receiver<Pending>, shared: Arc<Shar
             _ = tick.tick(), if awake => {
                 flush(&shared, &mut ready, &mut flushes);
                 for p in facts::release_parked(&shared) {
-                    spawn_work(&shared, p, &mut tasks).await;
+                    admit(&shared, p, &mut tasks, &mut waiting);
                 }
                 facts::sweep_children(&shared);
                 shared.notify.lock().unwrap().send_due(&shared.events, shared.tuning.notify_period);
@@ -124,22 +138,35 @@ pub(crate) async fn run_writer(mut rx: mpsc::Receiver<Pending>, shared: Arc<Shar
     while flushes.join_next().await.is_some() {}
 }
 
-async fn next_event(shared: &Arc<Shared>, p: Pending, tasks: &mut JoinSet<Done>) {
-    let p = if p.format == Format::Oci {
-        match facts::oci_classify(shared, p).await {
-            Some(p) => p,
-            None => return,
-        }
+/// An OCI event is classified inline, in arrival order; `None` is parked
+/// or suppressed.
+async fn classify(shared: &Arc<Shared>, p: Pending) -> Option<Pending> {
+    if p.format == Format::Oci {
+        facts::oci_classify(shared, p).await
     } else {
-        p
-    };
-    spawn_work(shared, p, tasks).await;
+        Some(p)
+    }
 }
 
-async fn spawn_work(shared: &Arc<Shared>, p: Pending, tasks: &mut JoinSet<Done>) {
-    let Ok(permit) = shared.inflight.clone().acquire_owned().await else {
-        return;
-    };
+/// Spawns at once when a slot is free, else queues for the next permit.
+fn admit(
+    shared: &Arc<Shared>,
+    p: Pending,
+    tasks: &mut JoinSet<Done>,
+    waiting: &mut VecDeque<Pending>,
+) {
+    match shared.inflight.clone().try_acquire_owned() {
+        Ok(permit) => spawn_work(shared, p, permit, tasks),
+        Err(_) => waiting.push_back(p),
+    }
+}
+
+fn spawn_work(
+    shared: &Arc<Shared>,
+    p: Pending,
+    permit: OwnedSemaphorePermit,
+    tasks: &mut JoinSet<Done>,
+) {
     let shared = shared.clone();
     tasks.spawn(async move {
         let _permit = permit;

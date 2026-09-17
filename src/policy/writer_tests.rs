@@ -443,6 +443,54 @@ async fn gather_timeout_writes_unknown_row() {
 }
 
 #[tokio::test]
+async fn full_slots_never_stall_the_tick() {
+    let fx = Fx::new().await;
+    let tuning = Tuning {
+        notify_period: Duration::from_millis(600),
+        gather_timeout: Duration::from_secs(5),
+        ..fast()
+    };
+    let (engine, writer) = engine_over(&fx, aged(), tuning);
+    let mut bus = engine.shared().events.subscribe();
+    tokio::spawn(writer);
+    engine.record(cargo(&fx, "first"));
+    wait_rows(&fx, 1).await;
+    let first = tokio::time::timeout(Duration::from_secs(1), bus.recv())
+        .await
+        .expect("the first flush emits at once")
+        .unwrap();
+    assert_eq!(first.data["count"], 1);
+    engine.record(cargo(&fx, "second"));
+    wait_rows(&fx, 2).await;
+
+    fx.set(|s| s.delay = Duration::from_secs(2));
+    let member = repo(fx.repo.id, &fx.repo.name, Format::Npm);
+    for i in 0..=crate::policy::INFLIGHT {
+        engine.record(pending(
+            &member,
+            &fx.up,
+            Format::Npm,
+            &format!("slow-{i}"),
+            Source::Npm {
+                filename: format!("slow-{i}-1.0.0.tgz"),
+                digest: None,
+            },
+        ));
+    }
+    let started = Instant::now();
+    let trailing = tokio::time::timeout(Duration::from_millis(1500), bus.recv())
+        .await
+        .expect("the pending frame goes out on the tick while every slot is held")
+        .unwrap();
+    assert_eq!(trailing.data["count"], 1);
+    assert!(started.elapsed() < Duration::from_millis(1500));
+    assert_eq!(engine.shared().inflight.available_permits(), 0);
+    let rows = wait_rows(&fx, 2 + crate::policy::INFLIGHT + 1).await;
+    assert!(rows[2..].iter().all(|(_, _, source)| source == "failed"));
+    assert_eq!(engine.dropped(), 0);
+}
+
+#[tokio::test]
 async fn flush_never_blocks_receive() {
     let fx = Fx::new().await;
     let osv = FakeOsv::start().await;
