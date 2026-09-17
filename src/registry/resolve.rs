@@ -22,18 +22,10 @@ pub struct UrlRepo<'a>(pub &'a str);
 #[derive(Clone, Copy, Debug)]
 pub struct CacheRepo<'a>(pub &'a Repository);
 
-/// How a walk with no hit but a failed member answers; commit 4b deletes it.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum FailurePolicy {
-    NotFound,
-    BadGateway,
-}
-
 pub struct Cx<'a> {
     pub state: &'a AppState,
     pub auth: Option<&'a AuthUser>,
     pub url: UrlRepo<'a>,
-    pub failure: FailurePolicy,
 }
 
 #[derive(Debug)]
@@ -100,8 +92,8 @@ pub struct Collected<T> {
     pub degraded: Option<String>,
 }
 
-/// First `Found` in member order; none is `NotFound`, or the failure policy's
-/// answer when a member failed on the way.
+/// First `Found` in member order; none is `NotFound`, or `BadGateway` when a
+/// member failed on the way.
 pub async fn first_hit<L: Leaf>(cx: &Cx<'_>, repo: &Repository, leaf: &L) -> AppResult<L::Out> {
     let mut w = Walk::new(repo, true);
     walk(cx, repo, leaf, 0, &mut w).await?;
@@ -109,8 +101,8 @@ pub async fn first_hit<L: Leaf>(cx: &Cx<'_>, repo: &Repository, leaf: &L) -> App
     hits.into_iter().next().ok_or_else(|| w.miss(cx))
 }
 
-/// Every `Found` in member order; zero hits after a failure follows the
-/// failure policy, hits after a failure are `degraded`.
+/// Every `Found` in member order; zero hits after a failure is `BadGateway`,
+/// hits after a failure are `degraded`.
 pub async fn collect<L: Leaf>(
     cx: &Cx<'_>,
     repo: &Repository,
@@ -161,11 +153,9 @@ impl<T> Walk<T> {
     }
 
     fn miss(&self, cx: &Cx<'_>) -> AppError {
-        match (&self.failure, cx.failure) {
-            (Some(why), FailurePolicy::BadGateway) => {
-                AppError::BadGateway(format!("group {}: {why}", cx.url.0))
-            }
-            _ => AppError::NotFound(format!("not found in repository '{}'", cx.url.0)),
+        match &self.failure {
+            Some(why) => AppError::BadGateway(format!("group {}: {why}", cx.url.0)),
+            None => AppError::NotFound(format!("not found in repository '{}'", cx.url.0)),
         }
     }
 }
@@ -344,65 +334,61 @@ mod tests {
             .unwrap()
     }
 
-    fn cx(state: &AppState, failure: FailurePolicy) -> Cx<'_> {
+    fn cx(state: &AppState) -> Cx<'_> {
         Cx {
             state,
             auth: None,
             url: UrlRepo("requested"),
-            failure,
         }
     }
 
-    async fn first(state: &AppState, name: &str, failure: FailurePolicy) -> AppResult<String> {
-        first_hit(&cx(state, failure), &repo(state, name).await, &Script).await
+    async fn first(state: &AppState, name: &str) -> AppResult<String> {
+        first_hit(&cx(state), &repo(state, name).await, &Script).await
     }
 
-    async fn all(state: &AppState, name: &str, failure: FailurePolicy) -> AppResult<Collected<String>> {
-        collect(&cx(state, failure), &repo(state, name).await, &Script).await
+    async fn all(state: &AppState, name: &str) -> AppResult<Collected<String>> {
+        collect(&cx(state), &repo(state, name).await, &Script).await
     }
 
     #[tokio::test]
     async fn error_policy_table() {
         let tmp = tempfile::TempDir::new().unwrap();
         let st = state(&tmp).await;
-        let (nf, bg) = (FailurePolicy::NotFound, FailurePolicy::BadGateway);
 
-        assert_eq!(first(&st, "h-found", nf).await.unwrap(), "h-found");
-        assert_eq!(first(&st, "p-found", nf).await.unwrap(), "p-found");
-        assert!(matches!(first(&st, "h-miss", nf).await, Err(AppError::NotFound(_))));
-        assert!(matches!(first(&st, "h-fail", nf).await, Err(AppError::NotFound(_))));
-        assert!(matches!(first(&st, "h-fail", bg).await, Err(AppError::BadGateway(_))));
+        assert_eq!(first(&st, "h-found").await.unwrap(), "h-found");
+        assert_eq!(first(&st, "p-found").await.unwrap(), "p-found");
+        assert!(matches!(first(&st, "h-miss").await, Err(AppError::NotFound(_))));
+        assert!(matches!(first(&st, "h-fail").await, Err(AppError::BadGateway(_))));
+        assert!(matches!(all(&st, "h-fail").await, Err(AppError::BadGateway(_))));
 
-        assert_eq!(first(&st, "g-order", nf).await.unwrap(), "h-found");
-        let ordered = all(&st, "g-order", nf).await.unwrap();
+        assert_eq!(first(&st, "g-order").await.unwrap(), "h-found");
+        let ordered = all(&st, "g-order").await.unwrap();
         assert_eq!(ordered.hits, vec!["h-found", "p-found"]);
         assert_eq!(ordered.degraded, None);
 
-        assert_eq!(first(&st, "g-fail-then-found", bg).await.unwrap(), "h-found");
-        let degraded = all(&st, "g-fail-then-found", bg).await.unwrap();
+        assert_eq!(first(&st, "g-fail-then-found").await.unwrap(), "h-found");
+        let degraded = all(&st, "g-fail-then-found").await.unwrap();
         assert_eq!(degraded.hits, vec!["h-found"]);
         assert!(degraded.degraded.unwrap().contains("h-fail is down"));
 
-        assert!(matches!(first(&st, "g-fail-only", nf).await, Err(AppError::NotFound(_))));
-        assert!(matches!(all(&st, "g-fail-only", nf).await, Err(AppError::NotFound(_))));
-        let Err(AppError::BadGateway(msg)) = first(&st, "g-fail-only", bg).await else {
-            panic!("no hit after a failure is 502 under BadGateway");
+        let Err(AppError::BadGateway(msg)) = first(&st, "g-fail-only").await else {
+            panic!("no hit after a failure is 502");
         };
         assert!(msg.contains("group requested") && msg.contains("h-fail"), "{msg}");
-        assert!(matches!(all(&st, "g-fail-only", bg).await, Err(AppError::BadGateway(_))));
+        assert!(matches!(all(&st, "g-fail-only").await, Err(AppError::BadGateway(_))));
 
-        assert!(matches!(first(&st, "g-skips", bg).await, Err(AppError::NotFound(_))));
-        let skipped = all(&st, "g-skips", bg).await.unwrap();
+        assert!(matches!(first(&st, "g-skips").await, Err(AppError::NotFound(_))));
+        let skipped = all(&st, "g-skips").await.unwrap();
         assert!(skipped.hits.is_empty() && skipped.degraded.is_none());
-        assert!(matches!(first(&st, "g-empty", bg).await, Err(AppError::NotFound(_))));
-        assert!(all(&st, "g-empty", bg).await.unwrap().hits.is_empty());
+        assert!(matches!(first(&st, "g-empty").await, Err(AppError::NotFound(_))));
+        assert!(all(&st, "g-empty").await.unwrap().hits.is_empty());
 
-        assert_eq!(first(&st, "g-cycle-a", nf).await.unwrap(), "p-found");
-        assert_eq!(all(&st, "g-cycle-b", nf).await.unwrap().hits, vec!["p-found"]);
-        assert_eq!(first(&st, "g-nested", nf).await.unwrap(), "h-found");
+        assert_eq!(first(&st, "g-cycle-a").await.unwrap(), "p-found");
+        assert_eq!(all(&st, "g-cycle-b").await.unwrap().hits, vec!["p-found"]);
+        assert_eq!(first(&st, "g-nested").await.unwrap(), "h-found");
 
-        assert_eq!(first(&st, "d1", nf).await.unwrap(), "h-found");
-        let Err(AppError::Internal(msg)) = first(&st, "d0", nf).await else {
+        assert_eq!(first(&st, "d1").await.unwrap(), "h-found");
+        let Err(AppError::Internal(msg)) = first(&st, "d0").await else {
             panic!("seven nested groups exceed the depth cap");
         };
         assert!(msg.contains("depth"), "{msg}");

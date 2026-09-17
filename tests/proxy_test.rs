@@ -434,6 +434,9 @@ async fn test_group_repo_serves_hosted_first() {
 /// - GET a real public scoped package from npm-group
 /// - The package is NOT in npm-private, so the group should fall through
 ///   to npm-proxy and return metadata from the upstream registry.
+/// - A 200 here proves the hosted miss is silent; a proxy member that
+///   cannot reach npmjs.org is a 502, not a 404
+///   (`npm_proxy_test::group_upstream_failure_is_502_not_404`).
 #[tokio::test]
 async fn test_group_repo_falls_through_to_proxy() {
     if !network_tests_enabled() {
@@ -472,8 +475,9 @@ async fn test_group_repo_falls_through_to_proxy() {
 }
 
 /// Request a non-existent scoped package through the proxy.
-/// The upstream registry should return a 404-level error, and our proxy
-/// should propagate that as a 404.
+/// npmjs.org answers 404, an authoritative miss: the proxy answers 404 and
+/// negative-caches it. Only a 404/410 maps to 404; any other upstream
+/// failure is a 502.
 #[tokio::test]
 async fn test_proxy_handles_nonexistent_package() {
     if !network_tests_enabled() {

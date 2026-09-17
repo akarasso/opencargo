@@ -247,3 +247,39 @@ async fn upstream_503_serves_stale_metadata() {
     assert_eq!(stale, fresh);
     assert_eq!(up.tap.count(&up.packument_path()), 2, "the refresh was attempted once");
 }
+
+#[tokio::test]
+async fn group_upstream_failure_is_502_not_404() {
+    let up = seed_upstream().await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            hosted("npm-local", RepositoryFormat::Npm, Visibility::Public),
+            proxy("npm-proxy", RepositoryFormat::Npm, &up.url()),
+            group("npm-group", RepositoryFormat::Npm, &["npm-local", "npm-proxy"]),
+        ],
+        ..Default::default()
+    })
+    .await;
+    up.tap.fail.store(true, std::sync::atomic::Ordering::SeqCst);
+
+    for url in [
+        format!("{}/npm-group/{PKG}", a.base_url),
+        format!("{}/npm-group/{PKG}/-/{TARBALL}", a.base_url),
+        format!("{}/npm-proxy/{PKG}", a.base_url),
+    ] {
+        let resp = reqwest::get(&url).await.expect("request failed");
+        assert_eq!(
+            resp.status(),
+            StatusCode::BAD_GATEWAY,
+            "GET {url}: an upstream 503 with no cached copy is a 502"
+        );
+    }
+
+    assert_eq!(
+        up.tap.count(&up.packument_path()),
+        2,
+        "every miss reached the upstream"
+    );
+    assert_eq!(up.tap.count(&up.tarball_path()), 1);
+    assert!(cache_rows(&a).await.is_empty(), "failures are never cached");
+}

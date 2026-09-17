@@ -24,6 +24,11 @@ All notable changes to this project will be documented in this file.
   command palette (Cmd+K), live dashboard manifest fed by the WebSocket
 
 ### Changed
+- A `proxy` or `group` repository whose upstream is unreachable or answers
+  anything other than 404/410 now returns 502 Bad Gateway instead of 404, so
+  npm/pnpm report a fetch error rather than E404. An upstream 404/410 is
+  still a 404 (negative-cached), and a stale cached copy is served with
+  `Warning: 110` before failing.
 - Web UI redesigned end to end (new design system, self-hosted IBM Plex /
   Space Grotesk, inline SVG icons, skeleton loaders, mobile drawer); frontend
   split into a framework-agnostic `core/` layer (typed API client, WebSocket

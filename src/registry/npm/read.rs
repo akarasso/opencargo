@@ -14,7 +14,7 @@ use crate::db::Repository;
 use crate::error::{AppError, AppResult};
 use crate::proxy;
 use crate::registry::extract_package_name;
-use crate::registry::resolve::{first_hit, Cx, FailurePolicy, UrlRepo};
+use crate::registry::resolve::{first_hit, Cx, UrlRepo};
 use crate::server::AppState;
 
 use super::leaves::{PackumentLeaf, TarballLeaf};
@@ -44,7 +44,6 @@ fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Repository)
         state,
         auth,
         url: UrlRepo(&repo.name),
-        failure: FailurePolicy::NotFound,
     }
 }
 
