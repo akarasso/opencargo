@@ -108,15 +108,18 @@ impl ProxyEngine {
         {
             if row.status != 200 {
                 if fresh {
+                    crate::telemetry::record_cache_hit(&member.0.name);
                     return Ok(Outcome::NotFound);
                 }
             } else if let Some(target) = self.resolve_row(s, a, row.clone()).await {
                 if fresh {
+                    crate::telemetry::record_cache_hit(&member.0.name);
                     return Ok(Outcome::Found(self.hit(&row, target).await?));
                 }
                 stale = Some(Stale { row, target });
             }
         }
+        crate::telemetry::record_cache_miss(&member.0.name);
         let reply = self.exchange(s, up, member, a, stale.as_ref()).await;
         match reply {
             Ok(Reply::NotModified) => match stale {

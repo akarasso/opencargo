@@ -146,6 +146,7 @@ impl Leaf for FileLeaf {
             FileKind::Mod => Payload::bytes(Bytes::from(version.metadata_json)),
             FileKind::Zip => {
                 let _ = crate::db::record_download(db, version.id).await;
+                crate::telemetry::record_download(&member.0.name, &package.name);
                 Payload::file(version.tarball_path, version.size.max(0) as u64)
             }
         };

@@ -53,6 +53,7 @@ impl Leaf for BlobLeaf {
         let payload = if self.head {
             Payload::head_only(size, content_type, Some(self.digest.clone()))
         } else {
+            crate::telemetry::record_download(&member.0.name, &self.name);
             let mut p = Payload::file(paths::blob_path(&member.0.name, &self.digest), size);
             p.content_type = content_type;
             with_digest(p, self.digest.clone())

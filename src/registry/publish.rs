@@ -55,6 +55,7 @@ pub async fn finalize_publish(
     published_by: &str,
     pre: PreScan,
 ) -> AppResult<()> {
+    crate::telemetry::record_publish(repo_name, package_name);
     state
         .webhook_dispatcher
         .dispatch(

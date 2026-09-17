@@ -258,6 +258,7 @@ GET    /metrics
 
 Prometheus metrics: `opencargo_http_requests_total{method,path,status}`,
 `opencargo_http_request_duration_seconds{method,path}`,
-`opencargo_downloads_total{repo,package}`, `opencargo_publishes_total{repo,package}`,
-`opencargo_cache_hits_total{repo}`, `opencargo_cache_misses_total{repo}`,
-`opencargo_storage_bytes{repo}`.
+`opencargo_downloads_total{repo,package}` (hosted artifacts served: npm
+tarballs, crates, module zips, OCI blobs), `opencargo_publishes_total{repo,package}`,
+`opencargo_cache_hits_total{repo}` and `opencargo_cache_misses_total{repo}`
+(proxy cache lookups, per member repository; a stale row counts as a miss).

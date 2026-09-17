@@ -443,6 +443,69 @@ async fn legacy_uppercase_name_proxies_and_stays_unpublishable() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "publish stays strict");
 }
 
+/// The recorder is process-wide, so the repositories are named for this test only.
+#[tokio::test]
+async fn metrics_count_publishes_downloads_and_cache_lookups() {
+    let up = spawn_server(SpawnOpts {
+        repositories: vec![hosted("npm-metrics-up", RepositoryFormat::Npm, Visibility::Public)],
+        ..Default::default()
+    })
+    .await;
+    let tarball = publish(&up, "npm-metrics-up", PKG, "metered").await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy(
+            "npm-metrics-proxy",
+            RepositoryFormat::Npm,
+            &format!("{}/npm-metrics-up", up.base_url),
+        )],
+        ..Default::default()
+    })
+    .await;
+    let url = format!("{}/npm-metrics-proxy/{PKG}/-/{TARBALL}", a.base_url);
+    assert_eq!(get_bytes(&url).await, tarball);
+    assert_eq!(get_bytes(&url).await, tarball);
+
+    let metric = |body: &str, name: &str, labels: &[&str]| -> Option<f64> {
+        body.lines()
+            .find(|l| l.starts_with(name) && labels.iter().all(|label| l.contains(label)))
+            .and_then(|l| l.rsplit(' ').next()?.parse().ok())
+    };
+    let upstream = reqwest::get(format!("{}/metrics", up.base_url))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric(&upstream, "opencargo_publishes_total", &["repo=\"npm-metrics-up\""]),
+        Some(1.0),
+        "{upstream}"
+    );
+    assert_eq!(
+        metric(
+            &upstream,
+            "opencargo_downloads_total",
+            &["package=\"@acme/widget\"", "repo=\"npm-metrics-up\""]
+        ),
+        Some(1.0)
+    );
+    let proxied = reqwest::get(format!("{}/metrics", a.base_url))
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert_eq!(
+        metric(&proxied, "opencargo_cache_misses_total", &["repo=\"npm-metrics-proxy\""]),
+        Some(1.0),
+        "{proxied}"
+    );
+    assert_eq!(
+        metric(&proxied, "opencargo_cache_hits_total", &["repo=\"npm-metrics-proxy\""]),
+        Some(1.0)
+    );
+}
+
 #[tokio::test]
 async fn packument_etag_304_touches_row() {
     let fake = fake_npm::start(

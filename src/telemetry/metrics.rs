@@ -1,6 +1,6 @@
 use std::time::Duration;
 
-use metrics::{counter, gauge, histogram};
+use metrics::{counter, histogram};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
 
 /// Install the Prometheus metrics recorder and return a handle that can be
@@ -67,10 +67,4 @@ pub fn record_cache_hit(repo: &str) {
 pub fn record_cache_miss(repo: &str) {
     let labels = [("repo", repo.to_string())];
     counter!("opencargo_cache_misses_total", &labels).increment(1);
-}
-
-/// Set the current storage usage in bytes for a repository.
-pub fn set_storage_bytes(repo: &str, bytes: u64) {
-    let labels = [("repo", repo.to_string())];
-    gauge!("opencargo_storage_bytes", &labels).set(bytes as f64);
 }

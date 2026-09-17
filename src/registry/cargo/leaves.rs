@@ -71,6 +71,7 @@ impl Leaf for CrateLeaf {
             return Ok(Outcome::NotFound);
         };
         let _ = crate::db::record_download(db, version.id).await;
+        crate::telemetry::record_download(&member.0.name, &package.name);
         Ok(Outcome::Found(Payload::file(
             version.tarball_path.clone(),
             version.size.max(0) as u64,

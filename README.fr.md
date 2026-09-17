@@ -778,7 +778,6 @@ opencargo_downloads_total{repo, package}
 opencargo_publishes_total{repo, package}
 opencargo_cache_hits_total{repo}
 opencargo_cache_misses_total{repo}
-opencargo_storage_bytes{repo}
 ```
 
 ---
