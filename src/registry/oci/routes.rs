@@ -3,10 +3,11 @@ use axum::{
     Router,
 };
 
-use super::{
-    api_version_check, complete_upload, delete_blob, delete_manifest, get_blob, get_manifest,
-    head_blob, head_manifest, list_tags, put_manifest, start_upload, upload_chunk,
-};
+use super::api_version_check;
+use super::blobs::{delete_blob, get_blob, head_blob};
+use super::manifests::{delete_manifest, get_manifest, head_manifest, put_manifest};
+use super::tags::list_tags;
+use super::uploads::{complete_upload, start_upload, upload_chunk};
 use crate::server::AppState;
 
 pub fn routes() -> Router<AppState> {
