@@ -440,7 +440,7 @@ async fn recorder_miss_never_404s_the_client() {
 #[tokio::test]
 async fn npm_version_newer_than_cached_packument_refreshes() {
     let fake = fake_widget(&[("1.0.0", "widget-1.0.0.tgz", "2026-01-01T00:00:00Z")]).await;
-    let floor = Duration::from_millis(300);
+    let floor = Duration::from_secs(5);
     let a = spawn_server(SpawnOpts {
         policy_tuning: Some(Tuning {
             refresh_floor: floor,
@@ -457,6 +457,8 @@ async fn npm_version_newer_than_cached_packument_refreshes() {
     wait_for_policy_rows(&a, 1).await;
     let first_etag = fake.etag();
 
+    // Each phase is unambiguously inside or past the floor, whatever the runner.
+    tokio::time::sleep(floor + Duration::from_millis(100)).await;
     fake.add_version("1.1.0", "2026-02-01T00:00:00Z");
     fake.add_tarball("widget-1.1.0.tgz", b"1.1.0");
     assert_ne!(fake.etag(), first_etag);
