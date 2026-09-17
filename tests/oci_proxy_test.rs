@@ -9,8 +9,8 @@ use sha2::Digest;
 use common::fake_upstream::oci::{self as fake_oci, Blob, FakeRegistry, Options};
 use common::upstream_tap::{self, Tap};
 use common::{
-    expire_entries, group, hosted, proxy, proxy_with, push_blob, sha256_digest, spawn_server,
-    ProxyOpts, SpawnOpts, TestServer, STATIC_TOKEN,
+    expire_entries, group, hosted, proxy, proxy_with, push_blob, respawn, sha256_digest,
+    spawn_server, ProxyOpts, SpawnOpts, TestServer, STATIC_TOKEN,
 };
 use opencargo::config::{ProxyConfig, RepositoryFormat, Visibility};
 use opencargo::proxy::{UpstreamAuth, UpstreamStrategy};
@@ -852,6 +852,38 @@ async fn token_cache_never_crosses_repositories() {
         })
         .count();
     assert_eq!(bearer_pulls, 1, "one token-bearing pull, by oci-proxy");
+}
+
+/// Credentials never travel through the API: a proxy created there takes
+/// `OPENCARGO_UPSTREAM_AUTH_<REPO>` from the environment at the next start.
+#[tokio::test]
+async fn api_created_proxy_takes_env_credentials_on_restart() {
+    let fake = fake_with_image(Options {
+        challenge: true,
+        realm_basic: Some(("hub".into(), "secret".into())),
+        ..Default::default()
+    })
+    .await;
+    let a = spawn_server(SpawnOpts::default()).await;
+    let resp = reqwest::Client::new()
+        .post(format!("{}/api/v1/repositories", a.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&json!({
+            "name": "oci-api-made", "type": "proxy", "format": "oci",
+            "visibility": "public", "upstream": fake.reg.base_url,
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let url_for = |a: &TestServer| format!("{}/v2/oci-api-made/{IMAGE}/manifests/1.0", a.base_url);
+    assert_eq!(get(&url_for(&a)).await.status(), StatusCode::BAD_GATEWAY);
+    assert_eq!(fake.reg.tokens_issued(), 0);
+
+    std::env::set_var("OPENCARGO_UPSTREAM_AUTH_OCI_API_MADE", "basic:hub:secret");
+    let a = respawn(a, SpawnOpts::default()).await;
+    assert_eq!(get(&url_for(&a)).await.status(), StatusCode::OK);
+    assert_eq!(fake.reg.tokens_issued(), 1);
 }
 
 #[tokio::test]

@@ -162,7 +162,16 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         Timeouts::from_connect_secs(connect_timeout_secs),
         ttl,
     );
-    let upstream_auth = Arc::new(load_upstream_creds(&config.repositories, std::env::vars())?);
+    let known: Vec<String> = crate::db::get_all_repositories(&db)
+        .await?
+        .into_iter()
+        .map(|r| r.name)
+        .collect();
+    let upstream_auth = Arc::new(load_upstream_creds(
+        &config.repositories,
+        &known,
+        std::env::vars(),
+    )?);
 
     // Initialize Prometheus metrics
     let metrics_handle = telemetry::init_metrics();
@@ -587,21 +596,26 @@ pub(crate) fn env_repo_key(name: &str) -> String {
         .collect()
 }
 
-/// Config credentials per repository, then the environment on top (env wins).
+/// Config credentials per repository, then the environment on top (env
+/// wins). `known` lists every repository row, so a proxy created through
+/// the API takes its `OPENCARGO_UPSTREAM_AUTH_<REPO>` at the next start.
 fn load_upstream_creds(
     repos: &[RepositoryConfig],
+    known: &[String],
     env: impl IntoIterator<Item = (String, String)>,
 ) -> anyhow::Result<HashMap<String, UpstreamCreds>> {
     let mut by_key: HashMap<String, &str> = HashMap::new();
+    for name in repos.iter().map(|r| r.name.as_str()).chain(known.iter().map(String::as_str)) {
+        let key = env_repo_key(name);
+        match by_key.insert(key.clone(), name) {
+            Some(other) if other != name => anyhow::bail!(
+                "repositories '{other}' and '{name}' both map to the environment key '{key}'"
+            ),
+            _ => {}
+        }
+    }
     let mut creds = HashMap::new();
     for repo in repos {
-        let key = env_repo_key(&repo.name);
-        if let Some(other) = by_key.insert(key.clone(), &repo.name) {
-            anyhow::bail!(
-                "repositories '{other}' and '{}' both map to the environment key '{key}'",
-                repo.name
-            );
-        }
         let token_realms = repo
             .token_realms
             .iter()
@@ -629,10 +643,11 @@ fn load_upstream_creds(
             (None, Some(key)) => (ENV_DL_ALLOW_PRIVATE, key),
             (None, None) => continue,
         };
-        let Some(entry) = by_key.get(key).and_then(|name| creds.get_mut(*name)) else {
-            warn!(var = %var, "environment override names no configured repository");
+        let Some(name) = by_key.get(key) else {
+            warn!(var = %var, "environment override names no known repository");
             continue;
         };
+        let entry = creds.entry(name.to_string()).or_default();
         if prefix == ENV_UPSTREAM_AUTH {
             entry.auth =
                 Some(UpstreamAuth::parse_env(&value).map_err(|e| anyhow::anyhow!("{var}: {e}"))?);
@@ -712,9 +727,14 @@ mod tests {
         assert_eq!(env_repo_key("npm.proxy"), "NPM_PROXY");
         assert_eq!(env_repo_key("Oci_Hub2"), "OCI_HUB2");
 
-        let err = load_upstream_creds(&[proxy("npm-proxy"), proxy("npm.proxy")], Vec::new())
+        let err = load_upstream_creds(&[proxy("npm-proxy"), proxy("npm.proxy")], &[], Vec::new())
             .expect_err("two names mangling alike must refuse startup");
         assert!(err.to_string().contains("npm-proxy") && err.to_string().contains("npm.proxy"));
+        let known = ["npm-proxy".to_string(), "npm.proxy".to_string()];
+        assert!(
+            load_upstream_creds(&[proxy("npm-proxy")], &known, Vec::new()).is_err(),
+            "a row created through the API collides the same way"
+        );
 
         let mut configured = proxy("npm-proxy");
         configured.upstream_auth = Some(UpstreamAuth::Bearer {
@@ -736,7 +756,20 @@ mod tests {
             ),
             ("OPENCARGO_BASE_URL".to_string(), "http://x".to_string()),
         ];
-        let creds = load_upstream_creds(&[configured, proxy("other")], env).unwrap();
+        let known = ["npm-proxy".to_string(), "other".to_string(), "api-made".to_string()];
+        let env = env
+            .into_iter()
+            .chain([(
+                "OPENCARGO_UPSTREAM_AUTH_API_MADE".to_string(),
+                "bearer:api-token".to_string(),
+            )])
+            .collect::<Vec<_>>();
+        let creds = load_upstream_creds(&[configured, proxy("other")], &known, env).unwrap();
+        assert!(
+            matches!(&creds["api-made"].auth, Some(UpstreamAuth::Bearer { token }) if token == "api-token"),
+            "a repository that exists only in the database takes its env credentials"
+        );
+        assert!(!creds.contains_key("unknown"));
         let npm = &creds["npm-proxy"];
         assert!(
             matches!(&npm.auth, Some(UpstreamAuth::Basic { username, .. }) if username == "u"),
@@ -749,6 +782,7 @@ mod tests {
 
         assert!(load_upstream_creds(
             &[proxy("npm-proxy")],
+            &[],
             vec![(
                 "OPENCARGO_UPSTREAM_AUTH_NPM_PROXY".to_string(),
                 "digest:x".to_string()

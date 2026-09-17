@@ -86,7 +86,16 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
 /// Start an opencargo on a random loopback port, ready to serve.
 pub async fn spawn_server(opts: SpawnOpts) -> TestServer {
     let tmp = TempDir::new().expect("failed to create temp dir");
+    spawn_in(tmp, opts).await
+}
 
+/// Stop `server` and start another on its database and storage: a restart.
+pub async fn respawn(server: TestServer, opts: SpawnOpts) -> TestServer {
+    server.handle.abort();
+    spawn_in(server.tmp, opts).await
+}
+
+async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind to random port");

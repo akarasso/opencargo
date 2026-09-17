@@ -155,7 +155,9 @@ the config seed. `DELETE` on a member of a group is `409`; deleting a proxy
 or a group also drops its cache. `purge-cache` removes the cached rows and
 files of a proxy (a group purges its proxy members) and never touches
 hosted data. Upstream credentials are set in the config file or the
-environment, never through this API (see the README).
+environment, never through this API: `OPENCARGO_UPSTREAM_AUTH_<REPO>` is
+read at startup for every repository, so a proxy created here takes its
+credentials at the next restart (see the README).
 
 Roles: `admin` (everything), `publisher` (read + write), `reader` (read).
 A per-user, per-repository grant overrides the role. Resolution order:

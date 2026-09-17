@@ -369,7 +369,7 @@ without a flag: `./config.toml`, `~/.opencargo/config.toml`, built-in defaults.
 | `OPENCARGO_CONFIG` | Path to the config file |
 | `OPENCARGO_ADMIN_PASSWORD` | Initial admin password (no generated file, no forced change) |
 | `OPENCARGO_BASE_URL` | Public URL of the server, used in tarball and download URLs (also `--base-url`) |
-| `OPENCARGO_UPSTREAM_AUTH_<REPO>` | Upstream credentials for a proxy, `basic:user:pass` or `bearer:token`; overrides `upstream_auth`. `<REPO>` is the name uppercased, non-alphanumerics as `_` |
+| `OPENCARGO_UPSTREAM_AUTH_<REPO>` | Upstream credentials for a proxy, `basic:user:pass` or `bearer:token`; overrides `upstream_auth`. `<REPO>` is the name uppercased, non-alphanumerics as `_`. Read at startup for every repository, declared in the file or created through the API (restart after creating one) |
 | `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>` | `1` to allow that proxy's `dl`/token realm on a private IP (same as `dl_allow_private = true`) |
 | `OPENCARGO_OSV_BASE_URL` | OSV API base URL (also `--osv-base-url`) |
 | `RUST_LOG` | Log filter, default `opencargo=info,tower_http=info` |
