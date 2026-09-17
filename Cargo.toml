@@ -46,6 +46,10 @@ tar = "0.4"
 # Async utilities
 async-trait = "0.1"
 bytes = "1"
+tokio-util = { version = "0.7", features = ["io"] }
+
+# Version ordering (go @latest)
+semver = "1"
 
 # Error handling
 thiserror = "2"

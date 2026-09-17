@@ -6,6 +6,7 @@ use serde_json;
 
 pub mod kinds;
 pub mod oci;
+pub mod proxy_cache;
 
 // ---------------------------------------------------------------------------
 // Row types
@@ -128,6 +129,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 
     let sql12 = include_str!("migrations/012_oci_manifest_blobs.sql");
     sqlx::raw_sql(sql12).execute(pool).await?;
+
+    let sql13 = include_str!("migrations/013_proxy_cache_entries.sql");
+    sqlx::raw_sql(sql13).execute(pool).await?;
 
     info!("Database migrations applied");
     Ok(())

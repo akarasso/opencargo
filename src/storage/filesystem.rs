@@ -1,9 +1,11 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use bytes::Bytes;
 use tokio::fs;
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncWriteExt};
 
 use crate::error::AppError;
 
@@ -21,6 +23,10 @@ impl FilesystemStorage {
             .canonicalize()
             .expect("failed to canonicalize storage base directory");
         Self { base_path }
+    }
+
+    pub fn resolve(&self, path: &str) -> Result<PathBuf, AppError> {
+        self.safe_path(path)
     }
 
     /// Resolve a relative path and ensure it stays within the base directory.
@@ -157,6 +163,82 @@ impl StorageBackend for FilesystemStorage {
         let full_path = self.safe_path(path)?;
         Ok(full_path.exists())
     }
+
+    async fn rename(&self, from: &str, to: &str) -> Result<(), AppError> {
+        let from_path = self.safe_path(from)?;
+        let to_path = self.safe_path(to)?;
+        if let Some(parent) = to_path.parent() {
+            fs::create_dir_all(parent).await?;
+        }
+        fs::rename(&from_path, &to_path).await?;
+        Ok(())
+    }
+
+    async fn read_stream(
+        &self,
+        path: &str,
+    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send>>), AppError> {
+        let full_path = self.safe_path(path)?;
+        let file = match fs::File::open(&full_path).await {
+            Ok(file) => file,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AppError::NotFound(format!("file not found: {path}")));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        let len = file.metadata().await?.len();
+        Ok((len, Box::pin(file)))
+    }
+
+    async fn remove_stale_parts(
+        &self,
+        prefix: &str,
+        older_than: Duration,
+    ) -> Result<u64, AppError> {
+        let root = self.safe_path(prefix)?;
+        if !root.is_dir() {
+            return Ok(0);
+        }
+        let cutoff = SystemTime::now() - older_than;
+        let mut removed = 0;
+        let mut pending = vec![root];
+        while let Some(dir) = pending.pop() {
+            let mut entries = fs::read_dir(&dir).await?;
+            while let Some(entry) = entries.next_entry().await? {
+                let file_type = entry.file_type().await?;
+                if file_type.is_dir() {
+                    pending.push(entry.path());
+                } else if file_type.is_file() && is_stale_part(&entry.path(), cutoff).await? {
+                    removed +=
+                        vanished_is_fine(fs::remove_file(entry.path()).await)?.is_some() as u64;
+                }
+            }
+        }
+        Ok(removed)
+    }
+}
+
+async fn is_stale_part(path: &Path, cutoff: SystemTime) -> Result<bool, AppError> {
+    let is_part = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .is_some_and(|n| n.contains(".part-"));
+    if !is_part {
+        return Ok(false);
+    }
+    match vanished_is_fine(fs::metadata(path).await)? {
+        Some(meta) => Ok(meta.modified()? < cutoff),
+        None => Ok(false),
+    }
+}
+
+// A part committed (renamed) between the listing and this call is not ours.
+fn vanished_is_fine<T>(res: std::io::Result<T>) -> Result<Option<T>, AppError> {
+    match res {
+        Ok(v) => Ok(Some(v)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e.into()),
+    }
 }
 
 #[cfg(test)]
@@ -174,6 +256,68 @@ mod tests {
 
     fn is_bad_request(res: &Result<std::path::PathBuf, AppError>) -> bool {
         matches!(res, Err(AppError::BadRequest(_)))
+    }
+
+    #[tokio::test]
+    async fn rename_read_stream_and_stale_parts() {
+        use super::StorageBackend;
+        use tokio::io::AsyncReadExt;
+        let (_tmp, s) = storage();
+        let old_mtime = std::time::SystemTime::now() - std::time::Duration::from_secs(7200);
+
+        s.put("c/a/blob.part-1", bytes::Bytes::from_static(b"first"))
+            .await
+            .unwrap();
+        s.rename("c/a/blob.part-1", "c/a/blob").await.unwrap();
+        assert!(!s.exists("c/a/blob.part-1").await.unwrap());
+        let (len, mut reader) = s.read_stream("c/a/blob").await.unwrap();
+        assert_eq!(len, 5);
+
+        s.put("c/a/blob.part-2", bytes::Bytes::from_static(b"second!"))
+            .await
+            .unwrap();
+        s.rename("c/a/blob.part-2", "c/a/blob").await.unwrap();
+        let mut held = Vec::new();
+        reader.read_to_end(&mut held).await.unwrap();
+        assert_eq!(
+            held, b"first",
+            "a reader opened before the rename drains the old inode"
+        );
+        assert_eq!(s.get("c/a/blob").await.unwrap().as_ref(), b"second!");
+        assert!(matches!(
+            s.read_stream("c/missing").await,
+            Err(AppError::NotFound(_))
+        ));
+
+        s.put("c/b/x.part-old", bytes::Bytes::from_static(b"o"))
+            .await
+            .unwrap();
+        s.put("c/b/x.part-new", bytes::Bytes::from_static(b"n"))
+            .await
+            .unwrap();
+        s.put("c/b/keep.part-me/y", bytes::Bytes::from_static(b"d"))
+            .await
+            .unwrap();
+        for rel in ["c/b/x.part-old", "c/b/keep.part-me/y"] {
+            let f = std::fs::File::options()
+                .write(true)
+                .open(s.resolve(rel).unwrap())
+                .unwrap();
+            f.set_modified(old_mtime).unwrap();
+        }
+        let hour = std::time::Duration::from_secs(3600);
+        assert_eq!(s.remove_stale_parts("c", hour).await.unwrap(), 1);
+        assert!(!s.exists("c/b/x.part-old").await.unwrap());
+        assert!(
+            s.exists("c/b/x.part-new").await.unwrap(),
+            "young parts stay"
+        );
+        assert!(
+            s.exists("c/b/keep.part-me/y").await.unwrap(),
+            "only file names are matched"
+        );
+        assert!(s.exists("c/a/blob").await.unwrap());
+        assert_eq!(s.remove_stale_parts("nowhere", hour).await.unwrap(), 0);
     }
 
     #[test]
