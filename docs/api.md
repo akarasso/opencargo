@@ -172,7 +172,32 @@ DELETE /api/v1/webhooks/{id}
 POST   /api/v1/webhooks/{id}/test
 
 GET    /api/v1/system/audit?page=1&size=50
+
+GET    /api/v1/policy/report?since=24h&repo=&rule=&page=1&size=50   Policy report (admin)
+DELETE /api/v1/policy/report?user=alice | ?user_id=17            Erase one user's rows -> {deleted}
+GET    /api/v1/policy/rules                                       Effective rules of every proxy
+GET    /api/v1/me/policy?since=&repo=&rule=&page=&size=           The caller's own rows
 ```
+
+Policy report: a proxy repository with at least one rule enabled in
+`[policy.<repo>]` records every artifact it serves (actor, artifact, time)
+and evaluates the enabled rules against it; nothing is ever blocked. A member
+with no rule on records nothing, so `/rules` says which members record
+(`recording`) and echoes each proxy's effective config, defaults included.
+`since` is an age (`24h`, `7d`; `s`/`m`/`h`/`d` only, default `24h`, `400`
+when it reaches before the earliest representable instant) or an RFC 3339
+instant; `repo` matches the requested or the member repository; `rule` is
+one of `min_release_age`, `osv_severity`, `install_scripts`, `typosquat`
+and narrows every total, chip and verdict to that rule's own row. `totals`
+are scoped by the filter; on the admin report alone,
+`process.dropped_since_start` is the process-lifetime count of events the
+writer dropped under overload. `DELETE`
+takes exactly one of `user` (404 when unknown) or `user_id` (works for a
+deleted user) and erases by identity, never by label: another user's token
+named alike keeps its rows. The erasure is audited as `policy.erase` with
+`deleted=N` as its target, never the name. `/me/policy` is forced to the
+caller's own rows (a DB user's, every token included, or the config token's)
+whatever the query says.
 
 Repository names match `[a-z0-9][a-z0-9._-]{0,63}` without `..`. `type` is
 `hosted`, `proxy` (requires `upstream`, an `http(s)` URL) or `group`
@@ -271,6 +296,7 @@ GET    /api/v1/search?q=
 | `repositories.changed` | everyone | empty |
 | `permissions.changed` | authenticated | `{username}` |
 | `audit.entry` | admin | `{username, action, target}` |
+| `policy.resolution` | admin | `{repo, member, count, would_block, unknown}`, one per flush per repo pair, at most two a second per pair |
 
 Client may send `{"type":"ping"}`; server answers `{"type":"pong"}`, pings
 every 30 s, re-validates the token every ~5 min (revoked token closes with
@@ -294,4 +320,5 @@ Prometheus metrics: `opencargo_http_requests_total{method,path,status}`,
 `opencargo_downloads_total{repo,package}` (hosted artifacts served: npm
 tarballs, crates, module zips, OCI blobs), `opencargo_publishes_total{repo,package}`,
 `opencargo_cache_hits_total{repo}` and `opencargo_cache_misses_total{repo}`
-(proxy cache lookups, per member repository; a stale row counts as a miss).
+(proxy cache lookups, per member repository; a stale row counts as a miss),
+`opencargo_policy_dropped_total` (policy events dropped under overload).

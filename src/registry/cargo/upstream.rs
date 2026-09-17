@@ -1,3 +1,5 @@
+use axum::http::{header, HeaderName, HeaderValue};
+
 use crate::error::{AppError, AppResult};
 use crate::proxy::strategy::{
     CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
@@ -28,6 +30,13 @@ pub enum CargoArtifact {
         dl: String,
         cksum: String,
     },
+    /// `{api}/api/v1/crates/{name}/{version}`: the only source of a
+    /// publish date, an upstream-chosen host like `dl`.
+    VersionMeta {
+        api: reqwest::Url,
+        name: String,
+        version: String,
+    },
 }
 
 pub struct CargoUpstream;
@@ -48,15 +57,21 @@ impl UpstreamStrategy for CargoUpstream {
                 dl,
                 cksum,
             } => return download_url(dl, name, version, cksum, up),
+            CargoArtifact::VersionMeta { api, name, version } => format!(
+                "{}/api/v1/crates/{name}/{version}",
+                api.as_str().trim_end_matches('/')
+            ),
         };
         parse_url(&url)
     }
 
     fn url_source(&self, up: &Upstream, a: &CargoArtifact) -> UrlSource {
         match a {
-            CargoArtifact::Crate { .. } => UrlSource::Content {
-                allow_private: up.dl_allow_private,
-            },
+            CargoArtifact::Crate { .. } | CargoArtifact::VersionMeta { .. } => {
+                UrlSource::Content {
+                    allow_private: up.dl_allow_private,
+                }
+            }
             CargoArtifact::Config | CargoArtifact::Index { .. } => UrlSource::Admin,
         }
     }
@@ -75,6 +90,10 @@ impl UpstreamStrategy for CargoUpstream {
                 kind: "cargo-crate",
                 key: format!("{}/{version}", name.to_lowercase()),
             },
+            CargoArtifact::VersionMeta { name, version, .. } => CacheKey {
+                kind: "cargo-meta",
+                key: format!("{}/{version}", name.to_lowercase()),
+            },
         }
     }
 
@@ -82,7 +101,9 @@ impl UpstreamStrategy for CargoUpstream {
         match a {
             CargoArtifact::Config => CachePolicy::Ttl(Ttl::Default),
             CargoArtifact::Index { .. } => CachePolicy::Ttl(Ttl::Secs(INDEX_TTL_SECS)),
-            CargoArtifact::Crate { .. } => CachePolicy::Immutable,
+            CargoArtifact::Crate { .. } | CargoArtifact::VersionMeta { .. } => {
+                CachePolicy::Immutable
+            }
         }
     }
 
@@ -96,7 +117,18 @@ impl UpstreamStrategy for CargoUpstream {
     fn max_bytes(&self, a: &CargoArtifact) -> u64 {
         match a {
             CargoArtifact::Crate { .. } => DEFAULT_MAX_UPSTREAM_BYTES,
-            CargoArtifact::Config | CargoArtifact::Index { .. } => MAX_METADATA_BYTES,
+            _ => MAX_METADATA_BYTES,
+        }
+    }
+
+    // crates.io refuses API requests without an identifying agent.
+    fn request_headers(&self, a: &CargoArtifact) -> Vec<(HeaderName, HeaderValue)> {
+        match a {
+            CargoArtifact::VersionMeta { .. } => vec![(
+                header::USER_AGENT,
+                HeaderValue::from_static(concat!("opencargo/", env!("CARGO_PKG_VERSION"))),
+            )],
+            _ => Vec::new(),
         }
     }
 
@@ -308,5 +340,33 @@ mod tests {
             s.expected_sha256(&c).as_deref(),
             Some("ab".repeat(32).as_str())
         );
+    }
+
+    #[test]
+    fn version_meta_is_paced_api_content_with_an_agent() {
+        let s = CargoUpstream;
+        let meta = CargoArtifact::VersionMeta {
+            api: reqwest::Url::parse("https://crates.io/").unwrap(),
+            name: "Serde".into(),
+            version: "1.0.0".into(),
+        };
+        assert_eq!(
+            s.upstream_url(&upstream(false), &meta).unwrap().as_str(),
+            "https://crates.io/api/v1/crates/Serde/1.0.0"
+        );
+        assert_eq!(
+            s.url_source(&upstream(true), &meta),
+            UrlSource::Content { allow_private: true }
+        );
+        let key = s.cache_key(&meta);
+        assert_eq!((key.kind, key.key.as_str()), ("cargo-meta", "serde/1.0.0"));
+        assert_eq!(s.cache_policy(&meta), CachePolicy::Immutable);
+        assert_eq!(s.transfer(&meta), Transfer::Buffered);
+        assert_eq!(s.max_bytes(&meta), MAX_METADATA_BYTES);
+        let headers = s.request_headers(&meta);
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, header::USER_AGENT);
+        assert!(headers[0].1.to_str().unwrap().starts_with("opencargo/"));
+        assert!(s.request_headers(&CargoArtifact::Config).is_empty());
     }
 }

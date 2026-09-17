@@ -20,6 +20,7 @@ use tracing::{info, warn};
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig};
+use crate::policy::PolicyEngine;
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
 use crate::storage::FilesystemStorage;
 use crate::telemetry;
@@ -55,10 +56,13 @@ pub struct AppState {
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
     pub events: Arc<crate::events::EventBus>,
+    /// Records proxy resolutions for the policy report; off until a rule is on.
+    pub policy: PolicyEngine,
 }
 
 pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
     // Ensure storage directory exists
     std::fs::create_dir_all(&config.server.storage_path)?;
 
@@ -178,6 +182,16 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     // Initialize vulnerability scanner
     let vuln_scanner = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
+    let events = Arc::new(crate::events::EventBus::new());
+    let policy = PolicyEngine::new(
+        db.clone(),
+        &config.policy,
+        vuln_scanner.clone(),
+        events.clone(),
+        proxy.clone(),
+    );
+    warn_policy_notes(&policy_notes);
+
     info!(
         storage_path = %config.server.storage_path,
         base_url = %config.server.base_url,
@@ -199,8 +213,25 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         webhook_dispatcher,
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
-        events: Arc::new(crate::events::EventBus::new()),
+        events,
+        policy,
     })
+}
+
+/// Recording is personal data: say which members do it, at startup.
+fn warn_policy_notes(notes: &crate::policy::startup::StartupNotes) {
+    if !notes.recording.is_empty() {
+        warn!(
+            members = ?notes.recording,
+            "policy rules enabled: every download through these members records its actor, artifact and time"
+        );
+    }
+    if !notes.unknown.is_empty() {
+        warn!(keys = ?notes.unknown, "[policy.*] keys naming no configured repository");
+    }
+    if !notes.inapplicable.is_empty() {
+        warn!(rules = ?notes.inapplicable, "policy rules that can only answer not_applicable on an OCI member");
+    }
 }
 
 pub fn build_router(state: AppState) -> Router {
@@ -275,6 +306,12 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::api::webhooks::test_webhook),
         )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
+        .route(
+            "/api/v1/policy/report",
+            get(crate::api::policy::report).delete(crate::api::policy::erase),
+        )
+        .route("/api/v1/policy/rules", get(crate::api::policy::rules))
+        .route("/api/v1/me/policy", get(crate::api::policy::me_policy))
         // Promote routes — scoped packages (@scope/name)
         .route(
             "/api/v1/promote/@{scope}/{name}/{version}",

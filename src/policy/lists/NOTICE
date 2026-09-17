@@ -1,0 +1,30 @@
+Name lists for the typosquat rule (src/policy/rules/typosquat.rs), regenerated
+by scripts/toplists.sh; each file's first line records its source and fetch
+date. Names are normalised as policy::distance::normalize does (lowercase,
+`_` as `-`, Go major suffixes stripped), deduplicated and sorted.
+
+npm.txt          The `topDownload` export of the npm package `npm-high-impact`
+                 (Titus Wormer, https://github.com/wooorm/npm-high-impact),
+                 the npm names with the most weekly downloads, first 5 000.
+                 Licence: MIT (the package's `license` file).
+
+crates.txt       The crates.io API, `GET /api/v1/crates?sort=downloads`,
+                 first 5 000, fetched at one request per second with an
+                 identifying User-Agent as the crates.io crawler policy asks
+                 (https://crates.io/policies). The same public data as the
+                 crates.io database dump; crates.io publishes no explicit
+                 licence for it, so the file carries the names alone.
+
+go.txt           https://packages.ecosyste.ms, registry `proxy.golang.org`,
+                 sorted by dependent packages, first 2 000 module paths after
+                 major-suffix normalisation. Licence: CC BY-SA 4.0
+                 (https://ecosyste.ms, "Data licensed under CC BY-SA 4.0").
+
+known/*.txt      https://packages.ecosyste.ms, registries `npmjs.org`,
+                 `crates.io` and `proxy.golang.org`, sorted by dependent
+                 packages, ranks 1-20 000: names the rule never compares.
+                 Licence: CC BY-SA 4.0, attribution as above.
+
+holdout/*.txt    The same ranking, ranks 20 001-40 000: test-only
+                 (`#[cfg(test)] include_str!`), never in the binary, the
+                 corpus of `typosquat_holdout_false_positive_rate`.

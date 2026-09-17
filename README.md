@@ -341,6 +341,7 @@ connect_timeout = "10s"
 enabled = true                     # default: false
 prerelease_older_than_days = 90
 proxy_cache_older_than_days = 30   # idle proxy cache entries; swept even with enabled = false
+policy_report_older_than_days = 90 # policy report rows; swept even with enabled = false, 0 disables
 
 [vuln_scan]
 enabled = true                     # default: false
@@ -348,6 +349,13 @@ block_on_critical = false          # refuse a publish with a critical advisory (
 fail_closed = false                # with block_on_critical: OSV down = 503, not an unscanned publish
 osv_base_url = "https://api.osv.dev"
 max_concurrency = 8
+
+[policy.npm-proxy]                 # per proxy repository, all rules off by default
+min_release_age = "48h"            # Ns | Nm | Nh | Nd
+osv_severity = "high"              # low | medium | high | critical; needs vuln_scan.enabled
+install_scripts = true             # npm only
+typosquat = true                   # not for OCI
+fetch_missing_facts = true         # false: cache-only facts, no recorder-initiated upstream request
 
 # Optional seed; managed via API afterwards
 [[repositories]]
@@ -376,6 +384,15 @@ members = ["oci-private", "hub-proxy"]   # same format, resolved in order, nesti
 
 Pass it with `--config /path/config.toml` or `OPENCARGO_CONFIG`. Lookup order
 without a flag: `./config.toml`, `~/.opencargo/config.toml`, built-in defaults.
+
+A `[policy.<repo>]` section with at least one rule on records the actor name
+(API token name or username), the artifact and the time of every download
+through that proxy member for `policy_report_older_than_days` days, and the
+admin report (`GET /api/v1/policy/report`) shows what each rule *would* have
+blocked;
+nothing is blocked, and startup warns which members record. Everyone can see
+their own rows at `GET /api/v1/me/policy`. `DELETE /api/v1/policy/report?user=`
+erases one user's rows, audited with the count and never the name.
 
 | Variable | Purpose |
 |---|---|

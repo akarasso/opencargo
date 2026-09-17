@@ -68,3 +68,8 @@ pub fn record_cache_miss(repo: &str) {
     let labels = [("repo", repo.to_string())];
     counter!("opencargo_cache_misses_total", &labels).increment(1);
 }
+
+/// Record a policy event the writer's queue could not take.
+pub fn record_policy_dropped() {
+    counter!("opencargo_policy_dropped_total").increment(1);
+}

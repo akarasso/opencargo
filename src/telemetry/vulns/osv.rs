@@ -137,7 +137,8 @@ impl OsvClient {
 
     /// Advisory ids per dependency, positionally aligned with `deps`; the
     /// response is third-party controlled, so a short answer pads with empty
-    /// lists and a long one is truncated.
+    /// lists and a long one is truncated. The POST holds one of the
+    /// `max_concurrency` permits, like every record fetch.
     pub async fn query_batch(
         &self,
         ecosystem: &str,
@@ -153,6 +154,11 @@ impl OsvClient {
                 version: version.clone(),
             })
             .collect();
+        let _permit = self
+            .sem
+            .acquire()
+            .await
+            .map_err(|_| ScanError::Upstream("scanner shut down".to_string()))?;
         let response = self
             .http
             .post(self.url("/v1/querybatch"))

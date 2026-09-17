@@ -15,7 +15,7 @@ use crate::storage::{FilesystemStorage, StorageBackend};
 
 use super::super::strategy::CacheKey;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Cached {
     pub entry: CacheEntry,
     pub stale: bool,

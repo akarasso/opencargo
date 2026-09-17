@@ -14,6 +14,9 @@ import type {
   PackagesResponse,
   PermissionFlags,
   PermissionGrant,
+  PolicyQuery,
+  PolicyReport,
+  PolicyRules,
   RepositoriesResponse,
   RepositoryDetail,
   SearchResponse,
@@ -200,6 +203,19 @@ export function deleteUserPermission(username: string, repo: string): Promise<vo
 
 export function fetchAudit(page = 1, size = 50): Promise<AuditResponse> {
   return http.get(`/api/v1/system/audit?page=${page}&size=${size}`);
+}
+
+export function fetchPolicyReport(q: PolicyQuery): Promise<PolicyReport> {
+  const params = new URLSearchParams();
+  for (const [key, value] of Object.entries(q)) {
+    if (value !== undefined && value !== '') params.set(key, String(value));
+  }
+  const qs = params.toString();
+  return http.get(`/api/v1/policy/report${qs ? `?${qs}` : ''}`);
+}
+
+export function fetchPolicyRules(): Promise<PolicyRules> {
+  return http.get('/api/v1/policy/rules');
 }
 
 export function fetchMetrics(): Promise<string> {

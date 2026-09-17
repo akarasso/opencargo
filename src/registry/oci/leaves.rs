@@ -1,4 +1,7 @@
+use crate::db::kinds::Format;
 use crate::error::{AppError, AppResult};
+use crate::policy::{self, Source};
+use crate::proxy::engine::Cached;
 use crate::proxy::Payload;
 use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
 
@@ -26,6 +29,16 @@ async fn from_engine(
             .await?
             .into_payload())
     }
+}
+
+/// `engine.fetch` without `into_payload`, for the one GET that records.
+async fn fetch_cached(
+    cx: &Cx<'_>,
+    member: CacheRepo<'_>,
+    up: &Upstream,
+    a: &OciArtifact,
+) -> AppResult<Outcome<Cached>> {
+    cx.state.proxy.fetch(&OciUpstream, up, member, a).await
 }
 
 fn with_digest(mut p: Payload, digest: String) -> Payload {
@@ -134,8 +147,24 @@ impl Leaf for ManifestLeaf {
                 tag: self.reference.clone(),
             }
         };
+        let found = if self.head {
+            from_engine(cx, member, up, &a, true).await?
+        } else {
+            let cached = fetch_cached(cx, member, up, &a).await?;
+            if let Outcome::Found(c) = &cached {
+                let version = Some(self.reference.clone());
+                policy::record(cx, member, up, Format::Oci, &self.name, version, || {
+                    Source::Oci {
+                        body: c.clone(),
+                        served: None,
+                        parsed: None,
+                    }
+                });
+            }
+            cached.into_payload()
+        };
         // Cache rows hold the bare body hash; the wire digest carries its algorithm.
-        Ok(match from_engine(cx, member, up, &a, self.head).await? {
+        Ok(match found {
             Outcome::Found(mut p) => {
                 p.digest = p.digest.map(|hex| format!("sha256:{hex}"));
                 Outcome::Found(p)

@@ -1,5 +1,5 @@
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
@@ -15,16 +15,18 @@ use crate::proxy::strategy::{
 use crate::storage::FilesystemStorage;
 
 #[derive(Default)]
-pub(super) struct FakeState {
+pub(crate) struct FakeState {
     pub hits: Vec<(Method, String, HeaderMap)>,
+    pub starts: Vec<Instant>,
     pub fail: bool,
     pub gone: bool,
+    pub status: Option<StatusCode>,
     pub body: Vec<u8>,
     pub etag: Option<String>,
     pub delay: Duration,
 }
 
-pub(super) type Shared = Arc<Mutex<FakeState>>;
+pub(crate) type Shared = Arc<Mutex<FakeState>>;
 
 async fn serve(State(st): State<Shared>, req: Request) -> Response {
     let (method, path, headers) = (
@@ -32,13 +34,24 @@ async fn serve(State(st): State<Shared>, req: Request) -> Response {
         req.uri().path().to_string(),
         req.headers().clone(),
     );
-    let (fail, gone, body, etag, delay) = {
+    let (fail, gone, status, body, etag, delay) = {
         let mut s = st.lock().unwrap();
         s.hits.push((method, path.clone(), headers.clone()));
-        (s.fail, s.gone, s.body.clone(), s.etag.clone(), s.delay)
+        s.starts.push(Instant::now());
+        (
+            s.fail,
+            s.gone,
+            s.status,
+            s.body.clone(),
+            s.etag.clone(),
+            s.delay,
+        )
     };
     if fail {
         return StatusCode::SERVICE_UNAVAILABLE.into_response();
+    }
+    if let Some(status) = status {
+        return status.into_response();
     }
     if gone || path.ends_with("/missing") {
         return StatusCode::NOT_FOUND.into_response();
@@ -82,7 +95,7 @@ async fn serve(State(st): State<Shared>, req: Request) -> Response {
     resp
 }
 
-pub(super) struct Strat {
+pub(crate) struct Strat {
     pub transfer: Transfer,
     pub policy: CachePolicy,
     pub pointer: bool,
@@ -150,14 +163,14 @@ impl UpstreamStrategy for Strat {
     }
 }
 
-pub(super) fn pointer_strat() -> Strat {
+pub(crate) fn pointer_strat() -> Strat {
     Strat {
         pointer: true,
         ..Default::default()
     }
 }
 
-pub(super) struct Fx {
+pub(crate) struct Fx {
     _tmp: tempfile::TempDir,
     pub pool: SqlitePool,
     pub storage: Arc<FilesystemStorage>,
@@ -166,7 +179,7 @@ pub(super) struct Fx {
     pub up: Upstream,
 }
 
-pub(super) fn timeouts() -> Timeouts {
+pub(crate) fn timeouts() -> Timeouts {
     Timeouts {
         connect: Duration::from_secs(1),
         read_idle: Duration::from_secs(5),

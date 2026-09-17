@@ -82,7 +82,10 @@ impl Format {
     }
 
     pub const fn supports_kind(self, kind: RepoKind) -> bool {
-        !matches!((self, kind), (Format::Pypi, RepoKind::Proxy | RepoKind::Group))
+        !matches!(
+            (self, kind),
+            (Format::Pypi, RepoKind::Proxy | RepoKind::Group)
+        )
     }
 }
 
@@ -374,7 +377,13 @@ mod tests {
             .lines()
             .find(|l| l.contains(&format!("CHECK({column} IN (")))
             .expect("CHECK constraint present");
-        let list = line.split("IN (").nth(1).unwrap().split(')').next().unwrap();
+        let list = line
+            .split("IN (")
+            .nth(1)
+            .unwrap()
+            .split(')')
+            .next()
+            .unwrap();
         list.split(',')
             .map(|v| v.trim().trim_matches('\'').to_string())
             .collect()
@@ -382,7 +391,10 @@ mod tests {
 
     #[test]
     fn roundtrip_matches_check_constraints() {
-        let kinds: Vec<String> = RepoKind::ALL.iter().map(|k| k.as_str().to_string()).collect();
+        let kinds: Vec<String> = RepoKind::ALL
+            .iter()
+            .map(|k| k.as_str().to_string())
+            .collect();
         assert_eq!(kinds, check_values("repo_type"));
         for kind in RepoKind::ALL {
             assert_eq!(kind.as_str().parse::<RepoKind>().unwrap(), kind);
@@ -405,18 +417,37 @@ mod tests {
         assert_eq!(repo.fmt().unwrap(), Format::Cargo);
         assert_eq!(repo.members(), vec!["a".to_string(), "b".to_string()]);
 
-        assert!(matches!("mirror".parse::<RepoKind>(), Err(AppError::BadRequest(_))));
-        assert!(matches!(repository("mirror", "npm").kind(), Err(AppError::Internal(_))));
-        assert!(matches!(repository("hosted", "deb").fmt(), Err(AppError::Internal(_))));
+        assert!(matches!(
+            "mirror".parse::<RepoKind>(),
+            Err(AppError::BadRequest(_))
+        ));
+        assert!(matches!(
+            repository("mirror", "npm").kind(),
+            Err(AppError::Internal(_))
+        ));
+        assert!(matches!(
+            repository("hosted", "deb").fmt(),
+            Err(AppError::Internal(_))
+        ));
     }
 
     #[tokio::test]
     async fn check_repository_names_refuses_pre_upgrade_slash() {
-        for ok in ["a", "npm-all", "oci-hosted", "npm-private", "a.b_c-d", &"x".repeat(64)] {
+        for ok in [
+            "a",
+            "npm-all",
+            "oci-hosted",
+            "npm-private",
+            "a.b_c-d",
+            &"x".repeat(64),
+        ] {
             assert!(validate_name(ok).is_ok(), "{ok}");
         }
         for bad in ["", "A", "a/b", "a..b", "-a", ".a", "a b", &"x".repeat(65)] {
-            assert!(matches!(validate_name(bad), Err(AppError::BadRequest(_))), "{bad}");
+            assert!(
+                matches!(validate_name(bad), Err(AppError::BadRequest(_))),
+                "{bad}"
+            );
         }
 
         let (_tmp, pool) = crate::db::testing::pool().await;

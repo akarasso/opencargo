@@ -1,0 +1,53 @@
+# Launch demo (docs/design/policy-report.md, section 10). Users ci (token ci-runner)
+# and alice (token dev-laptop) are created through the API once the server is up.
+
+[server]
+bind = "127.0.0.1:6789"
+base_url = "http://localhost:6789"
+storage_path = "./data/storage"
+
+[database]
+url = "sqlite:./data/db/opencargo.db"
+
+[auth]
+anonymous_read = false
+token_prefix = "trg_"
+static_tokens = []
+
+[auth.admin]
+username = "admin"
+password = "admin"
+
+[proxy]
+default_ttl = "24h"
+negative_cache_ttl = "1h"
+connect_timeout = "10s"
+
+[vuln_scan]
+enabled = true
+
+[policy.npm-proxy]
+min_release_age = "24h"
+osv_severity = "high"
+install_scripts = true
+typosquat = true
+
+[[repositories]]
+name = "npm-hosted"
+type = "hosted"
+format = "npm"
+visibility = "private"
+
+[[repositories]]
+name = "npm-proxy"
+type = "proxy"
+format = "npm"
+visibility = "public"
+upstream = "https://registry.npmjs.org"
+
+[[repositories]]
+name = "npm-all"
+type = "group"
+format = "npm"
+visibility = "public"
+members = ["npm-hosted", "npm-proxy"]

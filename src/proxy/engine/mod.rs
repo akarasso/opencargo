@@ -64,6 +64,21 @@ struct Stale {
     target: CacheEntry,
 }
 
+#[allow(clippy::large_enum_variant)]
+enum Lookup {
+    Fresh(Cached),
+    Negative,
+    Stale(Stale),
+    Cold,
+}
+
+/// Whether an upstream miss is remembered as a negative row or ignored.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Miss {
+    Record,
+    Ignore,
+}
+
 impl ProxyEngine {
     pub fn new(
         storage: Arc<FilesystemStorage>,
@@ -96,31 +111,152 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Cached>> {
+        self.run(s, up, member, a, false, Miss::Record).await
+    }
+
+    /// `fetch` for a recorder: a fresh row is a hit and a cold key is
+    /// fetched, but a miss or failure leaves no negative row and no file
+    /// deleted, so recording never changes what clients are served.
+    pub async fn observe<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+    ) -> AppResult<Outcome<Cached>> {
+        self.run(s, up, member, a, false, Miss::Ignore).await
+    }
+
+    /// A conditional re-fetch of a `status 200` row whatever its freshness,
+    /// read-only on failure like `observe`: for a packument that may
+    /// predate the version a recorder asks about.
+    pub async fn refresh<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+    ) -> AppResult<Outcome<Cached>> {
+        self.run(s, up, member, a, true, Miss::Ignore).await
+    }
+
+    /// Lookup, singleflight, exchange, settle; cache hit and miss are
+    /// counted for client fetches only.
+    async fn run<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        force_stale: bool,
+        miss: Miss,
+    ) -> AppResult<Outcome<Cached>> {
         let key = s.cache_key(a);
-        let lock_key = format!("{}/{}/{}", member.0.id, key.kind, key.key);
-        let _guard = self
-            .inflight
-            .acquire(&lock_key, self.timeouts.singleflight_wait)
-            .await;
-        let mut stale = None;
-        if let Some((row, fresh)) =
-            proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?
-        {
-            if row.status != 200 {
-                if fresh {
+        let _guard = self.lock(member, &key, force_stale).await;
+        let counted = miss == Miss::Record;
+        let stale = match self.lookup(s, member, a, &key, force_stale).await? {
+            Lookup::Fresh(cached) => {
+                if counted {
                     crate::telemetry::record_cache_hit(&member.0.name);
-                    return Ok(Outcome::NotFound);
                 }
-            } else if let Some(target) = self.resolve_row(s, a, row.clone()).await {
-                if fresh {
-                    crate::telemetry::record_cache_hit(&member.0.name);
-                    return Ok(Outcome::Found(self.hit(&row, target).await?));
-                }
-                stale = Some(Stale { row, target });
+                return Ok(Outcome::Found(cached));
             }
+            Lookup::Negative => {
+                if counted {
+                    crate::telemetry::record_cache_hit(&member.0.name);
+                }
+                return Ok(Outcome::NotFound);
+            }
+            Lookup::Stale(stale) => Some(stale),
+            Lookup::Cold => None,
+        };
+        if counted {
+            crate::telemetry::record_cache_miss(&member.0.name);
         }
-        crate::telemetry::record_cache_miss(&member.0.name);
         let reply = self.exchange(s, up, member, a, stale.as_ref()).await;
+        self.settle(s, member, a, reply, stale, miss).await
+    }
+
+    /// The cached body, fresh or stale, with no upstream request and no
+    /// row touched; `None` when there is none on disk.
+    pub async fn peek<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+    ) -> AppResult<Option<Cached>> {
+        let key = s.cache_key(a);
+        let Some((row, fresh)) =
+            proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?
+        else {
+            return Ok(None);
+        };
+        if row.status != 200 {
+            return Ok(None);
+        }
+        Ok(self.resolve_row(s, a, row).await.map(|entry| Cached {
+            entry,
+            stale: !fresh,
+        }))
+    }
+
+    /// Refreshes coalesce among themselves in their own namespace: a
+    /// client's hit on a fresh row never waits behind a recorder's
+    /// conditional request.
+    async fn lock(
+        &self,
+        member: CacheRepo<'_>,
+        key: &CacheKey,
+        refresh: bool,
+    ) -> Option<super::singleflight::Guard> {
+        let space = if refresh { "refresh/" } else { "" };
+        let lock_key = format!("{space}{}/{}/{}", member.0.id, key.kind, key.key);
+        self.inflight
+            .acquire(&lock_key, self.timeouts.singleflight_wait)
+            .await
+    }
+
+    /// What the row says before any request; `force_stale` turns a fresh
+    /// `200` row into a conditional request instead of a hit.
+    async fn lookup<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        key: &CacheKey,
+        force_stale: bool,
+    ) -> AppResult<Lookup> {
+        let Some((row, fresh)) =
+            proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?
+        else {
+            return Ok(Lookup::Cold);
+        };
+        if row.status != 200 {
+            return Ok(if fresh {
+                Lookup::Negative
+            } else {
+                Lookup::Cold
+            });
+        }
+        let Some(target) = self.resolve_row(s, a, row.clone()).await else {
+            return Ok(Lookup::Cold);
+        };
+        if fresh && !force_stale {
+            return Ok(Lookup::Fresh(self.hit(&row, target).await?));
+        }
+        Ok(Lookup::Stale(Stale { row, target }))
+    }
+
+    async fn settle<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        reply: AppResult<Reply>,
+        stale: Option<Stale>,
+        miss: Miss,
+    ) -> AppResult<Outcome<Cached>> {
+        let key = s.cache_key(a);
         match reply {
             Ok(Reply::NotModified) => match stale {
                 Some(Stale { row, target }) => {
@@ -143,21 +279,27 @@ impl ProxyEngine {
                 entry: *entry,
                 stale: false,
             })),
-            Ok(Reply::Miss(status)) => {
-                self.record_miss(member, &key, status, stale.as_ref()).await?;
+            Ok(Reply::Miss(status)) if miss == Miss::Record => {
+                self.record_miss(member, &key, status, stale.as_ref())
+                    .await?;
                 Ok(Outcome::NotFound)
             }
-            Ok(Reply::Refused) => Ok(Outcome::NotFound),
+            Ok(Reply::Miss(_)) | Ok(Reply::Refused) => Ok(Outcome::NotFound),
             Ok(Reply::Failed(why)) => match stale {
-                Some(Stale { target, .. }) => {
-                    warn!(key = %lock_key, error = %why, "upstream failed; serving stale cache");
+                Some(Stale { target, .. }) if miss == Miss::Record => {
+                    warn!(key = %key.key, error = %why, "upstream failed; serving stale cache");
                     Ok(Outcome::Found(Cached {
                         entry: target,
                         stale: true,
                     }))
                 }
+                Some(_) => Ok(Outcome::NotFound),
                 None => Err(AppError::BadGateway(why)),
             },
+            Err(e) if miss == Miss::Ignore => {
+                warn!(key = %key.key, error = %e, "refresh failed; cache left as is");
+                Ok(Outcome::NotFound)
+            }
             Err(e) => Err(e),
         }
     }
@@ -342,7 +484,11 @@ impl ProxyEngine {
         a: &S::Artifact,
     ) -> AppResult<reqwest::Url> {
         let url = s.upstream_url(up, a)?;
-        if s.url_source(up, a) == (UrlSource::Content { allow_private: false }) {
+        if s.url_source(up, a)
+            == (UrlSource::Content {
+                allow_private: false,
+            })
+        {
             super::refuse_blocked_host(&url).await?;
         }
         Ok(url)
@@ -358,6 +504,6 @@ impl ProxyEngine {
 }
 
 #[cfg(test)]
-mod fixture;
+pub(crate) mod fixture;
 #[cfg(test)]
 mod tests;

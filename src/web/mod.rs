@@ -105,6 +105,7 @@ pub fn web_routes() -> Router<AppState> {
         .route("/admin/users/{username}/tokens", get(serve_spa))
         .route("/admin/packages", get(serve_spa))
         .route("/admin/audit", get(serve_spa))
+        .route("/admin/policy", get(serve_spa))
         .route("/admin/system", get(serve_spa))
         .route("/admin/password", get(serve_spa))
         .route("/admin/webhooks", get(serve_spa))

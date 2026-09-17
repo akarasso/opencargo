@@ -112,6 +112,10 @@ export default function Sidebar() {
                 <Icon name="history" />
                 <span>Audit log</span>
               </A>
+              <A class="nav-link" href="/admin/policy" activeClass="active" onClick={close}>
+                <Icon name="shield" />
+                <span>Policy report</span>
+              </A>
               <A class="nav-link" href="/admin/system" activeClass="active" onClick={close}>
                 <Icon name="settings" />
                 <span>System</span>

@@ -22,20 +22,34 @@ pub(crate) struct SweepStats {
 pub(crate) struct CleanupStats {
     pub prereleases: Option<u64>,
     pub proxy: Option<SweepStats>,
+    pub policy: Option<u64>,
 }
 
 fn proxy_idle_days(config: &CleanupConfig) -> Option<u64> {
     config.proxy_cache_older_than_days.filter(|days| *days > 0)
 }
 
+fn policy_days(config: &CleanupConfig) -> Option<u64> {
+    config
+        .policy_report_older_than_days
+        .filter(|days| *days > 0)
+}
+
+/// The task starts when any sweep has something to do: pre-releases under
+/// `enabled`, the proxy cache or the policy report under their own bound.
+pub(crate) fn sweeps_configured(config: &CleanupConfig) -> bool {
+    config.enabled || proxy_idle_days(config).is_some() || policy_days(config).is_some()
+}
+
 /// Start a background cleanup task that runs every 24 hours: the pre-release
-/// sweep when `enabled`, the proxy cache sweep whenever an idle bound is set.
+/// sweep when `enabled`, the proxy cache and policy report sweeps whenever
+/// their bound is set.
 pub async fn start_cleanup_task(
     db: SqlitePool,
     storage: Arc<dyn StorageBackend>,
     config: CleanupConfig,
 ) {
-    if !config.enabled && proxy_idle_days(&config).is_none() {
+    if !sweeps_configured(&config) {
         info!("Cleanup task is disabled");
         return;
     }
@@ -68,6 +82,16 @@ pub(crate) async fn run_cleanup(
         match sweep_proxy_cache(db, storage, days).await {
             Ok(sweep) => stats.proxy = Some(sweep),
             Err(e) => error!(error = %e, "Failed to sweep the proxy cache"),
+        }
+    }
+
+    if let Some(days) = policy_days(config) {
+        match crate::policy::store::delete_older_than(db, days).await {
+            Ok(deleted) => {
+                info!(deleted, days, "Policy report sweep complete");
+                stats.policy = Some(deleted);
+            }
+            Err(e) => error!(error = %e, "Failed to sweep the policy report"),
         }
     }
     stats
@@ -391,6 +415,7 @@ mod tests {
             enabled: false,
             prerelease_older_than_days: Some(0),
             proxy_cache_older_than_days: Some(30),
+            policy_report_older_than_days: None,
         };
 
         let stats = run_cleanup(&fx.pool, &fx.storage, &config).await;
@@ -409,6 +434,95 @@ mod tests {
             ..config
         };
         let stats = run_cleanup(&fx.pool, &fx.storage, &disabled).await;
+        assert!(stats.prereleases.is_none() && stats.proxy.is_none() && stats.policy.is_none());
+    }
+
+    #[test]
+    fn sweeps_configured_by_policy_bound_alone() {
+        let policy_only = CleanupConfig {
+            enabled: false,
+            prerelease_older_than_days: None,
+            proxy_cache_older_than_days: Some(0),
+            policy_report_older_than_days: Some(30),
+        };
+        assert!(sweeps_configured(&policy_only));
+        for bound in [Some(0), None] {
+            let nothing = CleanupConfig {
+                policy_report_older_than_days: bound,
+                ..policy_only.clone()
+            };
+            assert!(!sweeps_configured(&nothing), "{bound:?}");
+        }
+        assert!(
+            sweeps_configured(&CleanupConfig::default()),
+            "the 90-day default sweeps"
+        );
+    }
+
+    impl Fx {
+        async fn policy_row(&self, name: &str, days_ago: i64) -> i64 {
+            let id: i64 = sqlx::query_scalar(
+                "INSERT INTO policy_resolutions (created_at, requested_repo, member_repo, format, name, actor, actor_kind)
+                 VALUES (datetime('now', ?1 || ' days'), 'p', 'p', 'npm', ?2, 'anonymous', 'anonymous') RETURNING id",
+            )
+            .bind(format!("-{days_ago}"))
+            .bind(name)
+            .fetch_one(&self.pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO policy_verdicts (resolution_id, rule, verdict) VALUES (?1, 'typosquat', 'pass')",
+            )
+            .bind(id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+            id
+        }
+
+        async fn policy_names(&self) -> Vec<String> {
+            sqlx::query_scalar("SELECT name FROM policy_resolutions ORDER BY id")
+                .fetch_all(&self.pool)
+                .await
+                .unwrap()
+        }
+
+        async fn verdict_count(&self) -> i64 {
+            sqlx::query_scalar("SELECT COUNT(*) FROM policy_verdicts")
+                .fetch_one(&self.pool)
+                .await
+                .unwrap()
+        }
+    }
+
+    #[tokio::test]
+    async fn policy_sweep_deletes_old_rows() {
+        let fx = fixture().await;
+        fx.policy_row("old-a", 100).await;
+        fx.policy_row("old-b", 31).await;
+        fx.policy_row("recent", 29).await;
+        fx.policy_row("today", 0).await;
+        assert_eq!(fx.verdict_count().await, 4);
+        let config = CleanupConfig {
+            enabled: false,
+            prerelease_older_than_days: None,
+            proxy_cache_older_than_days: Some(0),
+            policy_report_older_than_days: Some(30),
+        };
+
+        let stats = run_cleanup(&fx.pool, &fx.storage, &config).await;
+
+        assert_eq!(stats.policy, Some(2));
         assert!(stats.prereleases.is_none() && stats.proxy.is_none());
+        assert_eq!(fx.policy_names().await, vec!["recent", "today"]);
+        assert_eq!(fx.verdict_count().await, 2, "verdicts cascade");
+
+        let off = CleanupConfig {
+            policy_report_older_than_days: Some(0),
+            ..config
+        };
+        let stats = run_cleanup(&fx.pool, &fx.storage, &off).await;
+        assert_eq!(stats.policy, None);
+        assert_eq!(fx.policy_names().await.len(), 2);
     }
 }

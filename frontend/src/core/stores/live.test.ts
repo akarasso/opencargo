@@ -83,6 +83,63 @@ describe('useLive', () => {
     });
   });
 
+  it('max_wait_fires_under_sustained_events', () => {
+    const refetch = vi.fn();
+    createRoot((dispose) => {
+      useLive(refetch, ['policy.resolution'], { debounce: 300, maxWait: 2000 });
+      for (let t = 0; t < 3000; t += 100) {
+        bus.emit('policy.resolution');
+        if (t === 1900) expect(refetch).not.toHaveBeenCalled();
+        if (t === 2000) expect(refetch).toHaveBeenCalledTimes(1);
+        vi.advanceTimersByTime(100);
+      }
+      vi.advanceTimersByTime(1000);
+      expect(refetch).toHaveBeenCalledTimes(2);
+      vi.advanceTimersByTime(5000);
+      expect(refetch).toHaveBeenCalledTimes(2);
+      dispose();
+    });
+  });
+
+  it('events during an in-flight refetch cost one more refetch after it lands', async () => {
+    let land!: () => void;
+    const refetch = vi.fn(() => new Promise<void>((resolve) => (land = resolve)));
+    const dispose = createRoot((d) => {
+      useLive(refetch, ['e'], { debounce: 100 });
+      return d;
+    });
+    bus.emit('e');
+    await vi.advanceTimersByTimeAsync(100);
+    expect(refetch).toHaveBeenCalledTimes(1);
+    for (let i = 0; i < 5; i++) {
+      bus.emit('e');
+      await vi.advanceTimersByTimeAsync(100);
+    }
+    expect(refetch).toHaveBeenCalledTimes(1);
+    land();
+    await vi.advanceTimersByTimeAsync(99);
+    expect(refetch).toHaveBeenCalledTimes(1);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(refetch).toHaveBeenCalledTimes(2);
+    land();
+    await vi.advanceTimersByTimeAsync(1000);
+    expect(refetch).toHaveBeenCalledTimes(2);
+    dispose();
+  });
+
+  it('max_wait deadline is cleared once the debounce fires', () => {
+    const refetch = vi.fn();
+    createRoot((dispose) => {
+      useLive(refetch, ['e'], { debounce: 300, maxWait: 2000 });
+      bus.emit('e');
+      vi.advanceTimersByTime(300);
+      expect(refetch).toHaveBeenCalledTimes(1);
+      vi.advanceTimersByTime(5000);
+      expect(refetch).toHaveBeenCalledTimes(1);
+      dispose();
+    });
+  });
+
   it('also refetches on $connected and $resync', () => {
     const refetch = vi.fn();
     createRoot((dispose) => {
