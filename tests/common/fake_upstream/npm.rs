@@ -31,6 +31,7 @@ struct Registry {
     etag: String,
     tarballs: HashMap<String, Vec<u8>>,
     latency: Duration,
+    gone: bool,
 }
 
 #[derive(Clone)]
@@ -85,6 +86,11 @@ impl FakeNpm {
     pub fn set_latency(&self, latency: Duration) {
         self.state.lock().unwrap().latency = latency;
     }
+
+    /// The packument answers 404 while set; tarballs stay served.
+    pub fn set_gone(&self, gone: bool) {
+        self.state.lock().unwrap().gone = gone;
+    }
 }
 
 pub async fn start(packument: Value, etag: &str) -> FakeNpm {
@@ -101,6 +107,7 @@ pub async fn start(packument: Value, etag: &str) -> FakeNpm {
         etag: etag.to_string(),
         tarballs: HashMap::new(),
         latency: Duration::ZERO,
+        gone: false,
     }));
     let hits = Arc::new(Mutex::new(Vec::new()));
     let app = App {
@@ -138,7 +145,7 @@ async fn serve(State(app): State<App>, req: Request) -> Response<Body> {
             .and_then(|f| state.tarballs.get(f));
         let (status, body, content_type) = if let Some(bytes) = tarball {
             (StatusCode::OK, bytes.clone(), "application/octet-stream")
-        } else if path != app.path {
+        } else if path != app.path || state.gone {
             (StatusCode::NOT_FOUND, Vec::new(), "application/json")
         } else if if_none_match.as_deref() == Some(state.etag.as_str()) {
             (StatusCode::NOT_MODIFIED, Vec::new(), "application/json")

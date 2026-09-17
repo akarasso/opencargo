@@ -122,6 +122,9 @@ pub(crate) async fn fetch_or_peek<S: UpstreamStrategy>(
     fetch_missing(shared, cfg, s, up, member, a).await
 }
 
+/// The recorder's own upstream request goes through `observe`, never
+/// `fetch`: a miss leaves no negative row, so recording never turns a
+/// client's next request into a 404.
 pub(crate) async fn fetch_missing<S: UpstreamStrategy>(
     shared: &Shared,
     cfg: &PolicyConfig,
@@ -135,7 +138,7 @@ pub(crate) async fn fetch_missing<S: UpstreamStrategy>(
     }
     match timeout(
         shared.tuning.gather_timeout,
-        shared.proxy.fetch(s, up, member, a),
+        shared.proxy.observe(s, up, member, a),
     )
     .await
     {
@@ -325,5 +328,64 @@ mod tests {
             assert_eq!(r.requested_repo, "requested");
         }
         assert!(fx.hits().is_empty(), "no rule on, no request");
+    }
+
+    #[tokio::test]
+    async fn missing_fact_never_writes_a_negative_row() {
+        use crate::registry::npm::upstream::{NpmArtifact, NpmUpstream};
+
+        let fx = Fx::new().await;
+        fx.set(|s| s.gone = true);
+        let cfg = PolicyConfig {
+            min_release_age: Some("1h".parse().unwrap()),
+            ..Default::default()
+        };
+        let (engine, _writer) = engine_over(&fx, cfg.clone(), fast());
+        let shared = engine.shared();
+        let member = CacheRepo(&fx.repo);
+        let mut up = fx.up.clone();
+        up.dl_allow_private = true;
+        let packument = NpmArtifact::Metadata {
+            name: "widget".into(),
+        };
+        let (cached, source) =
+            fetch_missing(shared, &cfg, &NpmUpstream, &up, member, &packument).await;
+        assert!(cached.is_none());
+        assert_eq!(source, "not-found");
+        let meta = CargoArtifact::VersionMeta {
+            api: fx.up.base.clone(),
+            name: "serde".into(),
+            version: "1.0.0".into(),
+        };
+        let (cached, source) = shared
+            .cargo_pacer
+            .fetch(shared, &cfg, member, &up, &meta)
+            .await;
+        assert!(cached.is_none());
+        assert_eq!(source, "not-found");
+        assert_eq!(fx.hits().len(), 2, "both asked upstream once");
+        for key in [
+            NpmUpstream.cache_key(&packument),
+            CargoUpstream.cache_key(&meta),
+        ] {
+            assert!(
+                fx.row(key.kind, &key.key).await.is_none(),
+                "{}/{}: a recorder miss leaves no negative row",
+                key.kind,
+                key.key
+            );
+        }
+        fx.set(|s| s.gone = false);
+        fx.set(|s| s.body = br#"{"name":"widget","versions":{},"time":{}}"#.to_vec());
+        let served = shared
+            .proxy
+            .fetch(&NpmUpstream, &up, member, &packument)
+            .await
+            .unwrap();
+        assert!(
+            matches!(served, Outcome::Found(_)),
+            "the next client request reaches upstream"
+        );
+        assert_eq!(fx.hits().len(), 3);
     }
 }

@@ -111,28 +111,25 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Cached>> {
-        let key = s.cache_key(a);
-        let _guard = self.lock(member, &key).await;
-        let stale = match self.lookup(s, member, a, &key, false).await? {
-            Lookup::Fresh(cached) => {
-                crate::telemetry::record_cache_hit(&member.0.name);
-                return Ok(Outcome::Found(cached));
-            }
-            Lookup::Negative => {
-                crate::telemetry::record_cache_hit(&member.0.name);
-                return Ok(Outcome::NotFound);
-            }
-            Lookup::Stale(stale) => Some(stale),
-            Lookup::Cold => None,
-        };
-        crate::telemetry::record_cache_miss(&member.0.name);
-        let reply = self.exchange(s, up, member, a, stale.as_ref()).await;
-        self.settle(s, member, a, reply, stale, Miss::Record).await
+        self.run(s, up, member, a, false, Miss::Record).await
+    }
+
+    /// `fetch` for a recorder: a fresh row is a hit and a cold key is
+    /// fetched, but a miss or failure leaves no negative row and no file
+    /// deleted, so recording never changes what clients are served.
+    pub async fn observe<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+    ) -> AppResult<Outcome<Cached>> {
+        self.run(s, up, member, a, false, Miss::Ignore).await
     }
 
     /// A conditional re-fetch of a `status 200` row whatever its freshness,
-    /// read-only on failure: no negative row, no file deleted. For a
-    /// recorder that must never change what clients are served.
+    /// read-only on failure like `observe`: for a packument that may
+    /// predate the version a recorder asks about.
     pub async fn refresh<S: UpstreamStrategy>(
         &self,
         s: &S,
@@ -140,16 +137,44 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Cached>> {
+        self.run(s, up, member, a, true, Miss::Ignore).await
+    }
+
+    /// Lookup, singleflight, exchange, settle; cache hit and miss are
+    /// counted for client fetches only.
+    async fn run<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        force_stale: bool,
+        miss: Miss,
+    ) -> AppResult<Outcome<Cached>> {
         let key = s.cache_key(a);
         let _guard = self.lock(member, &key).await;
-        let stale = match self.lookup(s, member, a, &key, true).await? {
-            Lookup::Fresh(cached) => return Ok(Outcome::Found(cached)),
-            Lookup::Negative => return Ok(Outcome::NotFound),
+        let counted = miss == Miss::Record;
+        let stale = match self.lookup(s, member, a, &key, force_stale).await? {
+            Lookup::Fresh(cached) => {
+                if counted {
+                    crate::telemetry::record_cache_hit(&member.0.name);
+                }
+                return Ok(Outcome::Found(cached));
+            }
+            Lookup::Negative => {
+                if counted {
+                    crate::telemetry::record_cache_hit(&member.0.name);
+                }
+                return Ok(Outcome::NotFound);
+            }
             Lookup::Stale(stale) => Some(stale),
             Lookup::Cold => None,
         };
+        if counted {
+            crate::telemetry::record_cache_miss(&member.0.name);
+        }
         let reply = self.exchange(s, up, member, a, stale.as_ref()).await;
-        self.settle(s, member, a, reply, stale, Miss::Ignore).await
+        self.settle(s, member, a, reply, stale, miss).await
     }
 
     /// The cached body, fresh or stale, with no upstream request and no

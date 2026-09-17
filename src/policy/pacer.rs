@@ -99,7 +99,7 @@ impl Pacer {
         gate.tick().await;
         let fetched = timeout(
             tuning.gather_timeout,
-            shared.proxy.fetch(&CargoUpstream, up, member, a),
+            shared.proxy.observe(&CargoUpstream, up, member, a),
         )
         .await;
         drop(gate);

@@ -404,6 +404,40 @@ async fn npm_ci_without_packument_still_dated() {
 }
 
 #[tokio::test]
+async fn recorder_miss_never_404s_the_client() {
+    let fake = fake_widget(&[("1.0.0", "widget-1.0.0.tgz", "2026-01-01T00:00:00Z")]).await;
+    fake.set_gone(true);
+    let a = spawn_server(npm_proxy(&fake.base_url, aged("48h"))).await;
+    get_ok(
+        &tarball_url(&a, "npm-proxy", "widget", "widget-1.0.0.tgz"),
+        None,
+    )
+    .await;
+    let rows = wait_for_policy_rows(&a, 1).await;
+    assert_eq!(rows[0].published_at, None);
+    assert_eq!(rows[0].date_source, "not-found");
+    assert_eq!(
+        fake.packument_hits().len(),
+        1,
+        "the recorder asked once and was told 404"
+    );
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(
+        verdict_of(&verdicts, rows[0].id, "min_release_age"),
+        ("unknown", "no publish date (not-found)")
+    );
+
+    fake.set_gone(false);
+    let resp = get(&format!("{}/npm-proxy/widget", a.base_url), None).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::OK,
+        "the recorder's miss left no negative row: the client reaches upstream"
+    );
+    assert_eq!(fake.packument_hits().len(), 2);
+}
+
+#[tokio::test]
 async fn npm_version_newer_than_cached_packument_refreshes() {
     let fake = fake_widget(&[("1.0.0", "widget-1.0.0.tgz", "2026-01-01T00:00:00Z")]).await;
     let a = spawn_server(npm_proxy(&fake.base_url, aged("48h"))).await;
