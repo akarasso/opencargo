@@ -8,13 +8,14 @@ use serde_json::{json, Value};
 
 use common::fake_osv::{self, cvss_record, labelled_record, FakeOsv};
 use common::{
-    build_npm_publish_body, build_tarball, hosted, spawn_server, SpawnOpts, TestServer,
-    STATIC_TOKEN,
+    build_cargo_publish_body, build_crate_data, build_npm_publish_body, build_tarball, hosted,
+    spawn_server, SpawnOpts, TestServer, STATIC_TOKEN,
 };
 use opencargo::config::{Config, RepositoryFormat, Visibility, VulnScanConfig};
 
 const NPM_REPO: &str = "test-npm";
 const GO_REPO: &str = "test-go";
+const CARGO_REPO: &str = "test-cargo";
 const PKG: &str = "@test/vuln-pkg";
 const VERSION: &str = "1.0.0";
 const DEP: &str = "lodash";
@@ -58,6 +59,7 @@ async fn spawn_lab(osv: FakeOsv, vuln: VulnScanConfig) -> Lab {
         repositories: vec![
             hosted(NPM_REPO, RepositoryFormat::Npm, Visibility::Public),
             hosted(GO_REPO, RepositoryFormat::Go, Visibility::Public),
+            hosted(CARGO_REPO, RepositoryFormat::Cargo, Visibility::Public),
         ],
         vuln,
         ..Default::default()
@@ -89,11 +91,50 @@ impl Lab {
         row
     }
 
-    /// Mark `lodash@4.17.20` as affected by `record`, ready for `publish`.
+    /// Mark `lodash@4.17.20` as affected by `record` in every scanned
+    /// ecosystem, ready for `publish`, `publish_crate` and `publish_module`.
     fn advisory(&self, record: Value) {
         let id = record["id"].as_str().expect("record id").to_string();
         self.osv.affect("npm", DEP, DEP_VERSION, &[&id]);
+        self.osv.affect("crates.io", DEP, DEP_VERSION, &[&id]);
+        self.osv
+            .affect("Go", DEP, &format!("v{DEP_VERSION}"), &[&id]);
         self.osv.record(record);
+    }
+
+    async fn publish_crate(&self) -> reqwest::Response {
+        let meta = format!(
+            r#"{{"name":"vuln-crate","vers":"{VERSION}","deps":[{{"name":"{DEP}","version_req":"={DEP_VERSION}","kind":"normal"}}],"features":{{}},"authors":[],"description":"d"}}"#
+        );
+        self.client
+            .put(format!("{}/{CARGO_REPO}/api/v1/crates/new", self.server.base_url))
+            .bearer_auth(STATIC_TOKEN)
+            .body(build_cargo_publish_body(&meta, &build_crate_data()))
+            .send()
+            .await
+            .expect("cargo publish request failed")
+    }
+
+    async fn publish_module(&self) -> reqwest::Response {
+        let module = "example.com/vuln";
+        let go_mod = format!("module {module}\n\ngo 1.21\n\nrequire {DEP} v{DEP_VERSION}\n");
+        let mut buf = Vec::new();
+        {
+            let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file(format!("{module}@v{VERSION}/go.mod"), options)
+                .unwrap();
+            zip.write_all(go_mod.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        self.client
+            .put(format!("{}/{GO_REPO}/{module}/@v/v{VERSION}", self.server.base_url))
+            .bearer_auth(STATIC_TOKEN)
+            .header("content-type", "application/zip")
+            .body(buf)
+            .send()
+            .await
+            .expect("go publish request failed")
     }
 
     async fn publish(&self, deps: Value) -> reqwest::Response {
@@ -347,18 +388,25 @@ async fn never_more_than_max_concurrency_in_flight() {
 // Publish gate
 // ---------------------------------------------------------------------------
 
+/// The gate runs before the first write in each of the three publish
+/// handlers, not only npm's.
 #[tokio::test]
 async fn blocked_publish_leaves_nothing_downloadable() {
     let lab = lab(scan(true, false)).await;
     lab.advisory(cvss_record("GHSA-block", "CVSS_V3", V3_CRITICAL));
 
-    let resp = lab.publish_lodash().await;
-    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
-    let body: Value = resp.json().await.expect("error json");
-    assert!(
-        body["error"].as_str().unwrap_or("").contains("critical"),
-        "the refusal names the reason: {body}"
-    );
+    for (format, resp) in [
+        ("npm", lab.publish_lodash().await),
+        ("cargo", lab.publish_crate().await),
+        ("go", lab.publish_module().await),
+    ] {
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{format}");
+        let body: Value = resp.json().await.expect("error json");
+        assert!(
+            body["error"].as_str().unwrap_or("").contains("critical"),
+            "{format}: the refusal names the reason: {body}"
+        );
+    }
 
     assert_eq!(
         lab.status_at(&format!("/{NPM_REPO}/{PKG}")).await,
@@ -369,12 +417,38 @@ async fn blocked_publish_leaves_nothing_downloadable() {
             .await,
         StatusCode::NOT_FOUND
     );
+    assert_eq!(
+        lab.status_at(&format!("/{CARGO_REPO}/index/vu/ln/vuln-crate")).await,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        lab.status_at(&format!("/{GO_REPO}/example.com/vuln/@v/list")).await,
+        StatusCode::NOT_FOUND
+    );
     assert_eq!(lab.count("SELECT COUNT(*) FROM versions").await, 0);
     assert_eq!(lab.count("SELECT COUNT(*) FROM packages").await, 0);
     assert_eq!(
         lab.count("SELECT COUNT(*) FROM vulnerability_scans").await,
         0
     );
+    let storage = lab.server.tmp.path().join("storage");
+    let written: Vec<_> = walkdir_files(&storage);
+    assert!(written.is_empty(), "nothing was written: {written:?}");
+}
+
+fn walkdir_files(dir: &std::path::Path) -> Vec<std::path::PathBuf> {
+    std::fs::read_dir(dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .flat_map(|e| {
+            if e.path().is_dir() {
+                walkdir_files(&e.path())
+            } else {
+                vec![e.path()]
+            }
+        })
+        .collect()
 }
 
 #[tokio::test]

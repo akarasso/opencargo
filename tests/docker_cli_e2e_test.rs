@@ -163,17 +163,16 @@ async fn docker_push_nested_then_pull_through_proxy_and_group() {
     docker.run(&["push", &pushed]).await;
     docker.run(&["rmi", &pushed]).await;
 
+    // Each pull starts from an empty local store, so the group pull really
+    // fetches the layers rather than finding them "Already exists".
     for image in &pulls {
         docker.run(&["pull", image]).await;
         assert_eq!(docker.layer_id(image).await, layer, "{image}");
+        docker.run(&["rmi", image]).await;
     }
     let kinds = cache_kinds(&a).await;
     for kind in ["oci-blob", "oci-manifest", "oci-tag"] {
         assert!(kinds.iter().any(|k| k == kind), "{kinds:?}");
-    }
-
-    for image in &pulls {
-        docker.run_quietly(&["rmi", image]).await;
     }
     docker.run_quietly(&["logout", &registry_b]).await;
 }

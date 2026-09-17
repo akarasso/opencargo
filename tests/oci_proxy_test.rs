@@ -214,7 +214,18 @@ async fn proxy_pull_by_tag_then_by_digest_from_second_instance() {
         assert_eq!(header(&resp, "content-length"), up.layer.len().to_string());
         assert_eq!(resp.bytes().await.unwrap(), up.layer.as_slice());
     }
-    assert_eq!(up.tap.count(&up.blob_path(&up.layer_digest())), 1);
+    expire_entries(&a).await;
+    let resp = get(&blob_url).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(resp.bytes().await.unwrap(), up.layer.as_slice());
+    let resp = get(&format!("{base}/manifests/{}", up.digest())).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(up.tap.count(&up.blob_path(&up.layer_digest())), 1, "blobs are immutable");
+    assert_eq!(
+        up.tap.count(&up.manifest_path(&up.digest())),
+        0,
+        "so is a manifest by digest"
+    );
     assert_eq!(
         oci_table_rows(&a).await,
         0,
