@@ -7,7 +7,7 @@ use reqwest::{Client, RequestBuilder, Response, Url};
 use tracing::warn;
 
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::Upstream;
+use crate::registry::resolve::{CacheRepo, Upstream};
 
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(300);
 const DOCKER_HUB_HOSTS: [&str; 3] = ["registry-1.docker.io", "index.docker.io", "docker.io"];
@@ -114,26 +114,31 @@ fn split_params(params: &str) -> Vec<(String, String)> {
     out
 }
 
-/// (upstream base, scope) -> token: the realm is only known once a challenge
-/// arrived, and the point of the cache is to skip it.
+/// The member holding the credentials, the upstream base and the scope: a
+/// token embodies the credentials it was acquired with, so two proxies on
+/// one upstream never share one.
+type TokenKey = (i64, String, String);
+
+/// The realm is only known once a challenge arrived, and the point of the
+/// cache is to skip it.
 #[derive(Default)]
 pub struct TokenCache {
-    inner: Mutex<HashMap<(String, String), (String, Instant)>>,
+    inner: Mutex<HashMap<TokenKey, (String, Instant)>>,
 }
 
 impl TokenCache {
-    fn get(&self, base: &Url, scope: &str) -> Option<String> {
+    fn get(&self, member_id: i64, base: &Url, scope: &str) -> Option<String> {
         let cache = self.inner.lock().expect("token cache poisoned");
         cache
-            .get(&(base.to_string(), scope.to_string()))
+            .get(&(member_id, base.to_string(), scope.to_string()))
             .filter(|(_, until)| *until > Instant::now())
             .map(|(token, _)| token.clone())
     }
 
-    fn put(&self, base: &Url, scope: &str, token: String, ttl: Duration) {
+    fn put(&self, member_id: i64, base: &Url, scope: &str, token: String, ttl: Duration) {
         let mut cache = self.inner.lock().expect("token cache poisoned");
         cache.insert(
-            (base.to_string(), scope.to_string()),
+            (member_id, base.to_string(), scope.to_string()),
             (token, Instant::now() + ttl.mul_f32(0.9)),
         );
     }
@@ -151,6 +156,7 @@ struct TokenReply {
 pub(crate) async fn send_with_auth(
     http: &Client,
     cache: &TokenCache,
+    member: CacheRepo<'_>,
     up: &Upstream,
     req: RequestBuilder,
     scope: Option<&str>,
@@ -158,7 +164,7 @@ pub(crate) async fn send_with_auth(
     let retry = req
         .try_clone()
         .ok_or_else(|| AppError::Internal("upstream request is not replayable".into()))?;
-    let first = match scope.and_then(|s| cache.get(&up.base, s)) {
+    let first = match scope.and_then(|s| cache.get(member.0.id, &up.base, s)) {
         Some(token) => req.bearer_auth(token),
         None => up.auth.iter().fold(req, |r, a| a.apply(r)),
     };
@@ -181,13 +187,14 @@ pub(crate) async fn send_with_auth(
         scope: challenge.scope.or_else(|| Some(scope.to_string())),
         ..challenge
     };
-    let token = acquire_token(http, cache, &challenge, up).await?;
+    let token = acquire_token(http, cache, member, &challenge, up).await?;
     retry.bearer_auth(token).send().await.map_err(transport)
 }
 
 pub(crate) async fn acquire_token(
     http: &Client,
     cache: &TokenCache,
+    member: CacheRepo<'_>,
     ch: &BearerChallenge,
     up: &Upstream,
 ) -> AppResult<String> {
@@ -224,7 +231,7 @@ pub(crate) async fn acquire_token(
         .expires_in
         .map_or(DEFAULT_TOKEN_TTL, Duration::from_secs);
     if let Some(scope) = &ch.scope {
-        cache.put(&up.base, scope, token.clone(), ttl);
+        cache.put(member.0.id, &up.base, scope, token.clone(), ttl);
     }
     Ok(token)
 }

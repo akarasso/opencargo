@@ -796,6 +796,54 @@ async fn hub_token_dance_with_fake_registry() {
 }
 
 #[tokio::test]
+async fn token_cache_never_crosses_repositories() {
+    let fake = fake_with_image(Options {
+        challenge: true,
+        realm_basic: Some(("hub".into(), "secret".into())),
+        ..Default::default()
+    })
+    .await;
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![
+            proxy_with(
+                "oci-proxy",
+                RepositoryFormat::Oci,
+                &fake.reg.base_url,
+                basic("hub", "secret"),
+            ),
+            proxy("oci-anon", RepositoryFormat::Oci, &fake.reg.base_url),
+        ],
+        ..Default::default()
+    })
+    .await;
+
+    let resp = get(&format!("{}/v2/oci-proxy/{IMAGE}/manifests/1.0", a.base_url)).await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(fake.reg.tokens_issued(), 1);
+
+    let resp = get(&format!("{}/v2/oci-anon/{IMAGE}/manifests/1.0", a.base_url)).await;
+    assert_eq!(
+        resp.status(),
+        StatusCode::BAD_GATEWAY,
+        "the anonymous proxy must not replay the credentialed proxy's token"
+    );
+    assert_eq!(fake.reg.tokens_issued(), 1, "the realm refused it a token");
+    let bearer_pulls = fake
+        .reg
+        .hits()
+        .into_iter()
+        .filter(|h| h.path == fake.manifest_path())
+        .filter(|h| {
+            h.headers
+                .get("authorization")
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.starts_with("Bearer tok-"))
+        })
+        .count();
+    assert_eq!(bearer_pulls, 1, "one token-bearing pull, by oci-proxy");
+}
+
+#[tokio::test]
 async fn accept_header_sent_upstream() {
     let fake = fake_with_image(Options::default()).await;
     let a = spawn_fake_proxy(&fake.reg, ProxyOpts::default(), "10s").await;

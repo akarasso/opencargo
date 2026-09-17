@@ -183,7 +183,7 @@ impl ProxyEngine {
         if s.head_via_get(a) {
             return Ok(self.fetch(s, up, member, a).await?.into_payload());
         }
-        self.forward_head(s, up, a).await
+        self.forward_head(s, up, member, a).await
     }
 
     pub async fn bytes(&self, c: &Cached) -> AppResult<Bytes> {
@@ -277,6 +277,7 @@ impl ProxyEngine {
         &self,
         s: &S,
         up: &Upstream,
+        member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Payload>> {
         let url = s.upstream_url(up, a)?;
@@ -287,6 +288,7 @@ impl ProxyEngine {
         let resp = send_with_auth(
             &self.http,
             &self.tokens,
+            member,
             up,
             req,
             s.bearer_scope(a).as_deref(),

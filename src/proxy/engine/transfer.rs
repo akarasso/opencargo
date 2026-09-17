@@ -63,7 +63,14 @@ impl ProxyEngine {
             req = req.header(header::IF_NONE_MATCH, etag);
         }
         let scope = s.bearer_scope(a);
-        let send = send_with_auth(&self.http, &self.tokens, up, req, scope.as_deref());
+        let send = send_with_auth(
+            &self.http,
+            &self.tokens,
+            member,
+            up,
+            req,
+            scope.as_deref(),
+        );
         match s.transfer(a) {
             Transfer::Buffered => {
                 let bounded = tokio::time::timeout(
