@@ -1,69 +1,35 @@
-# opencargo -- Mode sidecar CI
+# opencargo as a CI sidecar
 
-Utiliser opencargo comme sidecar dans vos pods CI pour cacher les telechargements npm/cargo sur le noeud local.
+Run opencargo next to your CI runner as a local pull-through cache for npm.
+The runner points `npm_config_registry` at `http://localhost:6789/npm-proxy/`,
+opencargo fetches from npmjs.org on the first request and serves the cache
+afterwards. Only npm is proxied today; see the main README's known limitations.
 
-## Principe
+## Files
 
-Le sidecar opencargo fonctionne comme un proxy-cache local dans le pod CI :
+- `sidecar-deployment.yaml`: Kubernetes pod with a `ci-runner` container and an
+  `opencargo-cache` sidecar.
+- `configmap.yaml`: sidecar configuration (one `proxy` repository towards
+  npmjs.org, anonymous reads, SQLite under `/data/db/`).
+- `github-actions-example.yaml`: opencargo as a service container.
+- `gitlab-ci-example.yaml`: opencargo as a GitLab CI service.
 
-1. Le runner CI configure son client npm/cargo pour pointer vers `http://localhost:6789`
-2. opencargo intercepte les requetes et les redirige vers le registry upstream (npmjs.org, crates.io, etc.)
-3. Les packages telecharges sont caches localement sur le noeud
-4. Les builds suivants beneficient du cache local
-
-## Gains de performance
-
-| Scenario | Temps `pnpm install` |
-|----------|---------------------|
-| Premier build (cache vide) | ~45s (identique a sans sidecar) |
-| Builds suivants (cache chaud) | ~5-10s |
-| Avec lockfile identique | ~2-3s |
-
-## Fichiers
-
-- `sidecar-deployment.yaml` -- Deploiement k8s avec sidecar opencargo
-- `configmap.yaml` -- Configuration du sidecar (proxy vers npmjs.org)
-- `github-actions-example.yaml` -- Exemple GitHub Actions avec service container
-- `gitlab-ci-example.yaml` -- Exemple GitLab CI avec service
-
-## Utilisation k8s
+## Kubernetes
 
 ```bash
 kubectl apply -f configmap.yaml
 kubectl apply -f sidecar-deployment.yaml
 ```
 
-Le pod CI aura deux containers :
-- `ci-runner` : votre runner CI (node, rust, etc.)
-- `opencargo-cache` : le sidecar opencargo qui sert de proxy-cache
+The cache lives in an `emptyDir` and disappears with the pod; use a persistent
+volume if you want it to survive between jobs.
 
-La variable `npm_config_registry` est automatiquement configuree pour pointer vers le sidecar.
+## GitHub Actions and GitLab CI
 
-## Utilisation GitHub Actions
+Both examples start opencargo as a service on port 6789 and write an `.npmrc`
+that points at it. Nothing else changes in the pipeline.
 
-Voir `github-actions-example.yaml` pour un exemple complet.
+## Resources
 
-Le principe est d'utiliser un service container Docker qui demarre opencargo sur le port 6789, puis de configurer `.npmrc` pour pointer vers ce service.
-
-## Utilisation GitLab CI
-
-Voir `gitlab-ci-example.yaml` pour un exemple complet.
-
-GitLab CI supporte nativement les services Docker. opencargo est declare comme service et accessible via son hostname.
-
-## Configuration du sidecar
-
-Le sidecar utilise un `ConfigMap` minimaliste :
-- Ecoute sur `0.0.0.0:6789`
-- Un seul repository de type `proxy` pointant vers npmjs.org
-- Lecture anonyme activee (pas d'auth dans le pod CI)
-- Base de donnees SQLite locale dans `/data/db/`
-
-Vous pouvez ajouter d'autres repositories proxy (crates.io, etc.) en editant le ConfigMap.
-
-## Ressources
-
-Le sidecar est tres leger :
-- **CPU** : 25m request / 200m limit
-- **Memoire** : 16Mi request / 64Mi limit
-- **Disque** : 2Gi emptyDir (supprime a la fin du pod)
+The sidecar requests 25m CPU and 16Mi of memory with limits of 200m and 64Mi;
+adjust the `emptyDir` size to your dependency volume.

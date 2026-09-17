@@ -17,6 +17,14 @@ struct Cli {
     #[arg(short, long)]
     bind: Option<String>,
 
+    /// Public URL clients use to reach this server (overrides config)
+    #[arg(long, env = "OPENCARGO_BASE_URL")]
+    base_url: Option<String>,
+
+    /// OSV API base URL for vulnerability scanning (overrides config)
+    #[arg(long, env = "OPENCARGO_OSV_BASE_URL")]
+    osv_base_url: Option<String>,
+
     #[command(subcommand)]
     command: Option<Commands>,
 }
@@ -45,18 +53,31 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let cfg = config::load_config(cli.config.as_deref())?;
+    let mut cfg = config::load_config(cli.config.as_deref())?;
+    if let Some(base_url) = cli.base_url {
+        cfg.server.base_url = base_url.trim_end_matches('/').to_string();
+    }
+    if let Some(osv_base_url) = cli.osv_base_url {
+        cfg.vuln_scan.osv_base_url = osv_base_url.trim_end_matches('/').to_string();
+    }
 
     match cli.command.unwrap_or(Commands::Serve) {
         Commands::Serve => {
             let bind = cli.bind.as_deref().unwrap_or(&cfg.server.bind);
             info!("Starting opencargo on {}", bind);
+            let loopback = bind.starts_with("127.") || bind.starts_with("localhost") || bind.starts_with("[::1]");
+            if !loopback && (cfg.server.base_url.contains("localhost") || cfg.server.base_url.contains("127.0.0.1")) {
+                tracing::warn!(
+                    base_url = %cfg.server.base_url,
+                    "base_url points to localhost while listening on {bind}: tarball URLs will not work from other machines, set OPENCARGO_BASE_URL or [server].base_url"
+                );
+            }
 
             let app_state = server::build_state(&cfg).await?;
 
             // Spawn the periodic cleanup/GC task before the router consumes
-            // app_state. It is a no-op unless cleanup.enabled and the retention
-            // thresholds are configured, so wiring it is safe by default.
+            // app_state: the pre-release sweep needs cleanup.enabled, the proxy
+            // cache sweep runs whenever proxy_cache_older_than_days is set.
             let cleanup_storage: std::sync::Arc<dyn opencargo::storage::StorageBackend> =
                 app_state.storage.clone();
             tokio::spawn(opencargo::telemetry::cleanup::start_cleanup_task(

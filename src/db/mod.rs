@@ -4,7 +4,9 @@ use tracing::info;
 // Re-export serde_json for convenience in this module
 use serde_json;
 
+pub mod kinds;
 pub mod oci;
+pub mod proxy_cache;
 
 // ---------------------------------------------------------------------------
 // Row types
@@ -128,6 +130,9 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
     let sql12 = include_str!("migrations/012_oci_manifest_blobs.sql");
     sqlx::raw_sql(sql12).execute(pool).await?;
 
+    let sql13 = include_str!("migrations/013_proxy_cache_entries.sql");
+    sqlx::raw_sql(sql13).execute(pool).await?;
+
     info!("Database migrations applied");
     Ok(())
 }
@@ -136,37 +141,37 @@ pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
 // Repository seeding
 // ---------------------------------------------------------------------------
 
-/// Insert pre-configured repositories if they do not already exist.
+/// Insert pre-configured repositories if they do not already exist; every
+/// entry is validated as an API write would be, with the whole list as
+/// `pending` so members may come later in the file.
 pub async fn init_repositories(
     pool: &SqlitePool,
     repos: &[crate::config::RepositoryConfig],
 ) -> anyhow::Result<()> {
+    let pending: Vec<kinds::Pending<'_>> = repos
+        .iter()
+        .map(|r| kinds::Pending {
+            name: &r.name,
+            kind: r.repo_type,
+            format: r.format,
+            members: r.members.as_deref().unwrap_or_default(),
+        })
+        .collect();
     for repo in repos {
-        let repo_type = match repo.repo_type {
-            crate::config::RepositoryType::Hosted => "hosted",
-            crate::config::RepositoryType::Proxy => "proxy",
-            crate::config::RepositoryType::Group => "group",
+        let spec = kinds::RepoSpec {
+            name: &repo.name,
+            kind: repo.repo_type,
+            format: repo.format,
+            upstream: repo.upstream.as_deref(),
+            members: repo.members.as_deref().unwrap_or_default(),
         };
-
-        let format = match repo.format {
-            crate::config::RepositoryFormat::Npm => "npm",
-            crate::config::RepositoryFormat::Cargo => "cargo",
-            crate::config::RepositoryFormat::Oci => "oci",
-            crate::config::RepositoryFormat::Go => "go",
-            crate::config::RepositoryFormat::Pypi => "pypi",
-        };
+        kinds::validate_spec(pool, &spec, &pending)
+            .await
+            .map_err(|e| anyhow::anyhow!("repository {}: {e}", repo.name))?;
 
         let visibility = match repo.visibility {
             crate::config::Visibility::Public => "public",
             crate::config::Visibility::Private => "private",
-        };
-
-        let config_json = match repo.repo_type {
-            crate::config::RepositoryType::Group => {
-                let members = repo.members.clone().unwrap_or_default();
-                Some(serde_json::json!({ "members": members }).to_string())
-            }
-            _ => None,
         };
 
         sqlx::query(
@@ -174,11 +179,11 @@ pub async fn init_repositories(
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         )
         .bind(&repo.name)
-        .bind(repo_type)
-        .bind(format)
+        .bind(repo.repo_type.as_str())
+        .bind(repo.format.as_str())
         .bind(visibility)
         .bind(repo.upstream.as_deref())
-        .bind(config_json.as_deref())
+        .bind(spec.config_json())
         .execute(pool)
         .await?;
     }
@@ -208,6 +213,23 @@ pub async fn get_package(
 ) -> Result<Option<Package>, sqlx::Error> {
     sqlx::query_as::<_, Package>(
         "SELECT * FROM packages WHERE repository_id = ?1 AND name = ?2",
+    )
+    .bind(repo_id)
+    .bind(name)
+    .fetch_optional(pool)
+    .await
+}
+
+/// Case-insensitive lookup for ecosystems whose names are unique regardless
+/// of case (cargo): the row keeps the case it was published with.
+pub async fn get_package_nocase(
+    pool: &SqlitePool,
+    repo_id: i64,
+    name: &str,
+) -> Result<Option<Package>, sqlx::Error> {
+    sqlx::query_as::<_, Package>(
+        "SELECT * FROM packages WHERE repository_id = ?1 AND name = ?2 COLLATE NOCASE
+         ORDER BY id LIMIT 1",
     )
     .bind(repo_id)
     .bind(name)
@@ -375,74 +397,6 @@ pub async fn set_yanked(
         .execute(pool)
         .await?;
     Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Proxy cache helpers
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, sqlx::FromRow)]
-pub struct ProxyCacheMeta {
-    pub id: i64,
-    pub repository_id: i64,
-    pub cache_key: String,
-    pub fetched_at: String,
-    pub ttl_seconds: i64,
-}
-
-pub async fn upsert_proxy_cache_meta(
-    pool: &SqlitePool,
-    repository_id: i64,
-    cache_key: &str,
-    ttl_seconds: i64,
-) -> Result<(), sqlx::Error> {
-    sqlx::query(
-        "INSERT INTO proxy_cache_meta (repository_id, cache_key, fetched_at, ttl_seconds)
-         VALUES (?1, ?2, datetime('now'), ?3)
-         ON CONFLICT(repository_id, cache_key)
-         DO UPDATE SET fetched_at = datetime('now'), ttl_seconds = excluded.ttl_seconds",
-    )
-    .bind(repository_id)
-    .bind(cache_key)
-    .bind(ttl_seconds)
-    .execute(pool)
-    .await?;
-    Ok(())
-}
-
-pub async fn get_proxy_cache_meta(
-    pool: &SqlitePool,
-    repository_id: i64,
-    cache_key: &str,
-) -> Result<Option<ProxyCacheMeta>, sqlx::Error> {
-    sqlx::query_as::<_, ProxyCacheMeta>(
-        "SELECT * FROM proxy_cache_meta WHERE repository_id = ?1 AND cache_key = ?2",
-    )
-    .bind(repository_id)
-    .bind(cache_key)
-    .fetch_optional(pool)
-    .await
-}
-
-/// Check whether a cache entry is still fresh.
-/// Returns `true` if the entry exists and `fetched_at + ttl_seconds > now`.
-pub async fn is_proxy_cache_fresh(
-    pool: &SqlitePool,
-    repository_id: i64,
-    cache_key: &str,
-) -> bool {
-    let result = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM proxy_cache_meta
-         WHERE repository_id = ?1
-           AND cache_key = ?2
-           AND datetime(fetched_at, '+' || ttl_seconds || ' seconds') > datetime('now')",
-    )
-    .bind(repository_id)
-    .bind(cache_key)
-    .fetch_one(pool)
-    .await;
-
-    matches!(result, Ok(count) if count > 0)
 }
 
 /// Return the list of member repository names for a group repo.
@@ -907,8 +861,8 @@ pub async fn get_all_repositories(pool: &SqlitePool) -> Result<Vec<Repository>, 
 pub async fn create_repository(
     pool: &SqlitePool,
     name: &str,
-    repo_type: &str,
-    format: &str,
+    kind: kinds::RepoKind,
+    format: kinds::Format,
     visibility: &str,
     upstream_url: Option<&str>,
     config_json: Option<&str>,
@@ -918,8 +872,8 @@ pub async fn create_repository(
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
     )
     .bind(name)
-    .bind(repo_type)
-    .bind(format)
+    .bind(kind.as_str())
+    .bind(format.as_str())
     .bind(visibility)
     .bind(upstream_url)
     .bind(config_json)
@@ -1206,4 +1160,17 @@ pub async fn seed_webhooks(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+pub(crate) mod testing {
+    /// A migrated (twice, proving idempotence) SQLite pool in a temp dir.
+    pub async fn pool() -> (tempfile::TempDir, sqlx::SqlitePool) {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
+        let pool = super::connect(&url).await.unwrap();
+        super::migrate(&pool).await.unwrap();
+        super::migrate(&pool).await.unwrap();
+        (tmp, pool)
+    }
 }

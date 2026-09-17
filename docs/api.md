@@ -1,0 +1,297 @@
+# API reference
+
+Base URL: your `server.base_url`. Authentication: `Authorization: Bearer trg_...`
+(API tokens) or HTTP Basic (username and password, used by Docker and handy
+for curl). Anonymous read is allowed on public repositories when
+`auth.anonymous_read = true`.
+
+## npm
+
+```
+GET    /{repo}/@{scope}/{name}                     Package metadata
+GET    /{repo}/@{scope}/{name}/-/{file}.tgz        Tarball
+PUT    /{repo}/@{scope}/{name}                     Publish
+GET    /{repo}/-/v1/search?text=                   Search
+GET    /{repo}/-/package/@{scope}/{name}/dist-tags  Dist-tags
+PUT    /{repo}/-/package/@{scope}/{name}/dist-tags/{tag}
+DELETE /{repo}/-/package/@{scope}/{name}/dist-tags/{tag}
+PUT    /-/user/org.couchdb.user:{username}         npm login (returns a token)
+GET    /-/whoami                                   Current user
+```
+
+Unscoped variants drop the `@{scope}/` segment. Reads accept any name npm
+still serves (`JSONStream`, `Base64`); publish enforces npm's lowercase rule.
+Publishing targets a `hosted` repository. Installing usually goes through a
+`group` that lists the hosted repo first and a `proxy` to npmjs.org after.
+Through a proxy or a group, metadata and `dist-tags` come from the cached
+packument (`proxy.default_ttl`, revalidated with `If-None-Match`), tarballs
+are cached forever (a tarball over 100 MiB is refused with `502`) and their
+URLs point at the repository the client asked for; `search` covers hosted
+members only, nested groups included: proxied packages are not searchable.
+`PUT`/`DELETE dist-tags` and publish are `400` on a proxy or a group. An unknown package is `404` and remembered for
+`proxy.negative_cache_ttl`; an unreachable upstream is `502`, or the stale
+cached copy with `Warning: 110`.
+
+## Cargo (sparse index)
+
+```
+GET    /{repo}/index/config.json
+GET    /{repo}/index/{prefix}/{name}
+PUT    /{repo}/api/v1/crates/new                   Publish
+GET    /{repo}/api/v1/crates/{name}/{ver}/download
+DELETE /{repo}/api/v1/crates/{name}/{ver}/yank
+PUT    /{repo}/api/v1/crates/{name}/{ver}/unyank
+```
+
+`config.json` is served without a token even when `auth.anonymous_read =
+false` and carries `"auth-required": true` on a private repository, so cargo
+sends the token from `$CARGO_HOME/credentials.toml`; its `dl` always points at
+the requested repository. A `proxy` has `upstream` = a sparse index root
+(`https://index.crates.io/` or another opencargo's `.../cargo-hosted/index`):
+index lines are cached for ten minutes and revalidated by ETag (its
+`config.json` for `proxy.default_ttl`), crates are fetched from the upstream
+`config.json`'s `dl` template (`{crate}`, `{version}`, `{prefix}`,
+`{lowerprefix}`, `{sha256-checksum}`, default `/{crate}/{version}/download`),
+verified against the index `cksum` (`502`, nothing stored, on a mismatch),
+capped at 100 MiB and cached forever. A `dl` whose host is, or resolves to,
+a private address is refused unless `dl_allow_private`; with `upstream_auth`
+a `dl` off the index host is refused unless listed in `token_realms`. Crate
+names are matched regardless of case, as cargo lowercases the index path. A
+`group` unions the index lines of its members (first member wins on a
+version and on download); when a member is unreachable the merged index is
+served with `Warning: 199`. Publish, yank and unyank are `400` on a proxy or
+a group. Unknown crate: `404`, negative-cached; upstream down: `502`, or the
+stale index with `Warning: 110`.
+
+## OCI Distribution v2
+
+```
+GET    /v2/
+GET    /v2/token?service=opencargo&scope=repository:{repo}/{name}:pull
+HEAD   /v2/{repo}/{name}/blobs/{digest}
+GET    /v2/{repo}/{name}/blobs/{digest}
+DELETE /v2/{repo}/{name}/blobs/{digest}
+POST   /v2/{repo}/{name}/blobs/uploads/
+PATCH  /v2/{repo}/{name}/blobs/uploads/{uuid}
+PUT    /v2/{repo}/{name}/blobs/uploads/{uuid}?digest=
+GET    /v2/{repo}/{name}/manifests/{reference}
+HEAD   /v2/{repo}/{name}/manifests/{reference}
+PUT    /v2/{repo}/{name}/manifests/{reference}
+DELETE /v2/{repo}/{name}/manifests/{reference}
+GET    /v2/{repo}/{name}/tags/list
+```
+
+Authentication follows the Docker token model. `GET /v2/` without
+credentials, and every `401` on a registry route under `/v2/`, carries
+`WWW-Authenticate: Bearer realm="{base_url}/v2/token",service="opencargo"`,
+with `scope="repository:{repo}/{name}:pull"` (or `:push`) when the route
+names an image. `GET /v2/token` answers `{"token", "access_token",
+"expires_in": 3600, "issued_at"}`: with Basic credentials it checks the
+user's password (throttled like any Basic login), an API token is accepted
+too; without credentials it issues an anonymous token when
+`auth.anonymous_read` is on, else `401`. The token endpoint's own `401`
+carries no challenge, only the `{"errors": [...]}` body Docker shows.
+`scope` may repeat and is only recorded in the token; rights are checked per
+request against the user's permissions, so a token never grants more than
+its user has, and an anonymous token only what an anonymous caller has. Tokens
+are signed with a key generated at startup, expire after one hour and live in
+no table; a restart invalidates them and the client fetches a new one on the
+next `401`. `Authorization: Basic` and API tokens are still accepted on every
+`/v2/` route, so curl and older tooling need no token dance.
+
+`{name}` may span several segments (`team/app`, `org/team/app`). Reads work
+on `hosted`, `proxy` and `group` repositories: a proxy fetches from
+`upstream` (a registry root such as `https://registry-1.docker.io` or
+`https://ghcr.io`, or another opencargo repository as
+`http://host:6789/oci-hosted`), answers the upstream's Bearer challenge (a
+realm whose host is, or resolves to, a private address is refused unless it
+is the upstream's own endpoint, listed in `token_realms` or allowed by
+`dl_allow_private`), and caches manifests and blobs (up to 4 GiB) by digest,
+tags for `proxy.default_ttl` and tag lists for ten minutes; a group serves
+the first member that knows the image and merges `tags/list` (`n`, default
+100, and `last` apply to the merged list; a partial page carries
+`Link: <...>; rel="next"`).
+`Docker-Content-Digest` is always derived from the content. Routes the registry does not implement (`referrers`, anything else under `/v2/`) answer `404` with a JSON error body, which clients such as Docker 29 treat as "no referrers". An unreachable
+upstream is `502`; an unknown image is `404`, also when the upstream answers
+`401`/`403` after issuing a token (a refusal is asked again on the next
+request, an upstream `404` is remembered for `proxy.negative_cache_ttl`).
+Push, upload and delete routes accept only
+`hosted` repositories (`400` otherwise). Registry tokens are only valid under `/v2/`, are signed with a per-process key (a restart invalidates them and the client fetches a new one on its next 401; a horizontally scaled deployment would need a shared signing key), and a token bought with an API token stops working the moment that API token is revoked. Upstream credentials are configured
+in the file or the environment (`upstream_auth`, `token_realms`,
+`OPENCARGO_UPSTREAM_AUTH_<REPO>`), never through this API.
+
+## Go modules (GOPROXY)
+
+```
+GET    /{repo}/{module}/@v/list
+GET    /{repo}/{module}/@latest
+GET    /{repo}/{module}/@v/{version}.info
+GET    /{repo}/{module}/@v/{version}.mod
+GET    /{repo}/{module}/@v/{version}.zip
+PUT    /{repo}/{module}/@v/{version}               Publish (zip body)
+```
+
+`{module}` and `{version}` arrive GOPROXY-escaped (`github.com/!burnt!sushi/toml`,
+`v1.0.0-!r!c1`); the publish route takes the raw path. `.info` `Time` is RFC 3339. A `proxy`
+(`upstream = "https://proxy.golang.org"` or another opencargo repository)
+caches canonical versions forever (zips up to 512 MiB) and `@v/list`,
+`@latest` and non-canonical queries (`master.info`) for ten minutes. A `group` answers `@v/list` with the
+union of its members, `@latest` with the highest semver, and `.info`/`.mod`/
+`.zip` from the first member that has the version. Unknown module or upstream
+`410`: `404` (negative-cached; an empty `@v/list` for a known module is
+`200`); upstream down: `502`. The checksum database is not proxied.
+
+## Administration
+
+```
+POST   /api/v1/repositories                        {name, type, format, visibility, upstream?, members?}
+GET    /api/v1/repositories
+GET    /api/v1/repositories/{name}
+PUT    /api/v1/repositories/{name}
+DELETE /api/v1/repositories/{name}
+POST   /api/v1/repositories/{name}/purge-cache
+
+POST   /api/v1/users                               {username, email?, role}  -> one-time password
+GET    /api/v1/users
+GET    /api/v1/users/{username}
+PUT    /api/v1/users/{username}
+DELETE /api/v1/users/{username}
+PUT    /api/v1/users/{username}/password           {current_password, new_password}
+GET    /api/v1/users/{username}/tokens
+POST   /api/v1/users/{username}/tokens             {name, expires_in_days}  -> one-time token
+DELETE /api/v1/users/{username}/tokens/{id}
+GET    /api/v1/users/{username}/permissions
+PUT    /api/v1/users/{username}/permissions/{repo} {can_read, can_write, can_delete, can_admin}
+DELETE /api/v1/users/{username}/permissions/{repo}
+GET    /api/v1/me/permissions                      Effective rights of the caller, with their source
+
+GET    /api/v1/webhooks
+POST   /api/v1/webhooks                            {url, events, secret?}
+PUT    /api/v1/webhooks/{id}
+DELETE /api/v1/webhooks/{id}
+POST   /api/v1/webhooks/{id}/test
+
+GET    /api/v1/system/audit?page=1&size=50
+```
+
+Repository names match `[a-z0-9][a-z0-9._-]{0,63}` without `..`. `type` is
+`hosted`, `proxy` (requires `upstream`, an `http(s)` URL) or `group`
+(requires a non-empty `members` list of existing repositories of the same
+`format`; groups may nest up to 5 levels, cycles are refused); every format
+supports the three types. Violations are `400`, on create, update and on
+the config seed. `PUT` with another `upstream` purges the proxy's cache
+first. `DELETE` on a member of a group is `409`; deleting a proxy also
+drops its cache, deleting a group leaves its members' caches alone.
+`purge-cache` removes the cached rows and files of a proxy (a group purges
+its proxy members) and never touches hosted data. Upstream credentials,
+`token_realms` and `dl_allow_private` are set in the config file or the
+environment (`OPENCARGO_UPSTREAM_AUTH_<REPO>`, `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>`),
+never through this API; the environment is read at startup for every
+repository, so a proxy created here takes its credentials at the next
+restart (see the README).
+
+Roles: `admin` (everything), `publisher` (read + write), `reader` (read).
+A per-user, per-repository grant overrides the role. Resolution order:
+admin role, explicit grant, role default, anonymous read on public repos.
+
+## Promotion
+
+```
+POST   /api/v1/promote/@{scope}/{name}/{version}   {from, to}
+POST   /api/v1/promote/{name}/{version}
+GET    /api/v1/promotions/@{scope}/{name}/{version}
+GET    /api/v1/promotions/{name}/{version}
+```
+
+The artifact is not copied; both repositories point to the same file.
+
+## Dependency graph
+
+```
+GET    /api/v1/deps/@{scope}/{name}/dependencies
+GET    /api/v1/deps/@{scope}/{name}/dependents
+GET    /api/v1/deps/@{scope}/{name}/versions/{ver}/impact
+```
+
+Unscoped variants drop the `@{scope}/` segment. Dependencies are extracted at
+publish time (npm `dependencies`/`devDependencies`, Cargo deps, `go.mod`).
+
+## Vulnerabilities (OSV.dev)
+
+```
+GET    /api/v1/vulns/@{scope}/{name}/{version}
+POST   /api/v1/vulns/@{scope}/{name}/{version}/rescan     (authenticated)
+```
+
+Unscoped variants drop the `@{scope}/` segment. Response:
+
+```json
+{"package": "left-pad", "version": "1.3.0", "scanned_at": "...",
+ "total_deps": 12, "vulnerable_deps": 1, "status": "critical",
+ "details": [{"dependency": "minimist", "version": "1.2.0",
+              "vuln_id": "GHSA-...", "summary": "...",
+              "severity": "critical", "score": 9.8}]}
+```
+
+`status` is `not_scanned`, `clean`, `warning` or `critical`. `severity` is
+per advisory: the OSV `database_specific.severity` label when present, else
+the highest CVSS 3.x/4.0 vector scored (`critical` ≥ 9.0, `high` ≥ 7.0,
+`medium` ≥ 4.0, `low`), `critical` for `MAL-` ids, `unknown` when only CVSS 2
+or no data exists (`score` null). Each advisory is fetched once and cached
+for the process. With `vuln_scan.block_on_critical`, a publish carrying a
+critical advisory is refused with `400` before anything is stored; with
+`fail_closed` too, an OSV outage answers `503` instead of publishing
+unscanned. `rescan` needs write access on the repository; an OCI image is
+not a package, so both routes answer `404` for one.
+
+## Frontend data
+
+```
+GET    /api/v1/dashboard
+GET    /api/v1/packages?q=&repo=&page=
+GET    /api/v1/packages/{name}
+GET    /api/v1/search?q=
+```
+
+## WebSocket events
+
+`GET /api/v1/events/ws`. Authenticate with the first frame:
+
+```
+→ {"type":"auth","token":"trg_..."}          or {"type":"auth"} for anonymous
+← {"type":"hello","username":"dev1","role":"publisher","anonymous":false}
+← {"type":"package.published","data":{...},"ts":"..."}
+```
+
+| Event | Visible to | Payload |
+|---|---|---|
+| `package.published`, `package.promoted` (public repo) | everyone | full |
+| `package.published`, `package.promoted` (private repo) | admin | full |
+| `registry.changed` | authenticated | `{repository}` |
+| `repositories.changed` | everyone | empty |
+| `permissions.changed` | authenticated | `{username}` |
+| `audit.entry` | admin | `{username, action, target}` |
+
+Client may send `{"type":"ping"}`; server answers `{"type":"pong"}`, pings
+every 30 s, re-validates the token every ~5 min (revoked token closes with
+code 4401), and sends `{"type":"resync"}` when the client lags.
+
+## Webhooks
+
+Events: `package.published`, `package.promoted`, `*`. With a `secret`, each
+delivery carries `X-Webhook-Signature` = HMAC-SHA256 of the body.
+
+## System
+
+```
+GET    /health/live
+GET    /health/ready
+GET    /metrics
+```
+
+Prometheus metrics: `opencargo_http_requests_total{method,path,status}`,
+`opencargo_http_request_duration_seconds{method,path}`,
+`opencargo_downloads_total{repo,package}` (hosted artifacts served: npm
+tarballs, crates, module zips, OCI blobs), `opencargo_publishes_total{repo,package}`,
+`opencargo_cache_hits_total{repo}` and `opencargo_cache_misses_total{repo}`
+(proxy cache lookups, per member repository; a stale row counts as a miss).

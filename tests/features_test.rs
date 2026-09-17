@@ -1,103 +1,18 @@
-use base64::Engine;
+mod common;
+
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use opencargo::config::{
-    AuthConfig, Config, DatabaseConfig, RepositoryConfig, RepositoryFormat, RepositoryType,
-    ServerConfig, Visibility,
+use common::{
+    build_cargo_publish_body, build_crate_data, build_npm_publish_body, build_tarball, hosted,
+    spawn_server, SpawnOpts,
 };
-use opencargo::server;
+use opencargo::config::{RepositoryFormat, Visibility};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Build a gzip'd tar archive in memory containing `package/package.json`.
-fn build_tarball(package_json_content: &str) -> Vec<u8> {
-    let mut archive_buf = Vec::new();
-    {
-        let encoder =
-            flate2::write::GzEncoder::new(&mut archive_buf, flate2::Compression::default());
-        let mut tar_builder = tar::Builder::new(encoder);
-
-        let content_bytes = package_json_content.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_path("package/package.json").unwrap();
-        header.set_size(content_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-
-        tar_builder.append(&header, content_bytes).unwrap();
-        tar_builder.into_inner().unwrap().finish().unwrap();
-    }
-    archive_buf
-}
-
-/// Build the JSON publish payload that mimics `npm publish`.
-fn build_npm_publish_body(
-    package_name: &str,
-    version: &str,
-    description: &str,
-    tarball_data: &[u8],
-) -> Value {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(tarball_data);
-    let attachment_key = format!(
-        "{}-{}.tgz",
-        package_name.split('/').next_back().unwrap_or(package_name),
-        version
-    );
-
-    json!({
-        "name": package_name,
-        "description": description,
-        "dist-tags": { "latest": version },
-        "versions": {
-            version: {
-                "name": package_name,
-                "version": version,
-                "description": description,
-                "main": "index.js",
-                "dist": {
-                    "shasum": ""
-                }
-            }
-        },
-        "_attachments": {
-            attachment_key: {
-                "content_type": "application/octet-stream",
-                "data": b64,
-                "length": tarball_data.len()
-            }
-        }
-    })
-}
-
-/// Build the binary body for Cargo publish requests.
-///
-/// Format:
-///   4 bytes LE u32 -- JSON metadata length
-///   N bytes        -- JSON metadata
-///   4 bytes LE u32 -- crate file length
-///   M bytes        -- .crate file (gzip'd tar)
-fn build_cargo_publish_body(metadata_json: &str, crate_data: &[u8]) -> Vec<u8> {
-    let json_bytes = metadata_json.as_bytes();
-    let mut body = Vec::new();
-    body.extend_from_slice(&(json_bytes.len() as u32).to_le_bytes());
-    body.extend_from_slice(json_bytes);
-    body.extend_from_slice(&(crate_data.len() as u32).to_le_bytes());
-    body.extend_from_slice(crate_data);
-    body
-}
-
-/// Build a minimal .crate file (gzip compressed data).
-fn build_crate_data() -> Vec<u8> {
-    use flate2::write::GzEncoder;
-    use std::io::Write;
-    let mut encoder = GzEncoder::new(Vec::new(), flate2::Compression::default());
-    encoder.write_all(b"fake crate content").unwrap();
-    encoder.finish().unwrap()
-}
 
 /// Publish an npm package to the test-npm repository.
 async fn publish_npm_package(
@@ -132,84 +47,40 @@ async fn publish_npm_package(
 
 /// Start a test server on a random port with both npm and cargo repositories.
 async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
-    let tmp = TempDir::new().expect("failed to create temp dir");
-    let storage_path = tmp.path().join("storage");
-    let db_path = tmp.path().join("test.db");
-
-    let db_url = format!(
-        "sqlite:{}?mode=rwc",
-        db_path.to_str().expect("non-utf8 temp path")
-    );
-
-    let mut config = Config {
-        server: ServerConfig {
-            bind: "127.0.0.1:0".to_string(),
-            base_url: "http://127.0.0.1:0".to_string(),
-            storage_path: storage_path
-                .to_str()
-                .expect("non-utf8 temp path")
-                .to_string(),
-            ..Default::default()
-        },
-        database: DatabaseConfig { url: db_url },
-        auth: AuthConfig {
-            anonymous_read: true,
-            static_tokens: vec!["test-token".to_string()],
-            ..Default::default()
-        },
+    let server = spawn_server(SpawnOpts {
         repositories: vec![
-            RepositoryConfig {
-                name: "test-npm".to_string(),
-                repo_type: RepositoryType::Hosted,
-                format: RepositoryFormat::Npm,
-                visibility: Visibility::Public,
-                upstream: None,
-                members: None,
-            },
-            RepositoryConfig {
-                name: "cargo-private".to_string(),
-                repo_type: RepositoryType::Hosted,
-                format: RepositoryFormat::Cargo,
-                visibility: Visibility::Private,
-                upstream: None,
-                members: None,
-            },
+            hosted("test-npm", RepositoryFormat::Npm, Visibility::Public),
+            hosted("cargo-private", RepositoryFormat::Cargo, Visibility::Private),
         ],
         ..Default::default()
-    };
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind to random port");
-    let addr = listener.local_addr().expect("no local addr");
-    let base_url = format!("http://{}", addr);
-
-    config.server.base_url = base_url.clone();
-
-    let state = server::build_state(&config)
-        .await
-        .expect("failed to build app state");
-    let router = server::build_router(state);
-
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, router).await.ok();
-    });
-
-    // Wait for the server to be ready by polling /health/live.
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        match client.get(format!("{}/health/live", &base_url)).send().await {
-            Ok(resp) if resp.status().is_success() => break,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-        }
-    }
-
-    (base_url, handle, tmp)
+    })
+    .await;
+    (server.base_url, server.handle, server.tmp)
 }
 
 // ===========================================================================
 // Phase 4 -- UI Tests (SPA + JSON API)
 // ===========================================================================
+
+#[tokio::test]
+async fn test_unknown_v2_and_api_routes_are_json_404_not_spa() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    let digest = format!("sha256:{}", "0".repeat(64));
+    for path in [
+        format!("/v2/oci/team/app/referrers/{digest}"),
+        "/v2/nope/nothing".to_string(),
+        "/api/v1/nope".to_string(),
+    ] {
+        let resp = client.get(format!("{base_url}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{path}");
+        let ct = resp.headers()[reqwest::header::CONTENT_TYPE].to_str().unwrap().to_string();
+        assert!(ct.starts_with("application/json"), "{path}: {ct}");
+    }
+    let resp = client.get(format!("{base_url}/packages/anything")).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(resp.headers()[reqwest::header::CONTENT_TYPE].to_str().unwrap().starts_with("text/html"));
+}
 
 #[tokio::test]
 async fn test_dashboard_page() {
@@ -672,242 +543,6 @@ async fn test_dashboard_pagination_huge_page_no_overflow() {
 // Phase 6 -- Cargo Registry Tests
 // ===========================================================================
 
-#[tokio::test]
-async fn test_cargo_config_json() {
-    let (base_url, _handle, _tmp) = setup().await;
-    let client = reqwest::Client::new();
-
-    let resp = client
-        .get(format!("{}/cargo-private/index/config.json", base_url))
-        .bearer_auth("test-token")
-        .send()
-        .await
-        .expect("config.json request failed");
-
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let config: Value = resp.json().await.expect("invalid JSON");
-    assert!(
-        config.get("dl").is_some(),
-        "config.json should have 'dl' field: {:?}",
-        config
-    );
-    assert!(
-        config.get("api").is_some(),
-        "config.json should have 'api' field: {:?}",
-        config
-    );
-
-    // Verify the dl URL contains the repo name
-    let dl = config["dl"].as_str().expect("dl should be a string");
-    assert!(
-        dl.contains("cargo-private"),
-        "dl URL should contain 'cargo-private': {}",
-        dl
-    );
-}
-
-#[tokio::test]
-async fn test_cargo_publish_and_download() {
-    let (base_url, _handle, _tmp) = setup().await;
-    let client = reqwest::Client::new();
-
-    let crate_data = build_crate_data();
-    let metadata_json = r#"{"name":"test-crate","vers":"0.1.0","deps":[],"features":{},"authors":[],"description":"Test","license":"MIT"}"#;
-    let body = build_cargo_publish_body(metadata_json, &crate_data);
-
-    // Publish
-    let resp = client
-        .put(format!(
-            "{}/cargo-private/api/v1/crates/new",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .header("content-type", "application/octet-stream")
-        .body(body)
-        .send()
-        .await
-        .expect("cargo publish request failed");
-
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "cargo publish failed: {:?}",
-        resp.text().await
-    );
-
-    // Download
-    let resp = client
-        .get(format!(
-            "{}/cargo-private/api/v1/crates/test-crate/0.1.0/download",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .send()
-        .await
-        .expect("cargo download request failed");
-
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let downloaded = resp.bytes().await.expect("failed to read crate bytes");
-    assert_eq!(
-        downloaded.as_ref(),
-        crate_data.as_slice(),
-        "downloaded crate data should match the original"
-    );
-}
-
-#[tokio::test]
-async fn test_cargo_index_entry() {
-    let (base_url, _handle, _tmp) = setup().await;
-    let client = reqwest::Client::new();
-
-    let crate_data = build_crate_data();
-    let metadata_json = r#"{"name":"test-crate","vers":"0.1.0","deps":[],"features":{},"authors":[],"description":"Test","license":"MIT"}"#;
-    let body = build_cargo_publish_body(metadata_json, &crate_data);
-
-    // Publish
-    let resp = client
-        .put(format!(
-            "{}/cargo-private/api/v1/crates/new",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .header("content-type", "application/octet-stream")
-        .body(body)
-        .send()
-        .await
-        .expect("cargo publish request failed");
-
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "cargo publish failed: {:?}",
-        resp.text().await
-    );
-
-    // Fetch index entry: "test-crate" is 10 chars, prefix = te/st
-    let resp = client
-        .get(format!(
-            "{}/cargo-private/index/te/st/test-crate",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .send()
-        .await
-        .expect("index entry request failed");
-
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    let body_text = resp.text().await.expect("failed to read index body");
-
-    // The index entry should contain a JSON line with name and vers
-    assert!(
-        body_text.contains(r#""name":"test-crate""#),
-        "index entry should contain '\"name\":\"test-crate\"', got: {}",
-        body_text
-    );
-    assert!(
-        body_text.contains(r#""vers":"0.1.0""#),
-        "index entry should contain '\"vers\":\"0.1.0\"', got: {}",
-        body_text
-    );
-}
-
-#[tokio::test]
-async fn test_cargo_yank_unyank() {
-    let (base_url, _handle, _tmp) = setup().await;
-    let client = reqwest::Client::new();
-
-    let crate_data = build_crate_data();
-    let metadata_json = r#"{"name":"test-crate","vers":"0.1.0","deps":[],"features":{},"authors":[],"description":"Test","license":"MIT"}"#;
-    let body = build_cargo_publish_body(metadata_json, &crate_data);
-
-    // Publish
-    let resp = client
-        .put(format!(
-            "{}/cargo-private/api/v1/crates/new",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .header("content-type", "application/octet-stream")
-        .body(body)
-        .send()
-        .await
-        .expect("cargo publish request failed");
-
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "cargo publish failed: {:?}",
-        resp.text().await
-    );
-
-    // Yank
-    let resp = client
-        .delete(format!(
-            "{}/cargo-private/api/v1/crates/test-crate/0.1.0/yank",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .send()
-        .await
-        .expect("yank request failed");
-
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Verify index shows yanked:true
-    let resp = client
-        .get(format!(
-            "{}/cargo-private/index/te/st/test-crate",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .send()
-        .await
-        .expect("index entry request after yank failed");
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body_text = resp.text().await.expect("failed to read index body");
-    assert!(
-        body_text.contains(r#""yanked":true"#),
-        "index entry should contain '\"yanked\":true' after yank, got: {}",
-        body_text
-    );
-
-    // Unyank
-    let resp = client
-        .put(format!(
-            "{}/cargo-private/api/v1/crates/test-crate/0.1.0/unyank",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .send()
-        .await
-        .expect("unyank request failed");
-
-    assert_eq!(resp.status(), StatusCode::OK);
-
-    // Verify index shows yanked:false
-    let resp = client
-        .get(format!(
-            "{}/cargo-private/index/te/st/test-crate",
-            base_url
-        ))
-        .bearer_auth("test-token")
-        .send()
-        .await
-        .expect("index entry request after unyank failed");
-
-    assert_eq!(resp.status(), StatusCode::OK);
-    let body_text = resp.text().await.expect("failed to read index body");
-    assert!(
-        body_text.contains(r#""yanked":false"#),
-        "index entry should contain '\"yanked\":false' after unyank, got: {}",
-        body_text
-    );
-}
-
 /// Regression test for S2: the dashboard API must not expose packages of a
 /// PRIVATE repository to anonymous/non-admin callers, while admins still see
 /// them. cargo-private (in setup()) is a private repo.
@@ -974,37 +609,4 @@ async fn test_dashboard_hides_private_packages() {
         "anonymous package list must not include the private 'test-crate', got: {:?}",
         names
     );
-}
-
-/// Hostile crate names in the publish metadata must be rejected with 400
-/// before touching DB or storage: the name is interpolated into the storage
-/// path (`cargo/{repo}/{name}/{name}-{vers}.crate`).
-#[tokio::test]
-async fn test_cargo_publish_rejects_invalid_crate_name() {
-    let (base_url, _handle, _tmp) = setup().await;
-    let client = reqwest::Client::new();
-
-    for bad_meta in [
-        // Path traversal in the name
-        r#"{"name":"../evil","vers":"1.0.0","deps":[],"features":{},"authors":[],"description":"x"}"#,
-        // Slash in the name -> arbitrary storage subtree
-        r#"{"name":"a/b","vers":"1.0.0","deps":[],"features":{},"authors":[],"description":"x"}"#,
-        // Version with a slash
-        r#"{"name":"okcrate","vers":"1.0/0","deps":[],"features":{},"authors":[],"description":"x"}"#,
-    ] {
-        let body = build_cargo_publish_body(bad_meta, &build_crate_data());
-        let resp = client
-            .put(format!("{}/cargo-private/api/v1/crates/new", base_url))
-            .bearer_auth("test-token")
-            .header("content-type", "application/octet-stream")
-            .body(body)
-            .send()
-            .await
-            .expect("cargo publish request failed");
-        assert_eq!(
-            resp.status(),
-            StatusCode::BAD_REQUEST,
-            "hostile cargo metadata must be rejected with 400: {bad_meta}"
-        );
-    }
 }

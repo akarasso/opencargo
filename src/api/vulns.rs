@@ -104,10 +104,12 @@ async fn get_vulns_impl(
 
     match scan {
         Some(s) => {
+            // The stored JSON is the whole ScanResult; pre-upgrade rows keep their old detail shape.
             let details: serde_json::Value = s
                 .scan_results_json
                 .as_deref()
-                .and_then(|j| serde_json::from_str(j).ok())
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                .and_then(|mut r| r.get_mut("details").map(serde_json::Value::take))
                 .unwrap_or(json!(null));
 
             Ok(Json(json!({
@@ -186,13 +188,13 @@ async fn rescan_impl(
             AppError::NotFound(format!("version not found: {name}@{version_str}"))
         })?;
 
-    // Determine ecosystem from the repository format
-    let ecosystem = match repo.format.as_str() {
-        "npm" => "npm",
-        "cargo" => "crates.io",
-        "go" => "Go",
-        _ => "npm",
-    };
+    let format = repo.fmt()?;
+    let ecosystem = format.osv_ecosystem().ok_or_else(|| {
+        AppError::BadRequest(format!(
+            "vulnerability scanning is not available for {} repositories",
+            format.as_str()
+        ))
+    })?;
 
     // Delete old scan results
     crate::db::delete_vulnerability_scans(&state.db, version.id).await?;
@@ -202,7 +204,7 @@ async fn rescan_impl(
         .vuln_scanner
         .scan_version(&state.db, version.id, &version.metadata_json, ecosystem)
         .await
-        .map_err(|e| AppError::Internal(format!("scan failed: {e}")))?;
+        .map_err(|e| AppError::ServiceUnavailable(format!("scan failed: {e}")))?;
 
     Ok(Json(json!({
         "package": name,

@@ -1,0 +1,15 @@
+# Example overlay for a Scaleway Kapsule cluster with a Gateway API ingress.
+#   kubectl apply -f k8s/scaleway/namespace.yaml
+#   kubectl apply -f k8s/scaleway/pvc.yaml        # once: the spec is immutable, see its header
+#   kubectl apply -k k8s/scaleway
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: infra
+resources:
+  - ../base  # configmap, deployment, service; the pvc is excluded there by design
+  - httproute.yaml
+labels:
+  - pairs:
+      app.kubernetes.io/name: opencargo
+      app.kubernetes.io/managed-by: kustomize
+    includeSelectors: false

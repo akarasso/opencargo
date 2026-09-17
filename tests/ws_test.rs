@@ -17,6 +17,8 @@
 //! right after publishing into the private repo is the *public* repo's event,
 //! the private one was filtered — no flaky sleep-and-assert-nothing needed.
 
+mod common;
+
 use std::time::Duration;
 
 use base64::Engine;
@@ -81,21 +83,27 @@ async fn setup(anonymous_read: bool) -> (String, tokio::task::JoinHandle<()>, Te
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-secret".to_string(),
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Private,
-                upstream: None,
-                members: None,
+                ..Default::default()
+            },
+            RepositoryConfig {
+                name: "cargo-pub".to_string(),
+                repo_type: RepositoryType::Hosted,
+                format: RepositoryFormat::Cargo,
+                visibility: Visibility::Public,
+                ..Default::default()
             },
         ],
         vuln_scan: VulnScanConfig {
             enabled: false,
             block_on_critical: false,
+            ..Default::default()
         },
         ..Default::default()
     };
@@ -367,11 +375,37 @@ async fn test_ws_admin_auth_and_private_repo_events() {
     assert_eq!(ev["type"], "package.published", "got {ev:?}");
     assert_eq!(ev["data"]["package"], "@sec/hidden");
     assert_eq!(ev["data"]["repository"], "npm-secret");
+    assert_eq!(ev["data"]["format"], "npm", "the format name, not the OSV ecosystem");
     assert!(ev["ts"].is_string(), "events carry an RFC 3339 timestamp");
 
     let hint = recv_json(&mut ws).await;
     assert_eq!(hint["type"], "registry.changed", "got {hint:?}");
     assert_eq!(hint["data"]["repository"], "npm-secret");
+}
+
+/// `data.format` is the format name (`cargo`), not the OSV ecosystem (`crates.io`).
+#[tokio::test]
+async fn test_ws_package_published_carries_the_format_name() {
+    let (base_url, _handle, _tmp) = setup(true).await;
+    let mut ws = ws_connect(&base_url).await;
+    ws_auth(&mut ws, None).await;
+    settle().await;
+
+    let meta = r#"{"name":"evented","vers":"0.1.0","deps":[],"features":{},"authors":[],"description":"d"}"#;
+    let resp = reqwest::Client::new()
+        .put(format!("{base_url}/cargo-pub/api/v1/crates/new"))
+        .bearer_auth("test-token")
+        .body(common::build_cargo_publish_body(meta, &common::build_crate_data()))
+        .send()
+        .await
+        .expect("cargo publish failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let ev = recv_json(&mut ws).await;
+    assert_eq!(ev["type"], "package.published", "got {ev:?}");
+    assert_eq!(ev["data"]["package"], "evented");
+    assert_eq!(ev["data"]["repository"], "cargo-pub");
+    assert_eq!(ev["data"]["format"], "cargo");
 }
 
 // ---------------------------------------------------------------------------

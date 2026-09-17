@@ -5,10 +5,13 @@ use axum::{
     Json,
 };
 use serde::Deserialize;
-use serde_json::json;
+use serde_json::{json, Value};
 
 use crate::api::{require_admin, require_auth};
+use crate::db::kinds::{validate_spec, Format, RepoKind, RepoSpec};
+use crate::db::Repository;
 use crate::error::{AppError, AppResult};
+use crate::proxy::purge::purge_repository;
 use crate::server::AppState;
 
 // ---------------------------------------------------------------------------
@@ -49,49 +52,19 @@ pub async fn create_repository(
 ) -> AppResult<impl IntoResponse> {
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
+    let body: CreateRepositoryRequest = read_json(request).await?;
 
-    let body: CreateRepositoryRequest = {
-        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
-        serde_json::from_slice(&bytes)?
-    };
-
-    // Validate repo_type
-    if !matches!(body.repo_type.as_str(), "hosted" | "proxy" | "group") {
-        return Err(AppError::BadRequest(format!(
-            "invalid repository type: {}",
-            body.repo_type
-        )));
-    }
-
-    // Validate format
-    if !matches!(
-        body.format.as_str(),
-        "npm" | "cargo" | "oci" | "go" | "pypi"
-    ) {
+    let kind: RepoKind = body.repo_type.parse()?;
+    let format: Format = body.format.parse()?;
+    // The API never exposes pypi: there is no registry module behind it.
+    if format == Format::Pypi {
         return Err(AppError::BadRequest(format!(
             "invalid repository format: {}",
             body.format
         )));
     }
+    validate_visibility(&body.visibility)?;
 
-    // Validate visibility
-    if !matches!(body.visibility.as_str(), "public" | "private") {
-        return Err(AppError::BadRequest(format!(
-            "invalid visibility: {}",
-            body.visibility
-        )));
-    }
-
-    // Validate the upstream URL (SSRF guard) when one is provided.
-    if let Some(ref upstream) = body.upstream {
-        if !upstream.is_empty() {
-            crate::proxy::validate_upstream_url(upstream)?;
-        }
-    }
-
-    // Check that repo does not already exist
     if crate::db::get_repository_by_name(&state.db, &body.name)
         .await?
         .is_some()
@@ -102,22 +75,24 @@ pub async fn create_repository(
         )));
     }
 
-    // Build config_json for group repos
-    let config_json = if body.repo_type == "group" {
-        let members = body.members.unwrap_or_default();
-        Some(serde_json::json!({ "members": members }).to_string())
-    } else {
-        None
+    let members = body.members.unwrap_or_default();
+    let spec = RepoSpec {
+        name: &body.name,
+        kind,
+        format,
+        upstream: non_empty(body.upstream.as_deref()),
+        members: &members,
     };
+    validate_spec(&state.db, &spec, &[]).await?;
 
-    let _id = crate::db::create_repository(
+    crate::db::create_repository(
         &state.db,
         &body.name,
-        &body.repo_type,
-        &body.format,
+        kind,
+        format,
         &body.visibility,
-        body.upstream.as_deref(),
-        config_json.as_deref(),
+        spec.upstream,
+        spec.config_json().as_deref(),
     )
     .await?;
 
@@ -128,20 +103,7 @@ pub async fn create_repository(
     crate::api::record_audit(&state, &caller, "repo.create", Some(&repo.name)).await;
     emit_repositories_changed(&state);
 
-    Ok((
-        StatusCode::CREATED,
-        Json(json!({
-            "id": repo.id,
-            "name": repo.name,
-            "type": repo.repo_type,
-            "format": repo.format,
-            "visibility": repo.visibility,
-            "upstream": repo.upstream_url,
-            "config": repo.config_json,
-            "created_at": repo.created_at,
-            "updated_at": repo.updated_at,
-        })),
-    ))
+    Ok((StatusCode::CREATED, Json(repo_json(&repo))))
 }
 
 /// GET /api/v1/repositories/{name} -- Get repository details (authenticated
@@ -154,9 +116,7 @@ pub async fn get_repository(
 ) -> AppResult<impl IntoResponse> {
     let caller = require_auth(&request)?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))?;
+    let repo = load_repo(&state, &name).await?;
 
     // A private repo the caller cannot read must be indistinguishable from a
     // missing one, so the permission denial maps to the same 404.
@@ -164,20 +124,12 @@ pub async fn get_repository(
         .await
         .map_err(|_| AppError::NotFound(format!("repository not found: {name}")))?;
 
-    Ok(Json(json!({
-        "id": repo.id,
-        "name": repo.name,
-        "type": repo.repo_type,
-        "format": repo.format,
-        "visibility": repo.visibility,
-        "upstream": repo.upstream_url,
-        "config": repo.config_json,
-        "created_at": repo.created_at,
-        "updated_at": repo.updated_at,
-    })))
+    Ok(Json(repo_json(&repo)))
 }
 
-/// PUT /api/v1/repositories/{name} -- Update repository (admin only)
+/// PUT /api/v1/repositories/{name} -- Update repository (admin only). The
+/// patch is merged onto the stored row and validated like a create; a new
+/// upstream purges the cache first, since rows are not keyed by upstream.
 pub async fn update_repository(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -185,65 +137,52 @@ pub async fn update_repository(
 ) -> AppResult<impl IntoResponse> {
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
+    let body: UpdateRepositoryRequest = read_json(request).await?;
 
-    let body: UpdateRepositoryRequest = {
-        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
-        serde_json::from_slice(&bytes)?
-    };
-
-    let _repo = crate::db::get_repository_by_name(&state.db, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))?;
-
+    let repo = load_repo(&state, &name).await?;
     if let Some(ref vis) = body.visibility {
-        if !matches!(vis.as_str(), "public" | "private") {
-            return Err(AppError::BadRequest(format!("invalid visibility: {vis}")));
-        }
+        validate_visibility(vis)?;
     }
 
-    // Validate the upstream URL (SSRF guard) when one is provided.
-    if let Some(ref upstream) = body.upstream {
-        if !upstream.is_empty() {
-            crate::proxy::validate_upstream_url(upstream)?;
-        }
+    let upstream_patch = non_empty(body.upstream.as_deref());
+    let members = body.members.clone().unwrap_or_else(|| repo.members());
+    let spec = RepoSpec {
+        name: &repo.name,
+        kind: repo.kind()?,
+        format: repo.fmt()?,
+        upstream: upstream_patch.or(repo.upstream_url.as_deref()),
+        members: &members,
+    };
+    validate_spec(&state.db, &spec, &[]).await?;
+    if upstream_patch.is_some_and(|u| Some(u) != repo.upstream_url.as_deref()) {
+        purge_repository(&state, &repo).await?;
     }
 
-    let config_json = body.members.map(|members| {
-        serde_json::json!({ "members": members }).to_string()
-    });
-
+    let config_json = body
+        .members
+        .is_some()
+        .then(|| json!({ "members": members }).to_string());
     crate::db::update_repository(
         &state.db,
         &name,
         body.visibility.as_deref(),
-        body.upstream.as_deref(),
+        upstream_patch,
         config_json.as_deref(),
     )
     .await?;
 
-    let updated = crate::db::get_repository_by_name(&state.db, &name)
-        .await?
-        .ok_or_else(|| AppError::Internal("failed to fetch updated repository".to_string()))?;
+    let updated = load_repo(&state, &name).await?;
 
     crate::api::record_audit(&state, &caller, "repo.update", Some(&name)).await;
     emit_repositories_changed(&state);
 
-    Ok(Json(json!({
-        "id": updated.id,
-        "name": updated.name,
-        "type": updated.repo_type,
-        "format": updated.format,
-        "visibility": updated.visibility,
-        "upstream": updated.upstream_url,
-        "config": updated.config_json,
-        "created_at": updated.created_at,
-        "updated_at": updated.updated_at,
-    })))
+    Ok(Json(repo_json(&updated)))
 }
 
-/// DELETE /api/v1/repositories/{name} -- Delete repository (admin only)
+/// DELETE /api/v1/repositories/{name} -- Delete repository (admin only):
+/// refused while packages or a group membership remain, a proxy's cache
+/// purged first so the row can go. A group owns no cache: its members keep
+/// theirs.
 pub async fn delete_repository(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -252,12 +191,8 @@ pub async fn delete_repository(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let repo = crate::db::get_repository_by_name(&state.db, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))?;
+    let repo = load_repo(&state, &name).await?;
 
-    // Refuse to delete a non-empty repo with a clear 409 instead of letting the
-    // foreign-key constraint blow up as an opaque 500.
     let pkg_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = ?1")
             .bind(repo.id)
@@ -269,12 +204,100 @@ pub async fn delete_repository(
         )));
     }
 
+    let holders = groups_containing(&state, &name).await?;
+    if !holders.is_empty() {
+        return Err(AppError::Conflict(format!(
+            "repository '{name}' is a member of group(s) {}; remove it from them first",
+            holders.join(", ")
+        )));
+    }
+
+    if repo.kind()? == RepoKind::Proxy {
+        purge_repository(&state, &repo).await?;
+    }
     crate::db::delete_repository(&state.db, &name).await?;
 
     crate::api::record_audit(&state, &caller, "repo.delete", Some(&name)).await;
     emit_repositories_changed(&state);
 
     Ok(Json(json!({"ok": true})))
+}
+
+/// POST /api/v1/repositories/{name}/purge-cache -- Purge the proxy cache of a
+/// proxy repository or of every proxy member of a group (admin only)
+pub async fn purge_cache(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    request: axum::http::Request<axum::body::Body>,
+) -> AppResult<impl IntoResponse> {
+    let caller = require_auth(&request)?;
+    require_admin(&caller)?;
+
+    let repo = load_repo(&state, &name).await?;
+    purge_repository(&state, &repo).await?;
+
+    crate::api::record_audit(&state, &caller, "repo.purge_cache", Some(&name)).await;
+
+    Ok(Json(json!({"ok": true, "message": format!("cache purged for repository: {name}")})))
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+async fn read_json<T: serde::de::DeserializeOwned>(
+    request: axum::http::Request<axum::body::Body>,
+) -> AppResult<T> {
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
+async fn load_repo(state: &AppState, name: &str) -> AppResult<Repository> {
+    crate::db::get_repository_by_name(&state.db, name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))
+}
+
+fn validate_visibility(visibility: &str) -> AppResult<()> {
+    if matches!(visibility, "public" | "private") {
+        return Ok(());
+    }
+    Err(AppError::BadRequest(format!(
+        "invalid visibility: {visibility}"
+    )))
+}
+
+/// An empty upstream string is treated as absent, as the UI sends it.
+fn non_empty(upstream: Option<&str>) -> Option<&str> {
+    upstream.filter(|u| !u.is_empty())
+}
+
+/// Names of the groups listing `name` as a member.
+async fn groups_containing(state: &AppState, name: &str) -> AppResult<Vec<String>> {
+    let repos = crate::db::get_all_repositories(&state.db).await?;
+    let mut holders = Vec::new();
+    for repo in repos {
+        if repo.kind()? == RepoKind::Group && repo.members().iter().any(|m| m == name) {
+            holders.push(repo.name);
+        }
+    }
+    Ok(holders)
+}
+
+fn repo_json(repo: &Repository) -> Value {
+    json!({
+        "id": repo.id,
+        "name": repo.name,
+        "type": repo.repo_type,
+        "format": repo.format,
+        "visibility": repo.visibility,
+        "upstream": repo.upstream_url,
+        "config": repo.config_json,
+        "created_at": repo.created_at,
+        "updated_at": repo.updated_at,
+    })
 }
 
 /// Public hint that the repository list changed. Payload-free on purpose: the
@@ -286,43 +309,4 @@ fn emit_repositories_changed(state: &AppState) {
         crate::events::Visibility::Public,
         serde_json::json!({}),
     );
-}
-
-/// POST /api/v1/repositories/{name}/purge-cache -- Purge proxy cache (admin only)
-pub async fn purge_cache(
-    State(state): State<AppState>,
-    Path(name): Path<String>,
-    request: axum::http::Request<axum::body::Body>,
-) -> AppResult<impl IntoResponse> {
-    let caller = require_auth(&request)?;
-    require_admin(&caller)?;
-
-    let repo = crate::db::get_repository_by_name(&state.db, &name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))?;
-
-    if repo.repo_type != "proxy" {
-        return Err(AppError::BadRequest(
-            "can only purge cache on proxy repositories".to_string(),
-        ));
-    }
-
-    // Delete all proxy cache metadata for this repository
-    sqlx::query("DELETE FROM proxy_cache_meta WHERE repository_id = ?1")
-        .bind(repo.id)
-        .execute(&state.db)
-        .await?;
-
-    // Delete the cached files too. Previously only the metadata table was
-    // cleared, so cached tarballs kept being served from disk (purge was a
-    // no-op for them) and storage leaked.
-    crate::storage::StorageBackend::delete_prefix(
-        state.storage.as_ref(),
-        &format!("_proxy_cache/{name}"),
-    )
-    .await?;
-
-    crate::api::record_audit(&state, &caller, "repo.purge_cache", Some(&name)).await;
-
-    Ok(Json(json!({"ok": true, "message": format!("cache purged for repository: {name}")})))
 }

@@ -44,3 +44,7 @@ frontend/stitch-*.html
 # MCP / tooling logs
 excalidraw.log
 .playwright-mcp/
+
+# Private business documents (never publish)
+plan-produit.md
+plan-lancement.md

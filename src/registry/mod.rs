@@ -2,11 +2,14 @@ pub mod cargo;
 pub mod go;
 pub mod npm;
 pub mod oci;
+pub mod publish;
+pub mod resolve;
 
 use std::collections::HashMap;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
+use crate::db::kinds::{Format, RepoKind};
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
@@ -21,6 +24,13 @@ pub fn extract_package_name(params: &HashMap<String, String>) -> String {
         Some(scope) => format!("@{}/{}", scope, params.get("name").unwrap_or(&String::new())),
         None => params.get("name").cloned().unwrap_or_default(),
     }
+}
+
+/// Load a repository by name; a missing one is a 404 naming it.
+pub async fn load_repo(db: &sqlx::SqlitePool, name: &str) -> AppResult<Repository> {
+    crate::db::get_repository_by_name(db, name)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))
 }
 
 /// Enforce read access on a repository before serving any of its content.
@@ -84,13 +94,16 @@ pub async fn ensure_can_write(
 /// Without this guard a payload of one format could be published into a repo of
 /// another (e.g. an npm tarball into a `cargo` repo), silently corrupting it
 /// since the underlying tables are shared.
-pub fn ensure_format(repo: &Repository, expected: &str) -> AppResult<()> {
-    if repo.format == expected {
+pub fn ensure_format(repo: &Repository, expected: Format) -> AppResult<()> {
+    let format = repo.fmt()?;
+    if format == expected {
         Ok(())
     } else {
         Err(AppError::BadRequest(format!(
             "repository '{}' is a '{}' repository, not '{}'",
-            repo.name, repo.format, expected
+            repo.name,
+            format.as_str(),
+            expected.as_str()
         )))
     }
 }
@@ -99,7 +112,7 @@ pub fn ensure_format(repo: &Repository, expected: &str) -> AppResult<()> {
 /// Factored out of the per-format publish handlers where the check was
 /// duplicated verbatim.
 pub fn ensure_hosted(repo: &Repository) -> AppResult<()> {
-    if repo.repo_type == "hosted" {
+    if repo.kind()? == RepoKind::Hosted {
         Ok(())
     } else {
         Err(AppError::BadRequest(
@@ -245,6 +258,39 @@ pub fn validate_package_name(format: &str, name: &str) -> AppResult<()> {
     Ok(())
 }
 
+/// One npm name part on a read: any legacy name npm still serves (uppercase,
+/// `~'!()*`) passes, only what would escape a path or break a URL is refused.
+fn is_safe_npm_read_part(part: &str) -> bool {
+    !part.is_empty()
+        && part != "."
+        && part != ".."
+        && part.bytes().all(|b| {
+            b.is_ascii_graphic() && !matches!(b, b'/' | b'\\' | b'?' | b'#' | b'%')
+        })
+}
+
+/// The read-side npm rule: publish enforces npm's naming policy through
+/// [`validate_package_name`], reads only need the name to be one safe path
+/// segment (or `@scope/name`), so packages published before the lowercase
+/// rule (`JSONStream`, `Base64`) keep resolving through a proxy.
+pub fn validate_npm_read_name(name: &str) -> AppResult<()> {
+    let invalid = || AppError::BadRequest(format!("invalid npm package name: '{name}'"));
+    if name.len() > 214 {
+        return Err(invalid());
+    }
+    let safe = match name.strip_prefix('@') {
+        Some(rest) => rest
+            .split_once('/')
+            .is_some_and(|(scope, pkg)| is_safe_npm_read_part(scope) && is_safe_npm_read_part(pkg)),
+        None => is_safe_npm_read_part(name),
+    };
+    if safe {
+        Ok(())
+    } else {
+        Err(invalid())
+    }
+}
+
 /// Validate a version string: `[a-zA-Z0-9.+-]+`, at most 128 chars. Covers
 /// semver (npm/cargo) and Go pseudo-versions; blocks path separators and
 /// traversal sequences in storage paths like `{name}-{version}.crate`.
@@ -284,84 +330,6 @@ pub fn validate_oci_tag(tag: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// Shared post-publish side effects, factored out of the per-format publish
-/// handlers where they were duplicated verbatim: fire the `package.published`
-/// webhook, emit the real-time event, then run the vulnerability scan. With
-/// `block_on_critical`, a critical finding aborts the publish (returns Err);
-/// otherwise the scan runs in the background.
-///
-/// `version_id` is `None` for ecosystems that do not record rows in the
-/// `versions` table (OCI stores manifests/tags in dedicated tables); the scan
-/// step is skipped in that case since `vulnerability_scans.version_id` has a
-/// foreign key on `versions(id)`.
-#[allow(clippy::too_many_arguments)]
-pub async fn finalize_publish(
-    state: &AppState,
-    ecosystem: &str,
-    repo_name: &str,
-    package_name: &str,
-    version_str: &str,
-    version_id: Option<i64>,
-    metadata_json: &str,
-    published_by: &str,
-) -> AppResult<()> {
-    state
-        .webhook_dispatcher
-        .dispatch(
-            "package.published",
-            &serde_json::json!({
-                "package": package_name,
-                "version": version_str,
-                "repository": repo_name,
-                "published_by": published_by,
-            }),
-        )
-        .await;
-
-    emit_package_event(
-        state,
-        "package.published",
-        repo_name,
-        serde_json::json!({
-            "package": package_name,
-            "version": version_str,
-            "repository": repo_name,
-            "format": ecosystem,
-            "published_by": published_by,
-        }),
-    )
-    .await;
-
-    let Some(version_id) = version_id else {
-        return Ok(());
-    };
-
-    if state.vuln_scan_config.block_on_critical {
-        let scan_result = state
-            .vuln_scanner
-            .scan_version(&state.db, version_id, metadata_json, ecosystem)
-            .await;
-        if let Ok(ref result) = scan_result {
-            if result.status == "critical" {
-                return Err(AppError::BadRequest(
-                    "publish blocked: critical vulnerabilities found in dependencies".to_string(),
-                ));
-            }
-        }
-    } else {
-        let scanner = state.vuln_scanner.clone();
-        let db = state.db.clone();
-        let meta_json = metadata_json.to_string();
-        let eco = ecosystem.to_string();
-        tokio::spawn(async move {
-            if let Err(e) = scanner.scan_version(&db, version_id, &meta_json, &eco).await {
-                tracing::warn!(error = %e, "Background vulnerability scan failed");
-            }
-        });
-    }
-    Ok(())
-}
-
 /// Broadcast a package event on the real-time bus, scoped by the repository's
 /// visibility:
 ///
@@ -396,7 +364,48 @@ pub async fn emit_package_event(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_oci_tag, validate_package_name, validate_version};
+    use super::{
+        validate_npm_read_name, validate_oci_tag, validate_package_name, validate_version,
+    };
+
+    #[test]
+    fn npm_read_names_accept_legacy_case_and_refuse_path_escapes() {
+        for ok in [
+            "JSONStream",
+            "Base64",
+            "@Scope/CSSselect",
+            "react",
+            "@scope/pkg",
+            "lodash.merge",
+            "weird~name!(1)*",
+        ] {
+            assert!(validate_npm_read_name(ok).is_ok(), "{ok} should be readable");
+            assert!(
+                validate_package_name("npm", ok).is_err() || ok.to_lowercase() == ok,
+                "{ok}: publish stays strict"
+            );
+        }
+        for bad in [
+            "",
+            "..",
+            "a/b",
+            "../evil",
+            "@scope",
+            "@scope/a/b",
+            "@/pkg",
+            "@scope/",
+            "@scope/..",
+            "a b",
+            "a\\b",
+            "a?b",
+            "a#b",
+            "a%2fb",
+            "\u{1}",
+            &"x".repeat(215),
+        ] {
+            assert!(validate_npm_read_name(bad).is_err(), "{bad:?} should be refused");
+        }
+    }
 
     #[test]
     fn npm_names() {

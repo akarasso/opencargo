@@ -1,6 +1,7 @@
 use axum::{
+    body::Body,
     extract::State,
-    http::{Request, StatusCode},
+    http::{header, HeaderMap, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
@@ -12,6 +13,7 @@ use std::sync::Arc;
 
 use super::rate_limit::RateLimiter;
 use super::tokens;
+use crate::registry::oci::token::{self, TokenSigner};
 
 // ---------------------------------------------------------------------------
 // Auth state (passed via axum's State extractor)
@@ -24,6 +26,9 @@ pub struct AuthState {
     pub db: SqlitePool,
     /// Shared with `AppState.login_rate_limiter`; throttles Basic Auth attempts.
     pub login_rate_limiter: Arc<RateLimiter>,
+    /// Names the token realm in every OCI challenge.
+    pub base_url: String,
+    pub registry_tokens: TokenSigner,
 }
 
 // ---------------------------------------------------------------------------
@@ -41,161 +46,252 @@ pub struct AuthUser {
     pub must_change_password: bool,
 }
 
-// ---------------------------------------------------------------------------
-// Middleware
-// ---------------------------------------------------------------------------
-
-/// Axum middleware for Bearer token authentication.
-///
-/// Supports both static tokens from config (backwards compat) and
-/// DB-backed API tokens with user lookup.
-pub async fn auth_middleware(
-    State(state): State<Arc<AuthState>>,
-    request: Request<axum::body::Body>,
-    next: Next,
-) -> Response {
-    let is_read = request.method() == axum::http::Method::GET
-        || request.method() == axum::http::Method::HEAD;
-
-    // Detect if this is an OCI request (Docker client) for proper Www-Authenticate headers
-    let is_oci = request.uri().path().starts_with("/v2");
-
-    // Try to extract the Bearer token from the Authorization header.
-    let bearer_token = request
-        .headers()
-        .get(axum::http::header::AUTHORIZATION)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .map(|t| t.to_string());
-
-    // Try Basic Auth if no Bearer token
-    let basic_auth = if bearer_token.is_none() {
-        request
-            .headers()
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            .and_then(|v| v.strip_prefix("Basic "))
-            .and_then(|b64| {
-                base64::engine::general_purpose::STANDARD.decode(b64).ok()
-            })
-            .and_then(|bytes| String::from_utf8(bytes).ok())
-            .and_then(|decoded| {
-                let parts: Vec<&str> = decoded.splitn(2, ':').collect();
-                if parts.len() == 2 {
-                    Some((parts[0].to_string(), parts[1].to_string()))
-                } else {
-                    None
-                }
-            })
-    } else {
-        None
-    };
-
-    // Handle Basic Auth
-    if let Some((username, password)) = basic_auth {
-        // Throttle Basic Auth to stop brute force and the Argon2 CPU DoS it
-        // enables — but only count FAILED attempts (recorded below), so a
-        // legitimate client making many authenticated requests in a burst
-        // (e.g. `docker push`) is never throttled. Checked before Argon2 so a
-        // username already over its failure budget can't keep burning CPU.
-        let rl_key = format!("basic:{username}");
-        if state.login_rate_limiter.is_limited(&rl_key) {
-            return too_many_requests_response();
-        }
-        // A DB failure (e.g. SQLITE_BUSY under load) says nothing about the
-        // credentials: answer 503 so the client retries — same treatment as
-        // the Bearer path — and do NOT record a rate-limit failure, so a DB
-        // hiccup can't push a legitimate user toward the throttle.
-        let user = match crate::db::get_user_by_username(&state.db, &username).await {
-            Ok(user) => user,
-            Err(e) => {
-                tracing::warn!(error = %e, "database error during basic authentication");
-                return service_unavailable_response();
-            }
-        };
-        if let Some(user) = user {
-            let password_ok =
-                super::users::verify_password_async(password, user.password_hash.clone())
-                    .await
-                    .unwrap_or(false);
-            if password_ok {
-                let auth_user = AuthUser {
-                    token: String::new(),
-                    user_id: Some(user.id),
-                    username: user.username,
-                    role: user.role,
-                    must_change_password: user.must_change_password == 1,
-                };
-                if let Some(resp) = password_change_pending_block(
-                    &auth_user,
-                    request.method(),
-                    request.uri().path(),
-                ) {
-                    return resp;
-                }
-                let mut request = request;
-                request.extensions_mut().insert(auth_user);
-                return next.run(request).await;
-            }
-        }
-        // Basic Auth failed (unknown user or bad password): record the failed
-        // attempt so repeated failures from this username get throttled.
-        state.login_rate_limiter.record_failure(&rl_key);
-        return unauthorized_response(is_oci);
-    }
-
-    match bearer_token {
-        Some(t) => {
-            // Static config tokens (constant-time compare), then DB-backed
-            // API tokens — shared with the WebSocket first-frame auth.
-            match authenticate_bearer(&state, &t).await {
-                Ok(Some(auth_user)) => {
-                    if let Some(resp) = password_change_pending_block(
-                        &auth_user,
-                        request.method(),
-                        request.uri().path(),
-                    ) {
-                        return resp;
-                    }
-                    let mut request = request;
-                    request.extensions_mut().insert(auth_user);
-                    next.run(request).await
-                }
-                // Token not valid
-                Ok(None) => {
-                    if state.anonymous_read && is_read {
-                        next.run(request).await
-                    } else {
-                        unauthorized_response(is_oci)
-                    }
-                }
-                // A DB failure (e.g. SQLITE_BUSY under load) says nothing
-                // about the token: answer 503 so the client retries, instead
-                // of the historical 401 that logged valid users out.
-                Err(e) => {
-                    tracing::warn!(error = %e, "database error during bearer authentication");
-                    service_unavailable_response()
-                }
-            }
-        }
-        None => {
-            // No token. Allow anonymous GET if configured.
-            if state.anonymous_read && is_read {
-                next.run(request).await
-            } else {
-                unauthorized_response(is_oci)
-            }
+impl AuthUser {
+    fn from_user(user: crate::db::User, token: &str) -> Self {
+        Self {
+            token: token.to_string(),
+            user_id: Some(user.id),
+            username: user.username,
+            role: user.role,
+            must_change_password: user.must_change_password == 1,
         }
     }
 }
 
-/// Build an unauthorized response. For OCI/Docker requests, include the
-/// `Www-Authenticate` header so Docker knows to send credentials.
+/// Why credentials could not be checked, as opposed to being wrong.
+pub(crate) enum AuthFailure {
+    Throttled,
+    Unavailable,
+}
+
+impl IntoResponse for AuthFailure {
+    fn into_response(self) -> Response {
+        match self {
+            AuthFailure::Throttled => too_many_requests_response(),
+            AuthFailure::Unavailable => service_unavailable_response(),
+        }
+    }
+}
+
+enum Credentials {
+    Basic(String, String),
+    Registry(String),
+    Bearer(String),
+    None,
+}
+
+// ---------------------------------------------------------------------------
+// Middleware
+// ---------------------------------------------------------------------------
+
+/// Axum middleware for Bearer and Basic authentication.
+///
+/// Bearer values are static config tokens, DB-backed API tokens or registry
+/// tokens issued by `/v2/token`; Basic credentials are checked against the
+/// user's password. Every 401 under `/v2/` carries the Bearer challenge that
+/// points Docker clients at the token endpoint.
+pub async fn auth_middleware(
+    State(state): State<Arc<AuthState>>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    let challenge = request
+        .uri()
+        .path()
+        .starts_with("/v2/")
+        .then(|| token::challenge(&state.base_url, request.method(), request.uri().path()))
+        .flatten();
+    let mut response = authenticate(&state, request, next).await;
+    if let Some(challenge) = challenge.filter(|_| response.status() == StatusCode::UNAUTHORIZED) {
+        response
+            .headers_mut()
+            .insert(header::WWW_AUTHENTICATE, challenge);
+    }
+    response
+}
+
+async fn authenticate(state: &AuthState, request: Request<Body>, next: Next) -> Response {
+    let is_oci = is_oci_path(request.uri().path());
+    match credentials(request.headers()) {
+        Credentials::Basic(username, password) => {
+            match authenticate_basic(state, &username, &password).await {
+                Ok(Some(auth_user)) => run_as(auth_user, request, next).await,
+                Ok(None) => unauthorized_response(is_oci),
+                Err(failure) => failure.into_response(),
+            }
+        }
+        Credentials::Registry(_) if !request.uri().path().starts_with("/v2/") => {
+            unauthorized_response(false)
+        }
+        Credentials::Registry(raw) => run_registry_token(state, &raw, is_oci, request, next).await,
+        Credentials::Bearer(raw) => match authenticate_bearer(state, &raw).await {
+            Ok(Some(auth_user)) => run_as(auth_user, request, next).await,
+            Ok(None) => run_anonymous(state, request, next).await,
+            Err(e) => {
+                tracing::warn!(error = %e, "database error during bearer authentication");
+                service_unavailable_response()
+            }
+        },
+        Credentials::None if is_read(&request) && is_cargo_config_path(request.uri().path()) => {
+            next.run(request).await
+        }
+        Credentials::None => run_anonymous(state, request, next).await,
+    }
+}
+
+fn credentials(headers: &HeaderMap) -> Credentials {
+    let Some(value) = headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+    else {
+        return Credentials::None;
+    };
+    if let Some(raw) = value.strip_prefix("Bearer ") {
+        if raw.starts_with(token::PREFIX) {
+            return Credentials::Registry(raw.to_string());
+        }
+        return Credentials::Bearer(raw.to_string());
+    }
+    match basic_credentials(value) {
+        Some((username, password)) => Credentials::Basic(username, password),
+        None => Credentials::None,
+    }
+}
+
+/// The `(username, password)` of a `Basic` header value, if it decodes.
+pub(crate) fn basic_credentials(value: &str) -> Option<(String, String)> {
+    let decoded = base64::engine::general_purpose::STANDARD
+        .decode(value.strip_prefix("Basic ")?)
+        .ok()?;
+    let decoded = String::from_utf8(decoded).ok()?;
+    let (username, password) = decoded.split_once(':')?;
+    Some((username.to_string(), password.to_string()))
+}
+
+/// Check a password, counting only failures against the login rate limiter
+/// so a burst of authenticated requests (a `docker push`) is never throttled.
+/// A DB failure says nothing about the credentials: it is reported as
+/// unavailable and not counted.
+pub(crate) async fn authenticate_basic(
+    state: &AuthState,
+    username: &str,
+    password: &str,
+) -> Result<Option<AuthUser>, AuthFailure> {
+    let rl_key = format!("basic:{username}");
+    if state.login_rate_limiter.is_limited(&rl_key) {
+        return Err(AuthFailure::Throttled);
+    }
+    let user = crate::db::get_user_by_username(&state.db, username)
+        .await
+        .map_err(|e| {
+            tracing::warn!(error = %e, "database error during basic authentication");
+            AuthFailure::Unavailable
+        })?;
+    if let Some(user) = user {
+        let password_ok =
+            super::users::verify_password_async(password.to_string(), user.password_hash.clone())
+                .await
+                .unwrap_or(false);
+        if password_ok {
+            return Ok(Some(AuthUser::from_user(user, "")));
+        }
+    }
+    state.login_rate_limiter.record_failure(&rl_key);
+    Ok(None)
+}
+
+/// A registry token names its user, or nobody: an anonymous token walks the
+/// anonymous path, one issued to a static config token is the same synthetic
+/// admin, and a named one is loaded like a DB token.
+async fn run_registry_token(
+    state: &AuthState,
+    raw: &str,
+    is_oci: bool,
+    mut request: Request<Body>,
+    next: Next,
+) -> Response {
+    let Some(claims) = state.registry_tokens.verify(raw) else {
+        return unauthorized_response(is_oci);
+    };
+    if let Some(id) = claims.api_token_id.as_deref() {
+        match api_token_is_live(&state.db, id).await {
+            Ok(true) => {}
+            Ok(false) => return unauthorized_response(is_oci),
+            Err(e) => {
+                tracing::warn!(error = %e, "database error during registry token authentication");
+                return service_unavailable_response();
+            }
+        }
+    }
+    let subject = claims.sub.clone();
+    let static_token = claims.static_token;
+    request.extensions_mut().insert(claims);
+    if static_token {
+        return run_as(static_token_user(raw), request, next).await;
+    }
+    let Some(username) = subject else {
+        return run_anonymous(state, request, next).await;
+    };
+    match crate::db::get_user_by_username(&state.db, &username).await {
+        Ok(Some(user)) => run_as(AuthUser::from_user(user, raw), request, next).await,
+        Ok(None) => unauthorized_response(is_oci),
+        Err(e) => {
+            tracing::warn!(error = %e, "database error during registry token authentication");
+            service_unavailable_response()
+        }
+    }
+}
+
+async fn run_as(auth_user: AuthUser, mut request: Request<Body>, next: Next) -> Response {
+    if let Some(resp) =
+        password_change_pending_block(&auth_user, request.method(), request.uri().path())
+    {
+        return resp;
+    }
+    request.extensions_mut().insert(auth_user);
+    next.run(request).await
+}
+
+async fn run_anonymous(state: &AuthState, request: Request<Body>, next: Next) -> Response {
+    if state.anonymous_read && is_read(&request) {
+        next.run(request).await
+    } else {
+        unauthorized_response(is_oci_path(request.uri().path()))
+    }
+}
+
+fn is_read(request: &Request<Body>) -> bool {
+    request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD
+}
+
+fn is_oci_path(path: &str) -> bool {
+    path.starts_with("/v2/")
+}
+
+/// `/{repo}/index/config.json`: cargo reads it before it knows whether to send
+/// a token and learns to from `auth-required`, so a tokenless read passes the
+/// anonymous gate; the handler discloses only existence and format.
+fn is_cargo_config_path(path: &str) -> bool {
+    let mut segments = path.split('/');
+    matches!(
+        (
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+            segments.next(),
+        ),
+        (Some(""), Some(repo), Some("index"), Some("config.json"), None) if !repo.is_empty()
+    )
+}
+
+/// Build an unauthorized response; OCI requests get the distribution error
+/// body, and `auth_middleware` adds the Bearer challenge on top.
 fn unauthorized_response(is_oci: bool) -> Response {
     if is_oci {
         (
             StatusCode::UNAUTHORIZED,
-            [(axum::http::header::WWW_AUTHENTICATE, "Basic realm=\"opencargo\"")],
+            [("Docker-Distribution-Api-Version", "registry/2.0")],
             Json(json!({
                 "errors": [{"code": "UNAUTHORIZED", "message": "authentication required"}]
             })),
@@ -281,15 +377,21 @@ pub(crate) async fn authenticate_bearer(
                 == 0
     });
     if is_static {
-        return Ok(Some(AuthUser {
-            token: token.to_string(),
-            user_id: None,
-            username: "static-token".to_string(),
-            role: "admin".to_string(),
-            must_change_password: false,
-        }));
+        return Ok(Some(static_token_user(token)));
     }
     try_db_token_auth(&state.db, token).await
+}
+
+/// The synthetic admin a static config token acts as; it has no row, so
+/// `user_id` is `None` and `username` is a fixed label.
+fn static_token_user(token: &str) -> AuthUser {
+    AuthUser {
+        token: token.to_string(),
+        user_id: None,
+        username: "static-token".to_string(),
+        role: "admin".to_string(),
+        must_change_password: false,
+    }
 }
 
 /// Attempt to authenticate via a DB API token.
@@ -302,32 +404,9 @@ async fn try_db_token_auth(
     db: &SqlitePool,
     raw_token: &str,
 ) -> Result<Option<AuthUser>, sqlx::Error> {
-    // The prefix stored in DB is the first 16 characters of the raw token.
-    if raw_token.len() < 16 {
-        return Ok(None);
-    }
-    let prefix = &raw_token[..16];
-
-    let Some(db_token) = crate::db::get_token_by_prefix(db, prefix).await? else {
+    let Some(db_token) = live_api_token(db, raw_token).await? else {
         return Ok(None);
     };
-
-    // Verify the token hash
-    if !tokens::verify_token(raw_token, &db_token.token_hash) {
-        return Ok(None);
-    }
-
-    // Check expiration. Fail CLOSED: an unparseable timestamp rejects the token
-    // rather than silently treating it as non-expiring (the previous behaviour).
-    if let Some(ref expires_at) = db_token.expires_at {
-        match chrono::NaiveDateTime::parse_from_str(expires_at, "%Y-%m-%d %H:%M:%S") {
-            Ok(exp) if exp < chrono::Utc::now().naive_utc() => return Ok(None), // expired
-            Ok(_) => {}                                                          // still valid
-            Err(_) => return Ok(None), // corrupt/unexpected format -> reject
-        }
-    }
-
-    // Load the user
     let Some(user) =
         sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
             .bind(db_token.user_id)
@@ -336,15 +415,42 @@ async fn try_db_token_auth(
     else {
         return Ok(None);
     };
-
-    // Update last_used_at (fire-and-forget)
     let _ = crate::db::update_token_last_used(db, &db_token.id).await;
+    Ok(Some(AuthUser::from_user(user, raw_token)))
+}
 
-    Ok(Some(AuthUser {
-        token: raw_token.to_string(),
-        user_id: Some(user.id),
-        username: user.username,
-        role: user.role,
-        must_change_password: user.must_change_password == 1,
-    }))
+/// The API token row behind `raw_token`, if it exists, matches and has not expired.
+pub(crate) async fn live_api_token(
+    db: &SqlitePool,
+    raw_token: &str,
+) -> Result<Option<crate::db::ApiToken>, sqlx::Error> {
+    if raw_token.len() < 16 {
+        return Ok(None);
+    }
+    let Some(db_token) = crate::db::get_token_by_prefix(db, &raw_token[..16]).await? else {
+        return Ok(None);
+    };
+    if !tokens::verify_token(raw_token, &db_token.token_hash) || expired(db_token.expires_at.as_deref()) {
+        return Ok(None);
+    }
+    Ok(Some(db_token))
+}
+
+/// Whether the API token `id` still exists and has not expired.
+pub(crate) async fn api_token_is_live(db: &SqlitePool, id: &str) -> Result<bool, sqlx::Error> {
+    let row: Option<(Option<String>,)> = sqlx::query_as("SELECT expires_at FROM api_tokens WHERE id = ?1")
+        .bind(id)
+        .fetch_optional(db)
+        .await?;
+    Ok(matches!(row, Some((expires_at,)) if !expired(expires_at.as_deref())))
+}
+
+// Fail closed: an unparseable timestamp counts as expired.
+fn expired(expires_at: Option<&str>) -> bool {
+    match expires_at {
+        None => false,
+        Some(text) => chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
+            .map(|exp| exp < chrono::Utc::now().naive_utc())
+            .unwrap_or(true),
+    }
 }

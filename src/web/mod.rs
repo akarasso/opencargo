@@ -1,6 +1,6 @@
 use axum::{
     extract::Path,
-    http::{header, StatusCode},
+    http::{header, StatusCode, Uri},
     response::IntoResponse,
     routing::get,
     Router,
@@ -108,5 +108,19 @@ pub fn web_routes() -> Router<AppState> {
         .route("/admin/system", get(serve_spa))
         .route("/admin/password", get(serve_spa))
         .route("/admin/webhooks", get(serve_spa))
-        .fallback(get(serve_spa))
+        .fallback(not_found_or_spa)
+}
+
+async fn not_found_or_spa(uri: Uri) -> axum::response::Response {
+    let path = uri.path();
+    let json = |body: &'static str| {
+        (StatusCode::NOT_FOUND, [(header::CONTENT_TYPE, "application/json")], body).into_response()
+    };
+    if path == "/v2" || path.starts_with("/v2/") {
+        return json(r#"{"errors":[{"code":"NAME_UNKNOWN","message":"unknown route"}]}"#);
+    }
+    if path.starts_with("/api/") {
+        return json(r#"{"error":"not found"}"#);
+    }
+    serve_spa().await.into_response()
 }

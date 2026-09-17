@@ -18,7 +18,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@1.93.0
         with:
           components: clippy
 
@@ -34,6 +34,13 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
+
+      # The go e2e suite shells out to `go` (tests/go_e2e_test.rs).
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
 
       - name: Install frontend dependencies
         run: cd frontend && pnpm install --frozen-lockfile
@@ -53,15 +60,20 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # The pnpm e2e tests shell out to `pnpm`, resolved from PATH (installed above).
+      # The real-client e2e suites shell out to `pnpm`, `cargo`, `go` and
+      # `docker`, resolved from PATH. Locally an absent client prints
+      # `skipped:`; OPENCARGO_E2E_REQUIRE=1 turns that into a failure so CI
+      # never silently skips a suite.
       - name: Run tests
+        env:
+          OPENCARGO_E2E_REQUIRE: '1'
         run: cargo test
 
   audit:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@1.93.0
       - name: Cache Rust
         uses: Swatinem/rust-cache@v2
       - name: Install cargo-audit
@@ -75,12 +87,13 @@ jobs:
 
   docker:
     runs-on: ubuntu-latest
-    needs: test
+    needs: [test, audit]
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
     # GITHUB_TOKEN needs packages:write to push the image to GHCR.
     permissions:
       contents: read
       packages: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
 
@@ -94,31 +107,27 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # Build (the Dockerfile builds the frontend + Rust release itself) and PUSH:
-      # previously the job built `:latest` locally and discarded it, so GHCR
-      # `:latest` never tracked main and every deploy needed a manual build.
-      # `platforms: linux/amd64` + `provenance: false` publish a single clean
-      # manifest — `:latest` resolves to ONE digest instead of an attestation index
-      # whose "unknown/unknown" child breaks digest pinning. `:sha-<commit>` is the
-      # immutable tag deployments pin to.
-      - name: Build and push image
+      - name: Build image
         uses: docker/build-push-action@v6
         with:
           context: .
-          push: true
+          load: true
           platforms: linux/amd64
           provenance: false
-          tags: |
-            ghcr.io/akarasso/opencargo:latest
-            ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
+          tags: opencargo:ci
 
       - name: Scan image for vulnerabilities (Trivy)
         uses: aquasecurity/trivy-action@0.35.0
         with:
-          image-ref: ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
+          image-ref: opencargo:ci
           format: table
-          # Report HIGH/CRITICAL but do not fail the build on unfixed CVEs yet.
-          # Flip exit-code to '1' once the base image is reliably clean.
-          exit-code: '0'
+          exit-code: '1'
           ignore-unfixed: true
           severity: HIGH,CRITICAL
+
+      - name: Push the scanned image
+        run: |
+          docker tag opencargo:ci ghcr.io/akarasso/opencargo:latest
+          docker tag opencargo:ci ghcr.io/akarasso/opencargo:sha-${{ github.sha }}
+          docker push ghcr.io/akarasso/opencargo:latest
+          docker push ghcr.io/akarasso/opencargo:sha-${{ github.sha }}

@@ -3,6 +3,8 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
+use crate::proxy::UpstreamAuth;
+
 // ---------------------------------------------------------------------------
 // Top-level config
 // ---------------------------------------------------------------------------
@@ -27,11 +29,28 @@ pub struct Config {
 // Vulnerability scanning
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize, Default, Clone)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default)]
 pub struct VulnScanConfig {
     pub enabled: bool,
     pub block_on_critical: bool,
+    pub osv_base_url: String,
+    /// With `block_on_critical`, an OSV outage refuses the publish (503)
+    /// instead of letting it through unscanned.
+    pub fail_closed: bool,
+    pub max_concurrency: usize,
+}
+
+impl Default for VulnScanConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            block_on_critical: false,
+            osv_base_url: "https://api.osv.dev".to_string(),
+            fail_closed: false,
+            max_concurrency: 8,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -161,19 +180,30 @@ impl Default for ProxyConfig {
 // Cleanup
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone, Deserialize, Default)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct CleanupConfig {
     pub enabled: bool,
     pub prerelease_older_than_days: Option<u64>,
+    /// Proxy cache rows idle this long are evicted; runs regardless of `enabled`.
     pub proxy_cache_older_than_days: Option<u64>,
+}
+
+impl Default for CleanupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            prerelease_older_than_days: None,
+            proxy_cache_older_than_days: Some(30),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Repository
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Default)]
 pub struct RepositoryConfig {
     pub name: String,
     #[serde(rename = "type")]
@@ -183,29 +213,20 @@ pub struct RepositoryConfig {
     pub visibility: Visibility,
     pub upstream: Option<String>,
     pub members: Option<Vec<String>>,
+    /// Upstream credentials; config and environment only, never the API.
+    pub upstream_auth: Option<UpstreamAuth>,
+    /// Token realms off the upstream host that may still see `upstream_auth`.
+    #[serde(default)]
+    pub token_realms: Vec<String>,
+    /// Let an upstream-chosen download URL point at a private IP literal.
+    #[serde(default)]
+    pub dl_allow_private: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RepositoryType {
-    Hosted,
-    Proxy,
-    Group,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RepositoryFormat {
-    Npm,
-    Cargo,
-    Oci,
-    Go,
-    /// NOT IMPLEMENTED: there is no `registry/pypi` module, so a repository
-    /// created with format=pypi is inert (no publish/serve routes). Kept in the
-    /// enum and CHECK constraint for forward-compat — implement or remove before
-    /// exposing it as a usable option.
-    Pypi,
-}
+/// Aliases kept so existing config and test code keep compiling; the enums
+/// themselves live next to the rows they are round-tripped from.
+pub type RepositoryType = crate::db::kinds::RepoKind;
+pub type RepositoryFormat = crate::db::kinds::Format;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]

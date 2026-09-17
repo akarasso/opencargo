@@ -7,7 +7,7 @@ pub mod webhooks;
 pub use http_metrics::http_metrics_middleware;
 pub use metrics::{
     init_metrics, record_cache_hit, record_cache_miss, record_download, record_http_request,
-    record_publish, set_storage_bytes,
+    record_publish,
 };
 
 use axum::response::IntoResponse;

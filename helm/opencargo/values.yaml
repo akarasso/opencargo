@@ -1,7 +1,7 @@
 replicaCount: 1
 
 image:
-  repository: ghcr.io/trace/opencargo
+  repository: ghcr.io/akarasso/opencargo
   # ":latest" is mutable and not reproducible. Prefer an immutable reference
   # (a version tag or "@sha256:<digest>") in real deployments.
   tag: "latest"

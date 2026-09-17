@@ -153,32 +153,28 @@ async fn setup_with_webhooks(
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-prod".to_string(),
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "go-hosted".to_string(),
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Go,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "oci-hosted".to_string(),
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Oci,
                 visibility: Visibility::Public,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
         ],
         webhooks,

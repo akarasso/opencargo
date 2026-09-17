@@ -1,147 +1,20 @@
-use base64::Engine;
+mod common;
+
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use opencargo::config::{
-    AuthConfig, Config, DatabaseConfig, RepositoryConfig, RepositoryFormat, RepositoryType,
-    ServerConfig, Visibility,
-};
-use opencargo::server;
+use common::{build_npm_publish_body, build_tarball, hosted, spawn_server, SpawnOpts};
+use opencargo::config::{RepositoryFormat, Visibility};
 
-/// Build a gzip'd tar archive in memory containing `package/package.json`.
-fn build_tarball(package_json_content: &str) -> Vec<u8> {
-    let mut archive_buf = Vec::new();
-    {
-        let encoder =
-            flate2::write::GzEncoder::new(&mut archive_buf, flate2::Compression::default());
-        let mut tar_builder = tar::Builder::new(encoder);
-
-        let content_bytes = package_json_content.as_bytes();
-        let mut header = tar::Header::new_gnu();
-        header.set_path("package/package.json").unwrap();
-        header.set_size(content_bytes.len() as u64);
-        header.set_mode(0o644);
-        header.set_cksum();
-
-        tar_builder.append(&header, content_bytes).unwrap();
-        tar_builder.into_inner().unwrap().finish().unwrap();
-    }
-    archive_buf
-}
-
-/// Build the JSON publish payload that mimics `npm publish`.
-fn build_publish_body(
-    package_name: &str,
-    version: &str,
-    description: &str,
-    tarball_data: &[u8],
-) -> Value {
-    let b64 = base64::engine::general_purpose::STANDARD.encode(tarball_data);
-    let attachment_key = format!(
-        "{}-{}.tgz",
-        package_name.split('/').next_back().unwrap_or(package_name),
-        version
-    );
-
-    json!({
-        "name": package_name,
-        "description": description,
-        "dist-tags": { "latest": version },
-        "versions": {
-            version: {
-                "name": package_name,
-                "version": version,
-                "description": description,
-                "main": "index.js",
-                "dist": {
-                    "shasum": ""
-                }
-            }
-        },
-        "_attachments": {
-            attachment_key: {
-                "content_type": "application/octet-stream",
-                "data": b64,
-                "length": tarball_data.len()
-            }
-        }
-    })
-}
-
-/// Start a test server on a random port.
-///
-/// Returns the base URL (e.g. `http://127.0.0.1:12345`), the join handle for
-/// the server task, and the TempDir (kept alive so the directory is not deleted
-/// while tests are running).
+/// Start a test server on a random port with one public npm repository.
 async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
-    let tmp = TempDir::new().expect("failed to create temp dir");
-    let storage_path = tmp.path().join("storage");
-    let db_path = tmp.path().join("test.db");
-
-    let db_url = format!(
-        "sqlite:{}?mode=rwc",
-        db_path.to_str().expect("non-utf8 temp path")
-    );
-
-    // We need a preliminary config to build state. The base_url will be
-    // corrected once we know the actual port.
-    let mut config = Config {
-        server: ServerConfig {
-            bind: "127.0.0.1:0".to_string(),
-            base_url: "http://127.0.0.1:0".to_string(), // placeholder
-            storage_path: storage_path
-                .to_str()
-                .expect("non-utf8 temp path")
-                .to_string(),
-            ..Default::default()
-        },
-        database: DatabaseConfig { url: db_url },
-        auth: AuthConfig {
-            anonymous_read: true,
-            static_tokens: vec!["test-token".to_string()],
-            ..Default::default()
-        },
-        repositories: vec![RepositoryConfig {
-            name: "test-npm".to_string(),
-            repo_type: RepositoryType::Hosted,
-            format: RepositoryFormat::Npm,
-            visibility: Visibility::Public,
-            upstream: None,
-            members: None,
-        }],
+    let server = spawn_server(SpawnOpts {
+        repositories: vec![hosted("test-npm", RepositoryFormat::Npm, Visibility::Public)],
         ..Default::default()
-    };
-
-    // Bind a listener to get the actual port.
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind to random port");
-    let addr = listener.local_addr().expect("no local addr");
-    let base_url = format!("http://{}", addr);
-
-    // Now set the real base_url in config so tarball URLs are correct.
-    config.server.base_url = base_url.clone();
-
-    let state = server::build_state(&config)
-        .await
-        .expect("failed to build app state");
-    let router = server::build_router(state);
-
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, router).await.ok();
-    });
-
-    // Wait for the server to be ready by polling /health/live.
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        match client.get(format!("{}/health/live", &base_url)).send().await {
-            Ok(resp) if resp.status().is_success() => break,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-        }
-    }
-
-    (base_url, handle, tmp)
+    })
+    .await;
+    (server.base_url, server.handle, server.tmp)
 }
 
 // ---------------------------------------------------------------------------
@@ -169,7 +42,7 @@ async fn test_publish_and_get_metadata() {
 
     let pkg_json = r#"{"name":"@test/hello","version":"1.0.0","description":"Test package","main":"index.js"}"#;
     let tarball = build_tarball(pkg_json);
-    let body = build_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
+    let body = build_npm_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
 
     // Publish
     let resp = client
@@ -218,13 +91,54 @@ async fn test_publish_and_get_metadata() {
 }
 
 #[tokio::test]
+async fn test_unscoped_publish_and_get_metadata() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let pkg_json = r#"{"name":"plainpkg","version":"2.0.0","main":"index.js"}"#;
+    let tarball = build_tarball(pkg_json);
+    let body = build_npm_publish_body("plainpkg", "2.0.0", "", &tarball);
+
+    let resp = client
+        .put(format!("{}/test-npm/plainpkg", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(resp.status(), StatusCode::OK, "publish failed: {:?}", resp.text().await);
+
+    let resp = client
+        .get(format!("{}/test-npm/plainpkg", base_url))
+        .send()
+        .await
+        .expect("get metadata request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(
+        resp.headers()[reqwest::header::CONTENT_TYPE]
+            .to_str()
+            .unwrap()
+            .starts_with("application/json"),
+        "unscoped metadata must not fall through to the SPA"
+    );
+    let meta: Value = resp.json().await.expect("invalid json");
+    assert_eq!(meta["name"], "plainpkg");
+    assert_eq!(meta["dist-tags"]["latest"], "2.0.0");
+    let tarball_url = meta["versions"]["2.0.0"]["dist"]["tarball"].as_str().unwrap();
+    assert!(tarball_url.contains("/test-npm/plainpkg/-/plainpkg-2.0.0.tgz"), "{tarball_url}");
+
+    let resp = client.get(tarball_url).send().await.expect("tarball request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+#[tokio::test]
 async fn test_download_tarball() {
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
     let pkg_json = r#"{"name":"@test/hello","version":"1.0.0","description":"Test package","main":"index.js"}"#;
     let tarball = build_tarball(pkg_json);
-    let body = build_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
+    let body = build_npm_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
 
     // Publish
     let resp = client
@@ -263,7 +177,7 @@ async fn test_publish_duplicate_version() {
 
     let pkg_json = r#"{"name":"@test/hello","version":"1.0.0","description":"Test package","main":"index.js"}"#;
     let tarball = build_tarball(pkg_json);
-    let body = build_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
+    let body = build_npm_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
 
     // First publish — should succeed
     let resp = client
@@ -293,7 +207,7 @@ async fn test_search() {
 
     let pkg_json = r#"{"name":"@test/hello","version":"1.0.0","description":"Test package","main":"index.js"}"#;
     let tarball = build_tarball(pkg_json);
-    let body = build_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
+    let body = build_npm_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
 
     // Publish
     let resp = client
@@ -351,7 +265,7 @@ async fn test_npm_search_size_is_clamped() {
             r#"{{"name":"{name}","version":"1.0.0","description":"zzclampword pkg","main":"index.js"}}"#
         );
         let tarball = build_tarball(&pkg_json);
-        let body = build_publish_body(&name, "1.0.0", "zzclampword pkg", &tarball);
+        let body = build_npm_publish_body(&name, "1.0.0", "zzclampword pkg", &tarball);
         let resp = client
             .put(format!("{}/test-npm/{}", base_url, name))
             .bearer_auth("test-token")
@@ -395,7 +309,7 @@ async fn test_abbreviated_metadata() {
 
     let pkg_json = r#"{"name":"@test/hello","version":"1.0.0","description":"Test package","main":"index.js"}"#;
     let tarball = build_tarball(pkg_json);
-    let body = build_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
+    let body = build_npm_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
 
     // Publish
     let resp = client
@@ -477,7 +391,7 @@ async fn test_auth_required_for_publish() {
 
     let pkg_json = r#"{"name":"@test/hello","version":"1.0.0","description":"Test package","main":"index.js"}"#;
     let tarball = build_tarball(pkg_json);
-    let body = build_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
+    let body = build_npm_publish_body("@test/hello", "1.0.0", "Test package", &tarball);
 
     // Attempt to publish WITHOUT a Bearer token
     let resp = client
@@ -504,7 +418,7 @@ async fn test_npm_deprecate() {
 
     // Publish version 1.0.0 first.
     let tarball = build_tarball(r#"{"name":"@test/deprecateme","version":"1.0.0"}"#);
-    let body = build_publish_body("@test/deprecateme", "1.0.0", "to deprecate", &tarball);
+    let body = build_npm_publish_body("@test/deprecateme", "1.0.0", "to deprecate", &tarball);
     let resp = client
         .put(format!("{}/test-npm/@test/deprecateme", base_url))
         .bearer_auth("test-token")
@@ -591,7 +505,7 @@ async fn test_npm_publish_rejects_invalid_name() {
     // Uppercase scope: npm names are lowercase-only.
     let pkg_json = r#"{"name":"@Test/hello","version":"1.0.0","description":"x","main":"index.js"}"#;
     let tarball = build_tarball(pkg_json);
-    let body = build_publish_body("@Test/hello", "1.0.0", "x", &tarball);
+    let body = build_npm_publish_body("@Test/hello", "1.0.0", "x", &tarball);
 
     let resp = client
         .put(format!("{}/test-npm/@Test/hello", base_url))
@@ -607,7 +521,7 @@ async fn test_npm_publish_rejects_invalid_name() {
     );
 
     // Leading dot in the name part.
-    let body = build_publish_body("@test/.hidden", "1.0.0", "x", &tarball);
+    let body = build_npm_publish_body("@test/.hidden", "1.0.0", "x", &tarball);
     let resp = client
         .put(format!("{}/test-npm/@test/.hidden", base_url))
         .bearer_auth("test-token")
@@ -633,7 +547,7 @@ async fn test_npm_publish_rejects_body_name_mismatch() {
     let pkg_json = r#"{"name":"@test/other","version":"1.0.0","description":"x","main":"index.js"}"#;
     let tarball = build_tarball(pkg_json);
     // Body says "@test/other" but the URL targets "@test/hello".
-    let body = build_publish_body("@test/other", "1.0.0", "x", &tarball);
+    let body = build_npm_publish_body("@test/other", "1.0.0", "x", &tarball);
 
     let resp = client
         .put(format!("{}/test-npm/@test/hello", base_url))
@@ -647,4 +561,64 @@ async fn test_npm_publish_rejects_body_name_mismatch() {
         StatusCode::BAD_REQUEST,
         "a body/URL package-name mismatch must be rejected with 400"
     );
+}
+
+/// `npm dist-tag ls|add|rm <pkg>` on an unscoped package addresses
+/// `/{repo}/-/package/{name}/dist-tags[/{tag}]`; only the scoped pair used to
+/// be routed, so every one of these 404'd on hosted repos.
+#[tokio::test]
+async fn unscoped_dist_tags_get_put_delete() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for version in ["1.0.0", "1.1.0"] {
+        let pkg_json = format!(r#"{{"name":"tagpkg","version":"{version}","main":"index.js"}}"#);
+        let tarball = build_tarball(&pkg_json);
+        let body = build_npm_publish_body("tagpkg", version, "Tagged package", &tarball);
+        let resp = client
+            .put(format!("{}/test-npm/tagpkg", base_url))
+            .bearer_auth("test-token")
+            .json(&body)
+            .send()
+            .await
+            .expect("publish request failed");
+        assert_eq!(resp.status(), StatusCode::OK, "publish {version} failed");
+    }
+
+    let dist_tags_url = format!("{}/test-npm/-/package/tagpkg/dist-tags", base_url);
+    let resp = client.get(&dist_tags_url).send().await.expect("get dist-tags failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let tags: Value = resp.json().await.expect("invalid json");
+    assert_eq!(tags, json!({"latest": "1.1.0"}));
+
+    let resp = client
+        .put(format!("{dist_tags_url}/beta"))
+        .bearer_auth("test-token")
+        .json(&json!("1.0.0"))
+        .send()
+        .await
+        .expect("put dist-tag failed");
+    assert_eq!(resp.status(), StatusCode::OK, "{:?}", resp.text().await);
+
+    let tags: Value = client.get(&dist_tags_url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(tags, json!({"latest": "1.1.0", "beta": "1.0.0"}));
+
+    let resp = client
+        .delete(format!("{dist_tags_url}/beta"))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("delete dist-tag failed");
+    assert_eq!(resp.status(), StatusCode::OK, "{:?}", resp.text().await);
+
+    let tags: Value = client.get(&dist_tags_url).send().await.unwrap().json().await.unwrap();
+    assert_eq!(tags, json!({"latest": "1.1.0"}));
+
+    let resp = client
+        .put(format!("{dist_tags_url}/beta"))
+        .json(&json!("1.0.0"))
+        .send()
+        .await
+        .expect("anonymous put dist-tag failed");
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "dist-tag writes need a token");
 }

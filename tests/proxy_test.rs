@@ -117,8 +117,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
                 repo_type: RepositoryType::Hosted,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Private,
-                upstream: None,
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-proxy".into(),
@@ -126,15 +125,15 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
                 upstream: Some("https://registry.npmjs.org".into()),
-                members: None,
+                ..Default::default()
             },
             RepositoryConfig {
                 name: "npm-group".into(),
                 repo_type: RepositoryType::Group,
                 format: RepositoryFormat::Npm,
                 visibility: Visibility::Public,
-                upstream: None,
                 members: Some(vec!["npm-private".into(), "npm-proxy".into()]),
+                ..Default::default()
             },
         ],
         ..Default::default()
@@ -171,6 +170,15 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
     (base_url, handle, tmp)
 }
 
+/// These cases reach the live npmjs.org registry; CI runs offline.
+fn network_tests_enabled() -> bool {
+    if std::env::var("OPENCARGO_NETWORK_TESTS").as_deref() == Ok("1") {
+        return true;
+    }
+    eprintln!("skipped: set OPENCARGO_NETWORK_TESTS=1 to run live npmjs.org proxy tests");
+    false
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -181,6 +189,9 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
 /// and that the tarball URLs have been rewritten to point to our server.
 #[tokio::test]
 async fn test_proxy_fetches_from_upstream() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -248,6 +259,9 @@ async fn test_proxy_fetches_from_upstream() {
 /// cache and both responses should be identical.
 #[tokio::test]
 async fn test_proxy_caches_metadata() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -297,6 +311,9 @@ async fn test_proxy_caches_metadata() {
 /// gzip magic bytes (0x1f 0x8b).
 #[tokio::test]
 async fn test_proxy_download_tarball() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -365,6 +382,9 @@ async fn test_proxy_download_tarball() {
 /// should be returned.
 #[tokio::test]
 async fn test_group_repo_serves_hosted_first() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -391,6 +411,7 @@ async fn test_group_repo_serves_hosted_first() {
     // Now fetch @test/mylib from the GROUP repo
     let resp = client
         .get(format!("{}/npm-group/@test/mylib", base_url))
+        .bearer_auth("test-token")
         .send()
         .await
         .expect("group metadata request failed");
@@ -413,8 +434,14 @@ async fn test_group_repo_serves_hosted_first() {
 /// - GET a real public scoped package from npm-group
 /// - The package is NOT in npm-private, so the group should fall through
 ///   to npm-proxy and return metadata from the upstream registry.
+/// - A 200 here proves the hosted miss is silent; a proxy member that
+///   cannot reach npmjs.org is a 502, not a 404
+///   (`npm_proxy_test::group_upstream_failure_is_502_not_404`).
 #[tokio::test]
 async fn test_group_repo_falls_through_to_proxy() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -448,10 +475,14 @@ async fn test_group_repo_falls_through_to_proxy() {
 }
 
 /// Request a non-existent scoped package through the proxy.
-/// The upstream registry should return a 404-level error, and our proxy
-/// should propagate that as a 404.
+/// npmjs.org answers 404, an authoritative miss: the proxy answers 404 and
+/// negative-caches it. Only a 404/410 maps to 404; any other upstream
+/// failure is a 502.
 #[tokio::test]
 async fn test_proxy_handles_nonexistent_package() {
+    if !network_tests_enabled() {
+        return;
+    }
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 

@@ -1,142 +1,24 @@
+mod common;
+
 use reqwest::StatusCode;
 use serde_json::Value;
 use tempfile::TempDir;
 
-use opencargo::config::{
-    AuthConfig, Config, DatabaseConfig, RepositoryConfig, RepositoryFormat, RepositoryType,
-    ServerConfig, Visibility,
-};
-use opencargo::server;
+use common::{build_go_module_zip, hosted, publish_go_module, spawn_server, SpawnOpts};
+use opencargo::config::{RepositoryFormat, Visibility};
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Build a Go module zip archive in memory.
-/// Contains a go.mod file and a dummy .go file.
-fn build_go_module_zip(module_name: &str, version: &str) -> Vec<u8> {
-    use std::io::Write;
-
-    let mut buf = Vec::new();
-    {
-        let mut zip_writer = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
-        let options = zip::write::SimpleFileOptions::default()
-            .compression_method(zip::CompressionMethod::Stored);
-
-        // Add go.mod
-        let go_mod_path = format!("{}@{}/go.mod", module_name, version);
-        zip_writer.start_file(&go_mod_path, options).unwrap();
-        let go_mod_content = format!("module {}\n\ngo 1.21\n", module_name);
-        zip_writer.write_all(go_mod_content.as_bytes()).unwrap();
-
-        // Add a dummy .go file
-        let go_file_path = format!("{}@{}/main.go", module_name, version);
-        zip_writer.start_file(&go_file_path, options).unwrap();
-        let go_content = format!(
-            "package {}\n\nfunc Hello() string {{ return \"hello\" }}\n",
-            module_name.split('/').next_back().unwrap_or("main")
-        );
-        zip_writer.write_all(go_content.as_bytes()).unwrap();
-
-        zip_writer.finish().unwrap();
-    }
-    buf
-}
-
 /// Start a test server on a random port with a Go hosted repository.
 async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
-    let tmp = TempDir::new().expect("failed to create temp dir");
-    let storage_path = tmp.path().join("storage");
-    let db_path = tmp.path().join("test.db");
-
-    let db_url = format!(
-        "sqlite:{}?mode=rwc",
-        db_path.to_str().expect("non-utf8 temp path")
-    );
-
-    let mut config = Config {
-        server: ServerConfig {
-            bind: "127.0.0.1:0".to_string(),
-            base_url: "http://127.0.0.1:0".to_string(),
-            storage_path: storage_path
-                .to_str()
-                .expect("non-utf8 temp path")
-                .to_string(),
-            ..Default::default()
-        },
-        database: DatabaseConfig { url: db_url },
-        auth: AuthConfig {
-            anonymous_read: true,
-            static_tokens: vec!["test-token".to_string()],
-            ..Default::default()
-        },
-        repositories: vec![RepositoryConfig {
-            name: "go-hosted".to_string(),
-            repo_type: RepositoryType::Hosted,
-            format: RepositoryFormat::Go,
-            visibility: Visibility::Public,
-            upstream: None,
-            members: None,
-        }],
+    let server = spawn_server(SpawnOpts {
+        repositories: vec![hosted("go-hosted", RepositoryFormat::Go, Visibility::Public)],
         ..Default::default()
-    };
-
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind to random port");
-    let addr = listener.local_addr().expect("no local addr");
-    let base_url = format!("http://{}", addr);
-
-    config.server.base_url = base_url.clone();
-
-    let state = server::build_state(&config)
-        .await
-        .expect("failed to build app state");
-    let router = server::build_router(state);
-
-    let handle = tokio::spawn(async move {
-        axum::serve(listener, router).await.ok();
-    });
-
-    // Wait for the server to be ready
-    let client = reqwest::Client::new();
-    for _ in 0..50 {
-        match client.get(format!("{}/health/live", &base_url)).send().await {
-            Ok(resp) if resp.status().is_success() => break,
-            _ => tokio::time::sleep(std::time::Duration::from_millis(50)).await,
-        }
-    }
-
-    (base_url, handle, tmp)
-}
-
-/// Publish a Go module to the test server.
-async fn publish_go_module(
-    client: &reqwest::Client,
-    base_url: &str,
-    module_name: &str,
-    version: &str,
-) {
-    let zip_data = build_go_module_zip(module_name, version);
-
-    let resp = client
-        .put(format!(
-            "{}/go-hosted/{}/@v/{}",
-            base_url, module_name, version
-        ))
-        .bearer_auth("test-token")
-        .header("content-type", "application/zip")
-        .body(zip_data)
-        .send()
-        .await
-        .expect("publish request failed");
-
-    assert_eq!(
-        resp.status(),
-        StatusCode::OK,
-        "go publish failed: {:?}",
-        resp.text().await
-    );
+    })
+    .await;
+    (server.base_url, server.handle, server.tmp)
 }
 
 // ---------------------------------------------------------------------------
@@ -150,10 +32,10 @@ async fn test_go_publish_and_list() {
     let client = reqwest::Client::new();
 
     // Publish v1.0.0
-    publish_go_module(&client, &base_url, "mymodule", "v1.0.0").await;
+    publish_go_module(&client, &base_url, "go-hosted", "mymodule", "v1.0.0").await;
 
     // Publish v1.1.0
-    publish_go_module(&client, &base_url, "mymodule", "v1.1.0").await;
+    publish_go_module(&client, &base_url, "go-hosted", "mymodule", "v1.1.0").await;
 
     // List versions
     let resp = client
@@ -230,7 +112,7 @@ async fn test_go_version_info() {
     let (base_url, _handle, _tmp) = setup().await;
     let client = reqwest::Client::new();
 
-    publish_go_module(&client, &base_url, "infomodule", "v2.0.0").await;
+    publish_go_module(&client, &base_url, "go-hosted", "infomodule", "v2.0.0").await;
 
     // Get version info
     let resp = client
@@ -266,7 +148,7 @@ async fn test_go_multi_segment_module() {
 
     let module = "example.com/org/repo";
 
-    publish_go_module(&client, &base_url, module, "v1.0.0").await;
+    publish_go_module(&client, &base_url, "go-hosted", module, "v1.0.0").await;
 
     // Publish v1.1.0 by hand, keeping the zip bytes for the download check.
     let zip_v110 = build_go_module_zip(module, "v1.1.0");
@@ -358,10 +240,11 @@ async fn test_go_publish_rejects_invalid_module_names() {
         );
     }
 
-    // Invalid version too
+    // Invalid version too: `%252F` survives the server's `%2F` decoding and
+    // reaches the handler as a version containing a slash.
     let zip_data = build_go_module_zip("okmod", "v1.0.0");
     let resp = client
-        .put(format!("{}/go-hosted/okmod/@v/v1.0%2F0", base_url))
+        .put(format!("{}/go-hosted/okmod/@v/v1.0%252F0", base_url))
         .bearer_auth("test-token")
         .header("content-type", "application/zip")
         .body(zip_data)
@@ -427,4 +310,99 @@ async fn test_go_oversized_gomod_rejected() {
         text.contains("too large"),
         "400 body should mention the go.mod is too large, got: {text}"
     );
+}
+
+/// 7. `Time` is RFC 3339 in `.info` and `@latest`: the go tool rejects the
+/// `YYYY-MM-DD HH:MM:SS` shape SQLite stores.
+#[tokio::test]
+async fn info_time_is_rfc3339() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    publish_go_module(&client, &base_url, "go-hosted", "timemod", "v1.0.0").await;
+
+    for path in ["timemod/@v/v1.0.0.info", "timemod/@latest"] {
+        let resp = client
+            .get(format!("{base_url}/go-hosted/{path}"))
+            .send()
+            .await
+            .expect("request failed");
+        assert_eq!(resp.status(), StatusCode::OK, "GET {path}");
+        let info: Value = resp.json().await.expect("invalid json");
+        let time = info["Time"].as_str().expect("Time should be a string");
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(time).is_ok(),
+            "{path}: Time {time:?} is not RFC 3339"
+        );
+        assert!(time.ends_with('Z'), "{path}: Time {time:?} should be UTC");
+    }
+}
+
+/// 8. `@latest` is the highest version by semver, not the last published
+/// one and not the lexical maximum (`v1.9.0` > `v1.10.0` lexically).
+#[tokio::test]
+async fn latest_is_max_semver() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    for version in ["v1.9.0", "v1.10.0", "v1.2.0"] {
+        publish_go_module(&client, &base_url, "go-hosted", "semvermod", version).await;
+    }
+
+    let resp = client
+        .get(format!("{base_url}/go-hosted/semvermod/@latest"))
+        .send()
+        .await
+        .expect("latest request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let latest: Value = resp.json().await.expect("invalid json");
+    assert_eq!(latest["Version"], "v1.10.0");
+}
+
+/// 9. An unknown module lists as 404 so `GOPROXY=a,b,direct` moves on; an
+/// empty 200 would end resolution here.
+/// GOPROXY case-encodes the version like the module: `v1.0.0-RC1` is
+/// requested as `v1.0.0-!r!c1`.
+#[tokio::test]
+async fn escaped_uppercase_version_is_served() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    publish_go_module(&client, &base_url, "go-hosted", "example.com/lib", "v1.0.0-RC1").await;
+
+    let resp = client
+        .get(format!("{base_url}/go-hosted/example.com/lib/@v/v1.0.0-!r!c1.info"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let info: Value = resp.json().await.unwrap();
+    assert_eq!(info["Version"], "v1.0.0-RC1");
+    let resp = client
+        .get(format!("{base_url}/go-hosted/example.com/lib/@v/v1.0.0-!r!c1.zip"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert_eq!(
+        resp.bytes().await.unwrap(),
+        build_go_module_zip("example.com/lib", "v1.0.0-RC1")
+    );
+
+    let resp = client
+        .get(format!("{base_url}/go-hosted/example.com/lib/@v/v1.0.0-!R.info"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "a malformed escape");
+}
+
+#[tokio::test]
+async fn unknown_module_list_is_404() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let resp = client
+        .get(format!("{base_url}/go-hosted/example.com/nope/@v/list"))
+        .send()
+        .await
+        .expect("list request failed");
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }

@@ -34,6 +34,9 @@ pub enum AppError {
     ServiceUnavailable(String),
 
     #[error("{0}")]
+    BadGateway(String),
+
+    #[error("{0}")]
     Internal(String),
 
     #[error(transparent)]
@@ -56,6 +59,7 @@ impl IntoResponse for AppError {
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
+            AppError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
             AppError::Database(err) => {
                 // A UNIQUE-constraint violation is a client-visible conflict, not

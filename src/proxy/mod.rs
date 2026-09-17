@@ -1,32 +1,22 @@
-use std::sync::Arc;
-use std::time::Duration;
+use std::net::{IpAddr, ToSocketAddrs};
 
-use bytes::Bytes;
 use serde_json::Value;
-use sqlx::SqlitePool;
-use tracing::{info, warn};
 
-use crate::error::AppError;
-use crate::storage::FilesystemStorage;
-use crate::storage::StorageBackend;
+use crate::error::{AppError, AppResult};
 
-/// Cap on a single upstream response body. Checked against the advertised
-/// Content-Length; chunked responses without one are not bounded here (a
-/// streaming reader would be needed for that).
-const MAX_UPSTREAM_BYTES: u64 = 100 * 1024 * 1024;
+pub mod auth;
+pub mod engine;
+pub mod purge;
+pub mod singleflight;
+pub mod strategy;
 
-/// An HTTP client that fetches from upstream registries and caches responses.
-#[derive(Clone)]
-pub struct ProxyClient {
-    client: reqwest::Client,
-    storage: Arc<FilesystemStorage>,
-    db: SqlitePool,
-}
+pub use auth::{UpstreamAuth, UpstreamCreds};
+pub use engine::{Payload, ProxyEngine, Timeouts, TtlConfig};
+pub use strategy::UpstreamStrategy;
 
-/// True for IP literals the proxy must never reach (basic SSRF guard). Does NOT
-/// cover DNS rebinding — hostnames are not resolved here; a custom resolver
-/// would be needed for that.
-pub(crate) fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
+/// True for addresses the proxy must never reach. Names are resolved once
+/// before the request, which does not cover DNS rebinding.
+pub(crate) fn is_blocked_ip(ip: &IpAddr) -> bool {
     match ip {
         std::net::IpAddr::V4(v4) => {
             v4.is_private()
@@ -44,8 +34,9 @@ pub(crate) fn is_blocked_ip(ip: &std::net::IpAddr) -> bool {
     }
 }
 
-/// Validate an upstream registry URL for proxy repositories: must be http(s)
-/// and must not be a literal private/loopback address.
+/// Validate an admin-chosen upstream URL: http(s) only, and no link-local or
+/// unspecified IP literal. Loopback and RFC 1918 stay allowed for local
+/// mirrors; redirect hops and upstream-chosen URLs are held to `is_blocked_ip`.
 pub fn validate_upstream_url(url: &str) -> Result<(), AppError> {
     let parsed = reqwest::Url::parse(url)
         .map_err(|e| AppError::BadRequest(format!("invalid upstream URL: {e}")))?;
@@ -54,246 +45,90 @@ pub fn validate_upstream_url(url: &str) -> Result<(), AppError> {
             "upstream URL scheme must be http or https".to_string(),
         ));
     }
-    // A literal private/loopback host is intentionally allowed here: upstream
-    // creation is admin-only and proxy setups legitimately target local mirrors.
-    // The real SSRF vector — an upstream that REDIRECTS to an internal address —
-    // is blocked by the client's redirect policy (see is_blocked_ip usage).
+    let literal = parsed
+        .host_str()
+        .and_then(|h| h.trim_matches(['[', ']']).parse::<std::net::IpAddr>().ok());
+    let refused = match literal {
+        Some(std::net::IpAddr::V4(v4)) => v4.is_link_local() || v4.is_unspecified(),
+        Some(std::net::IpAddr::V6(v6)) => {
+            (v6.segments()[0] & 0xffc0) == 0xfe80 || v6.is_unspecified()
+        }
+        None => false,
+    };
+    if refused {
+        return Err(AppError::BadRequest(
+            "upstream URL must not point at a link-local or unspecified address".to_string(),
+        ));
+    }
     Ok(())
 }
 
-impl ProxyClient {
-    /// Create a new ProxyClient with the given timeout.
-    pub fn new(
-        storage: Arc<FilesystemStorage>,
-        db: SqlitePool,
-        connect_timeout_secs: u64,
-    ) -> Self {
-        let client = reqwest::Client::builder()
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .timeout(Duration::from_secs(connect_timeout_secs * 3))
-            // SSRF hardening: cap redirects (was 10 by default) and refuse any
-            // hop whose host is a literal private/loopback/link-local IP.
-            .redirect(reqwest::redirect::Policy::custom(|attempt| {
-                if attempt.previous().len() >= 5 {
-                    return attempt.error("too many redirects");
-                }
-                match attempt
-                    .url()
-                    .host_str()
-                    .and_then(|h| h.parse::<std::net::IpAddr>().ok())
-                {
-                    Some(ip) if is_blocked_ip(&ip) => attempt.stop(),
-                    _ => attempt.follow(),
-                }
-            }))
-            .build()
-            .expect("failed to build reqwest client");
+fn ip_literal(url: &reqwest::Url) -> Option<IpAddr> {
+    url.host_str()?.trim_matches(['[', ']']).parse().ok()
+}
 
-        Self {
-            client,
-            storage,
-            db,
+fn host_port(url: &reqwest::Url) -> AppResult<(&str, u16)> {
+    let host = url
+        .host_str()
+        .ok_or_else(|| AppError::BadGateway(format!("{url} has no host")))?;
+    Ok((host, url.port_or_known_default().unwrap_or(443)))
+}
+
+fn first_blocked(addrs: impl IntoIterator<Item = IpAddr>) -> Option<IpAddr> {
+    addrs.into_iter().find(is_blocked_ip)
+}
+
+pub(crate) fn same_endpoint(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+    a.host_str() == b.host_str() && a.port_or_known_default() == b.port_or_known_default()
+}
+
+/// Refuse an upstream-chosen URL whose host is, or resolves to, an address
+/// the proxy must never reach.
+pub(crate) async fn refuse_blocked_host(url: &reqwest::Url) -> AppResult<()> {
+    let blocked = match ip_literal(url) {
+        Some(ip) => first_blocked([ip]),
+        None => {
+            let (host, port) = host_port(url)?;
+            let addrs = tokio::net::lookup_host((host, port))
+                .await
+                .map_err(|e| AppError::BadGateway(format!("{url} does not resolve: {e}")))?;
+            first_blocked(addrs.map(|a| a.ip()))
         }
+    };
+    match blocked {
+        Some(ip) => Err(AppError::BadGateway(format!(
+            "{url} points at a private address ({ip})"
+        ))),
+        None => Ok(()),
     }
+}
 
-    /// Fetch package metadata from an upstream registry, caching the JSON response.
-    ///
-    /// `repo_name` is used for the cache key namespace.
-    /// `upstream_url` should be the base URL of the upstream registry (e.g. `https://registry.npmjs.org`).
-    /// `package_name` is the full npm package name (e.g. `react` or `@scope/name`).
-    pub async fn fetch_package_metadata(
-        &self,
-        repo_name: &str,
-        upstream_url: &str,
-        package_name: &str,
-        repo_id: i64,
-        ttl_seconds: u64,
-    ) -> Result<Value, AppError> {
-        let cache_key = format!("metadata:{}", package_name);
-        let cache_storage_path = format!(
-            "_proxy_cache/{}/{}/metadata.json",
-            repo_name, package_name
-        );
-
-        // Check if cache is fresh
-        let is_fresh = crate::db::is_proxy_cache_fresh(&self.db, repo_id, &cache_key).await;
-
-        if is_fresh {
-            // Try to return cached metadata
-            if let Ok(data) = self.storage.get(&cache_storage_path).await {
-                let cached: Value = serde_json::from_slice(&data)
-                    .map_err(|e| AppError::Internal(format!("corrupt cached metadata: {e}")))?;
-                info!(
-                    package = %package_name,
-                    repo = %repo_name,
-                    "Serving package metadata from cache"
-                );
-                return Ok(cached);
-            }
-        }
-
-        // Fetch from upstream
-        let url = format!(
-            "{}/{}",
-            upstream_url.trim_end_matches('/'),
-            package_name
-        );
-
-        match self.client.get(&url).send().await {
-            Ok(response) => {
-                if !response.status().is_success() {
-                    // Upstream returned an error. If we have a cached version, serve it.
-                    if let Ok(data) = self.storage.get(&cache_storage_path).await {
-                        warn!(
-                            package = %package_name,
-                            status = %response.status(),
-                            "Upstream returned error, serving stale cache"
-                        );
-                        let cached: Value = serde_json::from_slice(&data)
-                            .map_err(|e| AppError::Internal(format!("corrupt cached metadata: {e}")))?;
-                        return Ok(cached);
-                    }
-                    return Err(AppError::NotFound(format!(
-                        "package not found upstream: {package_name} (status {})",
-                        response.status()
-                    )));
-                }
-
-                if let Some(len) = response.content_length() {
-                    if len > MAX_UPSTREAM_BYTES {
-                        return Err(AppError::BadRequest(format!(
-                            "upstream response too large: {len} bytes"
-                        )));
-                    }
-                }
-                let body = response.bytes().await.map_err(|e| {
-                    AppError::Internal(format!("failed to read upstream response: {e}"))
-                })?;
-
-                let metadata: Value = serde_json::from_slice(&body).map_err(|e| {
-                    AppError::Internal(format!("invalid JSON from upstream: {e}"))
-                })?;
-
-                // Cache the metadata
-                self.storage
-                    .put(&cache_storage_path, body.clone())
-                    .await?;
-
-                // Update cache meta in DB
-                let _ = crate::db::upsert_proxy_cache_meta(
-                    &self.db,
-                    repo_id,
-                    &cache_key,
-                    ttl_seconds as i64,
-                )
-                .await;
-
-                info!(
-                    package = %package_name,
-                    repo = %repo_name,
-                    "Fetched and cached package metadata from upstream"
-                );
-
-                Ok(metadata)
-            }
-            Err(e) => {
-                // Network error. Try stale cache.
-                if let Ok(data) = self.storage.get(&cache_storage_path).await {
-                    warn!(
-                        package = %package_name,
-                        error = %e,
-                        "Upstream unreachable, serving stale cache"
-                    );
-                    let cached: Value = serde_json::from_slice(&data)
-                        .map_err(|err| AppError::Internal(format!("corrupt cached metadata: {err}")))?;
-                    return Ok(cached);
-                }
-                Err(AppError::Internal(format!(
-                    "upstream unreachable and no cache available: {e}"
-                )))
-            }
-        }
+// A redirect policy is synchronous; the OS resolver is consulted in place,
+// once per cross-origin hop.
+fn blocked_hop(url: &reqwest::Url) -> Option<IpAddr> {
+    if let Some(ip) = ip_literal(url) {
+        return first_blocked([ip]);
     }
+    let addrs = host_port(url).ok()?.to_socket_addrs().ok()?;
+    first_blocked(addrs.map(|a| a.ip()))
+}
 
-    /// Fetch a tarball from an upstream registry, caching it in storage.
-    ///
-    /// Tarballs are immutable by version so they are cached indefinitely once fetched.
-    pub async fn fetch_tarball(
-        &self,
-        repo_name: &str,
-        upstream_url: &str,
-        package_name: &str,
-        filename: &str,
-        repo_id: i64,
-    ) -> Result<Bytes, AppError> {
-        let cache_storage_path = format!(
-            "_proxy_cache/{}/{}/{}",
-            repo_name, package_name, filename
-        );
-
-        // Check if already cached
-        if self.storage.exists(&cache_storage_path).await? {
-            info!(
-                package = %package_name,
-                filename = %filename,
-                "Serving tarball from cache"
-            );
-            return self.storage.get(&cache_storage_path).await;
+/// SSRF hardening: cap redirects (was 10 by default), follow hops on the
+/// origin the admin chose, and hold every other hop to `is_blocked_ip`.
+pub(crate) fn redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        if attempt.previous().len() >= 5 {
+            return attempt.error("too many redirects");
         }
-
-        // Fetch from upstream
-        let url = format!(
-            "{}/{}/-/{}",
-            upstream_url.trim_end_matches('/'),
-            package_name,
-            filename
-        );
-
-        let response = self.client.get(&url).send().await.map_err(|e| {
-            AppError::Internal(format!("failed to fetch tarball from upstream: {e}"))
-        })?;
-
-        if !response.status().is_success() {
-            return Err(AppError::NotFound(format!(
-                "tarball not found upstream: {filename} (status {})",
-                response.status()
-            )));
+        let origin = attempt.previous().first();
+        if origin.is_some_and(|o| same_endpoint(o, attempt.url())) {
+            return attempt.follow();
         }
-
-        if let Some(len) = response.content_length() {
-            if len > MAX_UPSTREAM_BYTES {
-                return Err(AppError::BadRequest(format!(
-                    "upstream tarball too large: {len} bytes"
-                )));
-            }
+        match blocked_hop(attempt.url()) {
+            Some(_) => attempt.stop(),
+            None => attempt.follow(),
         }
-        let data = response.bytes().await.map_err(|e| {
-            AppError::Internal(format!("failed to read upstream tarball: {e}"))
-        })?;
-
-        // Cache the tarball (infinite TTL for tarballs)
-        self.storage
-            .put(&cache_storage_path, data.clone())
-            .await?;
-
-        // Record cache meta in DB (very long TTL — effectively infinite)
-        let _ = crate::db::upsert_proxy_cache_meta(
-            &self.db,
-            repo_id,
-            &format!("tarball:{}/{}", package_name, filename),
-            315_360_000, // ~10 years
-        )
-        .await;
-
-        info!(
-            package = %package_name,
-            filename = %filename,
-            size = data.len(),
-            "Fetched and cached tarball from upstream"
-        );
-
-        Ok(data)
-    }
+    })
 }
 
 /// Rewrite all `dist.tarball` URLs in an npm package metadata document
@@ -324,5 +159,37 @@ pub fn rewrite_tarball_urls(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(s: &str) -> reqwest::Url {
+        reqwest::Url::parse(s).unwrap()
+    }
+
+    #[tokio::test]
+    async fn blocked_hosts_are_refused_as_literals_and_as_names() {
+        for private in [
+            "http://127.0.0.1:1/x",
+            "http://10.0.0.5/x",
+            "http://[::1]/x",
+            "http://localhost:1/x",
+        ] {
+            let err = refuse_blocked_host(&url(private)).await.unwrap_err();
+            assert!(
+                matches!(err, AppError::BadGateway(ref m) if m.contains("private address")),
+                "{private}: {err}"
+            );
+            assert!(blocked_hop(&url(private)).is_some(), "{private}");
+        }
+        assert!(refuse_blocked_host(&url("http://93.184.216.34/x"))
+            .await
+            .is_ok());
+        assert!(blocked_hop(&url("http://93.184.216.34/x")).is_none());
+        assert!(same_endpoint(&url("http://h:80/a"), &url("http://h/b")));
+        assert!(!same_endpoint(&url("http://h:81/a"), &url("http://h/b")));
     }
 }

@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker clean frontend release docker deploy undeploy logs publish lint fmt
 
 # Load .env if it exists
 -include .env
@@ -49,17 +49,30 @@ tilt: ## Lancer avec Tilt (hot reload)
 test: ## Lancer tous les tests
 	cargo test
 
-test-quick: ## Tests rapides (sans réseau)
-	cargo test --test npm_test --test pnpm_e2e_test --test auth_test --test features_test --test promote_test --test permissions_test
+test-quick: ## Tests rapides (sans réseau ni client externe)
+	cargo test --test npm_test --test npm_proxy_test --test cargo_test --test cargo_proxy_test \
+		--test go_test --test go_proxy_test --test oci_test --test oci_nested_test --test oci_proxy_test \
+		--test vuln_test --test group_resolver_test --test auth_test --test features_test \
+		--test promote_test --test permissions_test
 
-test-network: ## Tests nécessitant le réseau
-	cargo test --test proxy_test --test vuln_test
+test-network: ## Tests contre npmjs.org / osv.dev (OPENCARGO_NETWORK_TESTS=1)
+	OPENCARGO_NETWORK_TESTS=1 cargo test --test proxy_test --test vuln_test
 
-test-docker: ## Tests Docker/OCI
-	cargo test --test oci_test --test docker_e2e_test
+test-docker: ## Tests Docker/OCI (HTTP, sans client docker)
+	cargo test --test oci_test --test oci_nested_test --test oci_proxy_test --test docker_e2e_test
 
-test-e2e: ## Tests E2E complets
-	cargo test --test pnpm_e2e_test --test e2e_scoped_test --test docker_e2e_test
+test-e2e: ## Tests E2E avec les vrais clients (pnpm, cargo, go, docker requis)
+	OPENCARGO_E2E_REQUIRE=1 cargo test --test pnpm_e2e_test --test e2e_scoped_test \
+		--test cargo_e2e_test --test go_e2e_test --test docker_cli_e2e_test
+
+test-e2e-cargo: ## E2E cargo (client cargo requis, ou CARGO_BIN)
+	OPENCARGO_E2E_REQUIRE=1 cargo test --test cargo_e2e_test
+
+test-e2e-go: ## E2E go (client go requis, ou GO_BIN)
+	OPENCARGO_E2E_REQUIRE=1 cargo test --test go_e2e_test
+
+test-e2e-docker: ## E2E docker CLI (client docker requis, ou DOCKER_BIN)
+	OPENCARGO_E2E_REQUIRE=1 cargo test --test docker_cli_e2e_test
 
 lint: ## Lancer clippy
 	cargo clippy -- -D warnings
@@ -144,24 +157,6 @@ sidecar-deploy: ## Deployer le sidecar cache CI sur k8s
 sidecar-undeploy: ## Supprimer le sidecar CI
 	kubectl delete -f k8s/sidecar/sidecar-deployment.yaml -n $(NAMESPACE) --ignore-not-found
 	kubectl delete -f k8s/sidecar/configmap.yaml -n $(NAMESPACE) --ignore-not-found
-
-# ---------------------------------------------------------------------------
-# Publish des packages @acme (test)
-# ---------------------------------------------------------------------------
-
-publish-trace: ## Publier les 4 packages @acme/* sur le registry local
-	@echo "Publication des packages @acme/* sur http://localhost:6789/npm-private/"
-	@for pkg in package-context package-logger package-httpclient package-httpservice; do \
-		echo "=== $$pkg ==="; \
-		TMPDIR=$$(mktemp -d); \
-		cp -r ../packages/$$pkg/* "$$TMPDIR/"; \
-		if [ -d "../packages/$$pkg/node_modules" ]; then \
-			cp -r ../packages/$$pkg/node_modules "$$TMPDIR/"; \
-		fi; \
-		echo '@acme:registry=http://localhost:6789/npm-private/\n//localhost:6789/npm-private/:_authToken=test-token' > "$$TMPDIR/.npmrc"; \
-		cd "$$TMPDIR" && pnpm publish --no-git-checks 2>&1 | tail -3; \
-		rm -rf "$$TMPDIR"; \
-	done
 
 # ---------------------------------------------------------------------------
 # Maintenance
