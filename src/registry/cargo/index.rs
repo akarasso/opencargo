@@ -1,23 +1,24 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use axum::{
     body::Body,
     extract::{Path, State},
-    http::{header, HeaderMap, Response, StatusCode, Uri},
+    http::{header, HeaderMap, HeaderValue, Response, StatusCode, Uri},
     response::IntoResponse,
     Json,
 };
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
+use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
 use crate::db::kinds::Format;
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{first_hit, Cx, UrlRepo};
+use crate::registry::resolve::{collect, Cx, UrlRepo};
 use crate::server::AppState;
 
-use super::compute_prefix;
-use super::leaves::IndexLeaf;
+use super::leaves::{IndexLeaf, IndexLines};
+use super::{compute_prefix, line_field};
 
 /// Readable without a token (the auth middleware lets it through): cargo
 /// fetches it before knowing whether to authenticate and learns to from
@@ -84,23 +85,31 @@ pub async fn get_index_entry(
     let leaf = IndexLeaf {
         name: name.to_string(),
     };
-    let index = first_hit(&cx, &repo, &leaf).await?;
-    let body = index.lines.join("\n");
+    let collected = collect(&cx, &repo, &leaf).await?;
+    let merged = merge_index_lines(collected.hits);
+    if merged.lines.is_empty() {
+        return Err(AppError::NotFound(format!("crate not found: {name}")));
+    }
+    let body = merged.lines.join("\n");
     let etag = format!("\"{:x}\"", Sha256::digest(body.as_bytes()));
     let mut response = Response::builder().header(header::ETAG, &etag);
+    if merged.stale {
+        response = response.header(header::WARNING, "110 - \"Response is Stale\"");
+    }
+    if let Some(why) = collected.degraded {
+        response = response.header(header::WARNING, degraded_warning(&why));
+    }
+    let build_failed = |e| AppError::Internal(format!("response build failed: {e}"));
     if if_none_match_hits(&headers, &etag) {
         return response
             .status(StatusCode::NOT_MODIFIED)
             .body(Body::empty())
-            .map_err(|e| AppError::Internal(format!("response build failed: {e}")));
-    }
-    response = response.header(header::CONTENT_TYPE, "application/json");
-    if index.stale {
-        response = response.header(header::WARNING, "110 - \"Response is Stale\"");
+            .map_err(build_failed);
     }
     response
+        .header(header::CONTENT_TYPE, "application/json")
         .body(Body::from(body))
-        .map_err(|e| AppError::Internal(format!("response build failed: {e}")))
+        .map_err(build_failed)
 }
 
 fn index_params(params: &HashMap<String, String>) -> AppResult<(&str, &str)> {
@@ -123,6 +132,29 @@ fn index_prefix(path: &str) -> Option<String> {
     }
 }
 
+/// Union in member order, one line per `vers`, the first member's line winning.
+fn merge_index_lines(hits: Vec<IndexLines>) -> IndexLines {
+    let mut seen = HashSet::new();
+    let mut merged = IndexLines {
+        lines: Vec::new(),
+        stale: false,
+    };
+    for hit in hits {
+        merged.stale |= hit.stale;
+        for line in hit.lines {
+            match line_field(&line, "vers") {
+                Some(vers) => {
+                    if seen.insert(vers) {
+                        merged.lines.push(line);
+                    }
+                }
+                None => warn!(line = %line, "index line without vers, dropped"),
+            }
+        }
+    }
+    merged
+}
+
 fn if_none_match_hits(headers: &HeaderMap, etag: &str) -> bool {
     headers
         .get(header::IF_NONE_MATCH)
@@ -130,10 +162,54 @@ fn if_none_match_hits(headers: &HeaderMap, etag: &str) -> bool {
         .is_some_and(|v| v.split(',').map(str::trim).any(|t| t == etag || t == "*"))
 }
 
+fn degraded_warning(why: &str) -> HeaderValue {
+    let text: String = why
+        .chars()
+        .filter(|c| (c.is_ascii_graphic() || *c == ' ') && *c != '"')
+        .collect();
+    HeaderValue::from_str(&format!("199 - \"{text}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("199 - \"member unavailable\""))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use axum::http::HeaderValue;
+
+    fn hit(stale: bool, lines: &[&str]) -> IndexLines {
+        IndexLines {
+            lines: lines.iter().map(|l| l.to_string()).collect(),
+            stale,
+        }
+    }
+
+    #[test]
+    fn merge_dedups_by_vers_first_member_wins() {
+        let merged = merge_index_lines(vec![
+            hit(false, &[r#"{"vers":"0.2.0","cksum":"a"}"#]),
+            hit(
+                true,
+                &[
+                    r#"{"vers":"0.1.0","cksum":"b"}"#,
+                    r#"{"vers":"0.2.0","cksum":"c"}"#,
+                    "junk",
+                ],
+            ),
+        ]);
+        assert_eq!(
+            merged.lines,
+            vec![
+                r#"{"vers":"0.2.0","cksum":"a"}"#,
+                r#"{"vers":"0.1.0","cksum":"b"}"#
+            ]
+        );
+        assert!(merged.stale);
+    }
+
+    #[test]
+    fn degraded_warning_is_a_valid_header() {
+        let w = degraded_warning("member p failed: \"quoted\"\nnext");
+        assert_eq!(w.to_str().unwrap(), "199 - \"member p failed: quotednext\"");
+    }
 
     #[test]
     fn index_prefix_is_every_segment_between_index_and_name() {
