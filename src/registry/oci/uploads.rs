@@ -91,10 +91,7 @@ pub async fn upload_chunk(
     owned_upload(&state, &repo, upload_uuid).await?;
 
     // Append keeps a multi-chunk upload O(N) and yields the total for Range.
-    let total_len = state
-        .storage
-        .append(&chunk_path(upload_uuid), body)
-        .await?;
+    let total_len = state.storage.append(&chunk_path(upload_uuid), body).await?;
 
     let location = format!("/v2/{}/blobs/uploads/{}", r.image_name(), upload_uuid);
     Ok((
@@ -141,7 +138,10 @@ pub async fn complete_upload(
 
     state
         .storage
-        .put(&paths::blob_path(&repo.name, &query.digest), blob_data.clone())
+        .put(
+            &paths::blob_path(&repo.name, &query.digest),
+            blob_data.clone(),
+        )
         .await?;
     sqlx::query(
         "INSERT OR IGNORE INTO oci_blobs (repository_id, digest, size, content_type)
@@ -165,7 +165,10 @@ pub async fn complete_upload(
         [
             ("Docker-Content-Digest", query.digest.clone()),
             ("Content-Length", "0".to_string()),
-            ("Location", format!("/v2/{}/blobs/{}", r.image_name(), query.digest)),
+            (
+                "Location",
+                format!("/v2/{}/blobs/{}", r.image_name(), query.digest),
+            ),
         ],
     )
         .into_response())

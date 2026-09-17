@@ -88,7 +88,10 @@ mod tests {
                 "/v2/r/team/app/manifests/sha256:abc",
                 "/v2/r/team%2Fapp/manifests/sha256:abc",
             ),
-            ("/v2/r/team/app/tags/list?n=5", "/v2/r/team%2Fapp/tags/list?n=5"),
+            (
+                "/v2/r/team/app/tags/list?n=5",
+                "/v2/r/team%2Fapp/tags/list?n=5",
+            ),
             (
                 "/v2/r/team/blobs/blobs/uploads/",
                 "/v2/r/team%2Fblobs/blobs/uploads/",

@@ -28,7 +28,8 @@ mod tests {
     fn image_manifest_and_index_shapes() {
         let image = br#"{"config":{"digest":"sha256:c"},"layers":[{"digest":"sha256:l1"},{"digest":"sha256:l2"}]}"#;
         assert_eq!(extract_refs(image), ["sha256:c", "sha256:l1", "sha256:l2"]);
-        let index = br#"{"manifests":[{"digest":"sha256:m1","platform":{}},{"digest":"sha256:m2"}]}"#;
+        let index =
+            br#"{"manifests":[{"digest":"sha256:m1","platform":{}},{"digest":"sha256:m2"}]}"#;
         assert_eq!(extract_refs(index), ["sha256:m1", "sha256:m2"]);
         assert!(extract_refs(b"not json").is_empty());
         assert!(extract_refs(br#"{"layers":"nope"}"#).is_empty());

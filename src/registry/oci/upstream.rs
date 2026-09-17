@@ -126,9 +126,11 @@ impl UpstreamStrategy for OciUpstream {
 
     fn verify_headers(&self, _a: &OciArtifact, h: &HeaderMap, body_sha256: &str) -> AppResult<()> {
         match h.get(DOCKER_CONTENT_DIGEST).and_then(|v| v.to_str().ok()) {
-            Some(claimed) if claimed != format!("sha256:{body_sha256}") => Err(AppError::BadGateway(
-                format!("upstream Docker-Content-Digest {claimed} does not match the body"),
-            )),
+            Some(claimed) if claimed != format!("sha256:{body_sha256}") => {
+                Err(AppError::BadGateway(format!(
+                    "upstream Docker-Content-Digest {claimed} does not match the body"
+                )))
+            }
             _ => Ok(()),
         }
     }
@@ -215,17 +217,29 @@ mod tests {
         let a = tag(&up, "org/app");
         for status in [401, 403, 404, 410] {
             let s = StatusCode::from_u16(status).unwrap();
-            assert_eq!(OciUpstream.classify_status(&a, s), Classified::Miss, "{status}");
+            assert_eq!(
+                OciUpstream.classify_status(&a, s),
+                Classified::Miss,
+                "{status}"
+            );
         }
         for status in [429, 500, 502, 503] {
             let s = StatusCode::from_u16(status).unwrap();
-            assert_eq!(OciUpstream.classify_status(&a, s), Classified::Fail, "{status}");
+            assert_eq!(
+                OciUpstream.classify_status(&a, s),
+                Classified::Fail,
+                "{status}"
+            );
         }
     }
 
     #[test]
     fn hub_aliases_map_to_registry_1_with_library_prefix() {
-        for base in ["https://docker.io", "https://index.docker.io", "https://registry-1.docker.io"] {
+        for base in [
+            "https://docker.io",
+            "https://index.docker.io",
+            "https://registry-1.docker.io",
+        ] {
             let up = upstream(base);
             let url = OciUpstream.upstream_url(&up, &tag(&up, "alpine")).unwrap();
             assert_eq!(
@@ -234,7 +248,10 @@ mod tests {
                 "{base}"
             );
             let nested = OciUpstream.upstream_url(&up, &tag(&up, "org/app")).unwrap();
-            assert_eq!(nested.as_str(), "https://registry-1.docker.io/v2/org/app/manifests/latest");
+            assert_eq!(
+                nested.as_str(),
+                "https://registry-1.docker.io/v2/org/app/manifests/latest"
+            );
         }
         let second = upstream("http://127.0.0.1:5000/oci-hosted");
         let a = OciArtifact::Blob {
@@ -245,7 +262,10 @@ mod tests {
             OciUpstream.upstream_url(&second, &a).unwrap().as_str(),
             "http://127.0.0.1:5000/v2/oci-hosted/alpine/blobs/sha256:abc"
         );
-        assert_eq!(OciUpstream.bearer_scope(&a).unwrap(), "repository:alpine:pull");
+        assert_eq!(
+            OciUpstream.bearer_scope(&a).unwrap(),
+            "repository:alpine:pull"
+        );
         let key = OciUpstream.store_key(&tag(&second, "a"), "ff");
         assert_eq!((key.kind, key.key.as_str()), ("oci-manifest", "sha256/ff"));
         let tags = OciArtifact::Tags { name: "a".into() };
@@ -253,6 +273,9 @@ mod tests {
             OciUpstream.upstream_url(&second, &tags).unwrap().as_str(),
             "http://127.0.0.1:5000/v2/oci-hosted/a/tags/list"
         );
-        assert_eq!(OciUpstream.cache_policy(&tags), CachePolicy::Ttl(Ttl::Secs(600)));
+        assert_eq!(
+            OciUpstream.cache_policy(&tags),
+            CachePolicy::Ttl(Ttl::Secs(600))
+        );
     }
 }

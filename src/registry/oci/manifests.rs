@@ -152,7 +152,10 @@ pub async fn put_manifest(
         [
             ("Docker-Content-Digest", digest.clone()),
             ("Content-Length", "0".to_string()),
-            ("Location", format!("/v2/{}/manifests/{}", r.image_name(), digest)),
+            (
+                "Location",
+                format!("/v2/{}/manifests/{}", r.image_name(), digest),
+            ),
         ],
     )
         .into_response())
@@ -171,7 +174,10 @@ async fn store_manifest(
 ) -> AppResult<()> {
     state
         .storage
-        .put(&paths::manifest_path(&r.image_name(), &r.name, digest), body.clone())
+        .put(
+            &paths::manifest_path(&r.image_name(), &r.name, digest),
+            body.clone(),
+        )
         .await?;
     sqlx::query(
         "INSERT OR REPLACE INTO oci_manifests (repository_id, name, digest, content_type, size)

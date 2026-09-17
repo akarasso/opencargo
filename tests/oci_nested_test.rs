@@ -82,16 +82,27 @@ async fn every_route_roundtrip(client: &reqwest::Client, base_url: &str, name: &
     assert_eq!(header(&resp, "docker-content-digest"), layer_digest);
     let resp = client.get(&blob_url).send().await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "{name}: GET blob");
-    assert_eq!(resp.bytes().await.unwrap(), format!("layer-of-{image}").as_bytes());
+    assert_eq!(
+        resp.bytes().await.unwrap(),
+        format!("layer-of-{image}").as_bytes()
+    );
 
     for reference in ["1.0", digest.as_str()] {
         let url = format!("{base_url}/v2/{image}/manifests/{reference}");
         let resp = client.head(&url).send().await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{name}: HEAD manifest {reference}");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{name}: HEAD manifest {reference}"
+        );
         assert_eq!(header(&resp, "docker-content-digest"), digest);
         assert_eq!(header(&resp, "content-length"), manifest.len().to_string());
         let resp = client.get(&url).send().await.unwrap();
-        assert_eq!(resp.status(), StatusCode::OK, "{name}: GET manifest {reference}");
+        assert_eq!(
+            resp.status(),
+            StatusCode::OK,
+            "{name}: GET manifest {reference}"
+        );
         assert_eq!(header(&resp, "content-type"), MANIFEST_TYPE);
         assert_eq!(resp.bytes().await.unwrap(), manifest.as_slice());
     }
@@ -104,7 +115,11 @@ async fn every_route_roundtrip(client: &reqwest::Client, base_url: &str, name: &
         .json()
         .await
         .unwrap();
-    assert_eq!(tags, json!({ "name": image, "tags": ["1.0"] }), "{name}: tags");
+    assert_eq!(
+        tags,
+        json!({ "name": image, "tags": ["1.0"] }),
+        "{name}: tags"
+    );
 
     let unreferenced = push_blob(client, base_url, &image, b"unreferenced").await;
     let resp = client
@@ -120,13 +135,21 @@ async fn every_route_roundtrip(client: &reqwest::Client, base_url: &str, name: &
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::ACCEPTED, "{name}: DELETE manifest");
+    assert_eq!(
+        resp.status(),
+        StatusCode::ACCEPTED,
+        "{name}: DELETE manifest"
+    );
     let resp = client
         .get(format!("{base_url}/v2/{image}/manifests/1.0"))
         .send()
         .await
         .unwrap();
-    assert_eq!(resp.status(), StatusCode::NOT_FOUND, "{name}: deleted manifest");
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "{name}: deleted manifest"
+    );
 }
 
 #[tokio::test]
@@ -143,7 +166,10 @@ async fn manifest_path_unchanged_for_single_segment_names() {
     let client = reqwest::Client::new();
     let storage = server.tmp.path().join("storage");
 
-    for (name, dir) in [("myapp", "myapp/manifests/myapp"), ("team/app", "team/app/manifests/team/app")] {
+    for (name, dir) in [
+        ("myapp", "myapp/manifests/myapp"),
+        ("team/app", "team/app/manifests/team/app"),
+    ] {
         let image = format!("{REPO}/{name}");
         let (manifest, resp) = push_image(&client, &server.base_url, &image, "v1").await;
         assert_eq!(resp.status(), StatusCode::CREATED);
@@ -151,14 +177,20 @@ async fn manifest_path_unchanged_for_single_segment_names() {
             .trim_start_matches("sha256:")
             .to_string();
         let manifest_file = storage.join(format!("oci/{REPO}/{dir}/sha256/{hex}"));
-        assert!(manifest_file.is_file(), "{name}: expected {manifest_file:?}");
+        assert!(
+            manifest_file.is_file(),
+            "{name}: expected {manifest_file:?}"
+        );
         assert_eq!(std::fs::read(&manifest_file).unwrap(), manifest);
 
         let layer_hex = sha256_digest(format!("layer-of-{image}").as_bytes())
             .trim_start_matches("sha256:")
             .to_string();
         let blob_file = storage.join(format!("oci/{REPO}/_blobs/sha256/{layer_hex}"));
-        assert!(blob_file.is_file(), "{name}: blobs never carry the image name");
+        assert!(
+            blob_file.is_file(),
+            "{name}: blobs never carry the image name"
+        );
     }
 }
 
@@ -197,7 +229,10 @@ async fn location_headers_carry_nested_name() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-    assert_eq!(header(&resp, "location"), format!("/v2/{image}/blobs/{digest}"));
+    assert_eq!(
+        header(&resp, "location"),
+        format!("/v2/{image}/blobs/{digest}")
+    );
 
     let (manifest, resp) = push_image(&client, &server.base_url, &image, "latest").await;
     assert_eq!(resp.status(), StatusCode::CREATED);
@@ -211,7 +246,12 @@ async fn location_headers_carry_nested_name() {
 async fn name_segment_called_blobs_or_manifests_routes() {
     let server = setup().await;
     let client = reqwest::Client::new();
-    for name in ["team/blobs", "team/manifests", "uploads/tags", "blobs/uploads/app"] {
+    for name in [
+        "team/blobs",
+        "team/manifests",
+        "uploads/tags",
+        "blobs/uploads/app",
+    ] {
         every_route_roundtrip(&client, &server.base_url, name).await;
     }
 }

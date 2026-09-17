@@ -21,7 +21,10 @@ async fn from_engine(
     if head {
         engine.head(&OciUpstream, up, member, a).await
     } else {
-        Ok(engine.fetch(&OciUpstream, up, member, a).await?.into_payload())
+        Ok(engine
+            .fetch(&OciUpstream, up, member, a)
+            .await?
+            .into_payload())
     }
 }
 
@@ -69,7 +72,8 @@ impl Leaf for BlobLeaf {
         };
         Ok(match from_engine(cx, member, up, &a, self.head).await? {
             Outcome::Found(mut p) => {
-                p.content_type.get_or_insert_with(|| OCTET_STREAM.to_string());
+                p.content_type
+                    .get_or_insert_with(|| OCTET_STREAM.to_string());
                 Outcome::Found(with_digest(p, self.digest.clone()))
             }
             Outcome::NotFound => Outcome::NotFound,
@@ -89,11 +93,13 @@ impl Leaf for ManifestLeaf {
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Payload>> {
         let db = &cx.state.db;
-        let Some(digest) = resolve_hosted_digest(db, member.0.id, &self.name, &self.reference).await?
+        let Some(digest) =
+            resolve_hosted_digest(db, member.0.id, &self.name, &self.reference).await?
         else {
             return Ok(Outcome::NotFound);
         };
-        let Some(manifest) = crate::db::oci::get_manifest(db, member.0.id, &self.name, &digest).await?
+        let Some(manifest) =
+            crate::db::oci::get_manifest(db, member.0.id, &self.name, &digest).await?
         else {
             return Ok(Outcome::NotFound);
         };
@@ -180,7 +186,11 @@ impl Leaf for TagsLeaf {
             .map_err(|e| AppError::BadGateway(format!("invalid tag list from upstream: {e}")))?;
         let tags = body["tags"]
             .as_array()
-            .map(|tags| tags.iter().filter_map(|t| t.as_str().map(String::from)).collect())
+            .map(|tags| {
+                tags.iter()
+                    .filter_map(|t| t.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         Ok(Outcome::Found(tags))
     }
