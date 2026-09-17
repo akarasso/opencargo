@@ -35,6 +35,13 @@ jobs:
         with:
           node-version: 22
 
+      # The go e2e suite shells out to `go` (tests/go_e2e_test.rs).
+      - name: Install Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.22'
+          cache: false
+
       - name: Install frontend dependencies
         run: cd frontend && pnpm install --frozen-lockfile
 
@@ -53,8 +60,13 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # The pnpm e2e tests shell out to `pnpm`, resolved from PATH (installed above).
+      # The real-client e2e suites shell out to `pnpm`, `cargo`, `go` and
+      # `docker`, resolved from PATH. Locally an absent client prints
+      # `skipped:`; OPENCARGO_E2E_REQUIRE=1 turns that into a failure so CI
+      # never silently skips a suite.
       - name: Run tests
+        env:
+          OPENCARGO_E2E_REQUIRE: '1'
         run: cargo test
 
   audit:
