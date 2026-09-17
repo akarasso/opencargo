@@ -155,9 +155,12 @@ Read this before the comparison table sells you anything.
   are better choices.
 - Storage is local disk (a volume or PVC), no S3 backend yet. No SSO; users
   and tokens are local.
-- `vuln_scan.block_on_critical` does not work yet: the OSV batch API returns
-  advisory IDs without severity, so nothing is ever classified critical. A fix
-  is in progress; until then treat the scan as an inventory, not a gate.
+- Vulnerability severity is read per advisory from the full OSV record: a
+  `database_specific.severity` label wins, else the highest CVSS 3.x/4.0
+  vector is scored, and `MAL-` ids are critical. `vuln_scan.block_on_critical`
+  refuses such a publish before anything is written; `vuln_scan.fail_closed`
+  turns an OSV outage into a 503 instead of an unscanned publish. Advisories
+  with only CVSS 2 data (or none) are reported as `unknown` and never block.
 - One maintainer, pre-1.0. Pin the image by digest and keep backups of `/data`.
 
 ---

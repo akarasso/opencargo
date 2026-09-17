@@ -104,10 +104,12 @@ async fn get_vulns_impl(
 
     match scan {
         Some(s) => {
+            // The stored JSON is the whole ScanResult; pre-upgrade rows keep their old detail shape.
             let details: serde_json::Value = s
                 .scan_results_json
                 .as_deref()
-                .and_then(|j| serde_json::from_str(j).ok())
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
+                .and_then(|mut r| r.get_mut("details").map(serde_json::Value::take))
                 .unwrap_or(json!(null));
 
             Ok(Json(json!({

@@ -1,62 +1,18 @@
+pub mod deps;
+pub mod osv;
+pub mod severity;
+
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use anyhow::Context;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::VulnScanConfig;
-
-// ---------------------------------------------------------------------------
-// OSV.dev API types
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize)]
-struct OsvQueryBatch {
-    queries: Vec<OsvQuery>,
-}
-
-#[derive(Debug, Serialize)]
-struct OsvQuery {
-    package: OsvPackage,
-    version: String,
-}
-
-#[derive(Debug, Serialize)]
-struct OsvPackage {
-    name: String,
-    ecosystem: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsvBatchResponse {
-    results: Vec<OsvResult>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsvResult {
-    #[serde(default)]
-    vulns: Vec<OsvVuln>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsvVuln {
-    id: String,
-    #[serde(default)]
-    summary: Option<String>,
-    #[serde(default)]
-    severity: Vec<OsvSeverity>,
-}
-
-#[derive(Debug, Deserialize)]
-struct OsvSeverity {
-    #[serde(rename = "type")]
-    #[allow(dead_code)]
-    severity_type: Option<String>,
-    score: Option<String>,
-}
-
-// ---------------------------------------------------------------------------
-// Scanner
-// ---------------------------------------------------------------------------
+use osv::{Advisory, OsvClient};
+use severity::Severity;
 
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
@@ -66,11 +22,10 @@ pub enum ScanError {
     Db(#[from] sqlx::Error),
 }
 
+/// `osv` is `None` while scanning is disabled: assess reports clean, nothing is recorded.
 #[derive(Clone)]
 pub struct VulnScanner {
-    client: reqwest::Client,
-    base: reqwest::Url,
-    enabled: bool,
+    osv: Option<OsvClient>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -98,7 +53,21 @@ pub struct VulnDetail {
     pub version: String,
     pub vuln_id: String,
     pub summary: String,
-    pub severity: Option<String>,
+    pub severity: Severity,
+    pub score: Option<f64>,
+}
+
+impl VulnDetail {
+    fn new(dependency: &str, version: &str, id: &str, advisory: Option<&Advisory>) -> Self {
+        Self {
+            dependency: dependency.to_string(),
+            version: version.to_string(),
+            vuln_id: id.to_string(),
+            summary: advisory.and_then(|a| a.summary.clone()).unwrap_or_default(),
+            severity: advisory.map_or(Severity::Unknown, |a| a.severity),
+            score: advisory.and_then(|a| a.score),
+        }
+    }
 }
 
 impl VulnScanner {
@@ -106,9 +75,9 @@ impl VulnScanner {
         let base = reqwest::Url::parse(&cfg.osv_base_url)
             .with_context(|| format!("invalid vuln_scan.osv_base_url: {}", cfg.osv_base_url))?;
         Ok(Self {
-            client: reqwest::Client::new(),
-            base,
-            enabled: cfg.enabled,
+            osv: cfg
+                .enabled
+                .then(|| OsvClient::new(base, cfg.max_concurrency)),
         })
     }
 
@@ -118,36 +87,23 @@ impl VulnScanner {
         metadata_json: &str,
         ecosystem: &str,
     ) -> Result<ScanResult, ScanError> {
-        if !self.enabled {
+        let Some(osv) = &self.osv else {
             return Ok(ScanResult::clean());
-        }
-        let deps = extract_dependencies(metadata_json, ecosystem);
+        };
+        let deps = deps::extract_dependencies(metadata_json, ecosystem);
         if deps.is_empty() {
             return Ok(ScanResult::clean());
         }
-        let queries: Vec<OsvQuery> = deps
+        let hits = osv.query_batch(ecosystem, &deps).await?;
+        let ids: Vec<String> = hits
             .iter()
-            .map(|(name, version)| OsvQuery {
-                package: OsvPackage {
-                    name: name.clone(),
-                    ecosystem: ecosystem.to_string(),
-                },
-                version: version.clone(),
-            })
+            .flatten()
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
             .collect();
-        let url = format!("{}/v1/querybatch", self.base.as_str().trim_end_matches('/'));
-        let response = self
-            .client
-            .post(url)
-            .json(&OsvQueryBatch { queries })
-            .timeout(std::time::Duration::from_secs(30))
-            .send()
-            .await
-            .map_err(|e| ScanError::Upstream(format!("request failed: {e}")))?
-            .json::<OsvBatchResponse>()
-            .await
-            .map_err(|e| ScanError::Upstream(format!("invalid response: {e}")))?;
-        Ok(summarize(&deps, &response))
+        let advisories = osv.advisories(&ids).await;
+        Ok(summarize(&deps, &hits, &advisories))
     }
 
     /// Record a scan result against a version row.
@@ -187,205 +143,50 @@ impl VulnScanner {
         ecosystem: &str,
     ) -> Result<ScanResult, ScanError> {
         let result = self.assess(metadata_json, ecosystem).await?;
-        if self.enabled {
+        if self.osv.is_some() {
             self.persist(db, version_id, &result).await?;
         }
         Ok(result)
     }
 }
 
-/// Fold the OSV batch response into a result; a score of 9.0 or more is critical.
-fn summarize(deps: &[(String, String)], response: &OsvBatchResponse) -> ScanResult {
+/// One detail per (dependency, advisory); a record that could not be fetched
+/// is still a finding, of unknown severity.
+fn summarize(
+    deps: &[(String, String)],
+    hits: &[Vec<String>],
+    advisories: &HashMap<String, Result<Arc<Advisory>, String>>,
+) -> ScanResult {
     let mut details = Vec::new();
-    let mut has_critical = false;
-
-    for (i, osv_result) in response.results.iter().enumerate() {
-        // The OSV response is third-party controlled; never index `deps` by its length.
-        let Some((dep_name, dep_version)) = deps.get(i) else {
-            continue;
-        };
-        for vuln in &osv_result.vulns {
-            let severity = vuln.severity.first().and_then(|s| s.score.clone());
-            if let Some(score) = severity.as_deref().and_then(|s| s.parse::<f64>().ok()) {
-                if score >= 9.0 {
-                    has_critical = true;
+    for ((name, version), ids) in deps.iter().zip(hits) {
+        for id in ids {
+            let advisory = match advisories.get(id) {
+                Some(Ok(a)) => Some(a.as_ref()),
+                Some(Err(e)) => {
+                    warn!(advisory = %id, error = %e, "advisory record unavailable");
+                    None
                 }
-            }
-            details.push(VulnDetail {
-                dependency: dep_name.clone(),
-                version: dep_version.clone(),
-                vuln_id: vuln.id.clone(),
-                summary: vuln.summary.clone().unwrap_or_default(),
-                severity,
-            });
+                None => None,
+            };
+            details.push(VulnDetail::new(name, version, id, advisory));
         }
     }
-
     let vulnerable_deps = details
         .iter()
         .map(|d| d.dependency.as_str())
-        .collect::<std::collections::HashSet<_>>()
+        .collect::<HashSet<_>>()
         .len();
-    let status = if has_critical {
+    let status = if details.iter().any(|d| d.severity == Severity::Critical) {
         "critical"
-    } else if vulnerable_deps > 0 {
-        "warning"
-    } else {
+    } else if details.is_empty() {
         "clean"
+    } else {
+        "warning"
     };
     ScanResult {
         total_deps: deps.len(),
         vulnerable_deps,
         status: status.to_string(),
         details,
-    }
-}
-
-/// Extract dependency name/version pairs from metadata JSON.
-///
-/// For npm: look at "dependencies", "devDependencies", etc.
-/// For cargo (crates.io): look at "deps" array.
-/// For Go: look at "dependencies".
-fn extract_dependencies(metadata_json: &str, ecosystem: &str) -> Vec<(String, String)> {
-    let meta: serde_json::Value = match serde_json::from_str(metadata_json) {
-        Ok(v) => v,
-        Err(_) => return vec![],
-    };
-
-    let mut deps = Vec::new();
-
-    match ecosystem {
-        "npm" => {
-            // npm metadata stores dependencies as {"name": "version_req"}
-            let fields = [
-                "dependencies",
-                "devDependencies",
-                "peerDependencies",
-                "optionalDependencies",
-            ];
-            for field in &fields {
-                if let Some(obj) = meta.get(*field).and_then(|v| v.as_object()) {
-                    for (name, version) in obj {
-                        let version_str = version.as_str().unwrap_or("*");
-                        // Only use exact versions for OSV queries (strip ^, ~, etc.)
-                        let clean_version = clean_version_string(version_str);
-                        if !clean_version.is_empty() {
-                            deps.push((name.clone(), clean_version));
-                        }
-                    }
-                }
-            }
-        }
-        "crates.io" => {
-            // Cargo metadata stores deps as an array of objects
-            if let Some(deps_array) = meta.get("deps").and_then(|v| v.as_array()) {
-                for dep in deps_array {
-                    let name = dep.get("name").and_then(|n| n.as_str()).unwrap_or("");
-                    let version_req = dep
-                        .get("version_req")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("*");
-                    let clean = clean_version_string(version_req);
-                    if !name.is_empty() && !clean.is_empty() {
-                        deps.push((name.to_string(), clean));
-                    }
-                }
-            }
-        }
-        "Go" => {
-            // Go module metadata
-            if let Some(obj) = meta.get("dependencies").and_then(|v| v.as_object()) {
-                for (name, version) in obj {
-                    let version_str = version.as_str().unwrap_or("");
-                    if !version_str.is_empty() {
-                        deps.push((name.clone(), version_str.to_string()));
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    deps
-}
-
-/// Clean a version string by removing common range prefixes.
-/// OSV.dev needs exact versions, not ranges.
-fn clean_version_string(version: &str) -> String {
-    let v = version.trim();
-    // Strip ^, ~, >=, <=, >, <, = prefixes
-    let v = v.trim_start_matches('^');
-    let v = v.trim_start_matches('~');
-    let v = v.trim_start_matches(">=");
-    let v = v.trim_start_matches("<=");
-    let v = v.trim_start_matches('>');
-    let v = v.trim_start_matches('<');
-    let v = v.trim_start_matches('=');
-    let v = v.trim();
-
-    // Skip wildcards and complex ranges
-    if v == "*" || v.contains("||") || v.contains(' ') {
-        return String::new();
-    }
-
-    v.to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_extract_npm_dependencies() {
-        let meta = r#"{
-            "name": "test-pkg",
-            "version": "1.0.0",
-            "dependencies": {
-                "lodash": "^4.17.20",
-                "axios": "~0.21.0"
-            },
-            "devDependencies": {
-                "jest": "^27.0.0"
-            }
-        }"#;
-
-        let deps = extract_dependencies(meta, "npm");
-        assert_eq!(deps.len(), 3);
-        assert!(deps.iter().any(|(n, v)| n == "lodash" && v == "4.17.20"));
-        assert!(deps.iter().any(|(n, v)| n == "axios" && v == "0.21.0"));
-        assert!(deps.iter().any(|(n, v)| n == "jest" && v == "27.0.0"));
-    }
-
-    #[test]
-    fn test_extract_cargo_dependencies() {
-        let meta = r#"{
-            "name": "my-crate",
-            "vers": "0.1.0",
-            "deps": [
-                {"name": "serde", "version_req": "^1.0"},
-                {"name": "tokio", "version_req": ">=1.0"}
-            ]
-        }"#;
-
-        let deps = extract_dependencies(meta, "crates.io");
-        assert_eq!(deps.len(), 2);
-        assert!(deps.iter().any(|(n, v)| n == "serde" && v == "1.0"));
-        assert!(deps.iter().any(|(n, v)| n == "tokio" && v == "1.0"));
-    }
-
-    #[test]
-    fn test_clean_version_string() {
-        assert_eq!(clean_version_string("^4.17.20"), "4.17.20");
-        assert_eq!(clean_version_string("~0.21.0"), "0.21.0");
-        assert_eq!(clean_version_string(">=1.0.0"), "1.0.0");
-        assert_eq!(clean_version_string("*"), "");
-        assert_eq!(clean_version_string("1.0.0 || 2.0.0"), "");
-    }
-
-    #[test]
-    fn test_extract_no_deps() {
-        let meta = r#"{"name": "empty", "version": "1.0.0"}"#;
-        let deps = extract_dependencies(meta, "npm");
-        assert!(deps.is_empty());
     }
 }
