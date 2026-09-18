@@ -15,10 +15,14 @@ use chrono::Utc;
 
 use opencargo::adapters::sqlite::SqliteStores;
 use opencargo::domain::{Format, RepoKind, RepoSpec, Visibility};
+use opencargo::ports::audit::AuditStore;
+use opencargo::ports::deps::DependencyStore;
 use opencargo::ports::packages::PackageStore;
+use opencargo::ports::policy::PolicyStore;
 use opencargo::ports::proxy_cache::ProxyCacheStore;
 use opencargo::ports::repositories::RepositoryStore;
 use opencargo::ports::search::SearchIndex;
+use opencargo::ports::vulns::VulnStore;
 use opencargo::ports::webhooks::WebhookStore;
 
 /// What an adapter hands the suite: its handles, plus whatever must outlive
@@ -1010,3 +1014,321 @@ macro_rules! proxy_cache_contract {
 
 #[allow(unused_imports)]
 pub(crate) use proxy_cache_contract;
+
+/// What the tail's four stores hand the suite. A separate handle set, like
+/// `CacheHandles`: an adapter proves one aggregate at a time.
+pub struct TailHandles {
+    pub policy: Arc<dyn PolicyStore>,
+    pub audit: Arc<dyn AuditStore>,
+    pub deps: Arc<dyn DependencyStore>,
+    pub vulns: Arc<dyn VulnStore>,
+    /// A published version both the graph and the scan record hang off: the
+    /// schema declares those foreign keys, so the suite states what it needs
+    /// through `PackageStore` rather than writing orphan rows.
+    pub release: Release,
+    _keep: Box<dyn Any + Send>,
+}
+
+/// The package and version the tail's rows point at.
+#[derive(Clone, Copy)]
+pub struct Release {
+    pub package: i64,
+    pub version: i64,
+}
+
+/// The tail's handles as an adapter exposes them.
+pub struct TailPorts {
+    pub policy: Arc<dyn PolicyStore>,
+    pub audit: Arc<dyn AuditStore>,
+    pub deps: Arc<dyn DependencyStore>,
+    pub vulns: Arc<dyn VulnStore>,
+    pub release: Release,
+}
+
+impl TailHandles {
+    pub fn new(ports: TailPorts, keep: Box<dyn Any + Send>) -> Self {
+        Self {
+            policy: ports.policy,
+            audit: ports.audit,
+            deps: ports.deps,
+            vulns: ports.vulns,
+            release: ports.release,
+            _keep: keep,
+        }
+    }
+}
+
+/// `cascade_contract!(name, opener)`: what the report, the trail, the graph
+/// and the scan record owe together.
+///
+/// Together, because what they share is a rule rather than a table: every
+/// row carries the clock its caller passed, and every deletion is decided by
+/// identity — `user_id`, a cut-off instant, a version id — never by a label
+/// or by the database's own idea of the time.
+#[allow(unused_macros)]
+macro_rules! cascade_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, SubsecRound, TimeZone, Utc};
+            use ::opencargo::domain::{RuleVerdict, ScanResult, Verdict, VulnDetail};
+            use ::opencargo::ports::audit::NewAuditEntry;
+            use ::opencargo::ports::deps::NewDependency;
+            use ::opencargo::ports::policy::{NewResolution, ReportFilter};
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 18, hour, 30, 0).unwrap()
+            }
+
+            fn window() -> ReportFilter<'static> {
+                ReportFilter {
+                    since: DateTime::UNIX_EPOCH,
+                    repo: None,
+                    rule: None,
+                    subject: None,
+                }
+            }
+
+            fn verdicts() -> Vec<RuleVerdict> {
+                vec![RuleVerdict::new("typosquat", Verdict::WouldBlock, "looks like left-pad")]
+            }
+
+            /// Two callers spelled the same and identified differently: the
+            /// label is display, `user_id` is the identity.
+            fn resolution<'a>(verdicts: &'a [RuleVerdict], user: i64) -> NewResolution<'a> {
+                NewResolution {
+                    requested_repo: "npm-all",
+                    member_repo: "npm-proxy",
+                    format: "npm",
+                    name: "left-pad",
+                    version: Some("1.0.0"),
+                    digest: None,
+                    published_at: Some(at(8)),
+                    date_source: "fetch",
+                    actor: "ci",
+                    actor_kind: "token",
+                    user_id: Some(user),
+                    verdicts,
+                }
+            }
+
+            /// 1.5: a row carries the timestamp the caller passed, never a
+            /// column default fired by the server's clock.
+            #[tokio::test]
+            async fn a_resolution_carries_the_callers_clock_and_its_verdicts() {
+                let handles = $open().await;
+                let verdicts = verdicts();
+                let ids = handles
+                    .policy
+                    .insert_batch(&[resolution(&verdicts, 7)], at(9))
+                    .await
+                    .unwrap();
+                assert_eq!(ids.len(), 1);
+
+                let listed = handles.policy.resolutions(&window(), 1, 10).await.unwrap();
+                assert_eq!(listed.len(), 1);
+                assert_eq!(
+                    listed[0].created_at.trunc_subsecs(0),
+                    at(9).trunc_subsecs(0)
+                );
+                assert_eq!(
+                    listed[0].published_at.map(|t| t.trunc_subsecs(0)),
+                    Some(at(8).trunc_subsecs(0))
+                );
+                assert_eq!(listed[0].date_source, "fetch");
+                assert!(listed[0].would_block);
+                assert_eq!(handles.policy.max_id().await.unwrap(), listed[0].id);
+
+                let stored = handles
+                    .policy
+                    .verdicts_for(&[listed[0].id], None)
+                    .await
+                    .unwrap();
+                assert_eq!(stored.len(), 1);
+                assert_eq!(
+                    (stored[0].rule.as_str(), stored[0].verdict.as_str()),
+                    ("typosquat", "would_block")
+                );
+            }
+
+            /// Erasure is by identity, never by label, and it takes the
+            /// verdicts with the rows: a homonymous caller keeps theirs.
+            #[tokio::test]
+            async fn erasure_takes_one_identity_and_leaves_its_homonym() {
+                let handles = $open().await;
+                let verdicts = verdicts();
+                handles
+                    .policy
+                    .insert_batch(
+                        &[resolution(&verdicts, 7), resolution(&verdicts, 8)],
+                        at(9),
+                    )
+                    .await
+                    .unwrap();
+
+                assert_eq!(handles.policy.erase_user(7).await.unwrap(), 1);
+
+                let left = handles.policy.resolutions(&window(), 1, 10).await.unwrap();
+                assert_eq!(left.len(), 1);
+                assert_eq!(left[0].user_id, Some(8), "the homonym keeps its rows");
+                assert_eq!(
+                    left[0].actor, "ci",
+                    "both were spelled the same; only the id decided"
+                );
+                let ids: Vec<i64> = left.iter().map(|r| r.id).collect();
+                assert_eq!(
+                    handles.policy.verdicts_for(&ids, None).await.unwrap().len(),
+                    1,
+                    "the erased row's verdicts went with it, and only those"
+                );
+            }
+
+            /// Retention is the caller's cut-off, so a store that read its own
+            /// clock would answer differently here.
+            #[tokio::test]
+            async fn retention_deletes_by_the_callers_cut_off() {
+                let handles = $open().await;
+                let verdicts = verdicts();
+                handles
+                    .policy
+                    .insert_batch(&[resolution(&verdicts, 7)], at(9) - ::chrono::Duration::days(100))
+                    .await
+                    .unwrap();
+                handles
+                    .policy
+                    .insert_batch(&[resolution(&verdicts, 7)], at(9))
+                    .await
+                    .unwrap();
+
+                assert_eq!(handles.policy.delete_older_than(30, at(9)).await.unwrap(), 1);
+                assert_eq!(
+                    handles.policy.resolutions(&window(), 1, 10).await.unwrap().len(),
+                    1
+                );
+                assert_eq!(handles.policy.delete_older_than(30, at(9)).await.unwrap(), 0);
+            }
+
+            /// The trail is read back newest first, under the caller's clock,
+            /// and `of_target` answers about one action on one target.
+            #[tokio::test]
+            async fn the_trail_reads_back_newest_first_under_the_callers_clock() {
+                let handles = $open().await;
+                for (hour, action) in [(9, "user.create"), (10, "user.delete")] {
+                    handles
+                        .audit
+                        .append(
+                            &NewAuditEntry {
+                                user_id: None,
+                                username: Some("ci"),
+                                action,
+                                target: Some("bob"),
+                                repository: None,
+                                ip: None,
+                                user_agent: None,
+                                details_json: None,
+                            },
+                            at(hour),
+                        )
+                        .await
+                        .unwrap();
+                }
+
+                let listed = handles.audit.recent(1, 10).await.unwrap();
+                assert_eq!(
+                    listed.iter().map(|e| e.action.as_str()).collect::<Vec<_>>(),
+                    vec!["user.delete", "user.create"],
+                    "newest first"
+                );
+                assert_eq!(listed[0].created_at.trunc_subsecs(0), at(10).trunc_subsecs(0));
+                assert_eq!(listed[0].username.as_deref(), Some("ci"));
+                assert_eq!(handles.audit.recent(2, 1).await.unwrap().len(), 1);
+
+                let deletes = handles.audit.of_target("user.delete", "bob").await.unwrap();
+                assert_eq!(deletes.len(), 1);
+                assert!(handles
+                    .audit
+                    .of_target("user.delete", "carol")
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+
+            /// A scan is a fact about a moment, and rescanning starts from
+            /// none: `forget` leaves the version unscanned, not clean.
+            #[tokio::test]
+            async fn a_scan_reads_back_and_a_forget_leaves_no_verdict() {
+                let handles = $open().await;
+                let result = ScanResult {
+                    total_deps: 3,
+                    vulnerable_deps: 1,
+                    status: "warning".to_string(),
+                    details: vec![VulnDetail {
+                        dependency: "left-pad".to_string(),
+                        version: "1.0.0".to_string(),
+                        vuln_id: "GHSA-x".to_string(),
+                        summary: "bad".to_string(),
+                        severity: ::opencargo::domain::Severity::High,
+                        score: Some(7.5),
+                    }],
+                };
+
+                assert!(handles.vulns.latest(handles.release.version).await.unwrap().is_none());
+                handles.vulns.record(handles.release.version, &result, at(9)).await.unwrap();
+
+                let stored = handles.vulns.latest(handles.release.version).await.unwrap().unwrap();
+                assert_eq!(stored.scanned_at.trunc_subsecs(0), at(9).trunc_subsecs(0));
+                assert_eq!((stored.total_deps, stored.vulnerable_deps), (3, 1));
+                assert_eq!(stored.status, "warning");
+                assert_eq!(
+                    stored.details.as_ref().and_then(|d| d.get(0)).and_then(|d| d["vuln_id"].as_str()),
+                    Some("GHSA-x")
+                );
+
+                handles.vulns.forget(handles.release.version).await.unwrap();
+                assert!(handles.vulns.latest(handles.release.version).await.unwrap().is_none());
+                handles.vulns.forget(handles.release.version).await.unwrap();
+            }
+
+            /// The graph is edges out of a version, in the order recorded.
+            #[tokio::test]
+            async fn a_versions_edges_come_back_in_the_order_they_were_recorded() {
+                let handles = $open().await;
+                for (name, requirement, kind) in [
+                    ("left-pad", "^1.0.0", "runtime"),
+                    ("tape", "^5.0.0", "dev"),
+                ] {
+                    handles
+                        .deps
+                        .record(
+                            &NewDependency {
+                                package: handles.release.package,
+                                version: handles.release.version,
+                                name,
+                                requirement,
+                                kind,
+                            },
+                            at(9),
+                        )
+                        .await
+                        .unwrap();
+                }
+
+                let edges = handles.deps.of_version(handles.release.version).await.unwrap();
+                assert_eq!(
+                    edges
+                        .iter()
+                        .map(|d| (d.name.as_str(), d.requirement.as_str(), d.kind.as_str()))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        ("left-pad", "^1.0.0", "runtime"),
+                        ("tape", "^5.0.0", "dev"),
+                    ]
+                );
+                assert!(handles.deps.of_version(handles.release.version + 1).await.unwrap().is_empty());
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use cascade_contract;

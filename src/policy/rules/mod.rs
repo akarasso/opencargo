@@ -8,11 +8,13 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
 
-use crate::telemetry::vulns::severity::Severity;
-use crate::telemetry::vulns::VulnScanner;
+use crate::domain::Severity;
+use crate::ports::vulns::VulnFeed;
 
 use super::age::Age;
-use super::{Resolution, RuleVerdict};
+use crate::domain::RuleVerdict;
+
+use super::Resolution;
 use osv_severity::{OsvMemo, OsvSeverity};
 
 /// The rules of one proxy member, all off unless configured; a member with
@@ -79,7 +81,7 @@ pub trait Rule: Send + Sync {
 
 /// The four strategies, in report order; `osv_severity` shares its memo
 /// with the writer's flush.
-pub fn all_rules(scanner: Arc<VulnScanner>, memo: Arc<OsvMemo>) -> Vec<Box<dyn Rule>> {
+pub fn all_rules(scanner: Arc<dyn VulnFeed>, memo: Arc<OsvMemo>) -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(min_release_age::MinReleaseAge),
         Box::new(OsvSeverity::new(scanner, memo)),
@@ -123,7 +125,12 @@ mod tests {
     #[test]
     fn only_enabled_rules_leave_a_slot() {
         let rules = all_rules(
-            Arc::new(VulnScanner::new(&crate::config::VulnScanConfig::default()).unwrap()),
+            Arc::new(
+                crate::telemetry::vulns::VulnScanner::new(
+                    &crate::config::VulnScanConfig::default(),
+                )
+                .unwrap(),
+            ),
             osv_severity::new_memo(),
         );
         let names: Vec<&str> = rules.iter().map(|r| r.name()).collect();

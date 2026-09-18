@@ -2,7 +2,8 @@ use chrono::{DateTime, Utc};
 
 use super::{PolicyConfig, Rule};
 use crate::domain::Format;
-use crate::policy::{Resolution, RuleVerdict, Verdict};
+use crate::domain::{RuleVerdict, Verdict};
+use crate::policy::Resolution;
 
 /// npm only: the fact was gathered from the packument by the recorder.
 pub struct InstallScripts;

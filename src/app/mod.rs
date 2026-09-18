@@ -7,4 +7,5 @@
 
 pub mod promote;
 pub mod publish;
+pub mod scan;
 pub mod webhooks;

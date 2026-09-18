@@ -1,9 +1,11 @@
 use tracing::warn;
 
-use crate::domain::Format;
+use chrono::Utc;
+
+use crate::app::scan::ScanVersion;
+use crate::domain::{Format, ScanResult};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
-use crate::telemetry::vulns::ScanResult;
 
 /// The scan that ran before the first write, if any; persisted by
 /// [`finalize_publish`] once the version row exists.
@@ -87,20 +89,19 @@ pub async fn finalize_publish(
         return Ok(());
     };
 
+    let scan = ScanVersion::new(state.vuln_scanner.clone(), state.vulns.clone());
     match pre.0 {
         Some(result) => {
             // The version is already served; a lost scan row is a warning, not a failed publish.
-            if let Err(e) = state.vuln_scanner.persist(&state.db, version_id, &result).await {
+            if let Err(e) = scan.record(version_id, &result, Utc::now()).await {
                 warn!(version_id, error = %e, "failed to persist the pre-publish scan");
             }
         }
         None => {
-            let scanner = state.vuln_scanner.clone();
-            let db = state.db.clone();
             let meta_json = metadata_json.to_string();
             let eco = ecosystem.to_string();
             tokio::spawn(async move {
-                if let Err(e) = scanner.scan_version(&db, version_id, &meta_json, &eco).await {
+                if let Err(e) = scan.run(version_id, &meta_json, &eco, Utc::now()).await {
                     warn!(error = %e, "Background vulnerability scan failed");
                 }
             });

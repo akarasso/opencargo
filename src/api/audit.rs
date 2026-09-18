@@ -9,6 +9,7 @@ use serde_json::json;
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
+use crate::wire::wire_ts;
 
 // ---------------------------------------------------------------------------
 // Query parameters
@@ -43,7 +44,7 @@ pub async fn list_audit(
     let page = query.page.unwrap_or(1).max(1);
     let size = query.size.unwrap_or(50).clamp(1, 200);
 
-    let entries = crate::db::list_audit_entries(&state.db, page, size).await?;
+    let entries = state.audit.recent(page, size).await?;
 
     let result: Vec<serde_json::Value> = entries
         .iter()
@@ -58,7 +59,7 @@ pub async fn list_audit(
                 "ip": e.ip,
                 "user_agent": e.user_agent,
                 "details_json": e.details_json,
-                "created_at": e.created_at,
+                "created_at": wire_ts(e.created_at),
             })
         })
         .collect();

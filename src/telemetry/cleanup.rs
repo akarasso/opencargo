@@ -6,6 +6,7 @@ use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::config::CleanupConfig;
+use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::storage::StorageBackend;
 
@@ -53,6 +54,7 @@ pub(crate) fn sweeps_configured(config: &CleanupConfig) -> bool {
 pub async fn start_cleanup_task(
     db: SqlitePool,
     cache: Arc<dyn ProxyCacheStore>,
+    policy: Arc<dyn PolicyStore>,
     storage: Arc<dyn StorageBackend>,
     config: CleanupConfig,
 ) {
@@ -65,7 +67,7 @@ pub async fn start_cleanup_task(
     loop {
         // Run first, THEN sleep: a service restarted more often than daily
         // (common under k8s) would otherwise never clean up at all.
-        run_cleanup(&db, cache.as_ref(), &storage, &config).await;
+        run_cleanup(&db, cache.as_ref(), policy.as_ref(), &storage, &config).await;
         tokio::time::sleep(Duration::from_secs(86400)).await;
     }
 }
@@ -73,6 +75,7 @@ pub async fn start_cleanup_task(
 pub(crate) async fn run_cleanup(
     db: &SqlitePool,
     cache: &dyn ProxyCacheStore,
+    policy: &dyn PolicyStore,
     storage: &Arc<dyn StorageBackend>,
     config: &CleanupConfig,
 ) -> CleanupStats {
@@ -94,7 +97,7 @@ pub(crate) async fn run_cleanup(
     }
 
     if let Some(days) = policy_days(config) {
-        match crate::policy::store::delete_older_than(db, days).await {
+        match policy.delete_older_than(days, Utc::now()).await {
             Ok(deleted) => {
                 info!(deleted, days, "Policy report sweep complete");
                 stats.policy = Some(deleted);
@@ -234,6 +237,7 @@ mod tests {
         _tmp: tempfile::TempDir,
         pool: SqlitePool,
         cache: Arc<dyn ProxyCacheStore>,
+        policy: Arc<dyn PolicyStore>,
         storage: Arc<dyn StorageBackend>,
     }
 
@@ -264,10 +268,12 @@ mod tests {
         .unwrap();
         let storage = crate::storage::filesystem(tmp.path().join("storage"));
         let cache = crate::server::proxy_cache_store(&pool);
+        let policy = crate::server::policy_store(&pool);
         Fx {
             _tmp: tmp,
             pool,
             cache,
+            policy,
             storage,
         }
     }
@@ -436,7 +442,14 @@ mod tests {
             policy_report_older_than_days: None,
         };
 
-        let stats = run_cleanup(&fx.pool, fx.cache.as_ref(), &fx.storage, &config).await;
+        let stats = run_cleanup(
+            &fx.pool,
+            fx.cache.as_ref(),
+            fx.policy.as_ref(),
+            &fx.storage,
+            &config,
+        )
+        .await;
 
         assert_eq!(stats.prereleases, None, "pre-release sweep needs enabled");
         assert_eq!(stats.proxy.map(|s| s.rows), Some(1));
@@ -451,7 +464,14 @@ mod tests {
             proxy_cache_older_than_days: Some(0),
             ..config
         };
-        let stats = run_cleanup(&fx.pool, fx.cache.as_ref(), &fx.storage, &disabled).await;
+        let stats = run_cleanup(
+            &fx.pool,
+            fx.cache.as_ref(),
+            fx.policy.as_ref(),
+            &fx.storage,
+            &disabled,
+        )
+        .await;
         assert!(stats.prereleases.is_none() && stats.proxy.is_none() && stats.policy.is_none());
     }
 
@@ -528,7 +548,14 @@ mod tests {
             policy_report_older_than_days: Some(30),
         };
 
-        let stats = run_cleanup(&fx.pool, fx.cache.as_ref(), &fx.storage, &config).await;
+        let stats = run_cleanup(
+            &fx.pool,
+            fx.cache.as_ref(),
+            fx.policy.as_ref(),
+            &fx.storage,
+            &config,
+        )
+        .await;
 
         assert_eq!(stats.policy, Some(2));
         assert!(stats.prereleases.is_none() && stats.proxy.is_none());
@@ -539,7 +566,14 @@ mod tests {
             policy_report_older_than_days: Some(0),
             ..config
         };
-        let stats = run_cleanup(&fx.pool, fx.cache.as_ref(), &fx.storage, &off).await;
+        let stats = run_cleanup(
+            &fx.pool,
+            fx.cache.as_ref(),
+            fx.policy.as_ref(),
+            &fx.storage,
+            &off,
+        )
+        .await;
         assert_eq!(stats.policy, None);
         assert_eq!(fx.policy_names().await.len(), 2);
     }

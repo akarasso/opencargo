@@ -5,7 +5,6 @@ mod memo;
 pub mod pacer;
 pub mod rules;
 pub mod startup;
-pub mod store;
 mod totals;
 mod writer;
 
@@ -17,18 +16,19 @@ use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use serde::Serialize;
-use sqlx::SqlitePool;
 use tokio::sync::mpsc::{self, error::TrySendError};
 use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
 use crate::domain::{CacheRepo, Format, Repository};
+use crate::error::StoreError;
 use crate::events::EventBus;
+use crate::ports::policy::{PolicyStore, ReportFilter, Totals};
 use crate::proxy::engine::Cached;
 use crate::proxy::ProxyEngine;
 use crate::registry::resolve::{Cx, Upstream};
-use crate::telemetry::vulns::VulnScanner;
+use crate::ports::vulns::VulnFeed;
 
 pub use age::Age;
 use facts::NpmSlot;
@@ -36,7 +36,6 @@ use memo::Memo;
 use pacer::Pacer;
 use rules::osv_severity::OsvMemo;
 use rules::{PolicyConfig, Rule};
-use store::{ReportFilter, Totals};
 use totals::TotalsCache;
 use writer::Notify;
 
@@ -165,43 +164,6 @@ pub struct Facts {
     pub date_source: &'static str,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum Verdict {
-    Pass,
-    WouldBlock,
-    Unknown,
-    NotApplicable,
-}
-
-impl Verdict {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Verdict::Pass => "pass",
-            Verdict::WouldBlock => "would_block",
-            Verdict::Unknown => "unknown",
-            Verdict::NotApplicable => "not_applicable",
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct RuleVerdict {
-    pub rule: &'static str,
-    pub verdict: Verdict,
-    pub reason: String,
-}
-
-impl RuleVerdict {
-    pub fn new(rule: &'static str, verdict: Verdict, reason: impl Into<String>) -> Self {
-        Self {
-            rule,
-            verdict,
-            reason: reason.into(),
-        }
-    }
-}
-
 /// Timing knobs; tests shrink them, production runs the defaults.
 #[derive(Clone, Copy, Debug)]
 pub struct Tuning {
@@ -240,12 +202,12 @@ impl Tuning {
 pub(crate) type ChildKey = (i64, String, String);
 
 pub(crate) struct Shared {
-    pub db: SqlitePool,
+    pub store: Arc<dyn PolicyStore>,
     pub proxy: ProxyEngine,
     pub rules: Vec<Box<dyn Rule>>,
     pub config: HashMap<String, PolicyConfig>,
     pub events: Arc<EventBus>,
-    pub scanner: Arc<VulnScanner>,
+    pub scanner: Arc<dyn VulnFeed>,
     pub osv_memo: Arc<OsvMemo>,
     pub recent_children: Mutex<HashMap<ChildKey, VecDeque<(u64, Instant)>>>,
     pub parked: Mutex<HashMap<u64, (Pending, Instant)>>,
@@ -296,34 +258,34 @@ pub struct PolicyEngine {
 impl PolicyEngine {
     /// Builds the channel and spawns the writer; always called under a runtime.
     pub fn new(
-        db: SqlitePool,
+        store: Arc<dyn PolicyStore>,
         config: &HashMap<String, PolicyConfig>,
-        scanner: Arc<VulnScanner>,
+        scanner: Arc<dyn VulnFeed>,
         events: Arc<EventBus>,
         proxy: ProxyEngine,
     ) -> Self {
-        Self::new_tuned(db, config, scanner, events, proxy, Tuning::default())
+        Self::new_tuned(store, config, scanner, events, proxy, Tuning::default())
     }
 
     #[doc(hidden)]
     pub fn new_tuned(
-        db: SqlitePool,
+        store: Arc<dyn PolicyStore>,
         config: &HashMap<String, PolicyConfig>,
-        scanner: Arc<VulnScanner>,
+        scanner: Arc<dyn VulnFeed>,
         events: Arc<EventBus>,
         proxy: ProxyEngine,
         tuning: Tuning,
     ) -> Self {
-        let (engine, writer) = Self::unspawned(db, config, scanner, events, proxy, tuning);
+        let (engine, writer) = Self::unspawned(store, config, scanner, events, proxy, tuning);
         tokio::spawn(writer);
         engine
     }
 
     /// The engine and its writer future, not spawned: unit tests drive it.
     pub(crate) fn unspawned(
-        db: SqlitePool,
+        store: Arc<dyn PolicyStore>,
         config: &HashMap<String, PolicyConfig>,
-        scanner: Arc<VulnScanner>,
+        scanner: Arc<dyn VulnFeed>,
         events: Arc<EventBus>,
         proxy: ProxyEngine,
         tuning: Tuning,
@@ -331,7 +293,7 @@ impl PolicyEngine {
         let (tx, rx) = mpsc::channel(QUEUE);
         let osv_memo = rules::osv_severity::new_memo();
         let shared = Arc::new(Shared {
-            db,
+            store,
             proxy,
             rules: rules::all_rules(scanner.clone(), osv_memo.clone()),
             config: config.clone(),
@@ -383,8 +345,15 @@ impl PolicyEngine {
 
     /// Report totals for `f`, snapshotted under `key` (the filter as the
     /// client spelled it) so refetches read only the rows landed since.
-    pub async fn totals(&self, f: &ReportFilter<'_>, key: String) -> Result<Totals, sqlx::Error> {
-        self.shared.totals.totals(&self.shared.db, f, key).await
+    pub async fn totals(
+        &self,
+        f: &ReportFilter<'_>,
+        key: String,
+    ) -> Result<Totals, StoreError> {
+        self.shared
+            .totals
+            .totals(self.shared.store.as_ref(), f, key)
+            .await
     }
 
     /// After an erasure: every snapshot counted rows that are gone.

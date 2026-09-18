@@ -209,11 +209,10 @@ mod tests {
         assert_eq!(tags.len(), 1);
         assert_eq!(tags[0].version_id, promoted.id);
 
-        let audit = db.audit();
-        assert_eq!(audit.len(), 1);
-        assert_eq!(audit[0].username, "alex");
-        assert_eq!(audit[0].target, "left-pad@1.0.0");
-        assert_eq!(audit[0].repository, "npm-prod");
+        assert_eq!(
+            db.audit_rows(),
+            vec![(Some(1), "package.promote".to_string(), "left-pad@1.0.0".to_string())]
+        );
     }
 
     /// A failed metadata transaction takes its copy back with it, so no
@@ -247,6 +246,6 @@ mod tests {
             .await
             .is_err());
         assert!(storage.get(&source.tarball_path).await.is_ok());
-        assert!(db.audit().is_empty());
+        assert!(db.audit_rows().is_empty());
     }
 }

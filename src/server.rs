@@ -23,9 +23,12 @@ use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
+use crate::ports::audit::AuditStore;
+use crate::ports::deps::DependencyStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
+use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::SearchIndex;
@@ -34,6 +37,7 @@ use crate::ports::users::{NewUser, UserPatch, UserStore};
 use crate::ports::webhooks::{NewWebhook, WebhookStore};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
 use crate::storage::StorageBackend;
+use crate::ports::vulns::{VulnFeed, VulnStore};
 use crate::telemetry;
 use crate::telemetry::vulns::VulnScanner;
 use crate::telemetry::webhooks::WebhookDispatcher;
@@ -74,7 +78,13 @@ pub struct AppState {
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
     pub oci: Arc<dyn OciStore>,
-    pub vuln_scanner: Arc<VulnScanner>,
+    pub audit: Arc<dyn AuditStore>,
+    pub deps: Arc<dyn DependencyStore>,
+    pub vulns: Arc<dyn VulnStore>,
+    /// The report's rows; the engine beside it owns the writing and the
+    /// totals cache, and holds the same store.
+    pub policy_store: Arc<dyn PolicyStore>,
+    pub vuln_scanner: Arc<dyn VulnFeed>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
     pub events: Arc<crate::events::EventBus>,
@@ -99,6 +109,11 @@ pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
 /// naming it themselves.
 pub fn proxy_cache_store(db: &SqlitePool) -> Arc<dyn ProxyCacheStore> {
     crate::adapters::sqlite::SqliteStores::new(db.clone()).proxy_cache()
+}
+
+/// The policy report store over an open pool, for the same reason.
+pub fn policy_store(db: &SqlitePool) -> Arc<dyn PolicyStore> {
+    crate::adapters::sqlite::SqliteStores::new(db.clone()).policy()
 }
 
 pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
@@ -140,11 +155,12 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let webhook_dispatcher = Arc::new(WebhookDispatcher::new(webhooks.clone()));
 
-    let vuln_scanner = Arc::new(VulnScanner::new(&config.vuln_scan)?);
+    let vuln_scanner: Arc<dyn VulnFeed> = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
     let events = Arc::new(crate::events::EventBus::new());
+    let policy_store = stores.policy();
     let policy = PolicyEngine::new(
-        db.clone(),
+        policy_store.clone(),
         &config.policy,
         vuln_scanner.clone(),
         events.clone(),
@@ -173,6 +189,10 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         packages: stores.packages(),
         search: stores.search(),
         oci: stores.oci(),
+        audit: stores.audit(),
+        deps: stores.dependencies(),
+        vulns: stores.vulns(),
+        policy_store,
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,
