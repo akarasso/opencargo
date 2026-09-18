@@ -87,6 +87,11 @@ async fn main() -> anyhow::Result<()> {
                 cfg.cleanup.clone(),
             ));
 
+            tokio::spawn(opencargo::app::sweep_storage::start_storage_sweep(
+                opencargo::app::sweep_storage::SweepStorage::new(app_state.storage.clone()),
+                app_state.clock.clone(),
+            ));
+
             let router = server::build_router(app_state);
 
             // Decode percent-encoded slashes (%2f) before routing.

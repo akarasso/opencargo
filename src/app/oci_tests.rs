@@ -19,7 +19,7 @@ impl Fx {
     }
 
     fn storage(&self) -> Arc<dyn StorageBackend> {
-        crate::storage::filesystem(self.root.path().to_str().unwrap())
+        crate::server::filesystem(self.root.path().to_str().unwrap())
     }
 
     fn exists(&self, key: &str) -> bool {
@@ -168,7 +168,7 @@ fn assembled<'a>(upload: &'a str, digest: &'a str) -> AssembledBlob<'a> {
         digest,
         content_type: "application/octet-stream",
         path: "oci/r/_blobs/sha256:bb",
-        scratch: "oci/_uploads/u1/data",
+        segments: vec!["oci/_uploads/u1/00000000000000000000".to_string()],
         bytes: Bytes::from_static(b"layer"),
     }
 }
@@ -180,7 +180,7 @@ async fn a_completed_upload_records_the_blob_and_closes_the_ledger() {
     let fx = Fx::new();
     fx.fakes.oci().start_upload("u1", 1, "app").await.unwrap();
     fx.storage()
-        .put("oci/_uploads/u1/data", Bytes::from_static(b"layer"))
+        .put("oci/_uploads/u1/00000000000000000000", Bytes::from_static(b"layer"))
         .await
         .unwrap();
 
@@ -193,7 +193,7 @@ async fn a_completed_upload_records_the_blob_and_closes_the_ledger() {
     let blob = oci.blob(1, LAYER).await.unwrap().expect("the blob row");
     assert_eq!(blob.size, 5);
     assert!(oci.upload_owner("u1").await.unwrap().is_none());
-    assert!(!fx.exists("oci/_uploads/u1/data"));
+    assert!(!fx.exists("oci/_uploads/u1/00000000000000000000"));
     assert!(fx.exists("oci/r/_blobs/sha256:bb"));
 }
 

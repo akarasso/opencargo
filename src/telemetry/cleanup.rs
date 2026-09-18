@@ -11,9 +11,6 @@ use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::storage::StorageBackend;
 
-/// Abandoned `*.part-*` files older than this are reclaimed by the sweep.
-const STALE_PART_AGE: Duration = Duration::from_secs(3600);
-
 /// A retention bound in days, as the duration the ports take.
 fn retention(days: u64) -> Duration {
     Duration::from_secs(days.saturating_mul(86_400))
@@ -28,7 +25,6 @@ const SWEEP_LIMIT: u32 = 10_000;
 pub(crate) struct SweepStats {
     pub rows: u64,
     pub files: u64,
-    pub parts: u64,
 }
 
 #[derive(Debug, Default)]
@@ -163,7 +159,7 @@ pub(crate) async fn sweep_prereleases(
 }
 
 /// Evict expired negative entries and every row idle for `idle_days`, file
-/// first, then row; then reclaim abandoned part files.
+/// first, then row.
 pub(crate) async fn sweep_proxy_cache(
     cache: &dyn ProxyCacheStore,
     storage: &Arc<dyn StorageBackend>,
@@ -181,13 +177,9 @@ pub(crate) async fn sweep_proxy_cache(
         cache.delete(row.id).await?;
         stats.rows += 1;
     }
-    stats.parts = storage
-        .remove_stale_parts("", STALE_PART_AGE)
-        .await?;
     info!(
         rows = stats.rows,
         files = stats.files,
-        parts = stats.parts,
         "Proxy cache sweep complete"
     );
     Ok(stats)
@@ -252,7 +244,7 @@ mod tests {
             ids.push(repos.create(&spec, now()).await.unwrap().id);
         }
         Fx {
-            storage: crate::storage::filesystem(tmp.path().join("storage")),
+            storage: crate::server::filesystem(tmp.path().join("storage")),
             packages: db.packages(),
             cache: db.proxy_cache(),
             policy: db.policy(),
@@ -428,7 +420,7 @@ mod tests {
             "the npm pre-release goes, and its dist-tag with it"
         );
         assert!(
-            !fx.storage.exists("npmpkg/1.0.0-beta.tgz").await.unwrap(),
+            fx.storage.stat("npmpkg/1.0.0-beta.tgz").await.unwrap().is_none(),
             "the artifact goes before the row that names it"
         );
         assert_eq!(
@@ -470,43 +462,14 @@ mod tests {
 
         assert_eq!(
             stats,
-            SweepStats {
-                rows: 2,
-                files: 1,
-                parts: 0
-            }
+            SweepStats { rows: 2, files: 1 }
         );
         assert!(!fx.cached("npm-tarball", "idle").await);
         assert!(!fx.cached("npm-metadata", "gone").await);
         assert!(fx.cached("npm-metadata", "stale").await);
         assert!(fx.cached("npm-metadata", "fresh-negative").await);
-        assert!(!fx.storage.exists("_proxy_cache/p/npm-tarball/idle").await.unwrap());
-        assert!(fx.storage.exists("_proxy_cache/p/npm-metadata/stale").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn sweep_reclaims_abandoned_part_file() {
-        let fx = fixture().await;
-        fx.put("_proxy_cache/p/npm-tarball/ab/abc.part-old").await;
-        fx.put("_proxy_cache/p/npm-tarball/ab/abc.part-new").await;
-        fx.put("_proxy_cache/p/npm-tarball/ab/abc").await;
-        let old = fx.storage.resolve("_proxy_cache/p/npm-tarball/ab/abc.part-old").unwrap();
-        let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(7200);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_modified(two_hours_ago)
-            .unwrap();
-
-        let stats = sweep_proxy_cache(fx.cache.as_ref(), &fx.storage, 30, now())
-            .await
-            .unwrap();
-
-        assert_eq!(stats.parts, 1);
-        assert!(!old.exists(), "an hour-old part is reclaimed");
-        assert!(fx.storage.exists("_proxy_cache/p/npm-tarball/ab/abc.part-new").await.unwrap());
-        assert!(fx.storage.exists("_proxy_cache/p/npm-tarball/ab/abc").await.unwrap());
+        assert!(fx.storage.stat("_proxy_cache/p/npm-tarball/idle").await.unwrap().is_none());
+        assert!(fx.storage.stat("_proxy_cache/p/npm-metadata/stale").await.unwrap().is_some());
     }
 
     #[tokio::test]

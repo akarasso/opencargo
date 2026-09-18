@@ -5,5 +5,6 @@
 //! the rule.
 
 pub mod events;
+pub mod fs;
 pub mod sqlite;
 pub mod system;

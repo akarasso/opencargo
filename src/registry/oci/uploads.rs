@@ -17,8 +17,22 @@ use crate::server::AppState;
 
 use super::{param, paths, sha256_digest, OciRef};
 
-fn chunk_path(upload_uuid: &str) -> String {
-    format!("oci/_uploads/{upload_uuid}/data")
+/// Every chunk of an upload is its own object, keyed by the offset it
+/// starts at, so a chunk is never rewritten and the upload never re-read.
+fn segments_prefix(upload_uuid: &str) -> String {
+    format!("oci/_uploads/{upload_uuid}")
+}
+
+async fn segments(state: &AppState, upload_uuid: &str) -> AppResult<Vec<(String, u64)>> {
+    use futures_util::TryStreamExt;
+    let mut found: Vec<(String, u64)> = state
+        .storage
+        .list(&segments_prefix(upload_uuid))
+        .map_ok(|meta| (meta.key, meta.size))
+        .try_collect()
+        .await?;
+    found.sort();
+    Ok(found)
 }
 
 /// The hosted OCI repository `r` names, once the caller may write to it.
@@ -86,8 +100,10 @@ pub async fn upload_chunk(
     let (repo, _) = writable_repo(&state, &r, auth).await?;
     owned_upload(&state, &repo, upload_uuid).await?;
 
-    // Append keeps a multi-chunk upload O(N) and yields the total for Range.
-    let total_len = state.storage.append(&chunk_path(upload_uuid), body).await?;
+    let received: u64 = segments(&state, upload_uuid).await?.iter().map(|(_, n)| n).sum();
+    let total_len = received + body.len() as u64;
+    let segment = format!("{}/{received:020}", segments_prefix(upload_uuid));
+    state.storage.put(&segment, body).await?;
 
     let location = format!("/v2/{}/blobs/uploads/{}", r.image_name(), upload_uuid);
     Ok((
@@ -119,8 +135,8 @@ pub async fn complete_upload(
     let (repo, _) = writable_repo(&state, &r, auth).await?;
     owned_upload(&state, &repo, upload_uuid).await?;
 
-    let chunk_path = chunk_path(upload_uuid);
-    let blob_data = assemble_blob(&state, &chunk_path, body).await;
+    let parts = segments(&state, upload_uuid).await?;
+    let blob_data = assemble_blob(&state, &parts, body).await?;
     if blob_data.is_empty() {
         return Err(AppError::BadRequest("no blob data provided".to_string()));
     }
@@ -139,7 +155,7 @@ pub async fn complete_upload(
             digest: &query.digest,
             content_type: "application/octet-stream",
             path: &paths::blob_path(&repo.name, &query.digest),
-            scratch: &chunk_path,
+            segments: parts.into_iter().map(|(key, _)| key).collect(),
             bytes: blob_data.clone(),
         })
         .await?;
@@ -159,15 +175,15 @@ pub async fn complete_upload(
         .into_response())
 }
 
-/// The chunks PATCHed so far followed by the PUT body, whichever exist.
-async fn assemble_blob(state: &AppState, chunk_path: &str, body: Bytes) -> Bytes {
-    match state.storage.get(chunk_path).await {
-        Ok(existing) if body.is_empty() => existing,
-        Ok(existing) => {
-            let mut combined = existing.to_vec();
-            combined.extend_from_slice(&body);
-            Bytes::from(combined)
-        }
-        Err(_) => body,
+/// The chunks PATCHed so far, in offset order, followed by the PUT body.
+async fn assemble_blob(state: &AppState, parts: &[(String, u64)], body: Bytes) -> AppResult<Bytes> {
+    if parts.is_empty() {
+        return Ok(body);
     }
+    let mut combined = Vec::new();
+    for (key, _) in parts {
+        combined.extend_from_slice(&state.storage.get(key).await?);
+    }
+    combined.extend_from_slice(&body);
+    Ok(Bytes::from(combined))
 }

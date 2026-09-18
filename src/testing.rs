@@ -24,3 +24,7 @@ pub mod fixture;
 /// holds ports instead of the whole application state.
 #[cfg(test)]
 pub mod resolver;
+
+/// An in-memory storage backend with a delete log and injected faults.
+#[cfg(test)]
+pub mod storage;

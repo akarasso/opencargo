@@ -169,7 +169,7 @@ mod tests {
     }
 
     async fn staged(root: &tempfile::TempDir) -> (Arc<dyn StorageBackend>, Version) {
-        let storage = crate::storage::filesystem(root.path().to_str().unwrap());
+        let storage = crate::server::filesystem(root.path().to_str().unwrap());
         let source = version("npm/npm-stage/left-pad/left-pad-1.0.0.tgz");
         storage
             .put(&source.tarball_path, Bytes::from_static(b"tgz!"))

@@ -149,15 +149,15 @@ pub struct CompleteUpload {
     storage: Arc<dyn StorageBackend>,
 }
 
-/// An upload's last chunk: the bytes, where the blob lands, and the scratch
-/// file they were assembled in.
+/// An upload's last chunk: the bytes, where the blob lands, and the segments
+/// they were assembled from.
 pub struct AssembledBlob<'a> {
     pub upload: &'a str,
     pub repository: i64,
     pub digest: &'a str,
     pub content_type: &'a str,
     pub path: &'a str,
-    pub scratch: &'a str,
+    pub segments: Vec<String>,
     pub bytes: Bytes,
 }
 
@@ -179,7 +179,7 @@ impl CompleteUpload {
                 },
             )
             .await?;
-        let _ = self.storage.delete(blob.scratch).await;
+        let _ = self.storage.delete_batch(&blob.segments).await;
         Ok(())
     }
 }

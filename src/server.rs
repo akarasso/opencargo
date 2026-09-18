@@ -45,7 +45,7 @@ use crate::ports::tokens::{NewToken, TokenStore};
 use crate::ports::users::{NewUser, UserPatch, UserStore};
 use crate::ports::webhooks::{NewWebhook, WebhookStore};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
-use crate::storage::StorageBackend;
+use crate::storage::{StorageBackend, StoreIdentity};
 use crate::ports::vulns::{VulnFeed, VulnStore};
 use crate::telemetry;
 use crate::telemetry::vulns::VulnScanner;
@@ -158,6 +158,69 @@ pub async fn open_stores(path: &std::path::Path) -> anyhow::Result<SqliteStores>
     SqliteStores::open(path).await
 }
 
+/// What a store is built for; its identity defaults to the role's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Artifacts,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Role::Artifacts => "artifacts",
+        }
+    }
+}
+
+/// Where a built store really points, for disjointness checks only: no
+/// `Display`, no `Serialize`, and a `Debug` that names nothing.
+pub struct ResolvedLocation {
+    backend: &'static str,
+    root: std::path::PathBuf,
+}
+
+impl std::fmt::Debug for ResolvedLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResolvedLocation(..)")
+    }
+}
+
+impl ResolvedLocation {
+    /// Two locations share nothing: another backend, or roots neither of
+    /// which contains the other.
+    pub fn disjoint(&self, other: &ResolvedLocation) -> bool {
+        self.backend != other.backend
+            || !(self.root.starts_with(&other.root) || other.root.starts_with(&self.root))
+    }
+}
+
+pub struct BuiltStorage {
+    pub backend: Arc<dyn StorageBackend>,
+    pub identity: StoreIdentity,
+    pub location: ResolvedLocation,
+}
+
+pub fn build_storage(root: impl Into<std::path::PathBuf>, role: Role) -> BuiltStorage {
+    let identity = StoreIdentity(role.name().to_string());
+    #[allow(clippy::disallowed_types)]
+    let fs = crate::adapters::fs::FilesystemStorage::new(root, identity.clone());
+    let location = ResolvedLocation {
+        backend: "fs",
+        root: fs.root().to_path_buf(),
+    };
+    BuiltStorage {
+        backend: Arc::new(fs),
+        identity,
+        location,
+    }
+}
+
+/// A filesystem store under `root`, for the fixtures that may not name an
+/// adapter.
+pub fn filesystem(root: impl Into<std::path::PathBuf>) -> Arc<dyn StorageBackend> {
+    build_storage(root, Role::Artifacts).backend
+}
+
 /// The real-time bus, for the same reason: `src/policy/`'s fixtures need one
 /// and may not name an adapter.
 pub fn event_bus() -> Arc<dyn Events> {
@@ -172,7 +235,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let repos = stores.repositories();
     seed_repositories(repos.as_ref(), &config.repositories, Utc::now()).await?;
 
-    let storage = crate::storage::filesystem(&config.server.storage_path);
+    let storage = build_storage(&config.server.storage_path, Role::Artifacts).backend;
 
     let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 

@@ -315,7 +315,7 @@ impl Fx {
             )
             .await
             .unwrap();
-        let storage = crate::storage::filesystem(tmp.path().join("storage"));
+        let storage = crate::server::filesystem(tmp.path().join("storage"));
         let clock = Arc::new(AtomicI64::new(0));
         let cache: Arc<dyn ProxyCacheStore> = Arc::new(Shifted {
             inner: stores.proxy_cache(),
@@ -391,9 +391,11 @@ impl Fx {
             .unwrap()
     }
 
+    /// Every file under the storage root, scratch included: a leak there is
+    /// a leak too.
     pub fn files(&self) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
-        let mut pending = vec![self.storage.resolve("").unwrap()];
+        let mut pending = vec![self._tmp.path().join("storage")];
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 if entry.path().is_dir() {

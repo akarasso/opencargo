@@ -22,7 +22,7 @@ use super::strategy::{
     CacheKey, CachePolicy, Classified, DigestAlgorithm, Ttl, UpstreamStrategy, UrlSource,
 };
 
-pub use payload::{cache_path, Cached, IntoPayload, PartFile, Payload, Src};
+pub use payload::{cache_path, Cached, IntoPayload, Payload, Src};
 use transfer::Reply;
 
 #[derive(Clone, Copy, Debug)]
@@ -393,10 +393,18 @@ impl ProxyEngine {
     }
 
     pub async fn purge_repo(&self, member: CacheRepo<'_>) -> AppResult<()> {
+        use futures_util::TryStreamExt;
         self.cache.delete_for_repo(member.0.id).await?;
-        self.storage
-            .delete_prefix(&format!("_proxy_cache/{}", member.0.name))
+        let prefix = format!("_proxy_cache/{}", member.0.name);
+        let keys: Vec<String> = self
+            .storage
+            .list(&prefix)
+            .map_ok(|meta| meta.key)
+            .try_collect()
             .await?;
+        for batch in keys.chunks(self.storage.upload_plan().delete_batch.max(1)) {
+            self.storage.delete_batch(batch).await?;
+        }
         Ok(())
     }
 
@@ -457,7 +465,7 @@ impl ProxyEngine {
             return None;
         }
         let path = target.storage_path.as_deref()?;
-        self.storage.exists(path).await.ok()?.then_some(target)
+        self.storage.head(path).await.ok()?.map(|_| target)
     }
 
     // An untouched pointer would be evicted under a hot tag.

@@ -89,20 +89,8 @@ async fn singleflight_wait_timeout_proceeds_unlocked() {
 }
 
 #[tokio::test]
-async fn part_file_unlinked_on_drop_and_cap() {
+async fn an_oversized_body_leaves_nothing_behind() {
     let fx = Fx::new().await;
-    let mut part = PartFile::new(fx.storage.as_ref(), "_proxy_cache/p/x.part-1".into())
-        .await
-        .unwrap();
-    part.write_chunk(b"abc").await.unwrap();
-    let resolved = fx.storage.resolve("_proxy_cache/p/x.part-1").unwrap();
-    assert!(std::fs::metadata(&resolved).is_ok());
-    drop(part);
-    assert!(
-        std::fs::metadata(&resolved).is_err(),
-        "unlinked synchronously on drop"
-    );
-
     let engine = fx.engine(timeouts());
     for transfer in [Transfer::Buffered, Transfer::Streamed] {
         let strat = Strat {
@@ -123,28 +111,6 @@ async fn part_file_unlinked_on_drop_and_cap() {
         "nothing recorded"
     );
     assert!(fx.files().is_empty(), "nothing written: {:?}", fx.files());
-}
-
-#[tokio::test]
-async fn part_file_commit_keeps_file() {
-    let fx = Fx::new().await;
-    let mut part = PartFile::new(fx.storage.as_ref(), "_proxy_cache/p/k/x.part-1".into())
-        .await
-        .unwrap();
-    part.write_chunk(b"abc").await.unwrap();
-    part.write_chunk(b"def").await.unwrap();
-    part.commit(fx.storage.as_ref(), "_proxy_cache/p/k/x")
-        .await
-        .unwrap();
-    assert!(!fx
-        .storage
-        .exists("_proxy_cache/p/k/x.part-1")
-        .await
-        .unwrap());
-    assert_eq!(
-        fx.storage.get("_proxy_cache/p/k/x").await.unwrap().as_ref(),
-        b"abcdef"
-    );
 }
 
 /// The ttl is a fact about time, not about a row: nothing is rewritten, no
@@ -188,8 +154,9 @@ async fn buffered_refresh_never_truncates_reader() {
             .await,
     );
     let path = first.entry.storage_path.clone().unwrap();
-    let (len, mut reader) = fx.storage.read_stream(&path).await.unwrap();
-    assert_eq!(len, 5);
+    let read = fx.storage.read_stream(&path).await.unwrap();
+    assert_eq!(read.total, 5);
+    let mut reader = read.body;
 
     fx.expire();
     fx.set(|s| s.body = b"a much longer body than before".to_vec());
@@ -400,11 +367,7 @@ async fn stale_pointer_without_target_regets_without_if_none_match() {
             .await,
     );
     assert!(!regot.stale);
-    assert!(fx
-        .storage
-        .exists(regot.entry.storage_path.as_deref().unwrap())
-        .await
-        .unwrap());
+    assert!(fx.storage.stat(regot.entry.storage_path.as_deref().unwrap()).await.unwrap().is_some());
     let hits = fx.hits();
     assert_eq!(hits.len(), 3);
     assert!(
@@ -426,7 +389,7 @@ async fn buffered_bodies_land_on_disk_as_they_arrive() {
     let parts: Vec<_> = fx
         .files()
         .into_iter()
-        .filter(|p| p.to_string_lossy().contains(".part-"))
+        .filter(|p| p.to_string_lossy().contains("/_scratch/"))
         .collect();
     assert_eq!(parts.len(), 1, "a buffered body is on disk, not in memory");
     let done = found(fetch.await);
@@ -434,7 +397,7 @@ async fn buffered_bodies_land_on_disk_as_they_arrive() {
     assert!(fx
         .files()
         .iter()
-        .all(|p| !p.to_string_lossy().contains(".part-")));
+        .all(|p| !p.to_string_lossy().contains("/_scratch/")));
 }
 
 #[tokio::test]
@@ -706,7 +669,7 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
             .await,
     );
     let path = cached.entry.storage_path.unwrap();
-    assert!(fx.storage.exists(&path).await.unwrap());
+    assert!(fx.storage.stat(&path).await.unwrap().is_some());
 
     fx.expire();
     fx.set(|s| s.gone = true);
@@ -717,7 +680,7 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
     let row = fx.row("t-item", "art/x").await.unwrap();
     assert_eq!((row.status, row.storage_path), (404, None));
     assert!(
-        !fx.storage.exists(&path).await.unwrap(),
+        fx.storage.stat(&path).await.unwrap().is_none(),
         "no row references the old body any more"
     );
     assert!(fx.files().is_empty(), "{:?}", fx.files());
@@ -746,7 +709,7 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
         .await;
     assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
     assert!(
-        fx.storage.exists(&body_path).await.unwrap(),
+        fx.storage.stat(&body_path).await.unwrap().is_some(),
         "a digest-addressed body may be shared and stays for the sweep"
     );
 }
@@ -892,7 +855,7 @@ async fn refresh_never_records_a_miss() {
     assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
     let row = fx.row("t-item", "art/x").await.unwrap();
     assert_eq!(row.status, 200, "no negative row");
-    assert!(fx.storage.exists(&path).await.unwrap(), "no file deleted");
+    assert!(fx.storage.stat(&path).await.unwrap().is_some(), "no file deleted");
     fx.set(|s| s.fail = false);
     let served = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
     assert_eq!(served.entry.id, first.entry.id);

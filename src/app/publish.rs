@@ -135,7 +135,7 @@ mod tests {
     fn use_case(db: &FakeDb, root: &tempfile::TempDir) -> PublishVersion {
         PublishVersion::new(
             db.packages(),
-            crate::storage::filesystem(root.path().to_str().unwrap()),
+            crate::server::filesystem(root.path().to_str().unwrap()),
         )
     }
 

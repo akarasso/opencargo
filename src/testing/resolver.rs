@@ -6,21 +6,23 @@
 //! ports too, which is why its storage root is a path nothing ever touches.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
-use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use tokio::io::AsyncRead;
+use chrono::{DateTime, Utc};
 
 use crate::auth::middleware::AuthUser;
 use crate::domain::UrlRepo;
 use crate::policy::{Pending, ResolutionRecorder};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamCreds};
 use crate::registry::resolve::Cx;
-use crate::storage::{StorageBackend, StorageError};
+use crate::storage::{
+    CheckReport, ObjectList, ObjectMeta, ObjectWriter, ReadStream, StorageBackend, StorageError,
+    StoreIdentity, UploadPlan,
+};
+use crate::testing::storage::MemStorage;
 use crate::testing::fakes::FakeDb;
 
 /// Keeps what it was handed, and watches only the members it was told about.
@@ -130,51 +132,68 @@ impl NoStorage {
 
 #[async_trait]
 impl StorageBackend for NoStorage {
-    async fn get(&self, _path: &str) -> Result<Bytes, StorageError> {
+    async fn get(&self, _key: &str) -> Result<Bytes, StorageError> {
         Self::refuse()
     }
 
-    async fn put(&self, _path: &str, _data: Bytes) -> Result<(), StorageError> {
+    async fn writer(&self, _key: &str) -> Result<Box<dyn ObjectWriter>, StorageError> {
         Self::refuse()
     }
 
-    async fn append(&self, _path: &str, _data: Bytes) -> Result<u64, StorageError> {
+    async fn read_stream(&self, _key: &str) -> Result<ReadStream, StorageError> {
         Self::refuse()
     }
 
-    async fn delete(&self, _path: &str) -> Result<(), StorageError> {
+    async fn copy_object(&self, _from: &str, _to: &str) -> Result<(), StorageError> {
         Self::refuse()
     }
 
-    async fn delete_prefix(&self, _prefix: &str) -> Result<(), StorageError> {
+    async fn relocate(&self, _from: &str, _to: &str) -> Result<(), StorageError> {
         Self::refuse()
     }
 
-    async fn exists(&self, _path: &str) -> Result<bool, StorageError> {
+    async fn head(&self, _key: &str) -> Result<Option<ObjectMeta>, StorageError> {
         Self::refuse()
     }
 
-    async fn rename(&self, _from: &str, _to: &str) -> Result<(), StorageError> {
+    async fn stat(&self, _key: &str) -> Result<Option<ObjectMeta>, StorageError> {
         Self::refuse()
     }
 
-    async fn read_stream(
+    async fn delete(&self, _key: &str) -> Result<(), StorageError> {
+        Self::refuse()
+    }
+
+    async fn delete_batch(&self, _keys: &[String]) -> Result<(), StorageError> {
+        Self::refuse()
+    }
+
+    fn list(&self, _prefix: &str) -> ObjectList {
+        Box::pin(futures_util::stream::once(async { Self::refuse() }))
+    }
+
+    async fn sweep_abandoned(
         &self,
-        _path: &str,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send>>), StorageError> {
-        Self::refuse()
-    }
-
-    async fn remove_stale_parts(
-        &self,
-        _prefix: &str,
         _older_than: Duration,
+        _now: DateTime<Utc>,
     ) -> Result<u64, StorageError> {
         Self::refuse()
     }
 
-    fn resolve(&self, _path: &str) -> Result<PathBuf, StorageError> {
+    async fn probe(&self) -> Result<(), StorageError> {
         Self::refuse()
+    }
+
+    fn upload_plan(&self) -> UploadPlan {
+        MemStorage::new().upload_plan()
+    }
+
+    async fn self_check(&self) -> CheckReport {
+        CheckReport::default()
+    }
+
+    fn identity(&self) -> StoreIdentity {
+        StoreIdentity("none".to_string())
     }
 }
 

@@ -1,6 +1,7 @@
 use std::future::Future;
 
 use axum::http::{header, HeaderMap, StatusCode};
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
@@ -8,12 +9,13 @@ use sha2::{Digest, Sha256, Sha512};
 use crate::domain::{CacheEntry, CacheRepo, NewEntry};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::Upstream;
+use crate::storage::ObjectWriter;
 
 use super::super::auth::send_with_auth;
 use super::super::strategy::{
     Classified, DigestAlgorithm, ExpectedDigests, RedirectRule, Transfer, UpstreamStrategy,
 };
-use super::{cache_path, PartFile, ProxyEngine, Stale};
+use super::{cache_path, ProxyEngine, Stale};
 
 /// What one upstream exchange ended in; `Failed` is stale-eligible, an
 /// integrity refusal (cap, digest, headers) is an `Err` and never serves stale.
@@ -113,10 +115,11 @@ impl ProxyEngine {
         }
     }
 
-    /// Hash, cap and verify the body chunk by chunk into a part file, then
-    /// land it under `store_key` by rename: no transfer holds its body in
-    /// memory, `Transfer` only decides the timeout. The inner `Err` is a
-    /// mid-body transport failure.
+    /// Hash, cap and verify the body chunk by chunk into a writer that
+    /// commits only once every digest holds. A store key that does not
+    /// depend on the digest streams; a digest-dependent one (an OCI tag's
+    /// manifest, bounded by its cap) is buffered until the digest is known.
+    /// The inner `Err` is a mid-body transport failure.
     async fn read_body<S: UpstreamStrategy>(
         &self,
         s: &S,
@@ -128,12 +131,10 @@ impl ProxyEngine {
         let expected = s.expected_digests(a, &headers);
         let mut digests = Hashers::for_expected(&expected);
         let max = s.max_bytes(a);
-        let part_rel = format!(
-            "{}.part-{}",
-            cache_path(member, &s.cache_key(a)),
-            uuid::Uuid::new_v4()
-        );
-        let mut part = PartFile::new(self.storage.as_ref(), part_rel).await?;
+        let mut sink = match digest_independent_key(s, a) {
+            Some(key) => Sink::Stream(self.storage.writer(&cache_path(member, &key)).await?),
+            None => Sink::Buffer(BytesMut::new()),
+        };
         let mut size = 0u64;
         loop {
             let chunk = match resp.chunk().await {
@@ -148,7 +149,7 @@ impl ProxyEngine {
                 )));
             }
             digests.update(&chunk);
-            part.write_chunk(&chunk).await?;
+            sink.write(chunk).await?;
         }
         let computed = digests.finish();
         if let Some(wrong) = expected.mismatch(|alg| computed.get(alg)) {
@@ -159,7 +160,12 @@ impl ProxyEngine {
         }
         let sha256 = computed.sha256.clone();
         let path = cache_path(member, &s.store_key(a, &sha256));
-        part.commit(self.storage.as_ref(), &path).await?;
+        match sink {
+            Sink::Stream(writer) => {
+                writer.commit().await?;
+            }
+            Sink::Buffer(buf) => self.storage.put(&path, buf.freeze()).await?,
+        }
         Ok(Ok(Body {
             path,
             sha256,
@@ -216,6 +222,30 @@ impl ProxyEngine {
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+enum Sink {
+    Stream(Box<dyn ObjectWriter>),
+    Buffer(BytesMut),
+}
+
+impl Sink {
+    async fn write(&mut self, chunk: Bytes) -> AppResult<()> {
+        match self {
+            Sink::Stream(writer) => {
+                writer.reserve(chunk.len()).await?;
+                writer.write(chunk).await?;
+            }
+            Sink::Buffer(buf) => buf.extend_from_slice(&chunk),
+        }
+        Ok(())
+    }
+}
+
+/// The store key when it is the same whatever the body's digest.
+fn digest_independent_key<S: UpstreamStrategy>(s: &S, a: &S::Artifact) -> Option<super::super::strategy::CacheKey> {
+    let low = s.store_key(a, &"0".repeat(64));
+    (low == s.store_key(a, &"f".repeat(64))).then_some(low)
 }
 
 /// sha256 always, for the store key; the others only when an expected digest

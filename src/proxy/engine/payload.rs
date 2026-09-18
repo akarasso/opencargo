@@ -1,11 +1,8 @@
-use std::path::PathBuf;
-
 use axum::body::Body;
 use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
 use crate::domain::{CacheEntry, CacheRepo, Outcome};
@@ -110,8 +107,8 @@ impl Payload {
     ) -> AppResult<Response> {
         let (length, body) = match &self.src {
             Src::File(path) => {
-                let (len, reader) = storage.read_stream(path).await.map_err(unreadable)?;
-                (len, Body::from_stream(ReaderStream::new(reader)))
+                let read = storage.read_stream(path).await.map_err(unreadable)?;
+                (read.total, Body::from_stream(ReaderStream::new(read.body)))
             }
             Src::Bytes(b) => (b.len() as u64, Body::from(b.clone())),
             Src::HeadOnly => (self.size, Body::empty()),
@@ -152,57 +149,4 @@ pub fn cache_path(member: CacheRepo<'_>, key: &CacheKey) -> String {
         key.kind,
         &h[..2]
     )
-}
-
-/// One open handle behind an RAII guard: `Drop` unlinks the part unless
-/// `commit` renamed it into place, so a refresh never truncates a reader's inode.
-pub struct PartFile {
-    rel: String,
-    resolved: PathBuf,
-    file: Option<tokio::fs::File>,
-    committed: bool,
-}
-
-impl PartFile {
-    pub async fn new(storage: &dyn StorageBackend, rel: String) -> AppResult<Self> {
-        let resolved = storage.resolve(&rel)?;
-        if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file = tokio::fs::File::create(&resolved).await?;
-        Ok(Self {
-            rel,
-            resolved,
-            file: Some(file),
-            committed: false,
-        })
-    }
-
-    pub async fn write_chunk(&mut self, chunk: &[u8]) -> AppResult<()> {
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| AppError::Internal("part file already closed".into()))?;
-        file.write_all(chunk).await?;
-        Ok(())
-    }
-
-    pub async fn commit(mut self, storage: &dyn StorageBackend, final_rel: &str) -> AppResult<()> {
-        if let Some(mut file) = self.file.take() {
-            file.flush().await?;
-            file.sync_data().await?;
-        }
-        storage.rename(&self.rel, final_rel).await?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for PartFile {
-    // Synchronous: Drop cannot await and a spawned task would leak at shutdown.
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_file(&self.resolved);
-        }
-    }
 }
