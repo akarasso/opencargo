@@ -26,7 +26,7 @@ declare_row domain-paths   max   0 '(crate|opencargo)::(error|server|db|api|regi
 declare_row domain-names   max   0 'AppError|AppResult|sqlx|axum|reqwest' plain src/domain '*.rs'
 declare_row tests-raw-sql  max  41 'sqlx::query|SqlitePool'  plain tests '*.rs' tests/common/contract.rs # ratchet-only (7.4); the contract suite is the one exclusion
 declare_row unit-tests     min 203 '#\[(tokio::)?test\]'     plain src '*.rs'                     # floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
-declare_row integ-tests    min 268 '#\[(tokio::)?test\]'     plain tests '*.rs'
+declare_row integ-tests    min 271 '#\[(tokio::)?test\]'     plain tests '*.rs' # 268 -> 271: step 3's three wire-format assertions
 
 # files <roots> <glob> [excluded paths...] -- the scope, one path per line
 files() {
