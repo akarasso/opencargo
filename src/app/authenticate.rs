@@ -59,13 +59,7 @@ impl AuthUser {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CredentialKind {
-    Password,
-    ApiToken,
-    StaticToken,
-    RegistryToken,
-}
+pub use crate::domain::CredentialKind;
 
 /// The header a credential arrived in; an adapter declares which one wins
 /// when two valid credentials name different principals.
