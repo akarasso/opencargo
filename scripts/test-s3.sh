@@ -2,7 +2,7 @@
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")/.."
 
-image=${MINIO_IMAGE:-minio/minio:RELEASE.2025-09-07T16-13-09Z}
+image=${MINIO_IMAGE:-quay.io/minio/minio:RELEASE.2025-09-07T16-13-09Z}
 port=${MINIO_PORT:-19000}
 bucket=${OPENCARGO_TEST_S3_BUCKET:-opencargo-test}
 name=opencargo-test-minio-$$
