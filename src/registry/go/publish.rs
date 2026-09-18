@@ -12,6 +12,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::app::publish::{Artifact, PublishVersion};
+use crate::app::publish_tail::Published;
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
@@ -61,8 +62,7 @@ pub async fn publish_module(
             .await
             .map_err(|e| AppError::Internal(format!("go.mod extraction task failed: {e}")))??
     };
-    let pre_scan =
-        crate::registry::publish::publish_gate(&state, Format::Go, &go_mod_content).await?;
+    let pre_scan = state.publish_gate().run(Format::Go, &go_mod_content).await?;
 
     let version_id = store_version(
         &state,
@@ -73,18 +73,22 @@ pub async fn publish_module(
         &go_mod_content,
     )
     .await?;
-    crate::registry::publish::finalize_publish(
-        &state,
-        Format::Go,
-        repo_name,
-        module_name,
-        version_str,
-        Some(version_id),
-        &go_mod_content,
-        &auth_user.username,
-        pre_scan,
-    )
-    .await?;
+    state
+        .publish_tail()
+        .run(
+            &Published {
+                format: Format::Go,
+                repository: repo_name,
+                package: module_name,
+                version: version_str,
+                version_id: Some(version_id),
+                metadata_json: &go_mod_content,
+                published_by: &auth_user.username,
+            },
+            pre_scan,
+            chrono::Utc::now(),
+        )
+        .await;
 
     info!(module = %module_name, version = %version_str, repo = %repo_name, "Go module published");
     Ok((StatusCode::OK, Json(json!({"ok": true}))))

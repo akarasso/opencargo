@@ -40,6 +40,11 @@ pub trait RepositoryStore: Send + Sync {
     /// scan a delete runs before it refuses.
     async fn all(&self) -> Result<Vec<Repository>, StoreError>;
 
+    /// Every stored name, in name order. Separate from [`Self::all`] because
+    /// the startup guard reports the names a schema no longer allows, and a
+    /// row it cannot decode must not stand in the way of that report.
+    async fn names(&self) -> Result<Vec<String>, StoreError>;
+
     /// `Conflict` if the name is taken. `now` fills `created_at` and
     /// `updated_at`, so no column default ever fires.
     async fn create(

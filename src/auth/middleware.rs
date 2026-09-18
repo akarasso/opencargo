@@ -17,7 +17,8 @@ use crate::domain::ApiToken;
 use crate::error::StoreError;
 use crate::ports::tokens::TokenStore;
 use crate::ports::users::UserStore;
-use crate::registry::oci::token::{self, TokenSigner};
+use crate::ports::signing::RegistryTokenSigner;
+use crate::registry::oci::token;
 
 // ---------------------------------------------------------------------------
 // Auth state (passed via axum's State extractor)
@@ -33,7 +34,7 @@ pub struct AuthState {
     pub login_rate_limiter: Arc<RateLimiter>,
     /// Names the token realm in every OCI challenge.
     pub base_url: String,
-    pub registry_tokens: TokenSigner,
+    pub registry_tokens: Arc<dyn RegistryTokenSigner>,
 }
 
 // ---------------------------------------------------------------------------
@@ -469,7 +470,7 @@ mod tests {
             tokens: db.tokens(),
             login_rate_limiter: Arc::new(RateLimiter::new(5, 60)),
             base_url: "http://localhost".to_string(),
-            registry_tokens: TokenSigner::random(),
+            registry_tokens: Arc::new(token::TokenSigner::random()),
         }
     }
 

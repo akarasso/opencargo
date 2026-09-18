@@ -13,6 +13,8 @@ use sha2::Digest;
 use tracing::info;
 
 use crate::app::publish::{Artifact, PublishVersion};
+use crate::app::releases::Yank;
+use crate::app::publish_tail::Published;
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
@@ -46,6 +48,15 @@ struct CargoPublishMeta {
     extra: HashMap<String, Value>,
 }
 
+/// The crate's `cksum`, off the runtime's threads: a crate is up to the
+/// body cap and hashing it inline would stall the executor.
+async fn checksum(data: &Bytes) -> AppResult<String> {
+    let data = data.clone();
+    tokio::task::spawn_blocking(move || hex_encode(sha2::Sha256::digest(&data)))
+        .await
+        .map_err(|e| AppError::Internal(format!("checksum task failed: {e}")))
+}
+
 pub async fn publish_crate(
     State(state): State<AppState>,
     Path(repo_name): Path<String>,
@@ -58,15 +69,12 @@ pub async fn publish_crate(
     crate::domain::validate_package_name("cargo", &meta.name)?;
     crate::domain::validate_version(&meta.vers)?;
 
-    let sha256_hex = {
-        let data = crate_data.clone();
-        tokio::task::spawn_blocking(move || hex_encode(sha2::Sha256::digest(&data)))
-            .await
-            .map_err(|e| AppError::Internal(format!("checksum task failed: {e}")))?
-    };
+    let sha256_hex = checksum(&crate_data).await?;
     let metadata_json = serde_json::to_string(&meta)?;
-    let pre_scan =
-        crate::registry::publish::publish_gate(&state, Format::Cargo, &metadata_json).await?;
+    let pre_scan = state
+        .publish_gate()
+        .run(Format::Cargo, &metadata_json)
+        .await?;
 
     // Read before write, as before: the store's own conflict is the safety
     // net for the race, but without this a duplicate publish would overwrite
@@ -102,18 +110,22 @@ pub async fn publish_crate(
         .map_err(|err| duplicate_named(err, &meta.name, &meta.vers))?;
     let version_id = landed.version.id;
     record_dependencies(&state, landed.package.id, version_id, &meta.deps).await;
-    crate::registry::publish::finalize_publish(
-        &state,
-        Format::Cargo,
-        &repo_name,
-        &meta.name,
-        &meta.vers,
-        Some(version_id),
-        &metadata_json,
-        &user.username,
-        pre_scan,
-    )
-    .await?;
+    state
+        .publish_tail()
+        .run(
+            &Published {
+                format: Format::Cargo,
+                repository: &repo_name,
+                package: &meta.name,
+                version: &meta.vers,
+                version_id: Some(version_id),
+                metadata_json: &metadata_json,
+                published_by: &user.username,
+            },
+            pre_scan,
+            chrono::Utc::now(),
+        )
+        .await;
 
     info!(crate_name = %meta.name, version = %meta.vers, size, repo = %repo_name, "Cargo crate published");
     Ok((
@@ -150,17 +162,9 @@ async fn set_yanked(
 ) -> AppResult<Json<Value>> {
     let user = require_user(auth_user)?;
     let repo = load_hosted(state, repo_name, &user).await?;
-    let package = state
-        .packages
-        .package(repo.id, name, NameMatch::Insensitive)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("crate not found: {name}")))?;
-    let row = state
-        .packages
-        .version(package.id, version)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("version not found: {name}@{version}")))?;
-    state.packages.set_yanked(row.id, yanked).await?;
+    Yank::new(state.packages.clone())
+        .run(repo.id, name, version, yanked)
+        .await?;
     let action = if yanked { "yanked" } else { "unyanked" };
     info!(crate_name = %name, version = %version, repo = %repo_name, "Cargo crate version {action}");
     Ok(Json(json!({"ok": true})))

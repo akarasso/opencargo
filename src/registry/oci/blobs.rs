@@ -6,6 +6,7 @@ use axum::{
     response::{IntoResponse, Response},
 };
 
+use crate::app::oci::{DeleteBlob, OciWriteError};
 use crate::auth::middleware::AuthUser;
 use crate::domain::Format;
 use crate::error::{AppError, AppResult};
@@ -70,36 +71,20 @@ pub async fn delete_blob(
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
 
-    // A blob still referenced by a manifest would break a live image.
-    let refs: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM oci_manifest_blobs WHERE repository_id = ?1 AND blob_digest = ?2",
-    )
-    .bind(repo.id)
-    .bind(&digest)
-    .fetch_one(&state.db)
-    .await?;
-    if refs > 0 {
-        return Err(AppError::Conflict(format!(
-            "blob {digest} is still referenced by {refs} manifest(s); delete those manifests first"
-        )));
-    }
-
-    let result = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = ?1 AND digest = ?2")
-        .bind(repo.id)
-        .bind(&digest)
-        .execute(&state.db)
-        .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound(format!(
-            "blob not found: {} in {}",
-            digest,
-            r.image_name()
-        )));
-    }
-    let _ = state
-        .storage
-        .delete(&paths::blob_path(&repo.name, &digest))
-        .await;
+    DeleteBlob::new(state.oci.clone(), state.storage.clone())
+        .run(repo.id, &digest, &paths::blob_path(&repo.name, &digest))
+        .await
+        .map_err(|err| match err {
+            OciWriteError::NotFound => AppError::NotFound(format!(
+                "blob not found: {} in {}",
+                digest,
+                r.image_name()
+            )),
+            OciWriteError::Referenced(n) => AppError::Conflict(format!(
+                "blob {digest} is still referenced by {n} manifest(s); delete those manifests first"
+            )),
+            other => other.into(),
+        })?;
 
     Ok(StatusCode::ACCEPTED.into_response())
 }

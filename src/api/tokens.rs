@@ -4,15 +4,13 @@ use axum::{
     response::IntoResponse,
     Json,
 };
-use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{record_audit, require_admin_or_self, require_auth};
-use crate::auth::tokens as auth_tokens;
+use crate::api::{actor, require_admin_or_self, require_auth};
+use crate::app::tokens::{IssueToken, RevokeToken};
 use crate::domain::User;
 use crate::error::{AppError, AppResult};
-use crate::ports::tokens::NewToken;
 use crate::server::AppState;
 use crate::wire::wire_ts;
 
@@ -83,42 +81,30 @@ pub async fn create_token(
         serde_json::from_slice(&bytes)?
     };
 
-    let user = load_user(&state, &username).await?;
-
-    let token_id = uuid::Uuid::new_v4().to_string();
-    let (raw_token, token_hash) = auth_tokens::generate_token("trg_");
-    let prefix = &raw_token[..16];
-
-    let now = Utc::now();
-    let expires_at = body
-        .expires_in_days
-        .map(|days| now + chrono::Duration::days(days));
-
-    state
-        .tokens
-        .create(
-            &NewToken {
-                id: &token_id,
-                user_id: user.id,
-                name: &body.name,
-                prefix,
-                token_hash: &token_hash,
-                expires_at,
-            },
-            now,
-        )
-        .await?;
-
-    record_audit(&state, &caller, "token.create", Some(&username)).await;
+    let issued = IssueToken::new(
+        state.users.clone(),
+        state.tokens.clone(),
+        state.ids.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+    )
+    .run(
+        &username,
+        &body.name,
+        body.expires_in_days,
+        &actor(&caller),
+        state.clock.now(),
+    )
+    .await?;
 
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "id": token_id,
-            "name": body.name,
-            "token": raw_token,
-            "prefix": prefix,
-            "expires_at": expires_at.map(wire_ts),
+            "id": issued.id,
+            "name": issued.name,
+            "token": issued.token,
+            "prefix": issued.prefix,
+            "expires_at": issued.expires_at.map(wire_ts),
         })),
     ))
 }
@@ -132,22 +118,14 @@ pub async fn delete_token(
     let caller = require_auth(&request)?;
     require_admin_or_self(&caller, &username)?;
 
-    // Verify the user exists
-    let user = load_user(&state, &username).await?;
-
-    // Verify token belongs to this user
-    let token = state
-        .tokens
-        .by_id(&token_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("token not found: {token_id}")))?;
-    if token.user_id != user.id {
-        return Err(AppError::Forbidden("token does not belong to this user".to_string()));
-    }
-
-    state.tokens.delete(&token_id).await?;
-
-    record_audit(&state, &caller, "token.revoke", Some(&username)).await;
+    RevokeToken::new(
+        state.users.clone(),
+        state.tokens.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+    )
+    .run(&username, &token_id, &actor(&caller), state.clock.now())
+    .await?;
 
     Ok(Json(json!({"ok": true})))
 }

@@ -1,13 +1,17 @@
+//! What a repository definition has to satisfy before it is written, and
+//! what every stored name has to satisfy before the server will serve it.
+//!
+//! The rules span more than one row — a group member must exist, share the
+//! format, and not reach back to the group — so they belong beside the use
+//! cases that create and update a repository rather than to the domain type.
+
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
-use sqlx::SqlitePool;
-
-use crate::domain::{Pending, RepoKind, RepoSpec, Repository};
+use crate::domain::{Pending, RepoKind, RepoSpec, Repository, MAX_GROUP_DEPTH};
 use crate::error::{AppError, AppResult};
 use crate::ports::repositories::RepositoryStore;
-use crate::domain::MAX_GROUP_DEPTH;
 
 trait SpecRules {
     fn refuse_upstream(&self) -> AppResult<()>;
@@ -144,8 +148,8 @@ async fn validate_members(
 
 /// Groups stacked below `name`, itself included: 0 for a hosted or proxy
 /// repository, 1 for a group of those. A row wins over a pending entry, as
-/// the seed's `INSERT OR IGNORE` does; a cycle counts once, `reaches`
-/// refuses it.
+/// the seed itself does when it skips a name already stored; a cycle counts
+/// once, `reaches` refuses it.
 fn nesting<'a>(
     repos: &'a dyn RepositoryStore,
     name: &'a str,
@@ -199,13 +203,12 @@ fn reaches<'a>(
     })
 }
 
-/// Startup guard: every stored name must pass the rule `validate_spec` applies
-/// on writes, or cache paths and purge prefixes would misbehave.
-pub async fn check_repository_names(pool: &SqlitePool) -> anyhow::Result<()> {
-    let names: Vec<String> = sqlx::query_scalar("SELECT name FROM repositories ORDER BY name")
-        .fetch_all(pool)
-        .await?;
-    let offenders: Vec<String> = names
+/// Startup guard: every stored name must pass the rule `validate_spec`
+/// applies on writes, or cache paths and purge prefixes would misbehave.
+pub async fn check_repository_names(repos: &dyn RepositoryStore) -> anyhow::Result<()> {
+    let offenders: Vec<String> = repos
+        .names()
+        .await?
         .into_iter()
         .filter(|name| validate_name(name).is_err())
         .collect();
@@ -221,9 +224,23 @@ pub async fn check_repository_names(pool: &SqlitePool) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{Format, Visibility};
+    use crate::testing::fakes::FakeDb;
+    use chrono::Utc;
 
-    #[tokio::test]
-    async fn check_repository_names_refuses_pre_upgrade_slash() {
+    fn spec(name: &str) -> RepoSpec<'_> {
+        RepoSpec {
+            name,
+            kind: RepoKind::Hosted,
+            format: Format::Npm,
+            visibility: Visibility::Private,
+            upstream: None,
+            members: &[],
+        }
+    }
+
+    #[test]
+    fn the_name_rule_is_one_lowercase_segment() {
         for ok in [
             "a",
             "npm-all",
@@ -240,14 +257,23 @@ mod tests {
                 "{bad}"
             );
         }
+    }
 
-        let (_tmp, pool) = crate::db::testing::pool().await;
-        check_repository_names(&pool).await.unwrap();
-        sqlx::query("INSERT INTO repositories (name, repo_type, format) VALUES ('a/b', 'hosted', 'npm'), ('ok', 'hosted', 'npm')")
-            .execute(&pool)
+    /// A name written before the rule existed is a boot failure naming it,
+    /// not a cache path that escapes its repository.
+    #[tokio::test]
+    async fn the_startup_guard_names_only_the_offenders() {
+        let db = FakeDb::new();
+        let repos = db.repositories();
+        check_repository_names(repos.as_ref()).await.unwrap();
+
+        repos.create(&spec("ok"), Utc::now()).await.unwrap();
+        repos.create(&spec("a/b"), Utc::now()).await.unwrap();
+
+        let err = check_repository_names(repos.as_ref())
             .await
-            .unwrap();
-        let err = check_repository_names(&pool).await.unwrap_err().to_string();
+            .unwrap_err()
+            .to_string();
         assert!(err.contains("a/b"), "{err}");
         assert!(!err.contains("ok"), "{err}");
     }

@@ -8,9 +8,11 @@ use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, TimeDelta, Utc};
-use sqlx::SqlitePool;
 
-use crate::domain::{CacheEntry, CacheEntryId, CacheRepo, NewEntry, RepoId, Repository};
+use crate::domain::{
+    CacheEntry, CacheEntryId, CacheRepo, Format, NewEntry, RepoId, RepoKind, RepoSpec, Repository,
+    Visibility,
+};
 use crate::error::StoreError;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::proxy::engine::{ProxyEngine, Timeouts, TtlConfig};
@@ -253,8 +255,9 @@ impl ProxyCacheStore for Shifted {
 
 pub(crate) struct Fx {
     _tmp: tempfile::TempDir,
-    pub pool: SqlitePool,
+    db_path: std::path::PathBuf,
     pub cache: Arc<dyn ProxyCacheStore>,
+    policy: Arc<dyn crate::ports::policy::PolicyStore>,
     pub storage: Arc<dyn StorageBackend>,
     pub repo: Repository,
     pub fake: Shared,
@@ -275,9 +278,8 @@ impl Fx {
     pub async fn new() -> Self {
         let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let tmp = tempfile::TempDir::new().unwrap();
-        let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
-        let pool = SqlitePool::connect(&url).await.unwrap();
-        crate::server::migrate(&pool).await.unwrap();
+        let db_path = tmp.path().join("test.db");
+        let stores = crate::server::open_stores(&db_path).await.unwrap();
         let fake: Shared = Arc::new(Mutex::new(FakeState {
             body: b"hello upstream".to_vec(),
             ..Default::default()
@@ -287,19 +289,25 @@ impl Fx {
             reqwest::Url::parse(&format!("http://{}/", listener.local_addr().unwrap())).unwrap();
         let app = axum::Router::new().fallback(serve).with_state(fake.clone());
         tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        sqlx::query("INSERT INTO repositories (name, repo_type, format, upstream_url) VALUES ('p', 'proxy', 'npm', ?1)")
-            .bind(base.as_str())
-            .execute(&pool)
+        let repo = stores
+            .repositories()
+            .create(
+                &RepoSpec {
+                    name: "p",
+                    kind: RepoKind::Proxy,
+                    format: Format::Npm,
+                    visibility: Visibility::Private,
+                    upstream: Some(base.as_str()),
+                    members: &[],
+                },
+                Utc::now(),
+            )
             .await
-            .unwrap();
-        let repo = crate::db::get_repository_by_name(&pool, "p")
-            .await
-            .unwrap()
             .unwrap();
         let storage = crate::storage::filesystem(tmp.path().join("storage"));
         let clock = Arc::new(AtomicI64::new(0));
         let cache: Arc<dyn ProxyCacheStore> = Arc::new(Shifted {
-            inner: crate::server::proxy_cache_store(&pool),
+            inner: stores.proxy_cache(),
             seconds: clock.clone(),
         });
         let up = Upstream {
@@ -310,8 +318,9 @@ impl Fx {
         };
         Self {
             _tmp: tmp,
-            pool,
+            db_path,
             cache,
+            policy: stores.policy(),
             storage,
             repo,
             fake,
@@ -320,10 +329,16 @@ impl Fx {
         }
     }
 
-    /// The policy report store over this fixture's database, reached through
-    /// the composition root like the cache store beside it.
+    /// This fixture's database file, for the SQLite adapter's own tests: one
+    /// of them opens a second connection to it with foreign keys off.
+    pub(crate) fn db_path(&self) -> &std::path::Path {
+        &self.db_path
+    }
+
+    /// The policy report store over this fixture's database, from the same
+    /// handle set as the cache store beside it.
     pub fn policy_store(&self) -> Arc<dyn crate::ports::policy::PolicyStore> {
-        crate::server::policy_store(&self.pool)
+        self.policy.clone()
     }
 
     pub fn engine(&self, timeouts: Timeouts) -> ProxyEngine {

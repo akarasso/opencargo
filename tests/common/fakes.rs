@@ -26,7 +26,7 @@ use opencargo::domain::{
 use opencargo::error::StoreError;
 use opencargo::ports::audit::{AuditEntry, AuditStore, NewAuditEntry};
 use opencargo::ports::deps::{Dependency, DependencyStore, Dependent, NewDependency};
-use opencargo::ports::oci::{Blob, Manifest, OciStore};
+use opencargo::ports::oci::{Blob, Manifest, NewBlob, NewManifest, OciStore, Orphaned};
 use opencargo::ports::packages::{
     NameMatch, NewRelease, PackageStore, Promotion, Release, StalePrerelease,
 };
@@ -76,6 +76,21 @@ struct BlobRow {
     digest: String,
     size: i64,
     content_type: Option<String>,
+}
+
+/// One layer a manifest lists, the row a blob's orphanhood is decided from.
+#[derive(Clone)]
+struct LinkRow {
+    repository_id: i64,
+    manifest_digest: String,
+    blob_digest: String,
+}
+
+/// One chunked push still assembling its blob.
+#[derive(Clone)]
+struct UploadRow {
+    id: String,
+    repository_id: i64,
 }
 
 /// One stored manifest of an image.
@@ -140,6 +155,8 @@ struct State {
     oci_blobs: Vec<BlobRow>,
     oci_manifests: Vec<ManifestRow>,
     oci_tags: Vec<TagRow>,
+    oci_links: Vec<LinkRow>,
+    oci_uploads: Vec<UploadRow>,
     next_id: i64,
     next_cache_id: i64,
     /// Queued refusals: a fake that cannot fail only ever proves the happy
@@ -194,8 +211,8 @@ impl FakeDb {
         Arc::new(Oci(self.0.clone()))
     }
 
-    /// The OCI push half is not a port yet, so its rows are seeded here
-    /// rather than written through one.
+    /// A blob a push is not being asked to land: the read half's tests want
+    /// the row, not the upload that would have written it.
     pub fn add_blob(&self, repository: i64, digest: &str, size: i64, content_type: Option<&str>) {
         self.0.lock().unwrap().oci_blobs.push(BlobRow {
             repository_id: repository,
@@ -458,6 +475,15 @@ impl RepositoryStore for Repositories {
             let mut all = state.repositories.clone();
             all.sort_by(|left, right| left.name.cmp(&right.name));
             Ok(all)
+        })
+    }
+
+    async fn names(&self) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let mut names: Vec<String> =
+                state.repositories.iter().map(|r| r.name.clone()).collect();
+            names.sort();
+            Ok(names)
         })
     }
 
@@ -1405,6 +1431,155 @@ impl OciStore for Oci {
                 .collect();
             tags.sort();
             Ok(tags)
+        })
+    }
+
+    async fn put_manifest(&self, m: NewManifest<'_>) -> Result<(), StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            state.oci_manifests.retain(|row| {
+                !(row.repository_id == m.repository
+                    && row.name == m.name
+                    && row.digest == m.digest)
+            });
+            state.oci_manifests.push(ManifestRow {
+                repository_id: m.repository,
+                name: m.name.to_string(),
+                digest: m.digest.to_string(),
+                content_type: m.content_type.to_string(),
+                size: m.size,
+            });
+            state.oci_links.retain(|row| {
+                !(row.repository_id == m.repository && row.manifest_digest == m.digest)
+            });
+            for blob in m.blobs {
+                state.oci_links.push(LinkRow {
+                    repository_id: m.repository,
+                    manifest_digest: m.digest.to_string(),
+                    blob_digest: blob.clone(),
+                });
+            }
+            if let Some(tag) = m.tag {
+                state.oci_tags.retain(|row| {
+                    !(row.repository_id == m.repository && row.name == m.name && row.tag == tag)
+                });
+                state.oci_tags.push(TagRow {
+                    repository_id: m.repository,
+                    name: m.name.to_string(),
+                    tag: tag.to_string(),
+                    manifest_digest: m.digest.to_string(),
+                });
+            }
+            Ok(())
+        })
+    }
+
+    async fn delete_manifest(
+        &self,
+        repository: i64,
+        name: &str,
+        digest: &str,
+    ) -> Result<Option<Orphaned>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let before = state.oci_manifests.len();
+            state.oci_manifests.retain(|row| {
+                !(row.repository_id == repository && row.name == name && row.digest == digest)
+            });
+            if state.oci_manifests.len() == before {
+                return Ok(None);
+            }
+            state.oci_tags.retain(|row| {
+                !(row.repository_id == repository
+                    && row.name == name
+                    && row.manifest_digest == digest)
+            });
+            let linked: Vec<String> = state
+                .oci_links
+                .iter()
+                .filter(|row| row.repository_id == repository && row.manifest_digest == digest)
+                .map(|row| row.blob_digest.clone())
+                .collect();
+            state
+                .oci_links
+                .retain(|row| !(row.repository_id == repository && row.manifest_digest == digest));
+
+            let mut blob_digests = Vec::new();
+            for blob in linked {
+                let still = state
+                    .oci_links
+                    .iter()
+                    .any(|row| row.repository_id == repository && row.blob_digest == blob);
+                if !still {
+                    state
+                        .oci_blobs
+                        .retain(|row| !(row.repository_id == repository && row.digest == blob));
+                    blob_digests.push(blob);
+                }
+            }
+            Ok(Some(Orphaned { blob_digests }))
+        })
+    }
+
+    async fn start_upload(
+        &self,
+        id: &str,
+        repository: i64,
+        _name: &str,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            state.oci_uploads.push(UploadRow {
+                id: id.to_string(),
+                repository_id: repository,
+            });
+            Ok(())
+        })
+    }
+
+    async fn upload_owner(&self, id: &str) -> Result<Option<i64>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            Ok(state
+                .oci_uploads
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.repository_id))
+        })
+    }
+
+    async fn complete_upload(&self, id: &str, blob: NewBlob<'_>) -> Result<(), StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let known = state
+                .oci_blobs
+                .iter()
+                .any(|row| row.repository_id == blob.repository && row.digest == blob.digest);
+            if !known {
+                state.oci_blobs.push(BlobRow {
+                    repository_id: blob.repository,
+                    digest: blob.digest.to_string(),
+                    size: blob.size,
+                    content_type: Some(blob.content_type.to_string()),
+                });
+            }
+            state.oci_uploads.retain(|row| row.id != id);
+            Ok(())
+        })
+    }
+
+    async fn blob_references(&self, repository: i64, digest: &str) -> Result<i64, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            Ok(state
+                .oci_links
+                .iter()
+                .filter(|row| row.repository_id == repository && row.blob_digest == digest)
+                .count() as i64)
+        })
+    }
+
+    async fn delete_blob(&self, repository: i64, digest: &str) -> Result<bool, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let before = state.oci_blobs.len();
+            state
+                .oci_blobs
+                .retain(|row| !(row.repository_id == repository && row.digest == digest));
+            Ok(state.oci_blobs.len() != before)
         })
     }
 }

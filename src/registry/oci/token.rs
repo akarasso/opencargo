@@ -9,7 +9,6 @@ use base64::Engine;
 use chrono::SecondsFormat;
 use hmac::{Hmac, Mac};
 use rand::Rng;
-use serde::{Deserialize, Serialize};
 use serde_json::json;
 use sha2::Sha256;
 
@@ -17,6 +16,8 @@ use crate::auth::middleware::{
     authenticate_basic, authenticate_bearer, basic_credentials, AuthFailure, AuthState, AuthUser,
 };
 use crate::error::AppError;
+use crate::ports::signing::RegistryTokenSigner;
+pub use crate::ports::signing::Claims;
 use crate::server::AppState;
 
 /// Every registry token starts with this, so the middleware can tell one
@@ -26,27 +27,6 @@ pub const SERVICE: &str = "opencargo";
 const TTL_SECS: i64 = 3600;
 const MAX_SCOPES: usize = 16;
 const MAX_SCOPE_LEN: usize = 256;
-
-/// What a registry token carries: the user it was issued to (none for an
-/// anonymous token) and its expiry. The scope is recorded for logging only;
-/// permissions are checked against the database on every request. A token
-/// carries its user's full rights on every route under the auth layer, even
-/// when it was bought with an API token: `ApiToken.permissions_json` is not
-/// enforced anywhere yet, and whoever enforces it must carry that scope here.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct Claims {
-    pub sub: Option<String>,
-    pub exp: i64,
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
-    pub scope: Vec<String>,
-    /// Issued to a static config token: the middleware resolves it to the
-    /// same synthetic admin instead of looking `sub` up in the database.
-    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
-    pub static_token: bool,
-    /// The API token it was bought with: revoking that token revokes this one.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub api_token_id: Option<String>,
-}
 
 /// Signs and verifies registry tokens with a key that lives for one process:
 /// a restart invalidates every outstanding token, which is fine for a
@@ -63,24 +43,25 @@ impl TokenSigner {
         Self { key }
     }
 
+    fn mac(&self) -> Hmac<Sha256> {
+        Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts any key length")
+    }
+}
+
+impl RegistryTokenSigner for TokenSigner {
     /// `ocr_` + base64url(claims JSON) + `.` + base64url(HMAC-SHA256).
-    pub fn sign(&self, claims: &Claims) -> String {
+    fn sign(&self, claims: &Claims) -> String {
         let payload = URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims).unwrap_or_default());
         let mac = self.mac().chain_update(&payload).finalize().into_bytes();
         format!("{PREFIX}{payload}.{}", URL_SAFE_NO_PAD.encode(mac))
     }
 
-    /// The claims of a token whose signature holds and which has not expired.
-    pub fn verify(&self, token: &str) -> Option<Claims> {
+    fn verify(&self, token: &str) -> Option<Claims> {
         let (payload, tag) = token.strip_prefix(PREFIX)?.split_once('.')?;
         let tag = URL_SAFE_NO_PAD.decode(tag).ok()?;
         self.mac().chain_update(payload).verify_slice(&tag).ok()?;
         let claims: Claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
         (claims.exp > chrono::Utc::now().timestamp()).then_some(claims)
-    }
-
-    fn mac(&self) -> Hmac<Sha256> {
-        Hmac::<Sha256>::new_from_slice(&self.key).expect("HMAC accepts any key length")
     }
 }
 

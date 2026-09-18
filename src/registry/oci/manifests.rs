@@ -8,6 +8,10 @@ use axum::{
 };
 use tracing::info;
 
+use crate::app::oci::{
+    DeleteManifest, ManifestTarget, OciWriteError, PushedManifest, PutManifest,
+};
+use crate::app::publish_tail::{PreScan, Published};
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult, StoreError};
@@ -116,21 +120,25 @@ pub async fn put_manifest(
         )));
     }
 
-    store_manifest(&state, &repo, &r, &reference, &digest, &content_type, &body).await?;
+    push_manifest(&state, &repo, &r, &reference, &digest, &content_type, &body).await?;
     // The "package" is the image name, the "version" the pushed reference;
     // OCI has no `versions` row, so no vulnerability scan applies.
-    crate::registry::publish::finalize_publish(
-        &state,
-        Format::Oci,
-        &r.repo,
-        &r.name,
-        &reference,
-        None,
-        &String::from_utf8_lossy(&body),
-        &auth_user.username,
-        crate::registry::publish::PreScan::default(),
-    )
-    .await?;
+    state
+        .publish_tail()
+        .run(
+            &Published {
+                format: Format::Oci,
+                repository: &r.repo,
+                package: &r.name,
+                version: &reference,
+                version_id: None,
+                metadata_json: &String::from_utf8_lossy(&body),
+                published_by: &auth_user.username,
+            },
+            PreScan::default(),
+            chrono::Utc::now(),
+        )
+        .await;
     info!(
         reference = %reference,
         digest = %digest,
@@ -153,9 +161,8 @@ pub async fn put_manifest(
         .into_response())
 }
 
-/// File first, then the manifest row, its blob links and, for a tag, the
-/// tag mapping.
-async fn store_manifest(
+/// The bytes, then the rows that claim them.
+async fn push_manifest(
     state: &AppState,
     repo: &Repository,
     r: &OciRef,
@@ -164,55 +171,18 @@ async fn store_manifest(
     content_type: &str,
     body: &Bytes,
 ) -> AppResult<()> {
-    state
-        .storage
-        .put(
-            &paths::manifest_path(&r.image_name(), &r.name, digest),
-            body.clone(),
-        )
+    PutManifest::new(state.oci.clone(), state.storage.clone())
+        .run(PushedManifest {
+            repository: repo.id,
+            name: &r.name,
+            digest,
+            content_type,
+            blobs: refs::extract_refs(body),
+            tag: (!is_digest(reference)).then_some(reference),
+            path: &paths::manifest_path(&r.image_name(), &r.name, digest),
+            body: body.clone(),
+        })
         .await?;
-    sqlx::query(
-        "INSERT OR REPLACE INTO oci_manifests (repository_id, name, digest, content_type, size)
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-    )
-    .bind(repo.id)
-    .bind(&r.name)
-    .bind(digest)
-    .bind(content_type)
-    .bind(body.len() as i64)
-    .execute(&state.db)
-    .await?;
-
-    sqlx::query("DELETE FROM oci_manifest_blobs WHERE repository_id = ?1 AND manifest_digest = ?2")
-        .bind(repo.id)
-        .bind(digest)
-        .execute(&state.db)
-        .await?;
-    for blob_digest in refs::extract_refs(body) {
-        let _ = sqlx::query(
-            "INSERT OR IGNORE INTO oci_manifest_blobs (repository_id, manifest_digest, blob_digest)
-             VALUES (?1, ?2, ?3)",
-        )
-        .bind(repo.id)
-        .bind(digest)
-        .bind(&blob_digest)
-        .execute(&state.db)
-        .await;
-    }
-
-    if !is_digest(reference) {
-        sqlx::query(
-            "INSERT INTO oci_tags (repository_id, name, tag, manifest_digest)
-             VALUES (?1, ?2, ?3, ?4)
-             ON CONFLICT(repository_id, name, tag) DO UPDATE SET manifest_digest = excluded.manifest_digest",
-        )
-        .bind(repo.id)
-        .bind(&r.name)
-        .bind(reference)
-        .bind(digest)
-        .execute(&state.db)
-        .await?;
-    }
     Ok(())
 }
 
@@ -242,75 +212,24 @@ pub async fn delete_manifest(
                 r.name, reference, r.repo
             ))
         })?;
-    let result = sqlx::query(
-        "DELETE FROM oci_manifests WHERE repository_id = ?1 AND name = ?2 AND digest = ?3",
-    )
-    .bind(repo.id)
-    .bind(&r.name)
-    .bind(&digest)
-    .execute(&state.db)
-    .await?;
-    if result.rows_affected() == 0 {
-        return Err(AppError::NotFound(format!(
-            "manifest not found: {}@{} in {}",
-            r.name, digest, r.repo
-        )));
-    }
-    sqlx::query(
-        "DELETE FROM oci_tags WHERE repository_id = ?1 AND name = ?2 AND manifest_digest = ?3",
-    )
-    .bind(repo.id)
-    .bind(&r.name)
-    .bind(&digest)
-    .execute(&state.db)
-    .await?;
-
-    gc_orphaned_blobs(&state, &repo, &digest).await;
-    let _ = state
-        .storage
-        .delete(&paths::manifest_path(&r.image_name(), &r.name, &digest))
-        .await;
+    DeleteManifest::new(state.oci.clone(), state.storage.clone())
+        .run(
+            ManifestTarget {
+                repository: repo.id,
+                name: &r.name,
+                digest: &digest,
+                path: &paths::manifest_path(&r.image_name(), &r.name, &digest),
+            },
+            |blob| paths::blob_path(&repo.name, blob),
+        )
+        .await
+        .map_err(|err| match err {
+            OciWriteError::NotFound => AppError::NotFound(format!(
+                "manifest not found: {}@{} in {}",
+                r.name, digest, r.repo
+            )),
+            other => other.into(),
+        })?;
 
     Ok(StatusCode::ACCEPTED.into_response())
-}
-
-/// Drop the manifest's blob links, then every blob no manifest of this
-/// repository references any more (row and file).
-async fn gc_orphaned_blobs(state: &AppState, repo: &Repository, digest: &str) {
-    let blob_digests: Vec<String> = sqlx::query_scalar(
-        "SELECT blob_digest FROM oci_manifest_blobs WHERE repository_id = ?1 AND manifest_digest = ?2",
-    )
-    .bind(repo.id)
-    .bind(digest)
-    .fetch_all(&state.db)
-    .await
-    .unwrap_or_default();
-    let _ = sqlx::query(
-        "DELETE FROM oci_manifest_blobs WHERE repository_id = ?1 AND manifest_digest = ?2",
-    )
-    .bind(repo.id)
-    .bind(digest)
-    .execute(&state.db)
-    .await;
-    for blob_digest in blob_digests {
-        let still: i64 = sqlx::query_scalar(
-            "SELECT COUNT(*) FROM oci_manifest_blobs WHERE repository_id = ?1 AND blob_digest = ?2",
-        )
-        .bind(repo.id)
-        .bind(&blob_digest)
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
-        if still == 0 {
-            let _ = sqlx::query("DELETE FROM oci_blobs WHERE repository_id = ?1 AND digest = ?2")
-                .bind(repo.id)
-                .bind(&blob_digest)
-                .execute(&state.db)
-                .await;
-            let _ = state
-                .storage
-                .delete(&paths::blob_path(&repo.name, &blob_digest))
-                .await;
-        }
-    }
 }

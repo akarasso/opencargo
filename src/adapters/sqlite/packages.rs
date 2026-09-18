@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::{bind_ts, immediate, store_error};
-use crate::db::{DistTagRow, PackageRow, VersionRow};
+use crate::adapters::sqlite::rows::{DistTagRow, PackageRow, VersionRow};
 use crate::domain::{DistTag, Package, Version};
 use crate::error::StoreError;
 use crate::ports::packages::{

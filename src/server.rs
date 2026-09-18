@@ -15,17 +15,22 @@ use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::SqlitePool;
 use tracing::{info, warn};
 
+use crate::adapters::sqlite::SqliteStores;
+use crate::app::events::Announce;
+use crate::app::publish_tail::{PublishGate, PublishTail};
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
 use crate::ports::audit::AuditStore;
+use crate::ports::clock::Clock;
 use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
+use crate::ports::events::Events;
+use crate::ports::ids::Ids;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
@@ -56,7 +61,6 @@ const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: SqlitePool,
     pub storage: Arc<dyn StorageBackend>,
     /// What the proxy remembers; the engine holds it too, and the background
     /// sweep needs it without going through the engine.
@@ -91,49 +95,77 @@ pub struct AppState {
     pub vuln_scanner: Arc<dyn VulnFeed>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
-    pub events: Arc<crate::events::EventBus>,
+    pub events: Arc<dyn Events>,
+    /// The wall clock, for the two callers that cannot be handed a `now`.
+    pub clock: Arc<dyn Clock>,
+    /// The generated identifiers that reach a client.
+    pub ids: Arc<dyn Ids>,
     /// Records proxy resolutions for the policy report; off until a rule is on.
     pub policy: PolicyEngine,
+}
+
+impl AppState {
+    /// The gate every publish passes before its first write.
+    pub fn publish_gate(&self) -> PublishGate {
+        PublishGate::new(self.vuln_scanner.clone(), self.vuln_scan_config.clone())
+    }
+
+    /// The tail every publish runs once its version is serveable: the
+    /// webhook, the event and its audience, then the scan.
+    pub fn publish_tail(&self) -> PublishTail {
+        PublishTail::new(
+            self.announce(),
+            self.webhook_dispatcher.clone(),
+            self.vuln_scanner.clone(),
+            self.vulns.clone(),
+        )
+    }
+
+    /// The audience decision, for the one caller outside a publish: a
+    /// promotion announces the same way.
+    pub fn announce(&self) -> Announce {
+        Announce::new(self.events.clone(), self.repos.clone())
+    }
 }
 
 /// Migrate a database and nothing else: the `opencargo migrate` subcommand, so
 /// the binary reaches the adapter through the composition root rather than
 /// importing it.
 pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
-
-    let db = crate::db::connect(&config.database.url).await?;
-    migrate(&db).await
-}
-
-/// Bring an open pool's schema up to date. The composition root is the only
-/// place that names the SQLite adapter, so everything else — the server, the
-/// subcommand, the temp-database fixtures — comes through here.
-/// The proxy cache store over an open pool. Like `migrate` above, it exists
-/// so the fixtures reach the adapter through the composition root instead of
-/// naming it themselves.
-pub fn proxy_cache_store(db: &SqlitePool) -> Arc<dyn ProxyCacheStore> {
-    crate::adapters::sqlite::SqliteStores::new(db.clone()).proxy_cache()
-}
-
-/// The policy report store over an open pool, for the same reason.
-pub fn policy_store(db: &SqlitePool) -> Arc<dyn PolicyStore> {
-    crate::adapters::sqlite::SqliteStores::new(db.clone()).policy()
-}
-
-pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
-    crate::adapters::sqlite::migrate::run_all(db).await?;
+    let db = crate::adapters::sqlite::connect(&config.database.url).await?;
+    crate::adapters::sqlite::migrate::run_all(&db).await?;
     Ok(())
+}
+
+/// A database URL turned into ports: the pool, migrated, with every store
+/// over it and the stored names checked. The other half of the composition
+/// root, so `main.rs` and the fixtures never name the adapter themselves.
+pub async fn connect_stores(config: &Config) -> anyhow::Result<SqliteStores> {
+    let db = crate::adapters::sqlite::connect(&config.database.url).await?;
+    crate::adapters::sqlite::migrate::run_all(&db).await?;
+    let stores = SqliteStores::new(db);
+    crate::app::repo_spec::check_repository_names(stores.repositories().as_ref()).await?;
+    Ok(stores)
+}
+
+/// A migrated database of its own, with every store over it: what the
+/// temp-database fixtures open, so they reach the adapter through the
+/// composition root instead of naming a pool themselves.
+pub async fn open_stores(path: &std::path::Path) -> anyhow::Result<SqliteStores> {
+    SqliteStores::open(path).await
+}
+
+/// The real-time bus, for the same reason: `src/policy/`'s fixtures need one
+/// and may not name an adapter.
+pub fn event_bus() -> Arc<dyn Events> {
+    Arc::new(crate::adapters::events::BroadcastEvents::new())
 }
 
 pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
     ensure_directories(config)?;
-    let db = crate::db::connect(&config.database.url).await?;
-    migrate(&db).await?;
-    crate::db::kinds::check_repository_names(&db).await?;
-
-    let stores = crate::adapters::sqlite::SqliteStores::new(db.clone());
+    let stores = connect_stores(config).await?;
     let repos = stores.repositories();
     seed_repositories(repos.as_ref(), &config.repositories, Utc::now()).await?;
 
@@ -150,7 +182,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let cache = stores.proxy_cache();
     let proxy = proxy_engine(config, storage.clone(), cache.clone());
-    let upstream_auth = Arc::new(upstream_creds(&db, config).await?);
+    let upstream_auth = Arc::new(upstream_creds(repos.as_ref(), config).await?);
 
     let metrics_handle = telemetry::init_metrics();
 
@@ -161,7 +193,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let vuln_scanner: Arc<dyn VulnFeed> = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
-    let events = Arc::new(crate::events::EventBus::new());
+    let events = event_bus();
     let policy_store = stores.policy();
     let policy = PolicyEngine::new(
         policy_store.clone(),
@@ -173,7 +205,6 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     report_ready(config, &policy_notes);
 
     Ok(AppState {
-        db,
         storage,
         cache,
         auth,
@@ -201,6 +232,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,
+        clock: Arc::new(crate::adapters::system::SystemClock),
+        ids: Arc::new(crate::adapters::system::UuidIds),
         policy,
     })
 }
@@ -220,7 +253,7 @@ fn auth_state(
         tokens: tokens.clone(),
         login_rate_limiter: login_rate_limiter.clone(),
         base_url: config.server.base_url.clone(),
-        registry_tokens: crate::registry::oci::token::TokenSigner::random(),
+        registry_tokens: Arc::new(crate::registry::oci::token::TokenSigner::random()),
     })
 }
 
@@ -375,7 +408,7 @@ async fn seed_repositories(
     // names a member seeded earlier in this same pass must see its row, or a
     // mutual membership would validate as two pending entries and be seeded.
     for spec in &specs {
-        crate::db::kinds::validate_spec(store, spec, &pending)
+        crate::app::repo_spec::validate_spec(store, spec, &pending)
             .await
             .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;
         store.ensure_seeded(std::slice::from_ref(spec), now).await?;
@@ -684,8 +717,13 @@ async fn health_live() -> impl IntoResponse {
 async fn health_ready(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
-    // Check DB connectivity
-    match sqlx::query("SELECT 1").execute(&state.db).await {
+    // Reachability, asked of a port rather than of a pool: a repository
+    // nobody can be called is one index lookup answering `None`, and a store
+    // that cannot answer it is a store the server is not ready to serve from.
+    // Wider than the `SELECT 1` this replaced, on purpose: a pool that is up
+    // over a database with no `repositories` table is not ready either, and
+    // used to report itself healthy.
+    match state.repos.by_name("").await {
         Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -799,7 +837,7 @@ async fn issue_login_token(
     user_id: i64,
 ) -> Result<String, crate::error::StoreError> {
     let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_");
-    let now = Utc::now();
+    let now = state.clock.now();
     state
         .tokens
         .create(
@@ -836,14 +874,10 @@ pub(crate) fn env_repo_key(name: &str) -> String {
 
 /// The credentials of every repository row, seeded or API-created.
 async fn upstream_creds(
-    db: &SqlitePool,
+    repos: &dyn RepositoryStore,
     config: &Config,
 ) -> anyhow::Result<HashMap<String, UpstreamCreds>> {
-    let known: Vec<String> = crate::db::get_all_repositories(db)
-        .await?
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
+    let known: Vec<String> = repos.all().await?.into_iter().map(|r| r.name).collect();
     load_upstream_creds(&config.repositories, &known, std::env::vars())
 }
 

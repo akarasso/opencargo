@@ -19,7 +19,7 @@ use crate::domain::{Format, Package, Repository, Version};
 use crate::error::{AppError, AppResult};
 use crate::ports::packages::NameMatch;
 use crate::registry::extract_package_name;
-use crate::registry::publish::{finalize_publish, publish_gate, PreScan};
+use crate::app::publish_tail::{PreScan, Published};
 use crate::server::AppState;
 
 const MAX_README_BYTES: usize = 256 * 1024;
@@ -213,7 +213,7 @@ async fn prepare_version(
     );
     let meta = with_dist(version_meta, tarball_url, &sha1, &integrity);
     let metadata_json = serde_json::to_string(&meta)?;
-    let pre = publish_gate(state, Format::Npm, &metadata_json).await?;
+    let pre = state.publish_gate().run(Format::Npm, &metadata_json).await?;
 
     Ok(NewVersion {
         version: version_str.to_string(),
@@ -298,18 +298,22 @@ async fn store_version(
     let (package, version_id) = (landed.package, landed.version.id);
     record_dependencies(state.deps.as_ref(), package.id, version_id, &v.meta).await;
 
-    finalize_publish(
-        state,
-        Format::Npm,
-        &repo.name,
-        &package.name,
-        &v.version,
-        Some(version_id),
-        &v.metadata_json,
-        &auth_user.username,
-        v.pre,
-    )
-    .await?;
+    state
+        .publish_tail()
+        .run(
+            &Published {
+                format: Format::Npm,
+                repository: &repo.name,
+                package: &package.name,
+                version: &v.version,
+                version_id: Some(version_id),
+                metadata_json: &v.metadata_json,
+                published_by: &auth_user.username,
+            },
+            v.pre,
+            chrono::Utc::now(),
+        )
+        .await;
 
     info!(
         package = %package.name,

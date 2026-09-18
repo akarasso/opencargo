@@ -24,7 +24,7 @@ async fn pool() -> (TempDir, SqlitePool) {
     let tmp = TempDir::new().unwrap();
     let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
     // The production pool: five connections, `foreign_keys` ON on each.
-    let pool = crate::db::connect(&url).await.unwrap();
+    let pool = crate::adapters::sqlite::connect(&url).await.unwrap();
     (tmp, pool)
 }
 

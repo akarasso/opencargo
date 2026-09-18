@@ -3,14 +3,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use chrono::Utc;
-use serde_json::json;
 use tokio::sync::{mpsc, OwnedSemaphorePermit};
 use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::error;
 
-use crate::domain::{Format, RuleVerdict, Verdict};
-use crate::events::{EventBus, Visibility};
+use crate::domain::{Audience, DomainEvent, Format, ResolutionCounts, RuleVerdict, Verdict};
+use crate::ports::events::Events;
 use crate::ports::policy::NewResolution;
 
 use super::rules::osv_severity;
@@ -41,7 +40,7 @@ impl Notify {
     pub fn offer(
         &mut self,
         rows: &[(Resolution, Vec<RuleVerdict>)],
-        events: &EventBus,
+        events: &dyn Events,
         period: Duration,
     ) {
         for (r, verdicts) in rows {
@@ -57,21 +56,20 @@ impl Notify {
         self.send_due(events, period);
     }
 
-    pub fn send_due(&mut self, events: &EventBus, period: Duration) {
+    pub fn send_due(&mut self, events: &dyn Events, period: Duration) {
         if self.pending.is_empty() || self.last.is_some_and(|at| at.elapsed() < period) {
             return;
         }
         for ((repo, member), counts) in self.pending.drain() {
             events.emit(
-                "policy.resolution",
-                Visibility::Admin,
-                json!({
-                    "repo": repo,
-                    "member": member,
-                    "count": counts.count,
-                    "would_block": counts.would_block,
-                    "unknown": counts.unknown,
+                DomainEvent::PolicyResolution(ResolutionCounts {
+                    repo,
+                    member,
+                    count: counts.count,
+                    would_block: counts.would_block,
+                    unknown: counts.unknown,
                 }),
+                Audience::Admin,
             );
         }
         self.last = Some(Instant::now());
@@ -130,7 +128,7 @@ pub(crate) async fn run_writer(mut rx: mpsc::Receiver<Pending>, shared: Arc<Shar
                     admit(&shared, p, &mut tasks, &mut waiting);
                 }
                 facts::sweep_children(&shared);
-                shared.notify.lock().unwrap().send_due(&shared.events, shared.tuning.notify_period);
+                shared.notify.lock().unwrap().send_due(shared.events.as_ref(), shared.tuning.notify_period);
             }
             Some(_) = flushes.join_next(), if !flushes.is_empty() => {}
         }
@@ -201,7 +199,7 @@ fn flush(shared: &Arc<Shared>, ready: &mut Vec<Done>, flushes: &mut JoinSet<()>)
         match shared.store.insert_batch(&commands, Utc::now()).await {
             Ok(_) => shared.notify.lock().unwrap().offer(
                 &rows,
-                &shared.events,
+                shared.events.as_ref(),
                 shared.tuning.notify_period,
             ),
             Err(e) => {

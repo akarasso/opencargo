@@ -12,7 +12,7 @@ use async_trait::async_trait;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use super::{public_packages, store_error};
-use crate::db::PackageRow;
+use crate::adapters::sqlite::rows::PackageRow;
 use crate::domain::Package;
 use crate::error::StoreError;
 use crate::ports::search::{SearchIndex, SearchQuery, SearchScope};

@@ -1,5 +1,5 @@
-//! The `PolicyStore` / `AuditStore` / `DependencyStore` / `VulnStore`
-//! contract, run twice: against the in-memory fake the unit tests use and
+//! The `PolicyStore` / `AuditStore` / `DependencyStore` / `VulnStore` /
+//! `OciStore` contract, run twice: against the in-memory fake the unit tests use and
 //! against the SQLite adapter the server runs on.
 //!
 //! The fake keeps full precision and the adapter truncates to the second,
@@ -64,6 +64,8 @@ async fn fake() -> TailHandles {
             audit: db.audit(),
             deps: db.dependencies(),
             vulns: db.vulns(),
+            oci: db.oci(),
+            repository,
             release: Release {
                 package: landed.package.id,
                 version: landed.version.id,
@@ -94,6 +96,8 @@ async fn sqlite() -> TailHandles {
             audit: stores.audit(),
             deps: stores.dependencies(),
             vulns: stores.vulns(),
+            oci: stores.oci(),
+            repository,
             release: Release {
                 package: landed.package.id,
                 version: landed.version.id,

@@ -9,6 +9,7 @@ use axum::{
 use serde::Deserialize;
 use tracing::info;
 
+use crate::app::oci::{AssembledBlob, CompleteUpload};
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
@@ -38,10 +39,12 @@ async fn writable_repo(
 
 /// An upload id is only usable from the repository it was started in.
 async fn owned_upload(state: &AppState, repo: &Repository, upload_uuid: &str) -> AppResult<()> {
-    let upload = crate::db::oci::get_upload(&state.db, upload_uuid)
+    let owner = state
+        .oci
+        .upload_owner(upload_uuid)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("upload not found: {upload_uuid}")))?;
-    if upload.repository_id != repo.id {
+    if owner != repo.id {
         return Err(AppError::Forbidden(
             "upload does not belong to this repository".to_string(),
         ));
@@ -57,13 +60,8 @@ pub async fn start_upload(
     let r = OciRef::parse(&params)?;
     let (repo, _) = writable_repo(&state, &r, auth).await?;
 
-    let upload_id = uuid::Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO oci_uploads (id, repository_id, name) VALUES (?1, ?2, ?3)")
-        .bind(&upload_id)
-        .bind(repo.id)
-        .bind(&r.name)
-        .execute(&state.db)
-        .await?;
+    let upload_id = state.ids.upload_id();
+    state.oci.start_upload(&upload_id, repo.id, &r.name).await?;
 
     let location = format!("/v2/{}/blobs/uploads/{}", r.image_name(), upload_id);
     Ok((
@@ -134,28 +132,17 @@ pub async fn complete_upload(
         )));
     }
 
-    state
-        .storage
-        .put(
-            &paths::blob_path(&repo.name, &query.digest),
-            blob_data.clone(),
-        )
+    CompleteUpload::new(state.oci.clone(), state.storage.clone())
+        .run(AssembledBlob {
+            upload: upload_uuid,
+            repository: repo.id,
+            digest: &query.digest,
+            content_type: "application/octet-stream",
+            path: &paths::blob_path(&repo.name, &query.digest),
+            scratch: &chunk_path,
+            bytes: blob_data.clone(),
+        })
         .await?;
-    sqlx::query(
-        "INSERT OR IGNORE INTO oci_blobs (repository_id, digest, size, content_type)
-         VALUES (?1, ?2, ?3, ?4)",
-    )
-    .bind(repo.id)
-    .bind(&query.digest)
-    .bind(blob_data.len() as i64)
-    .bind("application/octet-stream")
-    .execute(&state.db)
-    .await?;
-    sqlx::query("DELETE FROM oci_uploads WHERE id = ?1")
-        .bind(upload_uuid)
-        .execute(&state.db)
-        .await?;
-    let _ = state.storage.delete(&chunk_path).await;
     info!(digest = %query.digest, size = blob_data.len(), image = %r.image_name(), "OCI blob uploaded");
 
     Ok((

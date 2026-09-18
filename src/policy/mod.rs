@@ -23,7 +23,7 @@ use tracing::warn;
 use crate::auth::middleware::AuthUser;
 use crate::domain::{CacheRepo, Format, Repository};
 use crate::error::StoreError;
-use crate::events::EventBus;
+use crate::ports::events::Events;
 use crate::ports::policy::{PolicyStore, ReportFilter, Totals};
 use crate::proxy::engine::Cached;
 use crate::proxy::ProxyEngine;
@@ -206,7 +206,7 @@ pub(crate) struct Shared {
     pub proxy: ProxyEngine,
     pub rules: Vec<Box<dyn Rule>>,
     pub config: HashMap<String, PolicyConfig>,
-    pub events: Arc<EventBus>,
+    pub events: Arc<dyn Events>,
     pub scanner: Arc<dyn VulnFeed>,
     pub osv_memo: Arc<OsvMemo>,
     pub recent_children: Mutex<HashMap<ChildKey, VecDeque<(u64, Instant)>>>,
@@ -261,7 +261,7 @@ impl PolicyEngine {
         store: Arc<dyn PolicyStore>,
         config: &HashMap<String, PolicyConfig>,
         scanner: Arc<dyn VulnFeed>,
-        events: Arc<EventBus>,
+        events: Arc<dyn Events>,
         proxy: ProxyEngine,
     ) -> Self {
         Self::new_tuned(store, config, scanner, events, proxy, Tuning::default())
@@ -272,7 +272,7 @@ impl PolicyEngine {
         store: Arc<dyn PolicyStore>,
         config: &HashMap<String, PolicyConfig>,
         scanner: Arc<dyn VulnFeed>,
-        events: Arc<EventBus>,
+        events: Arc<dyn Events>,
         proxy: ProxyEngine,
         tuning: Tuning,
     ) -> Self {
@@ -286,7 +286,7 @@ impl PolicyEngine {
         store: Arc<dyn PolicyStore>,
         config: &HashMap<String, PolicyConfig>,
         scanner: Arc<dyn VulnFeed>,
-        events: Arc<EventBus>,
+        events: Arc<dyn Events>,
         proxy: ProxyEngine,
         tuning: Tuning,
     ) -> (Self, impl Future<Output = ()>) {

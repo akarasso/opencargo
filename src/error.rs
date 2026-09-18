@@ -10,9 +10,9 @@ use crate::storage::StorageError;
 
 pub type AppResult<T> = Result<T, AppError>;
 
-/// The 409 body of a concurrent double publish: served by the unique-violation
-/// sniff below until every format publishes through a store, and by
-/// [`StoreError::Conflict`] after that, so the two cannot drift apart.
+/// The 409 body of a concurrent double publish. Every format now publishes
+/// through a store, so the race is the adapter's unique-violation turned into
+/// [`StoreError::Conflict`] — there is no second spelling of it left.
 const CONFLICT_BODY: &str = "resource already exists (conflict)";
 
 #[derive(Debug, thiserror::Error)]
@@ -48,9 +48,6 @@ pub enum AppError {
     Internal(String),
 
     #[error(transparent)]
-    Database(#[from] sqlx::Error),
-
-    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
@@ -69,26 +66,6 @@ impl IntoResponse for AppError {
             AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             AppError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
-            AppError::Database(err) => {
-                // A UNIQUE-constraint violation is a client-visible conflict, not
-                // an internal error. It happens e.g. on two concurrent publishes
-                // of the same package@version: both pass the pre-insert existence
-                // check, then the second INSERT violates UNIQUE(package_id,version).
-                // Map it to 409 instead of 500. (Full atomicity via DB
-                // transactions around publish/promote remains a follow-up — it
-                // needs threading a &mut Transaction through the DAL.)
-                if let sqlx::Error::Database(db_err) = err {
-                    if db_err.is_unique_violation() {
-                        return (
-                            StatusCode::CONFLICT,
-                            Json(json!({ "error": CONFLICT_BODY })),
-                        )
-                            .into_response();
-                    }
-                }
-                tracing::error!("Database error: {}", err);
-                (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())
-            }
             AppError::Io(err) => {
                 tracing::error!("IO error: {}", err);
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal server error".to_string())

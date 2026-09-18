@@ -1,4 +1,9 @@
+#![allow(clippy::disallowed_types, clippy::disallowed_methods)]
 //! The SQLite adapter: the only place the dialect and the driver are named.
+//!
+//! The allow above is the boundary's one legal silencing of those two lints,
+//! and it means exactly that: axum is deliberately off both lists, so a file
+//! carrying it is the persistence adapter and nothing else (4.1).
 
 use std::future::Future;
 use std::path::Path;
@@ -9,6 +14,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use rand::Rng;
 use sqlx::{Sqlite, SqlitePool, Transaction};
+use tracing::info;
 
 use crate::domain::DomainError;
 use crate::error::StoreError;
@@ -38,6 +44,7 @@ pub mod permissions;
 pub mod policy;
 pub mod proxy_cache;
 pub mod repositories;
+pub mod rows;
 pub mod search;
 pub mod tokens;
 pub mod users;
@@ -52,9 +59,9 @@ pub mod webhooks;
 /// mis-evaluate every legacy row. Every statement here binds it, so no column
 /// default ever fires and the row carries the caller's clock.
 ///
-/// It is defined next to its inverse `parse_ts`, one module below, which the
-/// statements not yet behind a store still reach; both move here when they do.
-pub(crate) use crate::db::{bind_ts, parse_ts};
+/// It is defined next to its inverse `parse_ts`, in `rows` beside the row
+/// structs that are the other half of the same codec.
+pub(crate) use rows::{bind_ts, parse_ts};
 
 /// `bind_ts`'s inverse, and the only place a stored timestamp is read: a
 /// column the schema was supposed to constrain coming back unreadable names
@@ -64,11 +71,36 @@ pub(crate) fn read_ts(
     column: &'static str,
     stored: &str,
 ) -> Result<DateTime<Utc>, DomainError> {
-    crate::db::parse_ts(stored).ok_or_else(|| DomainError::CorruptColumn {
+    parse_ts(stored).ok_or_else(|| DomainError::CorruptColumn {
         repo: subject.to_string(),
         column,
         value: stored.to_string(),
     })
+}
+
+/// Create a connection pool and enable WAL mode.
+pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
+    use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
+    use std::str::FromStr;
+
+    let opts = SqliteConnectOptions::from_str(url)?
+        .create_if_missing(true)
+        .journal_mode(SqliteJournalMode::Wal)
+        // Wait for a busy writer instead of failing immediately: instant
+        // SQLITE_BUSY errors under load used to surface as spurious 401s in
+        // the auth middleware.
+        .busy_timeout(std::time::Duration::from_secs(5))
+        // SQLite leaves foreign-key enforcement OFF per connection unless
+        // asked; the schema declares FK constraints and relies on them.
+        .pragma("foreign_keys", "ON");
+
+    let pool = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(5)
+        .connect_with(opts)
+        .await?;
+
+    info!("Connected to SQLite database");
+    Ok(pool)
 }
 
 /// The rows of `packages` a caller without the run of the place may see,
@@ -200,10 +232,17 @@ impl SqliteStores {
         Self { pool }
     }
 
+    /// What these stores are over, for this adapter's own tests: one of them
+    /// corrupts a column no port can write.
+    #[cfg(test)]
+    pub(crate) fn pool(&self) -> SqlitePool {
+        self.pool.clone()
+    }
+
     /// A database of its own, migrated: the way in for anything that owns no
     /// pool, such as the contract suite.
     pub async fn open(path: &Path) -> anyhow::Result<Self> {
-        let pool = crate::db::connect(&format!("sqlite:{}?mode=rwc", path.display())).await?;
+        let pool = connect(&format!("sqlite:{}?mode=rwc", path.display())).await?;
         migrate::run_all(&pool).await?;
         Ok(Self::new(pool))
     }

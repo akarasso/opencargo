@@ -59,7 +59,7 @@ pub fn engine_with(
         fx.policy_store(),
         &config,
         scanner,
-        Arc::new(EventBus::new()),
+        crate::server::event_bus(),
         fx.engine(timeouts()),
         tuning,
     )

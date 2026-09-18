@@ -24,7 +24,7 @@ pub async fn my_permissions(
     State(state): State<AppState>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    let repos = crate::db::get_all_repositories(&state.db).await?;
+    let repos = state.repos.all().await?;
 
     let Some(axum::Extension(user)) = auth else {
         // Anonymous caller (only reachable when anonymous_read is on).

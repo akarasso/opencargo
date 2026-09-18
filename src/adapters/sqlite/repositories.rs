@@ -9,7 +9,7 @@ use chrono::{DateTime, Utc};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
 use super::{bind_ts, immediate, store_error, Tx};
-use crate::db::RepositoryRow;
+use crate::adapters::sqlite::rows::RepositoryRow;
 use crate::domain::{RepoSpec, Repository};
 use crate::error::StoreError;
 use crate::ports::repositories::{RepoPatch, RepositoryStore};
@@ -108,6 +108,13 @@ impl RepositoryStore for SqliteRepositoryStore {
         decode(rows.into_iter())
     }
 
+    async fn names(&self) -> Result<Vec<String>, StoreError> {
+        sqlx::query_scalar("SELECT name FROM repositories ORDER BY name")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)
+    }
+
     async fn create(
         &self,
         spec: &RepoSpec<'_>,
@@ -197,5 +204,48 @@ impl RepositoryStore for SqliteRepositoryStore {
             .map_err(store_error)?;
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::adapters::sqlite::SqliteStores;
+    use crate::app::repo_spec::check_repository_names;
+    use crate::domain::{Format, RepoKind, Visibility};
+
+    /// The startup guard reads names and nothing else, so a column no row
+    /// decoder accepts cannot mask the report of the name it is about — the
+    /// report is the only thing that tells the operator what to rename.
+    #[tokio::test]
+    async fn a_corrupt_column_does_not_hide_an_offending_name() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let stores = SqliteStores::open(&tmp.path().join("t.db")).await.unwrap();
+        let repos = stores.repositories();
+        repos
+            .create(
+                &RepoSpec {
+                    name: "a/b",
+                    kind: RepoKind::Hosted,
+                    format: Format::Npm,
+                    visibility: Visibility::Public,
+                    upstream: None,
+                    members: &[],
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE repositories SET created_at = 'not a time'")
+            .execute(&stores.pool())
+            .await
+            .unwrap();
+
+        assert!(repos.all().await.is_err(), "the row no longer decodes");
+        let err = check_repository_names(repos.as_ref())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("a/b"), "{err}");
     }
 }

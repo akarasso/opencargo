@@ -11,7 +11,9 @@ use tracing::info;
 
 use crate::app::promote::{is_conflict, PromoteVersion, Promoter, Request};
 use crate::auth::middleware::AuthUser;
-use crate::domain::{can_admin, RepoKind, Repository, Visibility};
+use crate::domain::{
+    can_admin, Audience, DomainEvent, PackagePromotion, RepoKind, Repository, Visibility,
+};
 use crate::error::{AppError, AppResult};
 use crate::ports::packages::NameMatch;
 use crate::registry::extract_package_name;
@@ -254,29 +256,25 @@ async fn announce(
         state.repos.by_name(&body.from).await,
         Ok(Some(ref r)) if r.visibility == Visibility::Public
     );
-    let mut payload = json!({
-        "package": name,
-        "version": version,
-        "to": body.to,
-        "repository": body.to,
-        "promoted_by": by.username,
+    let promotion = DomainEvent::PackagePromoted(PackagePromotion {
+        package: name.to_string(),
+        version: version.to_string(),
+        to: body.to.clone(),
+        promoted_by: by.username.clone(),
+        from: from_is_public.then(|| body.from.clone()),
     });
-    if from_is_public {
-        payload["from"] = json!(body.from);
-    }
-    crate::registry::emit_package_event(state, "package.promoted", &body.to, payload).await;
+    state.announce().package_event(promotion, &body.to).await;
 
     // Mirrored on the bus so the admin audit view updates live: the entry
     // itself is written inside the promotion's transaction, not through
     // `record_audit`.
     state.events.emit(
-        "audit.entry",
-        crate::events::Visibility::Admin,
-        json!({
-            "username": by.username,
-            "action": "package.promote",
-            "target": target,
-        }),
+        DomainEvent::AuditEntry {
+            username: by.username.clone(),
+            action: "package.promote".to_string(),
+            target: Some(target.to_string()),
+        },
+        Audience::Admin,
     );
 }
 

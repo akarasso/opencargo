@@ -16,14 +16,17 @@ fn now() -> DateTime<Utc> {
 /// The fixture's database with foreign keys off: a verdict left behind by a
 /// cascade shows.
 async fn without_cascade(fx: &Fx) -> SqlitePolicyStore {
-    let file: String = sqlx::query_scalar("SELECT file FROM pragma_database_list")
-        .fetch_one(&fx.pool)
-        .await
-        .unwrap();
-    let opts = SqliteConnectOptions::from_str(&format!("sqlite:{file}"))
+    let opts = SqliteConnectOptions::from_str(&format!("sqlite:{}", fx.db_path().display()))
         .unwrap()
         .foreign_keys(false);
     SqlitePolicyStore::new(SqlitePool::connect_with(opts).await.unwrap())
+}
+
+/// A pool of this fixture's own over the same file, foreign keys on.
+async fn pool(fx: &Fx) -> SqlitePool {
+    crate::adapters::sqlite::connect(&format!("sqlite:{}", fx.db_path().display()))
+        .await
+        .unwrap()
 }
 
 fn verdicts() -> Vec<RuleVerdict> {
@@ -82,7 +85,7 @@ fn window(since: DateTime<Utc>) -> ReportFilter<'static> {
 #[tokio::test]
 async fn a_batch_carries_the_callers_clock_not_the_column_default() {
     let fx = Fx::new().await;
-    let store = SqlitePolicyStore::new(fx.pool.clone());
+    let store = SqlitePolicyStore::new(pool(&fx).await);
     let at = now() - Duration::days(400);
     rows(&store, 1, at, 1).await;
 

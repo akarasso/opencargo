@@ -6,7 +6,8 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{require_admin, require_auth};
+use crate::api::{actor, require_admin, require_auth};
+use crate::app::permissions::{RevokePermission, SetPermission};
 use crate::domain::{Rights, User};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
@@ -74,23 +75,27 @@ pub async fn set_permission(
         serde_json::from_slice(&bytes)?
     };
 
-    let user = load_user(&state, &username).await?;
-    let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
-
     let rights = Rights {
         read: body.can_read.unwrap_or(true),
         write: body.can_write.unwrap_or(false),
         delete: body.can_delete.unwrap_or(false),
         admin: body.can_admin.unwrap_or(false),
     };
-    state
-        .permissions
-        .set(user.id, repo.id, rights, chrono::Utc::now())
-        .await?;
-
-    let audit_target = format!("{username} on {repo_name}");
-    crate::api::record_audit(&state, &caller, "permission.set", Some(&audit_target)).await;
-    emit_permissions_changed(&state, &username);
+    SetPermission::new(
+        state.users.clone(),
+        state.repos.clone(),
+        state.permissions.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+    )
+    .run(
+        &username,
+        &repo_name,
+        rights,
+        &actor(&caller),
+        chrono::Utc::now(),
+    )
+    .await?;
 
     Ok(Json(json!({
         "ok": true,
@@ -112,14 +117,15 @@ pub async fn delete_permission(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let user = load_user(&state, &username).await?;
-    let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
-
-    state.permissions.revoke(user.id, repo.id).await?;
-
-    let audit_target = format!("{username} on {repo_name}");
-    crate::api::record_audit(&state, &caller, "permission.remove", Some(&audit_target)).await;
-    emit_permissions_changed(&state, &username);
+    RevokePermission::new(
+        state.users.clone(),
+        state.repos.clone(),
+        state.permissions.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+    )
+    .run(&username, &repo_name, &actor(&caller), chrono::Utc::now())
+    .await?;
 
     Ok(Json(json!({"ok": true})))
 }
@@ -130,15 +136,4 @@ async fn load_user(state: &AppState, username: &str) -> AppResult<User> {
         .by_name(username)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))
-}
-
-/// Notify open sessions that a user's effective rights changed so they can
-/// refetch `/api/v1/me/permissions` (and admins their permission editors).
-/// Carries only the username — the actual rights stay behind the REST API.
-fn emit_permissions_changed(state: &AppState, username: &str) {
-    state.events.emit(
-        "permissions.changed",
-        crate::events::Visibility::Authenticated,
-        json!({ "username": username }),
-    );
 }

@@ -13,7 +13,7 @@ const HOUR: Duration = Duration::from_secs(3600);
 async fn ledger() -> (TempDir, SqlitePool, SqliteMultipartLedger) {
     let tmp = TempDir::new().unwrap();
     let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
-    let pool = crate::db::connect(&url).await.unwrap();
+    let pool = crate::adapters::sqlite::connect(&url).await.unwrap();
     migrate::run_all(&pool).await.unwrap();
     let ledger = SqliteMultipartLedger::new(pool.clone());
     (tmp, pool, ledger)

@@ -8,6 +8,7 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::app::releases::{ClearDistTag, SetDistTag};
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Package};
 use crate::error::{AppError, AppResult};
@@ -78,19 +79,12 @@ pub async fn put_dist_tag(
     body: Bytes,
 ) -> AppResult<impl IntoResponse> {
     // Body is the version string, JSON-encoded (e.g., "\"1.0.0\"")
-    let version_str: String = serde_json::from_slice(&body)
+    let version: String = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("invalid version string".to_string()))?;
     let target = writable_tag_target(&state, &params, auth_user).await?;
 
-    let version = state
-        .packages
-        .version(target.package.id, &version_str)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("version not found: {version_str}")))?;
-
-    state
-        .packages
-        .set_dist_tag(target.package.id, &target.tag, version.id)
+    SetDistTag::new(state.packages.clone())
+        .run(target.package.id, &target.tag, &version)
         .await?;
 
     Ok(Json(json!({"ok": true})))
@@ -103,16 +97,9 @@ pub async fn delete_dist_tag(
 ) -> AppResult<impl IntoResponse> {
     let target = writable_tag_target(&state, &params, auth_user).await?;
 
-    // Removing a tag that was never set is not an error the client can act
-    // on: the tag is gone either way.
-    match state
-        .packages
-        .clear_dist_tag(target.package.id, &target.tag)
-        .await
-    {
-        Ok(()) | Err(crate::error::StoreError::NotFound) => {}
-        Err(err) => return Err(err.into()),
-    }
+    ClearDistTag::new(state.packages.clone())
+        .run(target.package.id, &target.tag)
+        .await?;
 
     Ok(Json(json!({"ok": true})))
 }

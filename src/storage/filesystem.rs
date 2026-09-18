@@ -1,6 +1,8 @@
 // The filesystem adapter: the one file that may name the concrete backend
 // (it becomes src/adapters/fs/ when s3.md's second implementation lands).
-#![allow(clippy::disallowed_types)]
+// The allows below are per item, not per file: a file-level one silences the
+// whole lint here, sqlx types included, which is the bypass clippy.toml warns
+// about.
 
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
@@ -17,6 +19,7 @@ pub struct FilesystemStorage {
     base_path: PathBuf,
 }
 
+#[allow(clippy::disallowed_types)]
 impl FilesystemStorage {
     pub fn new(base_path: impl Into<PathBuf>) -> Self {
         let base_path = base_path.into();
@@ -104,6 +107,7 @@ impl FilesystemStorage {
 }
 
 #[async_trait]
+#[allow(clippy::disallowed_types)]
 impl StorageBackend for FilesystemStorage {
     fn resolve(&self, path: &str) -> Result<PathBuf, StorageError> {
         self.safe_path(path)
@@ -266,6 +270,7 @@ fn vanished_is_fine<T>(res: std::io::Result<T>) -> Result<Option<T>, StorageErro
 }
 
 #[cfg(test)]
+#[allow(clippy::disallowed_types)]
 mod tests {
     use super::{FilesystemStorage, StorageError};
 

@@ -5,6 +5,7 @@ use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
 
 use crate::config::CleanupConfig;
+use crate::ports::clock::Clock;
 use crate::ports::packages::PackageStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
@@ -61,6 +62,7 @@ pub async fn start_cleanup_task(
     cache: Arc<dyn ProxyCacheStore>,
     policy: Arc<dyn PolicyStore>,
     storage: Arc<dyn StorageBackend>,
+    clock: Arc<dyn Clock>,
     config: CleanupConfig,
 ) {
     if !sweeps_configured(&config) {
@@ -78,7 +80,7 @@ pub async fn start_cleanup_task(
             policy: policy.as_ref(),
             storage: &storage,
         };
-        sweeps.run(&config, Utc::now()).await;
+        sweeps.run(&config, clock.now()).await;
         tokio::time::sleep(Duration::from_secs(86400)).await;
     }
 }

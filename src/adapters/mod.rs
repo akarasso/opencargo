@@ -4,4 +4,6 @@
 //! from here; every other module names a port. `scripts/boundary.sh` counts
 //! the rule.
 
+pub mod events;
 pub mod sqlite;
+pub mod system;

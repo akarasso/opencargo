@@ -8,11 +8,12 @@ use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{record_audit, require_admin, require_admin_or_self, require_auth};
-use crate::auth::users as auth_users;
+use crate::api::{actor, require_admin, require_admin_or_self, require_auth};
+use crate::app::users::{
+    AccountPatch, ChangePassword, CreateUser, DeleteUser, NewAccount, UpdateUser,
+};
 use crate::domain::User;
 use crate::error::{AppError, AppResult};
-use crate::ports::users::{NewUser, UserPatch};
 use crate::server::AppState;
 use crate::wire::wire_ts;
 
@@ -59,7 +60,8 @@ pub async fn list_users(
     Ok(Json(json!(result)))
 }
 
-/// POST /api/v1/users — create a user (admin only)
+/// POST /api/v1/users — create a user (admin only). The password is generated
+/// server-side and returned once; any password in the request is ignored.
 pub async fn create_user(
     State(state): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
@@ -67,60 +69,28 @@ pub async fn create_user(
     // Extract auth first, then consume body
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
+    let body: CreateUserRequest = read_json(request).await?;
 
-    let body: CreateUserRequest = {
-        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
-        serde_json::from_slice(&bytes)?
-    };
-
-    // Check that user does not already exist
-    if state.users.by_name(&body.username).await?.is_some() {
-        return Err(AppError::Conflict(format!(
-            "user already exists: {}",
-            body.username
-        )));
-    }
-
-    let role = body.role.as_deref().unwrap_or("reader");
-    if !matches!(role, "admin" | "publisher" | "reader") {
-        return Err(AppError::BadRequest(format!("invalid role: {role}")));
-    }
-
-    // Always generate a random password (ignore any password in the request)
-    let raw_password = auth_users::generate_random_password();
-    let password_hash = auth_users::hash_password_async(raw_password.clone())
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to hash password: {e}")))?;
-
-    let user = state
-        .users
-        .create(
-            &NewUser {
+    let created = CreateUser::new(state.users.clone(), state.audit.clone(), state.events.clone())
+        .run(
+            &NewAccount {
                 username: &body.username,
                 email: body.email.as_deref(),
-                password_hash: &password_hash,
-                role,
+                role: body.role.as_deref(),
             },
+            &actor(&caller),
             Utc::now(),
         )
         .await?;
 
-    record_audit(&state, &caller, "user.create", Some(&body.username)).await;
-
-    // No forced password change — the admin receives the generated password
-    // and transmits it securely to the user. Only the initial admin account
-    // (created at first startup) requires a password change.
-
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "username": user.username,
-            "email": user.email,
-            "role": user.role,
-            "password": raw_password,
-            "created_at": wire_ts(user.created_at),
+            "username": created.user.username,
+            "email": created.user.email,
+            "role": created.user.role,
+            "password": created.password,
+            "created_at": wire_ts(created.user.created_at),
         })),
     ))
 }
@@ -147,62 +117,20 @@ pub async fn update_user(
 ) -> AppResult<impl IntoResponse> {
     let caller = require_auth(&request)?;
     require_admin_or_self(&caller, &username)?;
+    let body: UpdateUserRequest = read_json(request).await?;
 
-    let body: UpdateUserRequest = {
-        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
-        serde_json::from_slice(&bytes)?
-    };
-
-    load_user(&state, &username).await?;
-
-    // Only admins can change roles
-    if body.role.is_some() && caller.role != "admin" {
-        return Err(AppError::Forbidden(
-            "only admins can change roles".to_string(),
-        ));
-    }
-
-    if let Some(ref role) = body.role {
-        if !matches!(role.as_str(), "admin" | "publisher" | "reader") {
-            return Err(AppError::BadRequest(format!("invalid role: {role}")));
-        }
-    }
-
-    let password_hash = match &body.password {
-        Some(pw) => Some(
-            auth_users::hash_password_async(pw.clone())
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to hash password: {e}")))?,
-        ),
-        None => None,
-    };
-
-    let user = state
-        .users
-        .update(
+    let user = UpdateUser::new(state.users.clone(), state.audit.clone(), state.events.clone())
+        .run(
             &username,
-            &UserPatch {
+            &AccountPatch {
                 email: body.email.as_deref(),
-                password_hash: password_hash.as_deref(),
+                password: body.password.as_deref(),
                 role: body.role.as_deref(),
-                ..UserPatch::default()
             },
+            &actor(&caller),
             Utc::now(),
         )
         .await?;
-
-    record_audit(&state, &caller, "user.update", Some(&username)).await;
-    if body.role.is_some() {
-        // A role change alters the user's effective rights everywhere; let
-        // their open sessions refresh what they can see and do.
-        state.events.emit(
-            "permissions.changed",
-            crate::events::Visibility::Authenticated,
-            json!({ "username": username }),
-        );
-    }
 
     Ok(Json(described(&user)))
 }
@@ -216,10 +144,9 @@ pub async fn delete_user(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    load_user(&state, &username).await?;
-    state.users.delete(&username).await?;
-
-    record_audit(&state, &caller, "user.delete", Some(&username)).await;
+    DeleteUser::new(state.users.clone(), state.audit.clone(), state.events.clone())
+        .run(&username, &actor(&caller), Utc::now())
+        .await?;
 
     Ok(Json(json!({"ok": true})))
 }
@@ -232,47 +159,28 @@ pub async fn change_password(
 ) -> AppResult<impl IntoResponse> {
     let caller = require_auth(&request)?;
     require_admin_or_self(&caller, &username)?;
+    let body: ChangePasswordRequest = read_json(request).await?;
 
-    let body: ChangePasswordRequest = {
-        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
-        serde_json::from_slice(&bytes)?
-    };
-
-    let user = load_user(&state, &username).await?;
-
-    // Non-admin callers must provide their current password
-    if caller.role != "admin" {
-        let current = body.current_password.as_deref().ok_or_else(|| {
-            AppError::BadRequest("current_password is required".to_string())
-        })?;
-        let ok = auth_users::verify_password_async(current.to_string(), user.password_hash.clone())
-            .await
-            .map_err(|e| AppError::Internal(format!("failed to verify password: {e}")))?;
-        if !ok {
-            return Err(AppError::Unauthorized("invalid current password".to_string()));
-        }
-    }
-
-    let new_hash = auth_users::hash_password_async(body.new_password.clone())
-        .await
-        .map_err(|e| AppError::Internal(format!("failed to hash password: {e}")))?;
-
-    state
-        .users
-        .update(
+    ChangePassword::new(state.users.clone())
+        .run(
             &username,
-            &UserPatch {
-                password_hash: Some(&new_hash),
-                must_change_password: Some(false),
-                ..UserPatch::default()
-            },
+            body.current_password.as_deref(),
+            &body.new_password,
+            &actor(&caller),
             Utc::now(),
         )
         .await?;
 
     Ok(Json(json!({"ok": true})))
+}
+
+async fn read_json<T: serde::de::DeserializeOwned>(
+    request: axum::http::Request<axum::body::Body>,
+) -> AppResult<T> {
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 /// The account, or the 404 naming it.

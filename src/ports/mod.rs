@@ -4,8 +4,11 @@
 //! behind it is chosen by the composition root and named nowhere else.
 
 pub mod audit;
+pub mod clock;
 pub mod dashboard;
 pub mod deps;
+pub mod events;
+pub mod ids;
 pub mod multipart;
 pub mod oci;
 pub mod packages;
@@ -14,6 +17,7 @@ pub mod policy;
 pub mod proxy_cache;
 pub mod repositories;
 pub mod search;
+pub mod signing;
 pub mod tokens;
 pub mod users;
 pub mod vulns;

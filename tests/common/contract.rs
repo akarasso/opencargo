@@ -17,6 +17,7 @@ use opencargo::adapters::sqlite::SqliteStores;
 use opencargo::domain::{Format, RepoKind, RepoSpec, Visibility};
 use opencargo::ports::audit::AuditStore;
 use opencargo::ports::deps::DependencyStore;
+use opencargo::ports::oci::OciStore;
 use opencargo::ports::packages::PackageStore;
 use opencargo::ports::policy::PolicyStore;
 use opencargo::ports::proxy_cache::ProxyCacheStore;
@@ -1122,13 +1123,17 @@ macro_rules! proxy_cache_contract {
 #[allow(unused_imports)]
 pub(crate) use proxy_cache_contract;
 
-/// What the tail's four stores hand the suite. A separate handle set, like
+/// What the tail's five stores hand the suite. A separate handle set, like
 /// `CacheHandles`: an adapter proves one aggregate at a time.
 pub struct TailHandles {
     pub policy: Arc<dyn PolicyStore>,
     pub audit: Arc<dyn AuditStore>,
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
+    pub oci: Arc<dyn OciStore>,
+    /// The repository an image's rows hang off; `OciStore` keys on it and
+    /// carries no release of its own.
+    pub repository: i64,
     /// A published version both the graph and the scan record hang off: the
     /// schema declares those foreign keys, so the suite states what it needs
     /// through `PackageStore` rather than writing orphan rows.
@@ -1149,6 +1154,8 @@ pub struct TailPorts {
     pub audit: Arc<dyn AuditStore>,
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
+    pub oci: Arc<dyn OciStore>,
+    pub repository: i64,
     pub release: Release,
 }
 
@@ -1159,19 +1166,24 @@ impl TailHandles {
             audit: ports.audit,
             deps: ports.deps,
             vulns: ports.vulns,
+            oci: ports.oci,
+            repository: ports.repository,
             release: ports.release,
             _keep: keep,
         }
     }
 }
 
-/// `cascade_contract!(name, opener)`: what the report, the trail, the graph
-/// and the scan record owe together.
+/// `cascade_contract!(name, opener)`: what the report, the trail, the graph,
+/// the scan record and an image's manifests owe together.
 ///
 /// Together, because what they share is a rule rather than a table: every
 /// row carries the clock its caller passed, and every deletion is decided by
-/// identity — `user_id`, a cut-off instant, a version id — never by a label
-/// or by the database's own idea of the time.
+/// identity — `user_id`, a cut-off instant, a version id, a manifest digest —
+/// never by a label or by the database's own idea of the time. The manifest
+/// cascade is here because it is the other deletion that decides what it
+/// takes with it, and the orphan set it reports is the whole of what the
+/// layer above acts on.
 #[allow(unused_macros)]
 macro_rules! cascade_contract {
     ($suite:ident, $open:path) => {
@@ -1181,6 +1193,7 @@ macro_rules! cascade_contract {
             use ::opencargo::domain::{RuleVerdict, ScanResult, Verdict, VulnDetail};
             use ::opencargo::ports::audit::NewAuditEntry;
             use ::opencargo::ports::deps::NewDependency;
+            use ::opencargo::ports::oci::{NewManifest, Orphaned};
             use ::opencargo::ports::policy::{NewResolution, ReportFilter};
 
             fn at(hour: u32) -> DateTime<Utc> {
@@ -1432,6 +1445,124 @@ macro_rules! cascade_contract {
                     ]
                 );
                 assert!(handles.deps.of_version(handles.release.version + 1).await.unwrap().is_empty());
+            }
+
+            fn manifest<'a>(
+                repository: i64,
+                digest: &'a str,
+                blobs: &'a [String],
+                tag: Option<&'a str>,
+            ) -> NewManifest<'a> {
+                NewManifest {
+                    repository,
+                    name: "app",
+                    digest,
+                    content_type: "application/vnd.oci.image.manifest.v1+json",
+                    size: 2,
+                    blobs,
+                    tag,
+                }
+            }
+
+            /// The orphan set is the point of the method: a layer another
+            /// manifest still lists is not in it, and a layer nothing lists
+            /// any more is — reported, never deleted from storage, because
+            /// the store may not touch a file.
+            #[tokio::test]
+            async fn a_manifest_delete_reports_only_the_layers_it_orphaned() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                let (shared, only) = ("sha256:cc".to_string(), "sha256:bb".to_string());
+                handles
+                    .oci
+                    .put_manifest(manifest(repo, "sha256:aa", &[only.clone(), shared.clone()], Some("v1")))
+                    .await
+                    .unwrap();
+                handles
+                    .oci
+                    .put_manifest(manifest(repo, "sha256:dd", std::slice::from_ref(&shared), Some("v2")))
+                    .await
+                    .unwrap();
+
+                let orphaned = handles
+                    .oci
+                    .delete_manifest(repo, "app", "sha256:aa")
+                    .await
+                    .unwrap()
+                    .expect("the manifest was there");
+
+                assert_eq!(orphaned, Orphaned { blob_digests: vec![only] });
+                assert!(handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().is_none());
+                assert!(handles.oci.digest_for_ref(repo, "app", "v1").await.unwrap().is_none());
+                assert_eq!(handles.oci.blob_references(repo, &shared).await.unwrap(), 1);
+                assert_eq!(handles.oci.tags(repo, "app").await.unwrap(), vec!["v2".to_string()]);
+            }
+
+            /// Nothing to delete is `None`, not an empty orphan set: the
+            /// layer above turns one into a 404 and the other into a 202.
+            #[tokio::test]
+            async fn deleting_an_unknown_manifest_reports_nothing() {
+                let handles = $open().await;
+                assert!(handles
+                    .oci
+                    .delete_manifest(handles.repository, "app", "sha256:aa")
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+
+            /// A re-push replaces the link rows wholesale, so a layer the new
+            /// manifest no longer lists stops being referenced — otherwise a
+            /// dropped layer would be undeletable for ever.
+            #[tokio::test]
+            async fn a_re_push_replaces_the_layers_and_moves_the_tag() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                let (old, new) = ("sha256:bb".to_string(), "sha256:cc".to_string());
+                handles
+                    .oci
+                    .put_manifest(manifest(repo, "sha256:aa", std::slice::from_ref(&old), Some("v1")))
+                    .await
+                    .unwrap();
+                handles
+                    .oci
+                    .put_manifest(manifest(repo, "sha256:aa", std::slice::from_ref(&new), Some("v1")))
+                    .await
+                    .unwrap();
+
+                assert_eq!(handles.oci.blob_references(repo, &old).await.unwrap(), 0);
+                assert_eq!(handles.oci.blob_references(repo, &new).await.unwrap(), 1);
+                assert_eq!(handles.oci.tags(repo, "app").await.unwrap(), vec!["v1".to_string()]);
+            }
+
+            /// The ledger is what tells a chunk which repository it belongs
+            /// to, and a completed upload closes it in the same breath as it
+            /// records the blob.
+            #[tokio::test]
+            async fn an_upload_is_owned_until_it_completes() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                handles.oci.start_upload("u1", repo, "app").await.unwrap();
+                assert_eq!(handles.oci.upload_owner("u1").await.unwrap(), Some(repo));
+
+                handles
+                    .oci
+                    .complete_upload(
+                        "u1",
+                        ::opencargo::ports::oci::NewBlob {
+                            repository: repo,
+                            digest: "sha256:bb",
+                            size: 5,
+                            content_type: "application/octet-stream",
+                        },
+                    )
+                    .await
+                    .unwrap();
+
+                assert!(handles.oci.upload_owner("u1").await.unwrap().is_none());
+                assert_eq!(handles.oci.blob(repo, "sha256:bb").await.unwrap().unwrap().size, 5);
+                assert!(handles.oci.delete_blob(repo, "sha256:bb").await.unwrap());
+                assert!(!handles.oci.delete_blob(repo, "sha256:bb").await.unwrap());
             }
         }
     };
