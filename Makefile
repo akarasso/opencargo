@@ -56,8 +56,9 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 		--test promote_test --test permissions_test --test policy_test \
 		--test nuget_test --test nuget_feed_store_test --test nuget_proxy_test --test nuget_group_test
 
-test-load: ## Test de charge du writer policy (5 000 evenements a 500/s, ~16 s)
+test-load: ## Tests de charge : writer policy (5 000 evenements a 500/s, ~16 s), memo NuGet
 	cargo test --lib burst_over_cold_rate_drops_nothing -- --ignored
+	cargo test --test nuget_group_test the_registration_memo
 
 test-network: ## Tests contre npmjs.org / osv.dev (OPENCARGO_NETWORK_TESTS=1)
 	OPENCARGO_NETWORK_TESTS=1 cargo test --test proxy_test --test vuln_test

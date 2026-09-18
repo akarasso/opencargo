@@ -182,6 +182,10 @@ under a new hash is fetched again. Resources on another origin than the upstream
 credentials, and any redirect off the origin asked is refused (`502`). A `group` merges
 versions and registrations by version, the first member winning, and search hits by id. A
 member down never makes a `404`: the other members and verified cache answer, else `502`.
+A merged flat index or registration is kept in memory: while the hosted members' versions do
+not change, and for at most 60 s when a proxy member contributed to it. A publish, unlist or
+relist shows at once; a new upstream version may take up to that long. Storage or database
+unavailable is `503`.
 
 ## Administration
 

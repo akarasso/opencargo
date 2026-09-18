@@ -135,6 +135,13 @@ pub trait PackageStore: Send + Sync {
     async fn version(&self, package: i64, version: &str)
         -> Result<Option<Version>, StoreError>;
 
+    /// The package's version stamp (A1 C5), opaque: every publish, yank,
+    /// unyank and delete of one of its versions moves it, nothing else does,
+    /// and equal stamps mean the same version rows in the same listing
+    /// state, so a reader validates what it derived from them without
+    /// reading them again.
+    async fn stamp(&self, package: i64) -> Result<String, StoreError>;
+
     async fn dist_tags(&self, package: i64) -> Result<Vec<DistTag>, StoreError>;
 
     /// The package upsert, the version row and this version's dist-tags, in

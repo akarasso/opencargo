@@ -1,19 +1,21 @@
 use axum::{
     extract::{Path, State},
-    http::{header, HeaderValue, StatusCode},
+    http::{header, HeaderValue},
     response::{IntoResponse, Response},
     Json,
 };
+use bytes::Bytes;
 use serde_json::Value;
 
 use crate::auth::middleware::AuthUser;
-use crate::domain::{DomainError, Format, RepoKind, Repository};
+use crate::domain::{CacheRepo, DomainError, Format, RepoKind, Repository};
 use crate::error::{AppError, AppResult};
 use crate::registry::cx;
-use crate::registry::resolve::{collect, first_hit, probe_access, Collected, ResolveError};
+use crate::registry::resolve::{collect, first_hit, probe_access, view, Collected, ResolveError};
 use crate::server::AppState;
 
-use super::leaves::{Coordinates, EntriesLeaf, NupkgLeaf, NuspecLeaf};
+use super::leaves::{hosted_stamp, Coordinates, EntriesLeaf, NupkgLeaf, NuspecLeaf};
+use super::merged::{DocKey, Sources};
 use super::model::{self, Entry};
 use super::render::{self, Base};
 
@@ -83,6 +85,53 @@ pub(super) async fn entries(
     Ok((merged, degraded))
 }
 
+/// A document rendered from the merged entries, through the registration
+/// memo: keyed by the repository, the id, the caller's view of the group
+/// and the document; valid while the hosted members' stamps hold and, when
+/// a proxy member is in the view, within the age cap. An answer missing a
+/// member that is down is served, never kept.
+async fn rendered<F>(
+    state: &AppState,
+    repo: &Repository,
+    auth: Option<&AuthUser>,
+    id: &str,
+    doc: String,
+    render: F,
+) -> AppResult<Response>
+where
+    F: FnOnce(&[Entry]) -> AppResult<Value>,
+{
+    let cx = cx(state, auth, repo);
+    let members = view(&cx, repo).await?;
+    let mut sources = Sources::default();
+    for member in &members {
+        match member.kind()? {
+            RepoKind::Hosted => sources.stamps.push(hosted_stamp(&cx, CacheRepo(member), id).await?),
+            _ => sources.upstream = true,
+        }
+    }
+    let key = DocKey {
+        repo: repo.id,
+        repo_name: repo.name.clone(),
+        id: id.to_string(),
+        view: members.iter().map(|m| m.id).collect(),
+        doc,
+    };
+    let mut degraded = None;
+    let body = state
+        .nuget_documents
+        .get_or_compute(key, sources, || async {
+            let (entries, why) = entries(state, repo, auth, id).await?;
+            let body = Bytes::from(serde_json::to_vec(&render(&entries)?)?);
+            let keep = why.is_none();
+            degraded = why;
+            Ok::<_, AppError>((body, keep))
+        })
+        .await?;
+    let response = ([(header::CONTENT_TYPE, "application/json")], body).into_response();
+    Ok(warned(response, degraded))
+}
+
 pub async fn service_index(
     State(state): State<AppState>,
     Path(repo_name): Path<String>,
@@ -101,8 +150,10 @@ pub async fn flat_index(
     let auth = auth.as_ref().map(|e| &e.0);
     let id = id_of(&id)?;
     let repo = open(&state, &repo_name, auth).await?;
-    let (entries, degraded) = entries(&state, &repo, auth, &id).await?;
-    Ok(warned(Json(render::flat_index(&entries)).into_response(), degraded))
+    rendered(&state, &repo, auth, &id, "flat".to_string(), |entries| {
+        Ok(render::flat_index(entries))
+    })
+    .await
 }
 
 /// `{id}.{version}.nupkg` or `{id}.nuspec` under `/{id}/{version}/`.
@@ -140,9 +191,11 @@ pub async fn registration_index(
     let auth = auth.as_ref().map(|e| &e.0);
     let id = id_of(&id)?;
     let repo = open(&state, &repo_name, auth).await?;
-    let (entries, degraded) = entries(&state, &repo, auth, &id).await?;
-    let doc = base(&state, &repo).registration_index_doc(&id, &entries);
-    Ok(warned(Json(doc).into_response(), degraded))
+    let base = base(&state, &repo);
+    rendered(&state, &repo, auth, &id, "index".to_string(), |entries| {
+        Ok(base.registration_index_doc(&id, entries))
+    })
+    .await
 }
 
 pub async fn registration_leaf(
@@ -157,13 +210,15 @@ pub async fn registration_leaf(
         .ok_or_else(|| AppError::NotFound(format!("no such document: {leaf}")))?;
     let key = key_of(version)?;
     let repo = open(&state, &repo_name, auth).await?;
-    let (entries, degraded) = entries(&state, &repo, auth, &id).await?;
-    let entry = entries
-        .iter()
-        .find(|e| e.key == key)
-        .ok_or_else(|| AppError::NotFound(format!("version not found: {id} {key}")))?;
-    let doc = base(&state, &repo).registration_leaf_doc(entry);
-    Ok(warned(Json(doc).into_response(), degraded))
+    let base = base(&state, &repo);
+    rendered(&state, &repo, auth, &id, format!("leaf/{key}"), |entries| {
+        let entry = entries
+            .iter()
+            .find(|e| e.key == key)
+            .ok_or_else(|| AppError::NotFound(format!("version not found: {id} {key}")))?;
+        Ok(base.registration_leaf_doc(entry))
+    })
+    .await
 }
 
 pub async fn registration_page(
@@ -177,9 +232,10 @@ pub async fn registration_page(
         .strip_suffix(".json")
         .ok_or_else(|| AppError::NotFound(format!("no such page: {upper}")))?;
     let repo = open(&state, &repo_name, auth).await?;
-    let (entries, degraded) = entries(&state, &repo, auth, &id).await?;
-    let doc = base(&state, &repo)
-        .registration_page_doc(&id, &entries, &lower, upper)
-        .ok_or_else(|| AppError::NotFound(format!("no such page: {lower}/{upper}")))?;
-    Ok(warned((StatusCode::OK, Json(doc)).into_response(), degraded))
+    let base = base(&state, &repo);
+    rendered(&state, &repo, auth, &id, format!("page/{lower}/{upper}"), |entries| {
+        base.registration_page_doc(&id, entries, &lower, upper)
+            .ok_or_else(|| AppError::NotFound(format!("no such page: {lower}/{upper}")))
+    })
+    .await
 }

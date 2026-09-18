@@ -38,6 +38,9 @@ impl PackageStore for ReclaimedOnce {
     async fn version(&self, p: i64, v: &str) -> Result<Option<Version>, StoreError> {
         self.inner.version(p, v).await
     }
+    async fn stamp(&self, p: i64) -> Result<String, StoreError> {
+        self.inner.stamp(p).await
+    }
     async fn dist_tags(&self, p: i64) -> Result<Vec<DistTag>, StoreError> {
         self.inner.dist_tags(p).await
     }

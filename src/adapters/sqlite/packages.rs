@@ -365,6 +365,18 @@ impl PackageStore for SqlitePackageStore {
         rows.into_iter().map(version_of).collect()
     }
 
+    async fn stamp(&self, package: i64) -> Result<String, StoreError> {
+        let stamp: Option<String> = sqlx::query_scalar(
+            "SELECT group_concat(id || ':' || yanked, ',')
+             FROM (SELECT id, yanked FROM versions WHERE package_id = ?1 ORDER BY id)",
+        )
+        .bind(package)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(stamp.unwrap_or_default())
+    }
+
     async fn version(
         &self,
         package: i64,

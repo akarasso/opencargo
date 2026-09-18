@@ -1,5 +1,6 @@
 pub mod auth_rules;
 pub mod leaves;
+pub mod merged;
 pub mod model;
 pub mod nuspec;
 pub mod publish;

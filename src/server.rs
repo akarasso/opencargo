@@ -93,6 +93,8 @@ pub struct AppState {
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
     pub nuget_feed: Arc<dyn crate::ports::nuget::NugetFeedRead>,
+    /// NuGet's registration memo, per server: its keys are repository ids.
+    pub nuget_documents: Arc<crate::registry::nuget::merged::Documents>,
     pub oci: Arc<dyn OciStore>,
     pub reclaim: Arc<dyn ReclaimStore>,
     pub referenced: Arc<dyn ReferencedKeys>,
@@ -331,6 +333,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         packages: stores.packages(),
         search: stores.search(),
         nuget_feed: stores.nuget_feed(),
+        nuget_documents: Arc::new(crate::registry::nuget::merged::documents()),
         oci: stores.oci(),
         reclaim: stores.reclaim(),
         referenced: stores.referenced(),

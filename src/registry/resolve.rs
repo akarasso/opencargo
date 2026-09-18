@@ -337,6 +337,46 @@ pub async fn probe_access(cx: &Cx<'_>, repo: &Repository) -> Result<(), ResolveE
     Ok(())
 }
 
+/// The hosted and proxy repositories a `collect` over `repo` asks for this
+/// caller, in walk order: the caller's permission view of `repo`, which a
+/// memo of merged answers keys by. Reads the configuration and the grants,
+/// never an upstream or a package store.
+pub async fn view(cx: &Cx<'_>, repo: &Repository) -> Result<Vec<Repository>, ResolveError> {
+    let mut seen = std::collections::HashSet::from([repo.id]);
+    let mut out = Vec::new();
+    view_of(cx, repo, 0, &mut seen, &mut out).await?;
+    Ok(out)
+}
+
+fn view_of<'a>(
+    cx: &'a Cx<'a>,
+    repo: &'a Repository,
+    depth: u32,
+    seen: &'a mut std::collections::HashSet<i64>,
+    out: &'a mut Vec<Repository>,
+) -> Pin<Box<dyn Future<Output = Result<(), ResolveError>> + Send + 'a>> {
+    Box::pin(async move {
+        if repo.kind()? != RepoKind::Group {
+            out.push(repo.clone());
+            return Ok(());
+        }
+        if depth >= MAX_GROUP_DEPTH {
+            return Err(ResolveError::Internal("group nesting depth exceeded".to_string()));
+        }
+        let format = repo.fmt()?;
+        for name in repo.members() {
+            let Some(member) = cx.repos.by_name(&name).await? else {
+                continue;
+            };
+            if !readable(cx, &member).await? || member.fmt()? != format || !seen.insert(member.id) {
+                continue;
+            }
+            view_of(cx, &member, depth + 1, seen, out).await?;
+        }
+        Ok(())
+    })
+}
+
 /// Whether the caller may read this member, and the one refusal that is not a
 /// verdict: while the grant cannot be read at all, "the store is unreliable"
 /// and "authorization is unsafe to decide" are the same fact, so the walk

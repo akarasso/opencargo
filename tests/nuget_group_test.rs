@@ -192,12 +192,23 @@ async fn an_unavailable_store_or_storage_is_503_never_404_nor_502() {
         }
     }
 
+    up.add("Cold.Lib", "1.0.0", nupkg("Cold.Lib", "1.0.0", &[]));
     outage.set(true, false);
-    for id in ["local.lib", "remote.lib"] {
-        for path in paths(id) {
-            for (who, t) in [("anonymous", None), ("reader", Some(token.as_str()))] {
-                let resp = get(format!("{base}/all/v3/{path}"), t).await;
-                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "storage down, {who}: {path}");
+    for (who, t) in [("anonymous", None), ("reader", Some(token.as_str()))] {
+        for id in ["local.lib", "remote.lib", "cold.lib"] {
+            let [flat, registration, package] = paths(id);
+            let resp = get(format!("{base}/all/v3/{package}"), t).await;
+            assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "storage down, {who}: {package}");
+            for path in [flat, registration] {
+                let status = get(format!("{base}/all/v3/{path}"), t).await.status();
+                if id == "cold.lib" {
+                    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "storage down, {who}: {path}");
+                } else {
+                    assert!(
+                        status == StatusCode::OK || status == StatusCode::SERVICE_UNAVAILABLE,
+                        "a warm document is served from memory or refused as ours, {who}: {path} {status}"
+                    );
+                }
             }
         }
     }
@@ -218,5 +229,117 @@ async fn an_unavailable_store_or_storage_is_503_never_404_nor_502() {
     for path in paths("local.lib") {
         let resp = get(format!("{base}/private-first/v3/{path}"), Some(&token)).await;
         assert_eq!(resp.status(), StatusCode::OK, "back up: {path}");
+    }
+}
+
+fn versions_of(reg: &Value) -> Vec<(String, bool)> {
+    reg["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .flat_map(|page| page["items"].as_array().unwrap().iter())
+        .map(|leaf| {
+            (
+                leaf["catalogEntry"]["version"].as_str().unwrap().to_string(),
+                leaf["catalogEntry"]["listed"].as_bool().unwrap(),
+            )
+        })
+        .collect()
+}
+
+/// NuGet decision 11 and invariant 7: a merged document is kept while the
+/// hosted members' stamps hold, so a publish or an unlist shows at once,
+/// whatever the upstream age cap.
+#[tokio::test]
+async fn the_registration_memo_is_invalidated_by_the_hosted_stamp() {
+    let up = fake::start().await;
+    let server = setup(&up).await;
+    let c = reqwest::Client::new();
+    let base = &server.base_url;
+    push(&c, base, "local", nupkg("Shared.Lib", "2.0.0", &[])).await;
+    up.add("Shared.Lib", "1.0.0", nupkg("Shared.Lib", "1.0.0", &[]));
+    let registration = format!("{base}/all/v3/registration/shared.lib/index.json");
+    let flat = format!("{base}/all/v3/flatcontainer/shared.lib/index.json");
+
+    let first = get(registration.clone(), None).await;
+    assert!(first.headers().get("warning").is_none());
+    let first: Value = first.json().await.unwrap();
+    assert_eq!(versions_of(&first), [("1.0.0".into(), true), ("2.0.0".into(), true)]);
+    assert_eq!(get(flat.clone(), None).await.status(), StatusCode::OK);
+
+    common::expire_entries(&server).await;
+    let asked = up.count("");
+    let kept: Value = get(registration.clone(), None).await.json().await.unwrap();
+    assert_eq!(kept, first);
+    assert_eq!(up.count(""), asked, "served from the memo: nothing revalidated upstream");
+
+    push(&c, base, "local", nupkg("Shared.Lib", "3.0.0", &[])).await;
+    let moved: Value = get(registration.clone(), None).await.json().await.unwrap();
+    assert!(up.count("") > asked, "the stamp moved: recomputed through the members");
+    assert!(versions_of(&moved).contains(&("3.0.0".into(), true)), "{moved}");
+    let flat_now: Value = get(flat.clone(), None).await.json().await.unwrap();
+    assert!(flat_now["versions"].as_array().unwrap().contains(&json!("3.0.0")), "{flat_now}");
+
+    let resp = c
+        .delete(format!("{base}/local/v3/package/shared.lib/3.0.0"))
+        .header("X-NuGet-ApiKey", STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    let unlisted: Value = get(registration.clone(), None).await.json().await.unwrap();
+    assert_eq!(
+        versions_of(&unlisted),
+        [("1.0.0".into(), true), ("2.0.0".into(), true), ("3.0.0".into(), false)]
+    );
+}
+
+/// Under load (NuGet checklist 4): many readers of the same and of distinct
+/// packages through a group with a proxy member, while pushes land, take
+/// no parse permit twice for one body and never answer saturated; every
+/// pushed version is in the merged documents once the pushes are done.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_registration_memo_holds_under_concurrent_reads_and_pushes() {
+    let up = fake::start().await;
+    let server = setup(&up).await;
+    let c = reqwest::Client::new();
+    let base = server.base_url.clone();
+    let ids: Vec<String> = (0..8).map(|i| format!("Load.Lib{i}")).collect();
+    for id in &ids {
+        up.add(id, "1.0.0", nupkg(id, "1.0.0", &[]));
+        push(&c, &base, "local", nupkg(id, "2.0.0", &[])).await;
+    }
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(120);
+    let mut readers = Vec::new();
+    for n in 0..64 {
+        let (base, id) = (base.clone(), ids[n % ids.len()].to_ascii_lowercase());
+        readers.push(tokio::spawn(async move {
+            let doc = if n % 2 == 0 { "registration" } else { "flatcontainer" };
+            let resp = get(format!("{base}/all/v3/{doc}/{id}/index.json"), None).await;
+            (resp.status(), id)
+        }));
+    }
+    let mut pushes = Vec::new();
+    for (n, id) in ids.iter().enumerate() {
+        let (c, base, id) = (c.clone(), base.clone(), id.clone());
+        pushes.push(tokio::spawn(async move {
+            push(&c, &base, "local", nupkg(&id, &format!("3.0.{n}"), &[])).await;
+        }));
+    }
+    for reader in readers {
+        let (status, id) = tokio::time::timeout_at(deadline, reader).await.unwrap().unwrap();
+        assert_eq!(status, StatusCode::OK, "{id}");
+    }
+    for p in pushes {
+        tokio::time::timeout_at(deadline, p).await.unwrap().unwrap();
+    }
+    for (n, id) in ids.iter().enumerate() {
+        let id = id.to_ascii_lowercase();
+        let flat: Value = get(format!("{base}/all/v3/flatcontainer/{id}/index.json"), None)
+            .await
+            .json()
+            .await
+            .unwrap();
+        assert_eq!(flat["versions"], json!(["1.0.0", "2.0.0", format!("3.0.{n}")]), "{id}");
     }
 }

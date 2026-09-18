@@ -7,7 +7,7 @@
 //! else the catalog leaf it names (nuget.org puts `packageHash` only there);
 //! a package neither declares is the one `none()` of this strategy.
 
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use axum::http::HeaderMap;
@@ -26,6 +26,7 @@ use crate::proxy::{IntoPayload, Payload};
 use crate::registry::resolve::{Cx, ResolveError, Upstream};
 
 use super::leaves::Coordinates;
+use super::merged::Sources;
 use super::model::Entry;
 use super::search::{Found, Hit, SearchParams};
 
@@ -193,17 +194,34 @@ pub async fn parse_metadata(bytes: Bytes) -> Result<Value, ResolveError> {
     .map_err(|e| ResolveError::Internal(format!("parse task failed: {e}")))?
 }
 
+/// A cached upstream document, parsed once per body: a document already
+/// parsed is not parsed again, so a warm group takes no parse permit.
 async fn document(
     cx: &Cx<'_>,
     member: CacheRepo<'_>,
     up: &Upstream,
     a: &NugetArtifact,
-) -> Result<Outcome<Value>, ResolveError> {
+) -> Result<Outcome<Arc<Value>>, ResolveError> {
     let engine = cx.proxy;
-    match engine.fetch(&NugetUpstream::of(up), up, member, a).await? {
-        Outcome::Found(cached) => Ok(Outcome::Found(parse_metadata(engine.bytes(&cached).await?).await?)),
-        Outcome::NotFound => Ok(Outcome::NotFound),
-    }
+    let Outcome::Found(cached) = engine.fetch(&NugetUpstream::of(up), up, member, a).await? else {
+        return Ok(Outcome::NotFound);
+    };
+    let parse = || async {
+        let bytes = engine.bytes(&cached).await?;
+        let size = bytes.len();
+        Ok::<_, ResolveError>((Arc::new(parse_metadata(bytes).await?), size))
+    };
+    let (value, _) = match cached.entry.digest.clone() {
+        Some(digest) => {
+            super::merged::parsed()
+                .get_or_compute(digest, Sources { stamps: Vec::new(), upstream: true }, || async {
+                    parse().await.map(|parsed| (parsed, true))
+                })
+                .await?
+        }
+        None => parse().await?,
+    };
+    Ok(Outcome::Found(value))
 }
 
 /// The resources a service index announces.

@@ -23,6 +23,15 @@ async fn hosted_package(
     Ok(cx.packages.package(member.0.id, id, NameMatch::Exact).await?)
 }
 
+/// The version stamp of `id` in a hosted member, `-` when the member has
+/// no such package: what a memoized document derived from it is valid for.
+pub async fn hosted_stamp(cx: &Cx<'_>, member: CacheRepo<'_>, id: &str) -> Result<String, ResolveError> {
+    Ok(match hosted_package(cx, member, id).await? {
+        Some(package) => cx.packages.stamp(package.id).await?,
+        None => "-".to_string(),
+    })
+}
+
 async fn hosted_version(
     cx: &Cx<'_>,
     member: CacheRepo<'_>,

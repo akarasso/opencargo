@@ -853,6 +853,18 @@ impl PackageStore for Packages {
         })
     }
 
+    async fn stamp(&self, package: i64) -> Result<String, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .versions
+                .iter()
+                .filter(|v| v.package_id == package)
+                .map(|v| format!("{}:{}", v.id, u8::from(v.yanked)))
+                .collect::<Vec<_>>()
+                .join(","))
+        })
+    }
+
     async fn version(
         &self,
         package: i64,

@@ -491,6 +491,51 @@ macro_rules! package_contract {
                 );
             }
 
+            /// A1 C5: each publish, yank, unyank and delete moves the stamp,
+            /// nothing else does, and a stamp is a function of the versions'
+            /// state, so a validated reader never sees a stale state as current.
+            #[tokio::test]
+            async fn the_version_stamp_moves_with_the_four_operations_only() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let first = handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "1.0.0", &[]))
+                    .await
+                    .unwrap();
+                let package = first.package.id;
+                let stamp = || handles.packages.stamp(package);
+                let one = stamp().await.unwrap();
+                let second = handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "2.0.0", &[]))
+                    .await
+                    .unwrap();
+                let two = stamp().await.unwrap();
+                assert_ne!(two, one, "publish");
+                handles.packages.set_yanked(first.version.id, true).await.unwrap();
+                let yanked = stamp().await.unwrap();
+                assert_ne!(yanked, two, "yank");
+                handles.packages.set_yanked(first.version.id, false).await.unwrap();
+                let unyanked = stamp().await.unwrap();
+                assert_ne!(unyanked, yanked, "unyank");
+                assert_eq!(unyanked, two, "the same state, the same stamp");
+                handles.packages.set_metadata(second.version.id, "{\"x\":1}").await.unwrap();
+                handles.packages.record_download(second.version.id).await.unwrap();
+                assert_eq!(stamp().await.unwrap(), two, "nothing else moves it");
+                handles.packages.delete_version(second.version.id, at(10)).await.unwrap();
+                let deleted = stamp().await.unwrap();
+                assert_ne!(deleted, two, "delete");
+                handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "2.0.0", &[]))
+                    .await
+                    .unwrap();
+                let republished = stamp().await.unwrap();
+                assert_ne!(republished, deleted, "republish");
+                assert_ne!(republished, two, "a republished version is a new row");
+            }
+
             #[tokio::test]
             async fn a_publish_lands_the_package_the_version_and_its_tags() {
                 let handles = $open().await;
