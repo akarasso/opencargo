@@ -289,12 +289,13 @@ pub async fn resolve_version(
     auth: Option<&AuthUser>,
     server: &str,
     version: &str,
+    include_deleted: bool,
 ) -> AppResult<(Repository, CatalogRow, Visibility, Gates)> {
     let (members, gates) = scope(state, repo, auth).await?;
     let wanted = (version != "latest").then_some(version);
     for member in members {
         if let Some(row) = state.mcp.version(member.id, repo.id, server, wanted).await? {
-            let visibility = gates.decide(member.id, &row, true);
+            let visibility = gates.decide(member.id, &row, include_deleted);
             if visibility.served() {
                 return Ok((member, row, visibility, gates));
             }
@@ -307,10 +308,12 @@ pub async fn get_version(
     State(state): State<AppState>,
     Path((repo_name, server, version)): Path<(String, String, String)>,
     auth: Option<Extension<AuthUser>>,
+    Query(params): Query<HashMap<String, String>>,
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
     let repo = open(&state, &repo_name, auth).await?;
-    let (member, row, visibility, gates) = resolve_version(&state, &repo, auth, &server, &version).await?;
+    let include_deleted = include_deleted(&params);
+    let (member, row, visibility, gates) = resolve_version(&state, &repo, auth, &server, &version, include_deleted).await?;
     super::record::served(&state, &repo, &member, &row, &gates, auth).await;
     Ok(Json(render(&row, &repo.name, &visibility)?))
 }

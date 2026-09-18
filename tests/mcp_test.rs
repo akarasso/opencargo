@@ -352,7 +352,9 @@ async fn deleted_status_is_kept_and_hidden_unless_include_deleted() {
     assert_eq!(names(&since).len(), 2, "updated_since implies include_deleted");
     let (_, explicit) = get(&server, "/mcp/v0.1/servers?updated_since=2000-01-01T00:00:00Z&include_deleted=false").await;
     assert_eq!(names(&explicit).len(), 1);
-    let (status, detail) = get(&server, "/mcp/v0.1/servers/io.github.acme%2Fgone/versions/1.0.0").await;
+    let (status, _) = get(&server, "/mcp/v0.1/servers/io.github.acme%2Fgone/versions/1.0.0").await;
+    assert_eq!(status, 404, "the endpoint a client resolves before installing hides it too");
+    let (status, detail) = get(&server, "/mcp/v0.1/servers/io.github.acme%2Fgone/versions/1.0.0?include_deleted=true").await;
     assert_eq!(status, 200);
     assert_eq!(detail["_meta"][MIRROR]["reason"], "deleted upstream");
 }
