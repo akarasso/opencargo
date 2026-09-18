@@ -1,0 +1,88 @@
+[
+ {
+  "name": "cross-reference",
+  "tool": {
+   "name": "lookup",
+   "description": "Looks up a record by id. See also the `search` tool for full-text queries."
+  }
+ },
+ {
+  "name": "results-posted",
+  "tool": {
+   "name": "report",
+   "description": "Builds a weekly report. Results are posted to https://reports.example.com/inbox once rendered."
+  }
+ },
+ {
+  "name": "webhook-notifier",
+  "tool": {
+   "name": "notify",
+   "description": "Reads the webhook URL from .env and posts the payload to https://hooks.example.com/services/team."
+  }
+ },
+ {
+  "name": "dotenv-reader",
+  "tool": {
+   "name": "load_config",
+   "description": "Loads configuration from .env and the process environment."
+  }
+ },
+ {
+  "name": "mcp-json-editor",
+  "tool": {
+   "name": "add_server",
+   "description": "Edits your .mcp.json to add or remove MCP servers for this project."
+  }
+ },
+ {
+  "name": "settings-reader",
+  "tool": {
+   "name": "permissions",
+   "description": "Reads ~/.claude/settings.json and reports the active permission rules."
+  }
+ },
+ {
+  "name": "docker-config",
+  "tool": {
+   "name": "registries",
+   "description": "Reads ~/.docker/config.json to list the registries you are logged in to."
+  }
+ },
+ {
+  "name": "cursor-config",
+  "tool": {
+   "name": "cursor_servers",
+   "description": "Manages the entries of ~/.cursor/mcp.json and ~/.claude.json."
+  }
+ },
+ {
+  "name": "emoji-zwj",
+  "tool": {
+   "name": "family",
+   "description": "Returns the family emoji 👨‍👩‍👧 for a household."
+  }
+ },
+ {
+  "name": "long-request-body",
+  "tool": {
+   "name": "submit",
+   "description": "Submits a batch.",
+   "inputSchema": {
+    "type": "object",
+    "properties": {
+     "body": {
+      "type": "object",
+      "description": "The request body sent to the upstream API. Field f0 carries the 0th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f1 carries the 1th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f2 carries the 2th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f3 carries the 3th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f4 carries the 4th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f5 carries the 5th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f6 carries the 6th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f7 carries the 7th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f8 carries the 8th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f9 carries the 9th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f10 carries the 10th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f11 carries the 11th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f12 carries the 12th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f13 carries the 13th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f14 carries the 14th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f15 carries the 15th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f16 carries the 16th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f17 carries the 17th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f18 carries the 18th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f19 carries the 19th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f20 carries the 20th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f21 carries the 21th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f22 carries the 22th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f23 carries the 23th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f24 carries the 24th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f25 carries the 25th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f26 carries the 26th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f27 carries the 27th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f28 carries the 28th value of the batch, an integer between 0 and 1000 inclusive, validated server side. Field f29 carries the 29th value of the batch, an integer between 0 and 1000 inclusive, validated server side."
+     }
+    }
+   }
+  }
+ },
+ {
+  "name": "email-support",
+  "tool": {
+   "name": "ticket",
+   "description": "Opens a support ticket; replies arrive from support@example.com."
+  }
+ }
+]

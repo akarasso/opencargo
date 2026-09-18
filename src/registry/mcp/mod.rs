@@ -2,5 +2,6 @@
 //! governed at distribution time.
 
 pub mod rules;
+pub mod scan;
 pub mod schema;
 pub mod surface;
