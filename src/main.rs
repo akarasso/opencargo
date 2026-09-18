@@ -172,7 +172,12 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let server::Started { state: app_state, lease } = server::build_state(&cfg).await?;
+            let srv = server::shutdown::ServerHandle::new();
+            let shutdown = server::shutdown::Shutdown::new();
+            let endpoint_drain = cfg.server.endpoint_drain()?;
+            let grace = cfg.server.shutdown_grace()?;
+            let server::Started { state: app_state, lease } =
+                server::build_state(&cfg, srv.clone(), shutdown.clone()).await?;
             let probe_every = config::parse_chrono_duration(&cfg.auth.sso.probe_interval)?
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(60));
@@ -202,47 +207,43 @@ async fn main() -> anyhow::Result<()> {
                 app_state.clock.clone(),
             ));
 
-            let router = server::build_router(app_state);
-
-            // Decode percent-encoded slashes (%2f) before routing.
-            // npm/pnpm clients encode scoped package names this way.
-            // This must wrap the Router externally (not via Router::layer)
-            // because Router::layer runs after route matching.
-            // Decode %2f in scoped package names before routing, on BOTH the
-            // TLS and plaintext paths (Router::layer runs after route matching,
-            // so this must wrap the Router externally). Previously the decoder
-            // was only applied on the plaintext branch, so scoped npm packages
-            // (`@scope%2fname`) returned 404 over HTTPS — the normal mode for a
-            // private registry. The map_request is built inside each branch
-            // because the body type differs (axum_server hands the service a
-            // `Request<Incoming>`, axum::serve a `Request<Body>`); the decoder
-            // is generic over the body type and only rewrites the URI.
-            if !cfg.server.tls.cert_path.is_empty() && !cfg.server.tls.key_path.is_empty() {
+            // Decode %2f in scoped package names before routing: this must
+            // wrap the Router, since Router::layer runs after route matching.
+            let app = server::build_router(app_state)
+                .map_request(server::decode_percent_encoded_slashes)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let listener = std::net::TcpListener::bind(bind)?;
+            listener.set_nonblocking(true)?;
+            let mut serving = if !cfg.server.tls.cert_path.is_empty() && !cfg.server.tls.key_path.is_empty() {
                 let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
                     &cfg.server.tls.cert_path,
                     &cfg.server.tls.key_path,
                 )
                 .await?;
-                let bind_addr: std::net::SocketAddr = bind.parse()?;
-                info!("Listening with TLS on {}", bind_addr);
-                axum_server::bind_rustls(bind_addr, tls_config)
-                    .serve(
-                        router
-                            .map_request(server::decode_percent_encoded_slashes)
-                            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                    )
-                    .await?;
+                info!("Listening with TLS on {}", listener.local_addr()?);
+                tokio::spawn(
+                    axum_server::from_tcp_rustls(listener, tls_config)?
+                        .handle(srv.clone())
+                        .serve(app),
+                )
             } else {
-                let app = router
-                    .map_request(server::decode_percent_encoded_slashes)
-                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
-                let listener = tokio::net::TcpListener::bind(bind).await?;
                 info!("Listening on {}", listener.local_addr()?);
-                axum::serve(listener, app).await?;
+                tokio::spawn(axum_server::from_tcp(listener)?.handle(srv.clone()).serve(app))
+            };
+
+            tokio::select! {
+                served = &mut serving => {
+                    served??;
+                }
+                () = server::shutdown::signal() => {
+                    shutdown.drain(&srv, endpoint_drain, grace).await;
+                    serving.await??;
+                }
             }
             if let Some(lease) = lease {
                 lease.release().await;
             }
+            info!("stopped");
         }
         Commands::ValidateConfig { path } => {
             let checked = config::load_config(Some(&path))?;

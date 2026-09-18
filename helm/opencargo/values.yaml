@@ -6,6 +6,14 @@ lease:
 startup:
   periodSeconds: 5
 
+shutdown:
+  endpointDrainSeconds: 0
+  graceSeconds: 30
+  wsCloseGraceSeconds: 5
+
+preStop:
+  sleepSeconds: 2
+
 image:
   repository: ghcr.io/akarasso/opencargo
   # ":latest" is mutable and not reproducible. Prefer an immutable reference

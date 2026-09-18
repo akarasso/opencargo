@@ -676,3 +676,87 @@ fn liveness_cannot_kill_a_pod_waiting_for_the_lease() {
         assert!(budget > wait + 30, "startup budget {budget}s against a {wait}s lease wait:\n{doc}");
     }
 }
+
+fn pre_stop_sleep(doc: &str) -> u64 {
+    let lifecycle = block(doc, "preStop");
+    let command = scalar(&lifecycle, "command").expect("a preStop command");
+    command
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .expect("preStop is a sleep of whole seconds")
+}
+
+fn env_secs(doc: &str, name: &str) -> u64 {
+    env_value(doc, name)
+        .unwrap_or_else(|| panic!("{name} reaches the container"))
+        .parse()
+        .unwrap()
+}
+
+/// Every term of the shutdown path fits before SIGKILL, in both manifests,
+/// at the default config and under an override, and when the values move.
+#[test]
+fn grace_period_covers_drain_plus_shutdown() {
+    let ws_close = opencargo::server::shutdown::WS_CLOSE_GRACE.as_secs();
+    let check = |doc: &str| {
+        let tgps = number(doc, "terminationGracePeriodSeconds");
+        let path = pre_stop_sleep(doc)
+            + env_secs(doc, "OPENCARGO_ENDPOINT_DRAIN")
+            + ws_close
+            + env_secs(doc, "OPENCARGO_SHUTDOWN_GRACE");
+        assert!(tgps >= path, "terminationGracePeriodSeconds {tgps} < {path}:\n{doc}");
+    };
+    check(&kustomize_deployment());
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    deployments.iter().for_each(|d| check(d));
+    let moved = helm_deployments(&[
+        "--set",
+        "shutdown.graceSeconds=90",
+        "--set",
+        "shutdown.endpointDrainSeconds=15",
+        "--set",
+        "preStop.sleepSeconds=4",
+    ])
+    .unwrap();
+    for doc in &moved {
+        check(doc);
+        assert_eq!(env_secs(doc, "OPENCARGO_SHUTDOWN_GRACE"), 90);
+    }
+}
+
+#[test]
+fn ws_close_grace_value_matches_the_constant() {
+    let values = common::manifests::read(std::path::Path::new("helm/opencargo/values.yaml"));
+    let mirrored: u64 = scalar(&values, "wsCloseGraceSeconds").unwrap().parse().unwrap();
+    assert_eq!(mirrored, opencargo::server::shutdown::WS_CLOSE_GRACE.as_secs());
+}
+
+/// The numbers the grace period is derived from reach the process as env,
+/// so an install that replaces the config block cannot move them apart.
+#[test]
+fn helm_shutdown_values_reach_the_container_as_env() {
+    let Some(deployments) = helm_deployments(&["--set", "shutdown.graceSeconds=45", "--set", "lease.waitSeconds=75"]) else {
+        return;
+    };
+    for doc in &deployments {
+        assert_eq!(env_secs(doc, "OPENCARGO_SHUTDOWN_GRACE"), 45);
+        assert_eq!(env_secs(doc, "OPENCARGO_ENDPOINT_DRAIN"), 0);
+        assert_eq!(env_secs(doc, "OPENCARGO_LEASE_WAIT"), 75);
+    }
+    let configmap = helm_renders(&[]).unwrap()[1].clone();
+    let configmap = document(&configmap, "ConfigMap").unwrap();
+    assert!(configmap.contains("registry.corp.example") && !configmap.contains("shutdown_grace"));
+}
+
+#[test]
+fn readiness_probe_keeps_the_default_failure_threshold() {
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in deployments.iter().chain([&kustomize_deployment()]) {
+        let readiness = block(doc, "readinessProbe");
+        assert_eq!(scalar(&readiness, "failureThreshold"), None, "{readiness}");
+        assert_eq!(number(&readiness, "timeoutSeconds"), 3);
+    }
+}

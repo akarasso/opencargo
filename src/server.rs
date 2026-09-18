@@ -1,4 +1,5 @@
 pub mod rewrite;
+pub mod shutdown;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -145,6 +146,9 @@ pub struct AppState {
     /// A view of the writer lease; `main` owns the lease itself.
     pub lease: LeaseHandle,
     pub server_state: Arc<dyn ServerStateStore>,
+    pub shutdown: shutdown::Shutdown,
+    /// The HTTP server's handle, for its open-connection count.
+    pub srv: shutdown::ServerHandle,
 }
 
 /// What a started server is made of: the state every request clones, and
@@ -557,7 +561,11 @@ pub fn event_bus() -> Arc<dyn Events> {
 
 /// Everything a server needs, in the order that keeps a second instance
 /// from writing: the lease is taken before the first migration runs.
-pub async fn build_state(config: &Config) -> anyhow::Result<Started> {
+pub async fn build_state(
+    config: &Config,
+    srv: shutdown::ServerHandle,
+    shutdown: shutdown::Shutdown,
+) -> anyhow::Result<Started> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     config.validate()?;
     let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
@@ -672,6 +680,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<Started> {
         password_mode: gate_policy(&config.auth.sso)?.password_mode,
         lease: lease.as_ref().map_or_else(LeaseHandle::disabled, LeaseGuard::handle),
         server_state: stores.server_state(),
+        shutdown,
+        srv,
     };
     Ok(Started { state, lease })
 }
@@ -1447,6 +1457,12 @@ async fn health_live() -> impl IntoResponse {
 async fn health_ready(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
+    if state.shutdown.draining() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "draining"})),
+        );
+    }
     // Reachability, asked of a port rather than of a pool: a repository
     // nobody can be called is one index lookup answering `None`, and a store
     // that cannot answer it is a store the server is not ready to serve from.

@@ -20,6 +20,8 @@ spec:
         app: opencargo
     spec:
       automountServiceAccountToken: false
+      # preStop sleep + OPENCARGO_ENDPOINT_DRAIN + WS close grace (5) + OPENCARGO_SHUTDOWN_GRACE + 10
+      terminationGracePeriodSeconds: 47
       securityContext:
         runAsNonRoot: true
         runAsUser: 10001
@@ -86,6 +88,11 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "2"]
           resources:
             requests:
               cpu: 100m
@@ -96,6 +103,10 @@ spec:
           env:
             - name: OPENCARGO_LEASE_WAIT
               value: "60"
+            - name: OPENCARGO_ENDPOINT_DRAIN
+              value: "0"
+            - name: OPENCARGO_SHUTDOWN_GRACE
+              value: "30"
           volumeMounts:
             - name: data
               mountPath: /data

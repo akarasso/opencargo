@@ -37,6 +37,7 @@ use opencargo::policy::rules::PolicyConfig;
 use opencargo::policy::{PolicyEngine, Tuning};
 use opencargo::proxy::UpstreamAuth;
 use opencargo::server;
+use opencargo::server::shutdown::{ServerHandle, Shutdown};
 
 /// The one static token every spawned server accepts.
 pub const STATIC_TOKEN: &str = "test-token";
@@ -58,6 +59,8 @@ pub struct SpawnOpts {
     pub lease: bool,
     /// `[auth].static_tokens`.
     pub static_tokens: Vec<String>,
+    /// `[server].endpoint_drain`.
+    pub endpoint_drain: String,
 }
 
 impl Default for SpawnOpts {
@@ -74,6 +77,7 @@ impl Default for SpawnOpts {
             public_url: None,
             lease: false,
             static_tokens: vec![STATIC_TOKEN.to_string()],
+            endpoint_drain: "0s".to_string(),
         }
     }
 }
@@ -86,12 +90,26 @@ pub struct TestServer {
     /// The store the server ran on, kept so a restart finds its bytes.
     pub storage: opencargo::config::StorageConfig,
     pub lease: Option<opencargo::app::lease::LeaseGuard>,
+    pub srv: ServerHandle,
+    pub shutdown: Shutdown,
+    endpoint_drain: Duration,
+    grace: Duration,
 }
 
 impl TestServer {
     /// Stop serving and give the lease back, as a clean shutdown would.
     pub async fn stop(&mut self) {
         self.handle.abort();
+        if let Some(lease) = self.lease.take() {
+            lease.release().await;
+        }
+    }
+
+    /// Production's drain, then the end of serving, then the lease: what
+    /// `main` does on SIGTERM, without a signal.
+    pub async fn drain(&mut self) {
+        self.shutdown.drain(&self.srv, self.endpoint_drain, self.grace).await;
+        (&mut self.handle).await.ok();
         if let Some(lease) = self.lease.take() {
             lease.release().await;
         }
@@ -119,6 +137,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
                 .expect("non-utf8 temp path")
                 .to_string(),
             lease: opts.lease,
+            endpoint_drain: opts.endpoint_drain.clone(),
             ..Default::default()
         },
         database: DatabaseConfig {
@@ -168,8 +187,16 @@ pub fn switch_storage(config: &mut Config) {
 /// `server::build_state` behind the switch, refusing a vacuous S3 run: a
 /// switched server that did not build an S3 store fails the test.
 pub async fn start(config: &mut Config) -> anyhow::Result<server::Started> {
+    start_with(config, ServerHandle::new(), Shutdown::new()).await
+}
+
+pub async fn start_with(
+    config: &mut Config,
+    srv: ServerHandle,
+    shutdown: Shutdown,
+) -> anyhow::Result<server::Started> {
     switch_storage(config);
-    let started = server::build_state(config).await?;
+    let started = server::build_state(config, srv, shutdown).await?;
     let want = if storage_is_s3() { "s3" } else { "fs" };
     assert_eq!(started.state.storage_backend, want, "the storage switch was not applied");
     Ok(started)
@@ -229,9 +256,8 @@ async fn spawn_in(
     opts: SpawnOpts,
     storage: Option<opencargo::config::StorageConfig>,
 ) -> TestServer {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind to random port");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind to random port");
+    listener.set_nonblocking(true).expect("a non-blocking listener");
     let addr = listener.local_addr().expect("no local addr");
     let base_url = format!("http://{addr}");
 
@@ -241,7 +267,9 @@ async fn spawn_in(
     if let Some(storage) = storage {
         config.storage = storage;
     }
-    let server::Started { mut state, lease } = start(&mut config)
+    let srv = ServerHandle::new();
+    let shutdown = Shutdown::new();
+    let server::Started { mut state, lease } = start_with(&mut config, srv.clone(), shutdown.clone())
         .await
         .expect("failed to build app state");
     if let Some(tuning) = tuning {
@@ -261,8 +289,11 @@ async fn spawn_in(
         .map_request(server::decode_percent_encoded_slashes)
         .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
+    let serving = axum_server::from_tcp(listener)
+        .expect("a listener axum_server accepts")
+        .handle(srv.clone());
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
+        serving.serve(app).await.ok();
     });
 
     let client = reqwest::Client::new();
@@ -280,14 +311,18 @@ async fn spawn_in(
         tmp,
         storage: config.storage.clone(),
         lease,
+        srv,
+        shutdown,
+        endpoint_drain: config.server.endpoint_drain().expect("a valid endpoint_drain"),
+        grace: config.server.shutdown_grace().expect("a valid shutdown_grace"),
     }
 }
 
 /// The error a restart of `server` on its own database refuses to start
 /// with under `opts`; the running server is left alone.
 pub async fn start_error_in(server: &TestServer, opts: SpawnOpts) -> String {
-    let config = test_config(&server.tmp, "http://127.0.0.1:0", opts);
-    server::build_state(&config)
+    let mut config = test_config(&server.tmp, "http://127.0.0.1:0", opts);
+    start(&mut config)
         .await
         .err()
         .expect("the start should be refused")

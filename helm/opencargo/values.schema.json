@@ -11,13 +11,47 @@
     "lease": {
       "type": "object",
       "properties": {
-        "waitSeconds": { "type": "integer", "minimum": 1 }
+        "waitSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
       }
     },
     "startup": {
       "type": "object",
       "properties": {
-        "periodSeconds": { "type": "integer", "minimum": 1 }
+        "periodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "shutdown": {
+      "type": "object",
+      "properties": {
+        "endpointDrainSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "graceSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "wsCloseGraceSeconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 5,
+          "description": "Mirrors WS_CLOSE_GRACE in src/server/shutdown.rs; not a knob."
+        }
+      }
+    },
+    "preStop": {
+      "type": "object",
+      "properties": {
+        "sleepSeconds": {
+          "type": "integer",
+          "minimum": 0
+        }
       }
     }
   }

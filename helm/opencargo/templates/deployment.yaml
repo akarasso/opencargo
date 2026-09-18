@@ -20,6 +20,7 @@ spec:
         release: {{ .Release.Name }}
     spec:
       automountServiceAccountToken: false
+      terminationGracePeriodSeconds: {{ add .Values.preStop.sleepSeconds .Values.shutdown.endpointDrainSeconds .Values.shutdown.wsCloseGraceSeconds .Values.shutdown.graceSeconds 10 }}
       securityContext:
         {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
@@ -54,6 +55,11 @@ spec:
               port: http
             initialDelaySeconds: 5
             periodSeconds: 10
+            timeoutSeconds: 3
+          lifecycle:
+            preStop:
+              exec:
+                command: ["sleep", "{{ .Values.preStop.sleepSeconds }}"]
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
           volumeMounts:
@@ -67,6 +73,10 @@ spec:
           env:
             - name: OPENCARGO_LEASE_WAIT
               value: {{ .Values.lease.waitSeconds | quote }}
+            - name: OPENCARGO_ENDPOINT_DRAIN
+              value: {{ .Values.shutdown.endpointDrainSeconds | quote }}
+            - name: OPENCARGO_SHUTDOWN_GRACE
+              value: {{ .Values.shutdown.graceSeconds | quote }}
             - name: OPENCARGO_ADMIN_PASSWORD
               valueFrom:
                 secretKeyRef:
