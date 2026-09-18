@@ -320,6 +320,7 @@ function RepositoriesInner() {
                 <option value="cargo">cargo</option>
                 <option value="oci">oci</option>
                 <option value="go">go</option>
+                <option value="pypi">pypi</option>
                 <option value="maven">maven</option>
                 <option value="nuget">nuget</option>
               </select>
