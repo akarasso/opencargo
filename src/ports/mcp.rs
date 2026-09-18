@@ -299,8 +299,63 @@ pub struct ProbeTarget {
     pub last_runs: Vec<ProbeRunRow>,
 }
 
+/// A skill archive to record once its bytes are placed: the pins are the
+/// placement's, spent in the same transaction.
+#[derive(Debug, Clone)]
+pub struct NewSkill {
+    pub repository: i64,
+    pub name: String,
+    pub version: String,
+    pub sha256: String,
+    pub size: i64,
+    pub description: Option<String>,
+    pub allowed_tools: Option<String>,
+    pub surface_sha256: String,
+    pub findings: Vec<NewFinding>,
+    /// Natively `high` findings in the frontmatter: the skill is never
+    /// distributed while any stands.
+    pub blocking: i64,
+    pub published_by: Option<String>,
+    pub pins: Vec<crate::ports::reclaim::PinToken>,
+    pub now: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillRow {
+    pub id: i64,
+    pub member: i64,
+    pub name: String,
+    pub version: String,
+    pub key: String,
+    pub sha256: String,
+    pub size: i64,
+    pub description: Option<String>,
+    pub allowed_tools: Option<String>,
+    pub surface_sha256: String,
+    pub findings_high: i64,
+    pub findings_medium: i64,
+    pub blocking: i64,
+    pub published_at: DateTime<Utc>,
+    /// The addressed repository's decision on this exact surface, the
+    /// member's as the fallback.
+    pub decision: Option<Decision>,
+}
+
 #[async_trait]
 pub trait McpStore: Send + Sync {
+    /// `Conflict` when the version exists, `Superseded` when a pin was
+    /// revoked; neither writes anything.
+    async fn publish_skill(&self, skill: &NewSkill) -> Result<i64, StoreError>;
+
+    /// Every skill of a hosted member, newest first.
+    async fn skills(&self, member: i64, addressed: i64) -> Result<Vec<SkillRow>, StoreError>;
+
+    async fn skill(&self, member: i64, addressed: i64, name: &str, version: &str) -> Result<Option<SkillRow>, StoreError>;
+
+    /// The row and its findings; its key is enqueued in the same
+    /// transaction and returned, never deleted here.
+    async fn delete_skill(&self, repository: i64, name: &str, version: &str, now: DateTime<Utc>) -> Result<Vec<String>, StoreError>;
+
     /// Insert or update in place, never replace: the row id is what
     /// surfaces, findings and the policy writer hold. The declared surface
     /// is upserted and its findings replaced in the same transaction.

@@ -2,6 +2,7 @@
 //! governed at distribution time.
 
 pub mod catalog;
+pub mod clients;
 pub mod gate;
 pub mod ingest;
 pub mod probe;
@@ -11,4 +12,5 @@ pub mod routes;
 pub mod rules;
 pub mod scan;
 pub mod schema;
+pub mod skills;
 pub mod surface;

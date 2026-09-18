@@ -18,6 +18,10 @@ use crate::ports::mcp::{
 
 #[path = "mcp_read.rs"]
 mod read;
+#[path = "mcp_skills.rs"]
+mod skills;
+
+pub(crate) use skills::REFERENCED;
 
 pub struct SqliteMcpStore {
     pool: SqlitePool,
@@ -622,6 +626,22 @@ async fn write_approval(tx: &mut Tx, a: &NewApproval) -> Result<i64, sqlx::Error
 
 #[async_trait]
 impl McpStore for SqliteMcpStore {
+    async fn publish_skill(&self, skill: &crate::ports::mcp::NewSkill) -> Result<i64, StoreError> {
+        skills::publish(&self.pool, skill).await
+    }
+
+    async fn skills(&self, member: i64, addressed: i64) -> Result<Vec<crate::ports::mcp::SkillRow>, StoreError> {
+        skills::list(&self.pool, member, addressed).await
+    }
+
+    async fn skill(&self, member: i64, addressed: i64, name: &str, version: &str) -> Result<Option<crate::ports::mcp::SkillRow>, StoreError> {
+        skills::one(&self.pool, member, addressed, name, version).await
+    }
+
+    async fn delete_skill(&self, repository: i64, name: &str, version: &str, now: DateTime<Utc>) -> Result<Vec<String>, StoreError> {
+        skills::delete(&self.pool, repository, name, version, now).await
+    }
+
     async fn upsert_record(&self, record: &RecordWrite) -> Result<Upserted, StoreError> {
         immediate(&self.pool, |mut tx| {
             Box::pin(async move {

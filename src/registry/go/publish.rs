@@ -1,5 +1,4 @@
 use std::collections::HashMap;
-use std::io::Read as _;
 
 use axum::{
     extract::{Path, State},
@@ -152,27 +151,24 @@ async fn store_version(
 /// The first `go.mod` in the archive (`{module}@{version}/go.mod` by
 /// convention), or a minimal one; the inflated read is capped against zip bombs.
 fn extract_go_mod_from_zip(zip_data: &[u8], module_name: &str) -> AppResult<String> {
-    let reader = std::io::Cursor::new(zip_data);
-    let mut archive = zip::ZipArchive::new(reader)
-        .map_err(|e| AppError::BadRequest(format!("invalid zip file: {e}")))?;
-
-    for i in 0..archive.len() {
-        let mut file = archive
-            .by_index(i)
-            .map_err(|e| AppError::BadRequest(format!("failed to read zip entry: {e}")))?;
-        if !file.name().ends_with("go.mod") {
-            continue;
-        }
-        if file.size() > MAX_GO_MOD_BYTES {
-            return Err(AppError::BadRequest("go.mod entry too large".to_string()));
-        }
-        let mut contents = String::new();
-        file.by_ref()
-            .take(MAX_GO_MOD_BYTES)
-            .read_to_string(&mut contents)
-            .map_err(|e| AppError::BadRequest(format!("failed to read go.mod: {e}")))?;
-        return Ok(contents);
+    use crate::registry::archive::{zip_check, zip_member, ArchiveError, Budget, Limits};
+    let refused = |e: ArchiveError| match e {
+        ArchiveError::Unreadable(why) => AppError::BadRequest(format!("invalid zip file: {why}")),
+        ArchiveError::TooLarge(..) => AppError::BadRequest("go.mod entry too large".to_string()),
+        other => AppError::BadRequest(format!("invalid zip file: {other}")),
+    };
+    let every = Limits {
+        max_members: None,
+        max_inflated: None,
+    };
+    zip_check(zip_data, every).map_err(refused)?;
+    let budget = Budget {
+        max_members: usize::MAX,
+        max_member_bytes: MAX_GO_MOD_BYTES,
+    };
+    match zip_member(zip_data, budget, |n| n.ends_with("go.mod")).map_err(refused)? {
+        Some((_, bytes)) => String::from_utf8(bytes)
+            .map_err(|e| AppError::BadRequest(format!("failed to read go.mod: {e}"))),
+        None => Ok(format!("module {module_name}\n\ngo 1.21\n")),
     }
-
-    Ok(format!("module {module_name}\n\ngo 1.21\n"))
 }

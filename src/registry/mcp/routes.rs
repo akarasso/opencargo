@@ -16,7 +16,13 @@ pub fn routes() -> Router<AppState> {
     let mut router = Router::new();
     router = router
         .route("/{repo}/v0.1/publish", post(super::publish::publish))
-        .route("/{repo}/v0.1/surfaces", post(super::publish::attest));
+        .route("/{repo}/v0.1/surfaces", post(super::publish::attest))
+        .route(
+            "/{repo}/skills/{name}/{version}/skill.zip",
+            get(super::skills::download).put(super::skills::upload).delete(super::skills::delete),
+        )
+        .route("/{repo}/.claude-plugin/marketplace.json", get(super::skills::marketplace))
+        .route("/{repo}/clients/{client}/config.json", get(super::clients::config));
     for v in VERSIONS {
         router = router
             .route(&format!("/{{repo}}/{v}/servers"), get(list_servers))
