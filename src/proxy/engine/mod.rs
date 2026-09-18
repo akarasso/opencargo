@@ -4,7 +4,7 @@ mod transfer;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::http::{header, HeaderName, HeaderValue, StatusCode};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
@@ -18,7 +18,9 @@ use crate::storage::StorageBackend;
 
 use super::auth::{send_with_auth, TokenCache};
 use super::singleflight::Singleflight;
-use super::strategy::{CacheKey, CachePolicy, Classified, Ttl, UpstreamStrategy, UrlSource};
+use super::strategy::{
+    CacheKey, CachePolicy, Classified, DigestAlgorithm, Ttl, UpstreamStrategy, UrlSource,
+};
 
 pub use payload::{cache_path, Cached, IntoPayload, PartFile, Payload, Src};
 use transfer::Reply;
@@ -448,6 +450,12 @@ impl ProxyEngine {
             }
             (None, None) => return None,
         };
+        if !s
+            .expected_digests(a, &HeaderMap::new())
+            .admits_stored_sha256(target.digest.as_deref())
+        {
+            return None;
+        }
         let path = target.storage_path.as_deref()?;
         self.storage.exists(path).await.ok()?.then_some(target)
     }
@@ -505,11 +513,11 @@ impl ProxyEngine {
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(0);
-            return Ok(Outcome::Found(Payload::head_only(
-                size,
-                content_type,
-                s.expected_sha256(a),
-            )));
+            let known = s
+                .expected_digests(a, &HeaderMap::new())
+                .known(DigestAlgorithm::Sha256)
+                .map(String::from);
+            return Ok(Outcome::Found(Payload::head_only(size, content_type, known)));
         }
         match s.classify_status(a, status) {
             Classified::Miss | Classified::Refused => Ok(Outcome::NotFound),

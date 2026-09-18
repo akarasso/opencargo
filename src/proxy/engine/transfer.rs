@@ -2,14 +2,17 @@ use std::future::Future;
 
 use axum::http::{header, HeaderMap, StatusCode};
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::domain::{CacheEntry, CacheRepo, NewEntry};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::Upstream;
 
 use super::super::auth::send_with_auth;
-use super::super::strategy::{Classified, Transfer, UpstreamStrategy};
+use super::super::strategy::{
+    Classified, DigestAlgorithm, ExpectedDigests, RedirectRule, Transfer, UpstreamStrategy,
+};
 use super::{cache_path, PartFile, ProxyEngine, Stale};
 
 /// What one upstream exchange ended in; `Failed` is stale-eligible, an
@@ -48,12 +51,21 @@ impl ProxyEngine {
             req = req.header(header::IF_NONE_MATCH, etag);
         }
         let scope = s.bearer_scope(a);
-        let send = send_with_auth(&self.http, &self.tokens, member, up, req, scope.as_deref());
+        let credentials = s.send_credentials(a);
+        let send = async {
+            if credentials {
+                send_with_auth(&self.http, &self.tokens, member, up, req, scope.as_deref()).await
+            } else {
+                req.send()
+                    .await
+                    .map_err(|e| AppError::BadGateway(format!("upstream request failed: {e}")))
+            }
+        };
         match s.transfer(a) {
             Transfer::Buffered => {
                 let bounded = tokio::time::timeout(
                     self.timeouts.buffered_total,
-                    self.complete(s, member, a, send, now),
+                    self.complete(s, member, a, &url, send, now),
                 );
                 match bounded.await {
                     Ok(reply) => reply,
@@ -62,7 +74,7 @@ impl ProxyEngine {
                     ))),
                 }
             }
-            Transfer::Streamed => self.complete(s, member, a, send, now).await,
+            Transfer::Streamed => self.complete(s, member, a, &url, send, now).await,
         }
     }
 
@@ -71,6 +83,7 @@ impl ProxyEngine {
         s: &S,
         member: CacheRepo<'_>,
         a: &S::Artifact,
+        asked: &reqwest::Url,
         send: impl Future<Output = AppResult<reqwest::Response>>,
         now: DateTime<Utc>,
     ) -> AppResult<Reply> {
@@ -79,6 +92,9 @@ impl ProxyEngine {
             Err(AppError::BadGateway(why)) => return Ok(Reply::Failed(why)),
             Err(e) => return Err(e),
         };
+        if !redirect_allowed(s.final_url_must_match(a), asked, resp.url()) {
+            return Err(AppError::BadGateway("upstream redirected off its origin".into()));
+        }
         let status = resp.status();
         if status == StatusCode::NOT_MODIFIED {
             return Ok(Reply::NotModified);
@@ -109,6 +125,8 @@ impl ProxyEngine {
         mut resp: reqwest::Response,
     ) -> AppResult<Result<Body, String>> {
         let headers = resp.headers().clone();
+        let expected = s.expected_digests(a, &headers);
+        let mut digests = Hashers::for_expected(&expected);
         let max = s.max_bytes(a);
         let part_rel = format!(
             "{}.part-{}",
@@ -116,7 +134,6 @@ impl ProxyEngine {
             uuid::Uuid::new_v4()
         );
         let mut part = PartFile::new(self.storage.as_ref(), part_rel).await?;
-        let mut hasher = Sha256::new();
         let mut size = 0u64;
         loop {
             let chunk = match resp.chunk().await {
@@ -130,16 +147,17 @@ impl ProxyEngine {
                     "upstream body exceeds {max} bytes"
                 )));
             }
-            hasher.update(&chunk);
+            digests.update(&chunk);
             part.write_chunk(&chunk).await?;
         }
-        let sha256 = format!("{:x}", hasher.finalize());
-        if s.expected_sha256(a)
-            .is_some_and(|expected| expected != sha256)
-        {
-            return Err(AppError::BadGateway("upstream body digest mismatch".into()));
+        let computed = digests.finish();
+        if let Some(wrong) = expected.mismatch(|alg| computed.get(alg)) {
+            return Err(AppError::BadGateway(format!(
+                "upstream body digest mismatch ({:?} {:?})",
+                wrong.source, wrong.algorithm
+            )));
         }
-        s.verify_headers(a, &headers, &sha256)?;
+        let sha256 = computed.sha256.clone();
         let path = cache_path(member, &s.store_key(a, &sha256));
         part.commit(self.storage.as_ref(), &path).await?;
         Ok(Ok(Body {
@@ -198,4 +216,64 @@ impl ProxyEngine {
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// sha256 always, for the store key; the others only when an expected digest
+/// names them.
+struct Hashers {
+    sha256: Sha256,
+    sha512: Option<Sha512>,
+    sha1: Option<Sha1>,
+}
+
+struct Computed {
+    sha256: String,
+    sha512: Option<String>,
+    sha1: Option<String>,
+}
+
+impl Hashers {
+    fn for_expected(expected: &ExpectedDigests) -> Self {
+        let wants = |alg| expected.entries().iter().any(|d| d.algorithm == alg);
+        Self {
+            sha256: Sha256::new(),
+            sha512: wants(DigestAlgorithm::Sha512).then(Sha512::new),
+            sha1: wants(DigestAlgorithm::Sha1).then(Sha1::new),
+        }
+    }
+
+    fn update(&mut self, chunk: &[u8]) {
+        self.sha256.update(chunk);
+        if let Some(h) = &mut self.sha512 {
+            h.update(chunk);
+        }
+        if let Some(h) = &mut self.sha1 {
+            h.update(chunk);
+        }
+    }
+
+    fn finish(self) -> Computed {
+        Computed {
+            sha256: format!("{:x}", self.sha256.finalize()),
+            sha512: self.sha512.map(|h| format!("{:x}", h.finalize())),
+            sha1: self.sha1.map(|h| format!("{:x}", h.finalize())),
+        }
+    }
+}
+
+impl Computed {
+    fn get(&self, alg: DigestAlgorithm) -> Option<String> {
+        match alg {
+            DigestAlgorithm::Sha256 => Some(self.sha256.clone()),
+            DigestAlgorithm::Sha512 => self.sha512.clone(),
+            DigestAlgorithm::Sha1 => self.sha1.clone(),
+        }
+    }
+}
+
+fn redirect_allowed(rule: RedirectRule, asked: &reqwest::Url, landed: &reqwest::Url) -> bool {
+    match rule {
+        RedirectRule::Unrestricted => true,
+        RedirectRule::SameOrigin => asked.origin() == landed.origin(),
+    }
 }

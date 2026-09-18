@@ -912,3 +912,52 @@ async fn refresh_never_records_a_miss() {
         "the same route under fetch writes the 404 row"
     );
 }
+
+fn sha256_hex(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(body))
+}
+
+#[tokio::test]
+async fn warm_entry_with_stale_digest_is_refetched() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/pinned".to_string();
+    let first = Strat {
+        policy: CachePolicy::Immutable,
+        known: Some(sha256_hex(b"hello upstream")),
+        ..Default::default()
+    };
+    found(engine.fetch(&first, &fx.up, fx.member(), &art).await);
+    found(engine.fetch(&first, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 1, "a matching warm entry is served");
+
+    fx.set(|s| s.body = b"republished".to_vec());
+    let republished = Strat {
+        policy: CachePolicy::Immutable,
+        known: Some(sha256_hex(b"republished")),
+        ..Default::default()
+    };
+    let got = found(engine.fetch(&republished, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 2, "a stale digest is a miss");
+    assert_eq!(
+        got.entry.digest.as_deref(),
+        Some(sha256_hex(b"republished").as_str())
+    );
+    assert_eq!(engine.bytes(&got).await.unwrap().as_ref(), b"republished");
+}
+
+#[tokio::test]
+async fn a_body_contradicting_its_known_digest_is_refused() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let strat = Strat {
+        known: Some(sha256_hex(b"something else")),
+        ..Default::default()
+    };
+    let res = engine
+        .fetch(&strat, &fx.up, fx.member(), &"art/x".to_string())
+        .await;
+    assert!(matches!(res, Err(AppError::BadGateway(_))), "{res:?}");
+    assert!(fx.row("t-item", "art/x").await.is_none(), "nothing recorded");
+}

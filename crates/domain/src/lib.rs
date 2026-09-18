@@ -26,7 +26,8 @@ pub use names::{
 pub use permission::{allows, can_admin, effective_rights, RepoAction, Rights, RightsSource};
 pub use policy::{RuleVerdict, Verdict};
 pub use proxy::{
-    CacheEntry, CacheEntryId, CachePolicy, Classified, NewEntry, RepoId, Transfer, Ttl, UrlSource,
+    CacheEntry, CacheEntryId, CachePolicy, Classified, DigestAlgorithm, DigestSource,
+    ExpectedDigest, ExpectedDigests, NewEntry, RedirectRule, RepoId, Transfer, Ttl, UrlSource,
 };
 pub use repository::{DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version};
 pub use resolve::{CacheRepo, Miss, Outcome, UrlRepo, Visit, Walk, MAX_GROUP_DEPTH};

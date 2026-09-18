@@ -17,7 +17,8 @@ use crate::error::StoreError;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::proxy::engine::{ProxyEngine, Timeouts, TtlConfig};
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
+    CacheKey, CachePolicy, DigestAlgorithm, DigestSource, ExpectedDigests, Transfer, Ttl,
+    UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
 };
 use crate::registry::resolve::{ResolveError, Upstream};
 use crate::storage::StorageBackend;
@@ -123,6 +124,8 @@ pub(crate) struct Strat {
     pub max: u64,
     pub via_get: bool,
     pub source: UrlSource,
+    /// The sha256 the artifact announces before any response.
+    pub known: Option<String>,
 }
 
 impl Default for Strat {
@@ -134,6 +137,7 @@ impl Default for Strat {
             max: DEFAULT_MAX_UPSTREAM_BYTES,
             via_get: true,
             source: UrlSource::Admin,
+            known: None,
         }
     }
 }
@@ -169,6 +173,13 @@ impl UpstreamStrategy for Strat {
 
     fn cache_policy(&self, _a: &String) -> CachePolicy {
         self.policy
+    }
+
+    fn expected_digests(&self, _a: &String, _h: &HeaderMap) -> ExpectedDigests {
+        match &self.known {
+            Some(hex) => ExpectedDigests::none().with(DigestAlgorithm::Sha256, hex, DigestSource::Known),
+            None => ExpectedDigests::none(),
+        }
     }
 
     fn transfer(&self, _a: &String) -> Transfer {

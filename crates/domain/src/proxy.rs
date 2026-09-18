@@ -54,6 +54,94 @@ pub enum UrlSource {
     Content { allow_private: bool },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum DigestAlgorithm {
+    Sha1,
+    Sha256,
+    Sha512,
+}
+
+/// Where an expected digest came from: the artifact's own address or index
+/// entry, a response header, or a sidecar document fetched beside it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum DigestSource {
+    Known,
+    Header,
+    Sidecar,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct ExpectedDigest {
+    pub algorithm: DigestAlgorithm,
+    /// Lowercase hex.
+    pub value: String,
+    pub source: DigestSource,
+}
+
+/// Every digest an upstream body must match; empty only when the strategy
+/// declares it has nothing to verify.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+pub struct ExpectedDigests(Vec<ExpectedDigest>);
+
+impl ExpectedDigests {
+    pub fn none() -> Self {
+        Self(Vec::new())
+    }
+
+    pub fn with(mut self, algorithm: DigestAlgorithm, value: &str, source: DigestSource) -> Self {
+        self.0.push(ExpectedDigest {
+            algorithm,
+            value: value.to_ascii_lowercase(),
+            source,
+        });
+        self
+    }
+
+    pub fn entries(&self) -> &[ExpectedDigest] {
+        &self.0
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    pub fn known(&self, algorithm: DigestAlgorithm) -> Option<&str> {
+        self.0
+            .iter()
+            .find(|d| d.algorithm == algorithm && d.source == DigestSource::Known)
+            .map(|d| d.value.as_str())
+    }
+
+    /// The first entry the computed digests contradict; a digest the caller
+    /// did not compute is a contradiction, never a pass.
+    pub fn mismatch(
+        &self,
+        computed: impl Fn(DigestAlgorithm) -> Option<String>,
+    ) -> Option<&ExpectedDigest> {
+        self.0
+            .iter()
+            .find(|d| computed(d.algorithm).is_none_or(|c| !c.eq_ignore_ascii_case(&d.value)))
+    }
+
+    /// Whether a stored body's sha256 agrees with the `Known` sha256, when
+    /// there is one.
+    pub fn admits_stored_sha256(&self, stored: Option<&str>) -> bool {
+        match (self.known(DigestAlgorithm::Sha256), stored) {
+            (Some(known), Some(stored)) => known.eq_ignore_ascii_case(stored),
+            (Some(_), None) => false,
+            (None, _) => true,
+        }
+    }
+}
+
+/// Where an upstream may redirect a request to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum RedirectRule {
+    #[default]
+    Unrestricted,
+    SameOrigin,
+}
+
 /// One remembered upstream answer: where its body is, what it was, and until
 /// when it may be served.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -118,6 +206,40 @@ mod tests {
 
     fn at(hour: u32) -> DateTime<Utc> {
         Utc.with_ymd_and_hms(2026, 9, 18, hour, 0, 0).unwrap()
+    }
+
+    #[test]
+    fn every_expected_digest_is_checked() {
+        let expected = ExpectedDigests::none()
+            .with(DigestAlgorithm::Sha256, "AB", DigestSource::Known)
+            .with(DigestAlgorithm::Sha512, "cd", DigestSource::Header);
+        let both = |a| match a {
+            DigestAlgorithm::Sha256 => Some("ab".to_string()),
+            DigestAlgorithm::Sha512 => Some("cd".to_string()),
+            DigestAlgorithm::Sha1 => None,
+        };
+        assert!(expected.mismatch(both).is_none());
+        let wrong = |a| match a {
+            DigestAlgorithm::Sha256 => Some("ab".to_string()),
+            _ => Some("zz".to_string()),
+        };
+        assert_eq!(
+            expected.mismatch(wrong).map(|d| d.source),
+            Some(DigestSource::Header)
+        );
+        assert!(expected.mismatch(|_| None).is_some(), "uncomputed is not a pass");
+        assert!(ExpectedDigests::none().mismatch(|_| None).is_none());
+    }
+
+    #[test]
+    fn a_stored_body_is_admitted_only_under_its_known_digest() {
+        let known = ExpectedDigests::none().with(DigestAlgorithm::Sha256, "ab", DigestSource::Known);
+        assert!(known.admits_stored_sha256(Some("AB")));
+        assert!(!known.admits_stored_sha256(Some("cd")));
+        assert!(!known.admits_stored_sha256(None));
+        let header =
+            ExpectedDigests::none().with(DigestAlgorithm::Sha256, "ab", DigestSource::Header);
+        assert!(header.admits_stored_sha256(Some("cd")), "a header is per response");
     }
 
     #[test]

@@ -2,7 +2,8 @@ use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 
 use crate::proxy::auth::is_docker_hub_host;
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Classified, Transfer, Ttl, UpstreamStrategy, MAX_METADATA_BYTES,
+    CacheKey, CachePolicy, Classified, DigestAlgorithm, DigestSource, ExpectedDigests, Transfer,
+    Ttl, UpstreamStrategy, MAX_METADATA_BYTES,
 };
 use crate::registry::resolve::{ResolveError, Upstream};
 
@@ -127,15 +128,23 @@ impl UpstreamStrategy for OciUpstream {
         }
     }
 
-    fn verify_headers(&self, _a: &OciArtifact, h: &HeaderMap, body_sha256: &str) -> Result<(), ResolveError> {
-        match h.get(DOCKER_CONTENT_DIGEST).and_then(|v| v.to_str().ok()) {
-            Some(claimed) if claimed != format!("sha256:{body_sha256}") => {
-                Err(ResolveError::Upstream(format!(
-                    "upstream Docker-Content-Digest {claimed} does not match the body"
-                )))
-            }
-            _ => Ok(()),
+    /// The digest of the address, and the one the upstream announces. An
+    /// announced digest in another algorithm cannot be checked and is
+    /// refused rather than ignored.
+    fn expected_digests(&self, a: &OciArtifact, h: &HeaderMap) -> ExpectedDigests {
+        let mut expected = ExpectedDigests::none();
+        if let Some(hex) = a.digest_hex() {
+            expected = expected.with(DigestAlgorithm::Sha256, hex, DigestSource::Known);
         }
+        if let Some(claimed) = h.get(DOCKER_CONTENT_DIGEST).and_then(|v| v.to_str().ok()) {
+            let (algorithm, hex) = match claimed.split_once(':') {
+                Some(("sha256", hex)) => (DigestAlgorithm::Sha256, hex),
+                Some(("sha512", hex)) => (DigestAlgorithm::Sha512, hex),
+                _ => (DigestAlgorithm::Sha256, claimed),
+            };
+            expected = expected.with(algorithm, hex, DigestSource::Header);
+        }
+        expected
     }
 
     fn cache_policy(&self, a: &OciArtifact) -> CachePolicy {
@@ -168,10 +177,6 @@ impl UpstreamStrategy for OciUpstream {
             }
             OciArtifact::Blob { .. } | OciArtifact::Tags { .. } => Vec::new(),
         }
-    }
-
-    fn expected_sha256(&self, a: &OciArtifact) -> Option<String> {
-        a.digest_hex().map(String::from)
     }
 
     fn bearer_scope(&self, a: &OciArtifact) -> Option<String> {
@@ -213,6 +218,30 @@ mod tests {
             name: upstream_name(up, name),
             tag: "latest".into(),
         }
+    }
+
+    #[test]
+    fn expected_digests_are_the_address_and_the_announced_digest() {
+        let blob = OciArtifact::Blob {
+            name: "a".into(),
+            digest: format!("sha256:{}", "ab".repeat(32)),
+        };
+        let mut h = HeaderMap::new();
+        h.insert(DOCKER_CONTENT_DIGEST, HeaderValue::from_static("sha256:CD"));
+        let got = OciUpstream.expected_digests(&blob, &h);
+        assert_eq!(got.known(DigestAlgorithm::Sha256), Some("ab".repeat(32).as_str()));
+        assert_eq!(got.entries().len(), 2);
+        assert_eq!(got.entries()[1].source, DigestSource::Header);
+        assert_eq!(got.entries()[1].value, "cd");
+
+        let tag = OciArtifact::Tag { name: "a".into(), tag: "latest".into() };
+        assert!(OciUpstream.expected_digests(&tag, &HeaderMap::new()).is_empty());
+        h.insert(DOCKER_CONTENT_DIGEST, HeaderValue::from_static("md5:zz"));
+        let odd = OciUpstream.expected_digests(&tag, &h);
+        assert!(
+            odd.mismatch(|_| Some("ab".repeat(32))).is_some(),
+            "an announced digest that cannot be checked is refused"
+        );
     }
 
     #[test]
