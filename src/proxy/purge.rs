@@ -4,26 +4,33 @@ use std::pin::Pin;
 
 use tracing::warn;
 
-use crate::db::kinds::RepoKind;
-use crate::db::Repository;
+use crate::domain::{CacheRepo, MAX_GROUP_DEPTH};
+use crate::domain::{RepoKind, Repository};
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{CacheRepo, MAX_GROUP_DEPTH};
-use crate::server::AppState;
+use crate::ports::repositories::RepositoryStore;
+use crate::proxy::engine::ProxyEngine;
 
 /// Proxy: rows, legacy meta and files; Group: every proxy member, nested
 /// groups included; Hosted: 400.
-pub async fn purge_repository(state: &AppState, repo: &Repository) -> AppResult<()> {
+pub async fn purge_repository(
+    proxy: &ProxyEngine,
+    repos: &dyn RepositoryStore,
+    repo: &Repository,
+) -> AppResult<()> {
     match repo.kind()? {
         RepoKind::Hosted => Err(AppError::BadRequest(
             "can only purge cache on proxy or group repositories".to_string(),
         )),
-        RepoKind::Proxy => state.proxy.purge_repo(CacheRepo(repo)).await,
-        RepoKind::Group => purge_members(state, repo, 0, &mut HashSet::from([repo.id])).await,
+        RepoKind::Proxy => proxy.purge_repo(CacheRepo(repo)).await,
+        RepoKind::Group => {
+            purge_members(proxy, repos, repo, 0, &mut HashSet::from([repo.id])).await
+        }
     }
 }
 
 fn purge_members<'a>(
-    state: &'a AppState,
+    proxy: &'a ProxyEngine,
+    repos: &'a dyn RepositoryStore,
     group: &'a Repository,
     depth: u32,
     seen: &'a mut HashSet<i64>,
@@ -35,7 +42,7 @@ fn purge_members<'a>(
             ));
         }
         for name in group.members() {
-            let Some(member) = crate::db::get_repository_by_name(&state.db, &name).await? else {
+            let Some(member) = repos.by_name(&name).await? else {
                 warn!(group = %group.name, member = %name, "group member not found; skipping purge");
                 continue;
             };
@@ -43,8 +50,8 @@ fn purge_members<'a>(
                 continue;
             }
             match member.kind()? {
-                RepoKind::Proxy => state.proxy.purge_repo(CacheRepo(&member)).await?,
-                RepoKind::Group => purge_members(state, &member, depth + 1, seen).await?,
+                RepoKind::Proxy => proxy.purge_repo(CacheRepo(&member)).await?,
+                RepoKind::Group => purge_members(proxy, repos, &member, depth + 1, seen).await?,
                 RepoKind::Hosted => {}
             }
         }

@@ -7,42 +7,28 @@ use axum::{
 };
 use serde_json::{json, Value};
 
+use crate::domain::{Package, Version};
 use crate::error::{AppError, AppResult};
+use crate::ports::packages::PackageStore;
 use crate::registry::extract_package_name;
 use crate::server::AppState;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Find a package across all repositories by name.
-/// Returns the first match found.
 /// `true` unless the caller is an admin — restricts dependency lookups to
 /// packages hosted in publicly-visible repositories.
 fn public_only(auth: &Option<axum::Extension<crate::auth::middleware::AuthUser>>) -> bool {
     !auth.as_ref().map(|e| e.0.role == "admin").unwrap_or(false)
 }
 
+/// The first package of that name anywhere, with its versions: these routes
+/// are addressed by a bare name, with no repository in the path.
 async fn find_package_by_name(
-    db: &sqlx::SqlitePool,
+    packages: &dyn PackageStore,
     name: &str,
     public_only: bool,
-) -> Result<Option<(crate::db::Package, Vec<crate::db::Version>)>, sqlx::Error> {
-    let vis = if public_only {
-        " AND repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
-    } else {
-        ""
-    };
-    let package: Option<crate::db::Package> = sqlx::query_as(&format!(
-        "SELECT * FROM packages WHERE name = ?1{vis} LIMIT 1",
-    ))
-    .bind(name)
-    .fetch_optional(db)
-    .await?;
-
-    match package {
+) -> AppResult<Option<(Package, Vec<Version>)>> {
+    match packages.anywhere(name, public_only).await? {
         Some(pkg) => {
-            let versions = crate::db::get_versions(db, pkg.id).await?;
+            let versions = packages.versions(pkg.id).await?;
             Ok(Some((pkg, versions)))
         }
         None => Ok(None),
@@ -75,7 +61,7 @@ async fn get_dependencies_impl(
     name: String,
     public_only: bool,
 ) -> AppResult<impl IntoResponse> {
-    let (pkg, versions) = find_package_by_name(&state.db, &name, public_only)
+    let (pkg, versions) = find_package_by_name(state.packages.as_ref(), &name, public_only)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
 
@@ -84,15 +70,15 @@ async fn get_dependencies_impl(
         AppError::NotFound(format!("no versions found for package: {name}"))
     })?;
 
-    let deps = crate::db::get_dependencies_for_version(&state.db, latest_version.id).await?;
+    let deps = state.deps.of_version(latest_version.id).await?;
 
     let dep_list: Vec<Value> = deps
         .iter()
         .map(|d| {
             json!({
-                "name": d.dependency_name,
-                "version_req": d.dependency_version_req,
-                "type": d.dependency_type,
+                "name": d.name,
+                "version_req": d.requirement,
+                "type": d.kind,
             })
         })
         .collect();
@@ -130,7 +116,7 @@ async fn get_dependents_impl(
     name: String,
     public_only: bool,
 ) -> AppResult<impl IntoResponse> {
-    let dependents = crate::db::get_dependents(&state.db, &name, public_only).await?;
+    let dependents = state.deps.dependents(&name, public_only).await?;
 
     let dep_list: Vec<Value> = dependents
         .iter()
@@ -181,7 +167,7 @@ async fn impact_analysis_impl(
     public_only: bool,
 ) -> AppResult<impl IntoResponse> {
     // Find all packages that depend on this package
-    let dependents = crate::db::get_dependents(&state.db, &name, public_only).await?;
+    let dependents = state.deps.dependents(&name, public_only).await?;
 
     let affected: Vec<String> = dependents
         .iter()

@@ -7,10 +7,12 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{record_audit, require_admin_or_self, require_auth};
-use crate::auth::tokens as auth_tokens;
+use crate::api::{actor, require_admin_or_self, require_auth};
+use crate::app::tokens::{IssueToken, RevokeToken};
+use crate::domain::User;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
+use crate::wire::wire_ts;
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -35,11 +37,8 @@ pub async fn list_tokens(
     let caller = require_auth(&request)?;
     require_admin_or_self(&caller, &username)?;
 
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))?;
-
-    let tokens = crate::db::list_user_tokens(&state.db, user.id).await?;
+    let user = load_user(&state, &username).await?;
+    let tokens = state.tokens.of_user(user.id).await?;
 
     let result: Vec<serde_json::Value> = tokens
         .iter()
@@ -48,9 +47,9 @@ pub async fn list_tokens(
                 "id": t.id,
                 "name": t.name,
                 "prefix": t.prefix,
-                "expires_at": t.expires_at,
-                "last_used_at": t.last_used_at,
-                "created_at": t.created_at,
+                "expires_at": t.expires_at.map(wire_ts),
+                "last_used_at": t.last_used_at.map(wire_ts),
+                "created_at": wire_ts(t.created_at),
             })
         })
         .collect();
@@ -82,41 +81,30 @@ pub async fn create_token(
         serde_json::from_slice(&bytes)?
     };
 
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))?;
-
-    let token_id = uuid::Uuid::new_v4().to_string();
-    let (raw_token, token_hash) = auth_tokens::generate_token("trg_");
-    let prefix = &raw_token[..16];
-
-    let expires_at = body.expires_in_days.map(|days| {
-        let now = chrono::Utc::now();
-        let expiry = now + chrono::Duration::days(days);
-        expiry.format("%Y-%m-%d %H:%M:%S").to_string()
-    });
-
-    crate::db::create_api_token(
-        &state.db,
-        &token_id,
-        user.id,
+    let issued = IssueToken::new(
+        state.users.clone(),
+        state.tokens.clone(),
+        state.ids.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+    )
+    .run(
+        &username,
         &body.name,
-        prefix,
-        &token_hash,
-        expires_at.as_deref(),
+        body.expires_in_days,
+        &actor(&caller),
+        state.clock.now(),
     )
     .await?;
-
-    record_audit(&state, &caller, "token.create", Some(&username)).await;
 
     Ok((
         StatusCode::CREATED,
         Json(json!({
-            "id": token_id,
-            "name": body.name,
-            "token": raw_token,
-            "prefix": prefix,
-            "expires_at": expires_at,
+            "id": issued.id,
+            "name": issued.name,
+            "token": issued.token,
+            "prefix": issued.prefix,
+            "expires_at": issued.expires_at.map(wire_ts),
         })),
     ))
 }
@@ -130,22 +118,23 @@ pub async fn delete_token(
     let caller = require_auth(&request)?;
     require_admin_or_self(&caller, &username)?;
 
-    // Verify the user exists
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))?;
-
-    // Verify token belongs to this user
-    let token = crate::db::get_token_by_id(&state.db, &token_id)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("token not found: {token_id}")))?;
-    if token.user_id != user.id {
-        return Err(AppError::Forbidden("token does not belong to this user".to_string()));
-    }
-
-    crate::db::delete_token(&state.db, &token_id).await?;
-
-    record_audit(&state, &caller, "token.revoke", Some(&username)).await;
+    RevokeToken::new(
+        state.users.clone(),
+        state.tokens.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+    )
+    .run(&username, &token_id, &actor(&caller), state.clock.now())
+    .await?;
 
     Ok(Json(json!({"ok": true})))
+}
+
+/// The account the tokens belong to, or the 404 naming it.
+async fn load_user(state: &AppState, username: &str) -> AppResult<User> {
+    state
+        .users
+        .by_name(username)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))
 }

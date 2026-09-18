@@ -1,12 +1,11 @@
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::db::kinds::Format;
-use crate::db::{Package, Version};
-use crate::error::{AppError, AppResult};
+use crate::domain::{CacheRepo, Format, Outcome, Package, Version};
 use crate::policy::{self, Source};
-use crate::proxy::Payload;
-use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
+use crate::ports::packages::NameMatch;
+use crate::proxy::{IntoPayload, Payload};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
 use super::escape::unescape;
 use super::upstream::{FileKind, GoArtifact, GoUpstream};
@@ -17,21 +16,23 @@ async fn hosted_package(
     cx: &Cx<'_>,
     member: CacheRepo<'_>,
     module: &str,
-) -> AppResult<Option<Package>> {
-    Ok(crate::db::get_package(&cx.state.db, member.0.id, &unescape(module)).await?)
+) -> Result<Option<Package>, ResolveError> {
+    let found = cx
+        .packages
+        .package(member.0.id, &unescape(module), NameMatch::Exact)
+        .await?;
+    Ok(found)
 }
 
 async fn hosted_versions(
     cx: &Cx<'_>,
     member: CacheRepo<'_>,
     module: &str,
-) -> AppResult<Option<Vec<Version>>> {
+) -> Result<Option<Vec<Version>>, ResolveError> {
     let Some(package) = hosted_package(cx, member, module).await? else {
         return Ok(None);
     };
-    Ok(Some(
-        crate::db::get_versions(&cx.state.db, package.id).await?,
-    ))
+    Ok(Some(cx.packages.versions(package.id).await?))
 }
 
 async fn fetch_bytes(
@@ -39,8 +40,8 @@ async fn fetch_bytes(
     member: CacheRepo<'_>,
     up: &Upstream,
     a: &GoArtifact,
-) -> AppResult<Outcome<Bytes>> {
-    let engine = &cx.state.proxy;
+) -> Result<Outcome<Bytes>, ResolveError> {
+    let engine = cx.proxy;
     Ok(match engine.fetch(&GoUpstream, up, member, a).await? {
         Outcome::Found(cached) => Outcome::Found(engine.bytes(&cached).await?),
         Outcome::NotFound => Outcome::NotFound,
@@ -56,7 +57,11 @@ pub struct ListLeaf {
 impl Leaf for ListLeaf {
     type Out = Vec<String>;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Vec<String>>> {
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Vec<String>>, ResolveError> {
         Ok(match hosted_versions(cx, member, &self.module).await? {
             Some(versions) => Outcome::Found(versions.into_iter().map(|v| v.version).collect()),
             None => Outcome::NotFound,
@@ -68,7 +73,7 @@ impl Leaf for ListLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Vec<String>>> {
+    ) -> Result<Outcome<Vec<String>>, ResolveError> {
         let artifact = GoArtifact::List {
             module: self.module.clone(),
         };
@@ -95,7 +100,11 @@ pub struct LatestLeaf {
 impl Leaf for LatestLeaf {
     type Out = Value;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Value>> {
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Value>, ResolveError> {
         let versions = hosted_versions(cx, member, &self.module).await?;
         Ok(match versions.as_deref().and_then(latest_of) {
             Some(latest) => Outcome::Found(info_json(latest)),
@@ -108,14 +117,14 @@ impl Leaf for LatestLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Value>> {
+    ) -> Result<Outcome<Value>, ResolveError> {
         let artifact = GoArtifact::Latest {
             module: self.module.clone(),
         };
         Ok(match fetch_bytes(cx, member, up, &artifact).await? {
             Outcome::Found(bytes) => {
                 Outcome::Found(serde_json::from_slice(&bytes).map_err(|e| {
-                    AppError::BadGateway(format!("invalid @latest document from upstream: {e}"))
+                    ResolveError::Upstream(format!("invalid @latest document from upstream: {e}"))
                 })?)
             }
             Outcome::NotFound => Outcome::NotFound,
@@ -133,21 +142,26 @@ pub struct FileLeaf {
 impl Leaf for FileLeaf {
     type Out = Payload;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Payload>> {
-        let db = &cx.state.db;
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let Some(package) = hosted_package(cx, member, &self.module).await? else {
             return Ok(Outcome::NotFound);
         };
-        let Some(version) =
-            crate::db::get_version(db, package.id, &unescape(&self.version)).await?
-        else {
+        let found = cx
+            .packages
+            .version(package.id, &unescape(&self.version))
+            .await?;
+        let Some(version) = found else {
             return Ok(Outcome::NotFound);
         };
         let payload = match self.kind {
             FileKind::Info => Payload::bytes(Bytes::from(info_json(&version).to_string())),
             FileKind::Mod => Payload::bytes(Bytes::from(version.metadata_json)),
             FileKind::Zip => {
-                let _ = crate::db::record_download(db, version.id).await;
+                let _ = cx.packages.record_download(version.id).await;
                 crate::telemetry::record_download(&member.0.name, &package.name);
                 Payload::file(version.tarball_path, version.size.max(0) as u64)
             }
@@ -160,17 +174,13 @@ impl Leaf for FileLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Payload>> {
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let artifact = GoArtifact::File {
             module: self.module.clone(),
             version: self.version.clone(),
             kind: self.kind,
         };
-        let cached = cx
-            .state
-            .proxy
-            .fetch(&GoUpstream, up, member, &artifact)
-            .await?;
+        let cached = cx.proxy.fetch(&GoUpstream, up, member, &artifact).await?;
         if let (Outcome::Found(c), FileKind::Zip) = (&cached, self.kind) {
             let version = Some(unescape(&self.version));
             policy::record(cx, member, up, Format::Go, &unescape(&self.module), version, || {

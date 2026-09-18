@@ -11,11 +11,12 @@ use serde_json::json;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
+use crate::registry::cx;
 use crate::registry::resolve::collect;
 use crate::server::AppState;
 
 use super::leaves::TagsLeaf;
-use super::{cx, OciRef, MAX_TAGS};
+use super::{OciRef, MAX_TAGS};
 
 #[derive(Deserialize)]
 pub struct ListTagsQuery {
@@ -33,9 +34,9 @@ pub async fn list_tags(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response> {
     let r = OciRef::parse(&params)?;
-    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
     let leaf = TagsLeaf {
         name: r.name.clone(),

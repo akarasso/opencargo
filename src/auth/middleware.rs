@@ -7,13 +7,18 @@ use axum::{
     Json,
 };
 use base64::Engine;
+use chrono::Utc;
 use serde_json::json;
-use sqlx::SqlitePool;
 use std::sync::Arc;
 
 use super::rate_limit::RateLimiter;
 use super::tokens;
-use crate::registry::oci::token::{self, TokenSigner};
+use crate::domain::ApiToken;
+use crate::error::StoreError;
+use crate::ports::tokens::TokenStore;
+use crate::ports::users::UserStore;
+use crate::ports::signing::RegistryTokenSigner;
+use crate::registry::oci::token;
 
 // ---------------------------------------------------------------------------
 // Auth state (passed via axum's State extractor)
@@ -23,12 +28,13 @@ use crate::registry::oci::token::{self, TokenSigner};
 pub struct AuthState {
     pub static_tokens: Vec<String>,
     pub anonymous_read: bool,
-    pub db: SqlitePool,
+    pub users: Arc<dyn UserStore>,
+    pub tokens: Arc<dyn TokenStore>,
     /// Shared with `AppState.login_rate_limiter`; throttles Basic Auth attempts.
     pub login_rate_limiter: Arc<RateLimiter>,
     /// Names the token realm in every OCI challenge.
     pub base_url: String,
-    pub registry_tokens: TokenSigner,
+    pub registry_tokens: Arc<dyn RegistryTokenSigner>,
 }
 
 // ---------------------------------------------------------------------------
@@ -49,13 +55,13 @@ pub struct AuthUser {
 }
 
 impl AuthUser {
-    fn from_user(user: crate::db::User, token: &str, token_name: Option<String>) -> Self {
+    fn from_user(user: crate::domain::User, token: &str, token_name: Option<String>) -> Self {
         Self {
             token: token.to_string(),
             user_id: Some(user.id),
             username: user.username,
             role: user.role,
-            must_change_password: user.must_change_password == 1,
+            must_change_password: user.must_change_password,
             token_name,
         }
     }
@@ -131,7 +137,7 @@ async fn authenticate(state: &AuthState, request: Request<Body>, next: Next) -> 
             Ok(Some(auth_user)) => run_as(auth_user, request, next).await,
             Ok(None) => run_anonymous(state, request, next).await,
             Err(e) => {
-                tracing::warn!(error = %e, "database error during bearer authentication");
+                tracing::warn!(error = %e, "store error during bearer authentication");
                 service_unavailable_response()
             }
         },
@@ -184,12 +190,10 @@ pub(crate) async fn authenticate_basic(
     if state.login_rate_limiter.is_limited(&rl_key) {
         return Err(AuthFailure::Throttled);
     }
-    let user = crate::db::get_user_by_username(&state.db, username)
-        .await
-        .map_err(|e| {
-            tracing::warn!(error = %e, "database error during basic authentication");
-            AuthFailure::Unavailable
-        })?;
+    let user = state.users.by_name(username).await.map_err(|e| {
+        tracing::warn!(error = %e, "store error during basic authentication");
+        AuthFailure::Unavailable
+    })?;
     if let Some(user) = user {
         let password_ok =
             super::users::verify_password_async(password.to_string(), user.password_hash.clone())
@@ -218,11 +222,11 @@ async fn run_registry_token(
     };
     let mut token_name = None;
     if let Some(id) = claims.api_token_id.as_deref() {
-        match live_api_token_by_id(&state.db, id).await {
+        match live_api_token_by_id(state, id).await {
             Ok(Some(api_token)) => token_name = Some(api_token.name),
             Ok(None) => return unauthorized_response(is_oci),
             Err(e) => {
-                tracing::warn!(error = %e, "database error during registry token authentication");
+                tracing::warn!(error = %e, "store error during registry token authentication");
                 return service_unavailable_response();
             }
         }
@@ -236,11 +240,11 @@ async fn run_registry_token(
     let Some(username) = subject else {
         return run_anonymous(state, request, next).await;
     };
-    match crate::db::get_user_by_username(&state.db, &username).await {
+    match state.users.by_name(&username).await {
         Ok(Some(user)) => run_as(AuthUser::from_user(user, raw, token_name), request, next).await,
         Ok(None) => unauthorized_response(is_oci),
         Err(e) => {
-            tracing::warn!(error = %e, "database error during registry token authentication");
+            tracing::warn!(error = %e, "store error during registry token authentication");
             service_unavailable_response()
         }
     }
@@ -366,12 +370,12 @@ fn password_change_pending_block(
 /// first-frame authentication (`api::ws`).
 ///
 /// `Ok(None)` means the token was actually rejected (unknown, bad hash,
-/// expired); `Err` means the DB could not answer and the caller must NOT
+/// expired); `Err` means the store could not answer and the caller must NOT
 /// treat the token as invalid.
 pub(crate) async fn authenticate_bearer(
     state: &AuthState,
     token: &str,
-) -> Result<Option<AuthUser>, sqlx::Error> {
+) -> Result<Option<AuthUser>, StoreError> {
     let is_static = state.static_tokens.iter().any(|st| {
         st.len() == token.len()
             && st
@@ -383,7 +387,7 @@ pub(crate) async fn authenticate_bearer(
     if is_static {
         return Ok(Some(static_token_user(token)));
     }
-    try_db_token_auth(&state.db, token).await
+    try_stored_token_auth(state, token).await
 }
 
 /// The synthetic admin a static config token acts as; it has no row, so
@@ -399,102 +403,179 @@ fn static_token_user(token: &str) -> AuthUser {
     }
 }
 
-/// Attempt to authenticate via a DB API token.
+/// Attempt to authenticate via a stored API token.
 ///
 /// Looks up the token by its prefix, verifies the hash, checks expiration,
-/// loads the user, and updates `last_used_at`. DB errors are propagated
-/// instead of being collapsed into a rejection (the historical "401 under
-/// load": SQLITE_BUSY looked like an invalid token).
-async fn try_db_token_auth(
-    db: &SqlitePool,
+/// loads the user, and records the use. Store errors are propagated instead
+/// of being collapsed into a rejection (the historical "401 under load":
+/// SQLITE_BUSY looked like an invalid token).
+async fn try_stored_token_auth(
+    state: &AuthState,
     raw_token: &str,
-) -> Result<Option<AuthUser>, sqlx::Error> {
-    let Some(db_token) = live_api_token(db, raw_token).await? else {
+) -> Result<Option<AuthUser>, StoreError> {
+    let Some(stored) = live_api_token(state, raw_token).await? else {
         return Ok(None);
     };
-    let Some(user) =
-        sqlx::query_as::<_, crate::db::User>("SELECT * FROM users WHERE id = ?1")
-            .bind(db_token.user_id)
-            .fetch_optional(db)
-            .await?
-    else {
+    let Some(user) = state.users.by_id(stored.user_id).await? else {
         return Ok(None);
     };
-    let _ = crate::db::update_token_last_used(db, &db_token.id).await;
-    Ok(Some(AuthUser::from_user(user, raw_token, Some(db_token.name))))
+    let _ = state.tokens.touch(&stored.id, Utc::now()).await;
+    Ok(Some(AuthUser::from_user(
+        user,
+        raw_token,
+        Some(stored.name),
+    )))
 }
 
-/// The API token row behind `raw_token`, if it exists, matches and has not expired.
+/// The API token behind `raw_token`, if it exists, matches and is still live.
 pub(crate) async fn live_api_token(
-    db: &SqlitePool,
+    state: &AuthState,
     raw_token: &str,
-) -> Result<Option<crate::db::ApiToken>, sqlx::Error> {
+) -> Result<Option<ApiToken>, StoreError> {
     if raw_token.len() < 16 {
         return Ok(None);
     }
-    let Some(db_token) = crate::db::get_token_by_prefix(db, &raw_token[..16]).await? else {
+    let Some(stored) = state.tokens.by_prefix(&raw_token[..16]).await? else {
         return Ok(None);
     };
-    if !tokens::verify_token(raw_token, &db_token.token_hash) || expired(db_token.expires_at.as_deref()) {
+    if !tokens::verify_token(raw_token, &stored.token_hash) || !stored.is_live(Utc::now()) {
         return Ok(None);
     }
-    Ok(Some(db_token))
+    Ok(Some(stored))
 }
 
-/// The API token row behind `id`, `None` when missing or expired: one
-/// statement, so a registry-token request learns the name for free.
+/// The API token behind `id`, `None` when missing or expired: one lookup, so
+/// a registry-token request learns the name for free.
 pub(crate) async fn live_api_token_by_id(
-    db: &SqlitePool,
+    state: &AuthState,
     id: &str,
-) -> Result<Option<crate::db::ApiToken>, sqlx::Error> {
-    let row = sqlx::query_as::<_, crate::db::ApiToken>("SELECT * FROM api_tokens WHERE id = ?1")
-        .bind(id)
-        .fetch_optional(db)
-        .await?;
-    Ok(row.filter(|t| !expired(t.expires_at.as_deref())))
-}
-
-// Fail closed: an unparseable timestamp counts as expired.
-fn expired(expires_at: Option<&str>) -> bool {
-    match expires_at {
-        None => false,
-        Some(text) => chrono::NaiveDateTime::parse_from_str(text, "%Y-%m-%d %H:%M:%S")
-            .map(|exp| exp < chrono::Utc::now().naive_utc())
-            .unwrap_or(true),
-    }
+) -> Result<Option<ApiToken>, StoreError> {
+    let stored = state.tokens.by_id(id).await?;
+    Ok(stored.filter(|token| token.is_live(Utc::now())))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ports::tokens::NewToken;
+    use crate::ports::users::NewUser;
+    use crate::testing::fakes::FakeDb;
+    use chrono::Duration;
+
+    fn state(db: &FakeDb) -> AuthState {
+        AuthState {
+            static_tokens: Vec::new(),
+            anonymous_read: false,
+            users: db.users(),
+            tokens: db.tokens(),
+            login_rate_limiter: Arc::new(RateLimiter::new(5, 60)),
+            base_url: "http://localhost".to_string(),
+            registry_tokens: Arc::new(token::TokenSigner::random()),
+        }
+    }
+
+    /// Issues a token the way `POST /users/{u}/tokens` does, `expires_in_days`
+    /// included, and hands back its raw value.
+    async fn issue(db: &FakeDb, id: &str, expires_in_days: Option<i64>) -> String {
+        let now = Utc::now();
+        let user = db
+            .users()
+            .by_name("ci")
+            .await
+            .unwrap()
+            .expect("the fixture user exists");
+        let (raw, hash) = tokens::generate_token("trg_");
+        db.tokens()
+            .create(
+                &NewToken {
+                    id,
+                    user_id: user.id,
+                    name: "ci-runner",
+                    prefix: &raw[..16],
+                    token_hash: &hash,
+                    expires_at: expires_in_days.map(|days| now + Duration::days(days)),
+                },
+                now,
+            )
+            .await
+            .unwrap();
+        raw
+    }
+
+    async fn with_user() -> FakeDb {
+        let db = FakeDb::new();
+        db.users()
+            .create(
+                &NewUser {
+                    username: "ci",
+                    email: None,
+                    password_hash: "hash",
+                    role: "reader",
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        db
+    }
+
+    /// The expiry a caller asked for in days is enforced as an instant, not
+    /// as a string in one adapter's spelling.
+    #[tokio::test]
+    async fn a_token_is_accepted_before_its_expiry_and_rejected_after() {
+        let db = with_user().await;
+        let state = state(&db);
+
+        let live = issue(&db, "t-live", Some(30)).await;
+        let dead = issue(&db, "t-dead", Some(-1)).await;
+        let forever = issue(&db, "t-forever", None).await;
+
+        for raw in [&live, &forever] {
+            let user = authenticate_bearer(&state, raw)
+                .await
+                .unwrap()
+                .expect("a live token authenticates");
+            assert_eq!(
+                (user.username.as_str(), user.token_name.as_deref()),
+                ("ci", Some("ci-runner"))
+            );
+        }
+        assert!(
+            authenticate_bearer(&state, &dead).await.unwrap().is_none(),
+            "an expired token is rejected, not accepted"
+        );
+    }
+
+    #[tokio::test]
+    async fn authenticating_records_the_use_but_a_wrong_hash_does_not() {
+        let db = with_user().await;
+        let state = state(&db);
+        let raw = issue(&db, "t-live", None).await;
+
+        assert!(authenticate_bearer(&state, &raw).await.unwrap().is_some());
+        let stored = db.tokens().by_id("t-live").await.unwrap().unwrap();
+        assert!(stored.last_used_at.is_some(), "the use is recorded");
+
+        let forged = format!("{}ffff", &raw[..raw.len() - 4]);
+        assert!(authenticate_bearer(&state, &forged).await.unwrap().is_none());
+    }
 
     #[tokio::test]
     async fn live_api_token_by_id_returns_name_and_rejects_expired() {
-        let (_tmp, pool) = crate::db::testing::pool().await;
-        crate::db::create_user(&pool, "ci", None, "hash", "reader")
-            .await
-            .unwrap();
-        let user = crate::db::get_user_by_username(&pool, "ci")
+        let db = with_user().await;
+        let state = state(&db);
+        issue(&db, "t-live", None).await;
+        issue(&db, "t-dead", Some(-1)).await;
+
+        let live = live_api_token_by_id(&state, "t-live")
             .await
             .unwrap()
             .unwrap();
-        crate::db::create_api_token(&pool, "t-live", user.id, "ci-runner", "p1", "h", None)
+        assert_eq!(live.name, "ci-runner");
+        assert!(live_api_token_by_id(&state, "t-dead")
             .await
-            .unwrap();
-        crate::db::create_api_token(
-            &pool,
-            "t-dead",
-            user.id,
-            "old",
-            "p2",
-            "h",
-            Some("2000-01-01 00:00:00"),
-        )
-        .await
-        .unwrap();
-        let live = live_api_token_by_id(&pool, "t-live").await.unwrap().unwrap();
-        assert_eq!((live.name.as_str(), live.user_id), ("ci-runner", user.id));
-        assert!(live_api_token_by_id(&pool, "t-dead").await.unwrap().is_none());
-        assert!(live_api_token_by_id(&pool, "nope").await.unwrap().is_none());
+            .unwrap()
+            .is_none());
+        assert!(live_api_token_by_id(&state, "nope").await.unwrap().is_none());
     }
 }

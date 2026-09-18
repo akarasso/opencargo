@@ -11,17 +11,16 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha1::Digest;
-use sqlx::SqlitePool;
 use tracing::info;
 
+use crate::app::publish::{Artifact, PublishVersion};
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
-use crate::db::{Package, Repository, Version};
+use crate::domain::{Format, Package, Repository, Version};
 use crate::error::{AppError, AppResult};
+use crate::ports::packages::NameMatch;
 use crate::registry::extract_package_name;
-use crate::registry::publish::{finalize_publish, publish_gate, PreScan};
+use crate::app::publish_tail::{PreScan, Published};
 use crate::server::AppState;
-use crate::storage::StorageBackend;
 
 const MAX_README_BYTES: usize = 256 * 1024;
 
@@ -90,7 +89,7 @@ pub async fn publish_package(
 
     let repo_name = super::param(&params, "repo")?;
     let package_name = extract_package_name(&params);
-    crate::registry::validate_package_name("npm", &package_name)?;
+    crate::domain::validate_package_name("npm", &package_name)?;
     if body.name != package_name {
         return Err(AppError::BadRequest(format!(
             "package name in body ('{}') does not match URL ('{}')",
@@ -98,24 +97,31 @@ pub async fn publish_package(
         )));
     }
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Npm)?;
-    crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
+    crate::registry::ensure_can_write(&*state.permissions, &repo, &auth_user).await?;
 
     let steps = plan_versions(&state, &repo, &package_name, &body).await?;
+    let readme = capped_readme(body.readme.as_deref());
 
-    let package =
-        get_or_create_package(&state.db, repo.id, &package_name, body.description.as_deref())
+    // A metadata-only publish carries a README too, and its package is
+    // already there; one that creates the package carries it in the release.
+    if let (Some(readme), Some(package)) = (readme, existing_package(&state, &repo, &package_name).await?)
+    {
+        state
+            .packages
+            .set_readme(package.id, readme, chrono::Utc::now())
             .await?;
-    store_readme(&state.db, package.id, body.readme.as_deref()).await?;
+    }
+
     for step in steps {
         match step {
             Step::Update { existing, meta } => {
-                apply_metadata_update(&state.db, &existing, &meta).await?
+                apply_metadata_update(&state, &existing, &meta).await?
             }
             Step::New(version) => {
-                store_version(&state, &repo, &package, &body.dist_tags, version, &auth_user)
+                store_version(&state, &repo, &package_name, &body, readme, version, &auth_user)
                     .await?
             }
         }
@@ -132,17 +138,20 @@ async fn plan_versions(
     package_name: &str,
     body: &PublishBody,
 ) -> AppResult<Vec<Step>> {
-    let existing = crate::db::get_package(&state.db, repo.id, package_name).await?;
+    let existing = state
+        .packages
+        .package(repo.id, package_name, NameMatch::Exact)
+        .await?;
     let mut steps = Vec::with_capacity(body.versions.len());
     for (version_str, version_meta) in &body.versions {
-        crate::registry::validate_version(version_str)?;
+        crate::domain::validate_version(version_str)?;
 
         // A publish carries a tarball attachment; `npm deprecate` does not.
         let attachment = find_attachment_key(&body.attachments, package_name, version_str)
             .and_then(|k| body.attachments.get(&k));
 
         let existing_version = match &existing {
-            Some(package) => crate::db::get_version(&state.db, package.id, version_str).await?,
+            Some(package) => state.packages.version(package.id, version_str).await?,
             None => None,
         };
         if let Some(existing) = existing_version {
@@ -204,7 +213,7 @@ async fn prepare_version(
     );
     let meta = with_dist(version_meta, tarball_url, &sha1, &integrity);
     let metadata_json = serde_json::to_string(&meta)?;
-    let pre = publish_gate(state, Format::Npm, &metadata_json).await?;
+    let pre = state.publish_gate().run(Format::Npm, &metadata_json).await?;
 
     Ok(NewVersion {
         version: version_str.to_string(),
@@ -253,49 +262,58 @@ fn with_dist(version_meta: &Value, tarball_url: String, sha1: &str, integrity: &
     meta
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn store_version(
     state: &AppState,
     repo: &Repository,
-    package: &Package,
-    dist_tags: &HashMap<String, String>,
+    package_name: &str,
+    body: &PublishBody,
+    readme: Option<&str>,
     v: NewVersion,
     auth_user: &AuthUser,
 ) -> AppResult<()> {
     let size = v.tarball.len() as i64;
-    state.storage.put(&v.storage_path, v.tarball).await?;
+    let tags = tags_for(&body.dist_tags, &v.version);
+    let landed = PublishVersion::new(state.packages.clone(), state.storage.clone())
+        .run(
+            Artifact {
+                repository: repo.id,
+                package: package_name,
+                match_name: NameMatch::Exact,
+                description: body.description.as_deref(),
+                readme,
+                version: &v.version,
+                metadata_json: &v.metadata_json,
+                checksum_sha1: Some(&v.sha1),
+                checksum_sha256: Some(&v.sha256),
+                integrity: Some(&v.integrity),
+                storage_path: &v.storage_path,
+                dist_tags: &tags,
+                bytes: v.tarball,
+            },
+            chrono::Utc::now(),
+        )
+        .await?;
 
-    let version_id = crate::db::create_version(
-        &state.db,
-        package.id,
-        &v.version,
-        &v.metadata_json,
-        Some(&v.sha1),
-        Some(&v.sha256),
-        Some(&v.integrity),
-        size,
-        &v.storage_path,
-    )
-    .await?;
+    let (package, version_id) = (landed.package, landed.version.id);
+    record_dependencies(state.deps.as_ref(), package.id, version_id, &v.meta).await;
 
-    for (tag, tag_version) in dist_tags {
-        if tag_version == &v.version {
-            crate::db::set_dist_tag(&state.db, package.id, tag, version_id).await?;
-        }
-    }
-    record_dependencies(&state.db, package.id, version_id, &v.meta).await;
-
-    finalize_publish(
-        state,
-        Format::Npm,
-        &repo.name,
-        &package.name,
-        &v.version,
-        Some(version_id),
-        &v.metadata_json,
-        &auth_user.username,
-        v.pre,
-    )
-    .await?;
+    state
+        .publish_tail()
+        .run(
+            &Published {
+                format: Format::Npm,
+                repository: &repo.name,
+                package: &package.name,
+                version: &v.version,
+                version_id: Some(version_id),
+                metadata_json: &v.metadata_json,
+                published_by: &auth_user.username,
+            },
+            v.pre,
+            chrono::Utc::now(),
+        )
+        .await;
 
     info!(
         package = %package.name,
@@ -307,7 +325,21 @@ async fn store_version(
     Ok(())
 }
 
-async fn record_dependencies(db: &SqlitePool, package_id: i64, version_id: i64, meta: &Value) {
+/// The tags the body points at this version.
+fn tags_for(dist_tags: &HashMap<String, String>, version: &str) -> Vec<String> {
+    dist_tags
+        .iter()
+        .filter(|(_, at)| at.as_str() == version)
+        .map(|(tag, _)| tag.clone())
+        .collect()
+}
+
+async fn record_dependencies(
+    deps: &dyn crate::ports::deps::DependencyStore,
+    package_id: i64,
+    version_id: i64,
+    meta: &Value,
+) {
     const DEP_TYPES: [(&str, &str); 4] = [
         ("dependencies", "runtime"),
         ("devDependencies", "dev"),
@@ -315,16 +347,18 @@ async fn record_dependencies(db: &SqlitePool, package_id: i64, version_id: i64, 
         ("optionalDependencies", "optional"),
     ];
     for (field, dep_type) in DEP_TYPES {
-        let Some(deps) = meta.get(field).and_then(|v| v.as_object()) else {
+        let Some(entries) = meta.get(field).and_then(|v| v.as_object()) else {
             continue;
         };
-        for (dep_name, dep_version) in deps {
-            let version_req = dep_version.as_str().unwrap_or("*");
-            let recorded = crate::db::insert_dependency(
-                db, package_id, version_id, dep_name, version_req, dep_type,
-            )
-            .await;
-            if let Err(e) = recorded {
+        for (dep_name, dep_version) in entries {
+            let dep = crate::ports::deps::NewDependency {
+                package: package_id,
+                version: version_id,
+                name: dep_name,
+                requirement: dep_version.as_str().unwrap_or("*"),
+                kind: dep_type,
+            };
+            if let Err(e) = deps.record(&dep, chrono::Utc::now()).await {
                 tracing::warn!(
                     dependency = %dep_name,
                     "failed to record dependency (graph may be incomplete): {e}"
@@ -334,38 +368,31 @@ async fn record_dependencies(db: &SqlitePool, package_id: i64, version_id: i64, 
     }
 }
 
-async fn get_or_create_package(
-    db: &SqlitePool,
-    repo_id: i64,
+async fn existing_package(
+    state: &AppState,
+    repo: &Repository,
     package_name: &str,
-    description: Option<&str>,
-) -> AppResult<Package> {
-    if let Some(package) = crate::db::get_package(db, repo_id, package_name).await? {
-        return Ok(package);
-    }
-    crate::db::create_package(db, repo_id, package_name, description).await?;
-    crate::db::get_package(db, repo_id, package_name)
-        .await?
-        .ok_or_else(|| AppError::Internal(format!("failed to create package: {package_name}")))
+) -> AppResult<Option<Package>> {
+    Ok(state
+        .packages
+        .package(repo.id, package_name, NameMatch::Exact)
+        .await?)
 }
 
 /// Raw markdown, sanitized at render time; capped on a UTF-8 boundary.
-async fn store_readme(db: &SqlitePool, package_id: i64, readme: Option<&str>) -> AppResult<()> {
-    let Some(readme) = readme.filter(|r| !r.is_empty()) else {
-        return Ok(());
-    };
+fn capped_readme(readme: Option<&str>) -> Option<&str> {
+    let readme = readme.filter(|r| !r.is_empty())?;
     let mut end = readme.len().min(MAX_README_BYTES);
     while !readme.is_char_boundary(end) {
         end -= 1;
     }
-    crate::db::update_package_readme(db, package_id, &readme[..end]).await?;
-    Ok(())
+    Some(&readme[..end])
 }
 
 /// Merge the incoming `deprecated` field into an existing version's metadata;
 /// npm sends `deprecated: ""` to undeprecate.
 async fn apply_metadata_update(
-    db: &SqlitePool,
+    state: &AppState,
     existing: &Version,
     new_meta: &Value,
 ) -> AppResult<()> {
@@ -382,7 +409,7 @@ async fn apply_metadata_update(
         }
     }
     let updated = serde_json::to_string(&meta)?;
-    crate::db::update_version_metadata(db, existing.id, &updated).await?;
+    state.packages.set_metadata(existing.id, &updated).await?;
     Ok(())
 }
 

@@ -12,6 +12,7 @@ pub mod vulns;
 pub mod webhooks;
 pub mod ws;
 
+use crate::app::audit::Actor;
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
 
@@ -43,42 +44,32 @@ pub(crate) fn require_admin_or_self(caller: &AuthUser, target_username: &str) ->
     Ok(())
 }
 
-/// Best-effort audit-log write for a sensitive mutation. A logging failure must
-/// never fail the underlying operation, so the error is swallowed with a warning
-/// rather than propagated.
-///
-/// Every audited mutation is also broadcast on the real-time event bus as an
-/// admin-visibility `audit.entry` event, so admin UIs (audit log, users,
-/// repositories, webhooks) update live without polling.
+/// The caller as a use case knows them: an identity and what they may do,
+/// with nothing of the request left on it.
+pub(crate) fn actor(caller: &AuthUser) -> Actor<'_> {
+    Actor {
+        user_id: caller.user_id,
+        username: &caller.username,
+        admin: caller.role == "admin",
+    }
+}
+
+/// Best-effort audit-log write for a sensitive mutation, for the handlers
+/// whose action is not a use case of its own; the rest record through the
+/// same function from inside theirs.
 pub(crate) async fn record_audit(
     state: &crate::server::AppState,
     caller: &AuthUser,
     action: &str,
     target: Option<&str>,
 ) {
-    if let Err(e) = crate::db::create_audit_entry(
-        &state.db,
-        caller.user_id,
-        Some(caller.username.as_str()),
+    crate::app::audit::record(
+        &*state.audit,
+        &*state.events,
+        &actor(caller),
         action,
         target,
-        None,
-        None,
-        None,
-        None,
+        chrono::Utc::now(),
     )
-    .await
-    {
-        tracing::warn!(error = %e, action, "failed to write audit log entry");
-    }
-
-    state.events.emit(
-        "audit.entry",
-        crate::events::Visibility::Admin,
-        serde_json::json!({
-            "username": caller.username,
-            "action": action,
-            "target": target,
-        }),
-    );
+    .await;
 }

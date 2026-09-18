@@ -1,7 +1,13 @@
+#![allow(clippy::disallowed_types, clippy::disallowed_methods)]
+//! SQLite-only by design: these assertions guarantee the schema, not the
+//! ports (designs-next/ports-and-adapters.md 7.4).
+
 #![allow(dead_code)]
 
+pub mod contract;
 pub mod fake_osv;
 pub mod fake_upstream;
+pub mod fakes;
 pub mod upstream_tap;
 
 use std::collections::HashMap;
@@ -119,7 +125,7 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
         .expect("failed to build app state");
     if let Some(tuning) = tuning {
         state.policy = PolicyEngine::new_tuned(
-            state.db.clone(),
+            state.policy_store.clone(),
             &config.policy,
             state.vuln_scanner.clone(),
             state.events.clone(),

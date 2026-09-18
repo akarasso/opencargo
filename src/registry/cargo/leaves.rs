@@ -1,10 +1,10 @@
 use serde_json::{json, Value};
 
-use crate::db::kinds::Format;
-use crate::error::{AppError, AppResult};
+use crate::domain::{CacheRepo, Format, Outcome};
 use crate::policy::{self, Source};
-use crate::proxy::{Payload, ProxyEngine};
-use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
+use crate::ports::packages::NameMatch;
+use crate::proxy::{IntoPayload, Payload, ProxyEngine};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
 use super::line_field;
 use super::upstream::{CargoArtifact, CargoUpstream};
@@ -24,13 +24,19 @@ impl Leaf for IndexLeaf {
     type Out = IndexLines;
 
     /// Cargo lowercases the index path; the line keeps the published case.
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<IndexLines>> {
-        let db = &cx.state.db;
-        let Some(package) = crate::db::get_package_nocase(db, member.0.id, &self.name).await?
-        else {
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<IndexLines>, ResolveError> {
+        let found = cx
+            .packages
+            .package(member.0.id, &self.name, NameMatch::Insensitive)
+            .await?;
+        let Some(package) = found else {
             return Ok(Outcome::NotFound);
         };
-        let versions = crate::db::get_versions(db, package.id).await?;
+        let versions = cx.packages.versions(package.id).await?;
         if versions.is_empty() {
             return Ok(Outcome::NotFound);
         }
@@ -49,8 +55,8 @@ impl Leaf for IndexLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<IndexLines>> {
-        fetch_index_lines(&cx.state.proxy, up, member, &self.name).await
+    ) -> Result<Outcome<IndexLines>, ResolveError> {
+        fetch_index_lines(cx.proxy, up, member, &self.name).await
     }
 }
 
@@ -63,16 +69,22 @@ pub struct CrateLeaf {
 impl Leaf for CrateLeaf {
     type Out = Payload;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Payload>> {
-        let db = &cx.state.db;
-        let Some(package) = crate::db::get_package_nocase(db, member.0.id, &self.name).await?
-        else {
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Payload>, ResolveError> {
+        let found = cx
+            .packages
+            .package(member.0.id, &self.name, NameMatch::Insensitive)
+            .await?;
+        let Some(package) = found else {
             return Ok(Outcome::NotFound);
         };
-        let Some(version) = crate::db::get_version(db, package.id, &self.version).await? else {
+        let Some(version) = cx.packages.version(package.id, &self.version).await? else {
             return Ok(Outcome::NotFound);
         };
-        let _ = crate::db::record_download(db, version.id).await;
+        let _ = cx.packages.record_download(version.id).await;
         crate::telemetry::record_download(&member.0.name, &package.name);
         Ok(Outcome::Found(Payload::file(
             version.tarball_path.clone(),
@@ -85,8 +97,8 @@ impl Leaf for CrateLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Payload>> {
-        let engine = &cx.state.proxy;
+    ) -> Result<Outcome<Payload>, ResolveError> {
+        let engine = cx.proxy;
         let dl = fetch_dl_template(engine, up, member).await?;
         let Outcome::Found(index) = fetch_index_lines(engine, up, member, &self.name).await? else {
             return Ok(Outcome::NotFound);
@@ -115,7 +127,7 @@ async fn fetch_index_lines(
     up: &Upstream,
     member: CacheRepo<'_>,
     name: &str,
-) -> AppResult<Outcome<IndexLines>> {
+) -> Result<Outcome<IndexLines>, ResolveError> {
     let artifact = CargoArtifact::Index {
         name: name.to_string(),
     };
@@ -124,7 +136,7 @@ async fn fetch_index_lines(
     };
     let bytes = engine.bytes(&cached).await?;
     let text = std::str::from_utf8(&bytes)
-        .map_err(|e| AppError::BadGateway(format!("invalid index from upstream: {e}")))?;
+        .map_err(|e| ResolveError::Upstream(format!("invalid index from upstream: {e}")))?;
     let lines = text
         .lines()
         .filter(|l| !l.trim().is_empty())
@@ -141,23 +153,23 @@ async fn fetch_dl_template(
     engine: &ProxyEngine,
     up: &Upstream,
     member: CacheRepo<'_>,
-) -> AppResult<String> {
+) -> Result<String, ResolveError> {
     let Outcome::Found(cached) = engine
         .fetch(&CargoUpstream, up, member, &CargoArtifact::Config)
         .await?
     else {
-        return Err(AppError::BadGateway(
+        return Err(ResolveError::Upstream(
             "upstream index has no config.json".into(),
         ));
     };
     let bytes = engine.bytes(&cached).await?;
     let config: Value = serde_json::from_slice(&bytes)
-        .map_err(|e| AppError::BadGateway(format!("invalid config.json from upstream: {e}")))?;
+        .map_err(|e| ResolveError::Upstream(format!("invalid config.json from upstream: {e}")))?;
     config
         .get("dl")
         .and_then(Value::as_str)
         .map(String::from)
-        .ok_or_else(|| AppError::BadGateway("upstream config.json has no dl".into()))
+        .ok_or_else(|| ResolveError::Upstream("upstream config.json has no dl".into()))
 }
 
 fn checksum_of(lines: &[String], version: &str) -> Option<String> {
@@ -167,7 +179,10 @@ fn checksum_of(lines: &[String], version: &str) -> Option<String> {
         .and_then(|l| line_field(l, "cksum"))
 }
 
-fn build_index_line(crate_name: &str, version: &crate::db::Version) -> AppResult<String> {
+fn build_index_line(
+    crate_name: &str,
+    version: &crate::domain::Version,
+) -> Result<String, ResolveError> {
     let meta: Value = serde_json::from_str(&version.metadata_json).unwrap_or(json!({}));
     let deps: Vec<Value> = meta
         .get("deps")
@@ -180,14 +195,15 @@ fn build_index_line(crate_name: &str, version: &crate::db::Version) -> AppResult
         "deps": deps,
         "cksum": version.checksum_sha256.clone().unwrap_or_default(),
         "features": meta.get("features").cloned().unwrap_or(json!({})),
-        "yanked": version.yanked != 0,
+        "yanked": version.yanked,
     });
     for key in ["features2", "links"] {
         if let Some(v) = meta.get(key) {
             line[key] = v.clone();
         }
     }
-    Ok(serde_json::to_string(&line)?)
+    serde_json::to_string(&line)
+        .map_err(|e| ResolveError::Internal(format!("index line is not serializable: {e}")))
 }
 
 /// The publish payload names the package and its alias as `name` /
@@ -219,8 +235,8 @@ fn index_dep(dep: &Value) -> Value {
 mod tests {
     use super::*;
 
-    fn version(metadata_json: &str) -> crate::db::Version {
-        crate::db::Version {
+    fn version(metadata_json: &str) -> crate::domain::Version {
+        crate::domain::Version {
             id: 1,
             package_id: 1,
             version: "0.1.0".into(),
@@ -230,8 +246,8 @@ mod tests {
             integrity: None,
             size: 1,
             tarball_path: String::new(),
-            published_at: String::new(),
-            yanked: 0,
+            published_at: chrono::DateTime::UNIX_EPOCH,
+            yanked: false,
         }
     }
 

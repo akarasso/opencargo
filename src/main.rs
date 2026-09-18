@@ -4,7 +4,7 @@ use tracing::info;
 
 use axum::ServiceExt as _;
 use tower::ServiceExt as _;
-use opencargo::{config, db, server};
+use opencargo::{config, server};
 
 #[derive(Parser)]
 #[command(name = "opencargo", version, about = "Lightweight universal package registry")]
@@ -78,11 +78,12 @@ async fn main() -> anyhow::Result<()> {
             // Spawn the periodic cleanup/GC task before the router consumes
             // app_state: the pre-release sweep needs cleanup.enabled, the proxy
             // cache sweep runs whenever proxy_cache_older_than_days is set.
-            let cleanup_storage: std::sync::Arc<dyn opencargo::storage::StorageBackend> =
-                app_state.storage.clone();
             tokio::spawn(opencargo::telemetry::cleanup::start_cleanup_task(
-                app_state.db.clone(),
-                cleanup_storage,
+                app_state.packages.clone(),
+                app_state.cache.clone(),
+                app_state.policy_store.clone(),
+                app_state.storage.clone(),
+                app_state.clock.clone(),
                 cfg.cleanup.clone(),
             ));
 
@@ -130,8 +131,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Config is valid.");
         }
         Commands::Migrate => {
-            let pool = db::connect(&cfg.database.url).await?;
-            db::migrate(&pool).await?;
+            server::run_migrations(&cfg).await?;
             println!("Migrations applied successfully.");
         }
     }

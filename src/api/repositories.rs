@@ -7,12 +7,15 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 
-use crate::api::{require_admin, require_auth};
-use crate::db::kinds::{validate_spec, Format, RepoKind, RepoSpec};
-use crate::db::Repository;
+use crate::api::{actor, require_admin, require_auth};
+use crate::app::repositories::{
+    CreateRepository, DeleteRepository, RepoUpdate, UpdateRepository,
+};
+use crate::domain::{Format, RepoKind, RepoSpec, Repository, Visibility};
 use crate::error::{AppError, AppResult};
 use crate::proxy::purge::purge_repository;
 use crate::server::AppState;
+use crate::wire::{wire_config, wire_ts};
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -53,7 +56,6 @@ pub async fn create_repository(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
     let body: CreateRepositoryRequest = read_json(request).await?;
-
     let kind: RepoKind = body.repo_type.parse()?;
     let format: Format = body.format.parse()?;
     // The API never exposes pypi: there is no registry module behind it.
@@ -63,45 +65,23 @@ pub async fn create_repository(
             body.format
         )));
     }
-    validate_visibility(&body.visibility)?;
-
-    if crate::db::get_repository_by_name(&state.db, &body.name)
-        .await?
-        .is_some()
-    {
-        return Err(AppError::Conflict(format!(
-            "repository already exists: {}",
-            body.name
-        )));
-    }
-
+    let visibility: Visibility = body.visibility.parse()?;
     let members = body.members.unwrap_or_default();
-    let spec = RepoSpec {
-        name: &body.name,
-        kind,
-        format,
-        upstream: non_empty(body.upstream.as_deref()),
-        members: &members,
-    };
-    validate_spec(&state.db, &spec, &[]).await?;
 
-    crate::db::create_repository(
-        &state.db,
-        &body.name,
-        kind,
-        format,
-        &body.visibility,
-        spec.upstream,
-        spec.config_json().as_deref(),
-    )
-    .await?;
-
-    let repo = crate::db::get_repository_by_name(&state.db, &body.name)
-        .await?
-        .ok_or_else(|| AppError::Internal("failed to fetch created repository".to_string()))?;
-
-    crate::api::record_audit(&state, &caller, "repo.create", Some(&repo.name)).await;
-    emit_repositories_changed(&state);
+    let repo = CreateRepository::new(state.repos.clone(), state.audit.clone(), state.events.clone())
+        .run(
+            &RepoSpec {
+                name: &body.name,
+                kind,
+                format,
+                visibility,
+                upstream: non_empty(body.upstream.as_deref()),
+                members: &members,
+            },
+            &actor(&caller),
+            chrono::Utc::now(),
+        )
+        .await?;
 
     Ok((StatusCode::CREATED, Json(repo_json(&repo))))
 }
@@ -120,16 +100,14 @@ pub async fn get_repository(
 
     // A private repo the caller cannot read must be indistinguishable from a
     // missing one, so the permission denial maps to the same 404.
-    crate::registry::ensure_can_read(&state.db, &repo, Some(&caller))
+    crate::registry::ensure_can_read(&*state.permissions, &repo, Some(&caller))
         .await
         .map_err(|_| AppError::NotFound(format!("repository not found: {name}")))?;
 
     Ok(Json(repo_json(&repo)))
 }
 
-/// PUT /api/v1/repositories/{name} -- Update repository (admin only). The
-/// patch is merged onto the stored row and validated like a create; a new
-/// upstream purges the cache first, since rows are not keyed by upstream.
+/// PUT /api/v1/repositories/{name} -- Update repository (admin only)
 pub async fn update_repository(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -138,51 +116,34 @@ pub async fn update_repository(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
     let body: UpdateRepositoryRequest = read_json(request).await?;
+    let visibility = body
+        .visibility
+        .as_deref()
+        .map(str::parse::<Visibility>)
+        .transpose()?;
 
-    let repo = load_repo(&state, &name).await?;
-    if let Some(ref vis) = body.visibility {
-        validate_visibility(vis)?;
-    }
-
-    let upstream_patch = non_empty(body.upstream.as_deref());
-    let members = body.members.clone().unwrap_or_else(|| repo.members());
-    let spec = RepoSpec {
-        name: &repo.name,
-        kind: repo.kind()?,
-        format: repo.fmt()?,
-        upstream: upstream_patch.or(repo.upstream_url.as_deref()),
-        members: &members,
-    };
-    validate_spec(&state.db, &spec, &[]).await?;
-    if upstream_patch.is_some_and(|u| Some(u) != repo.upstream_url.as_deref()) {
-        purge_repository(&state, &repo).await?;
-    }
-
-    let config_json = body
-        .members
-        .is_some()
-        .then(|| json!({ "members": members }).to_string());
-    crate::db::update_repository(
-        &state.db,
+    let updated = UpdateRepository::new(
+        state.repos.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+        state.proxy.clone(),
+    )
+    .run(
         &name,
-        body.visibility.as_deref(),
-        upstream_patch,
-        config_json.as_deref(),
+        &RepoUpdate {
+            visibility,
+            upstream: non_empty(body.upstream.as_deref()),
+            members: body.members.as_deref(),
+        },
+        &actor(&caller),
+        chrono::Utc::now(),
     )
     .await?;
-
-    let updated = load_repo(&state, &name).await?;
-
-    crate::api::record_audit(&state, &caller, "repo.update", Some(&name)).await;
-    emit_repositories_changed(&state);
 
     Ok(Json(repo_json(&updated)))
 }
 
-/// DELETE /api/v1/repositories/{name} -- Delete repository (admin only):
-/// refused while packages or a group membership remain, a proxy's cache
-/// purged first so the row can go. A group owns no cache: its members keep
-/// theirs.
+/// DELETE /api/v1/repositories/{name} -- Delete repository (admin only)
 pub async fn delete_repository(
     State(state): State<AppState>,
     Path(name): Path<String>,
@@ -191,34 +152,14 @@ pub async fn delete_repository(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let repo = load_repo(&state, &name).await?;
-
-    let pkg_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = ?1")
-            .bind(repo.id)
-            .fetch_one(&state.db)
-            .await?;
-    if pkg_count > 0 {
-        return Err(AppError::Conflict(format!(
-            "repository '{name}' is not empty ({pkg_count} package(s)); delete its packages first"
-        )));
-    }
-
-    let holders = groups_containing(&state, &name).await?;
-    if !holders.is_empty() {
-        return Err(AppError::Conflict(format!(
-            "repository '{name}' is a member of group(s) {}; remove it from them first",
-            holders.join(", ")
-        )));
-    }
-
-    if repo.kind()? == RepoKind::Proxy {
-        purge_repository(&state, &repo).await?;
-    }
-    crate::db::delete_repository(&state.db, &name).await?;
-
-    crate::api::record_audit(&state, &caller, "repo.delete", Some(&name)).await;
-    emit_repositories_changed(&state);
+    DeleteRepository::new(
+        state.repos.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+        state.proxy.clone(),
+    )
+    .run(&name, &actor(&caller), chrono::Utc::now())
+    .await?;
 
     Ok(Json(json!({"ok": true})))
 }
@@ -234,7 +175,7 @@ pub async fn purge_cache(
     require_admin(&caller)?;
 
     let repo = load_repo(&state, &name).await?;
-    purge_repository(&state, &repo).await?;
+    purge_repository(&state.proxy, state.repos.as_ref(), &repo).await?;
 
     crate::api::record_audit(&state, &caller, "repo.purge_cache", Some(&name)).await;
 
@@ -255,35 +196,16 @@ async fn read_json<T: serde::de::DeserializeOwned>(
 }
 
 async fn load_repo(state: &AppState, name: &str) -> AppResult<Repository> {
-    crate::db::get_repository_by_name(&state.db, name)
+    state
+        .repos
+        .by_name(name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))
-}
-
-fn validate_visibility(visibility: &str) -> AppResult<()> {
-    if matches!(visibility, "public" | "private") {
-        return Ok(());
-    }
-    Err(AppError::BadRequest(format!(
-        "invalid visibility: {visibility}"
-    )))
 }
 
 /// An empty upstream string is treated as absent, as the UI sends it.
 fn non_empty(upstream: Option<&str>) -> Option<&str> {
     upstream.filter(|u| !u.is_empty())
-}
-
-/// Names of the groups listing `name` as a member.
-async fn groups_containing(state: &AppState, name: &str) -> AppResult<Vec<String>> {
-    let repos = crate::db::get_all_repositories(&state.db).await?;
-    let mut holders = Vec::new();
-    for repo in repos {
-        if repo.kind()? == RepoKind::Group && repo.members().iter().any(|m| m == name) {
-            holders.push(repo.name);
-        }
-    }
-    Ok(holders)
 }
 
 fn repo_json(repo: &Repository) -> Value {
@@ -294,19 +216,8 @@ fn repo_json(repo: &Repository) -> Value {
         "format": repo.format,
         "visibility": repo.visibility,
         "upstream": repo.upstream_url,
-        "config": repo.config_json,
-        "created_at": repo.created_at,
-        "updated_at": repo.updated_at,
+        "config": wire_config(repo.config.as_ref()),
+        "created_at": wire_ts(repo.created_at),
+        "updated_at": wire_ts(repo.updated_at),
     })
-}
-
-/// Public hint that the repository list changed. Payload-free on purpose: the
-/// anonymous-visible repo list is already public, and every client refetches
-/// through the REST API which enforces per-caller filtering.
-fn emit_repositories_changed(state: &AppState) {
-    state.events.emit(
-        "repositories.changed",
-        crate::events::Visibility::Public,
-        serde_json::json!({}),
-    );
 }

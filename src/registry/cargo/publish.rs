@@ -12,12 +12,14 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use tracing::info;
 
+use crate::app::publish::{Artifact, PublishVersion};
+use crate::app::releases::Yank;
+use crate::app::publish_tail::Published;
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
-use crate::db::{Package, Repository};
+use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
+use crate::ports::packages::NameMatch;
 use crate::server::AppState;
-use crate::storage::StorageBackend;
 
 /// Cargo publish metadata (the JSON portion of the PUT body).
 #[derive(Debug, Deserialize, Serialize)]
@@ -46,6 +48,15 @@ struct CargoPublishMeta {
     extra: HashMap<String, Value>,
 }
 
+/// The crate's `cksum`, off the runtime's threads: a crate is up to the
+/// body cap and hashing it inline would stall the executor.
+async fn checksum(data: &Bytes) -> AppResult<String> {
+    let data = data.clone();
+    tokio::task::spawn_blocking(move || hex_encode(sha2::Sha256::digest(&data)))
+        .await
+        .map_err(|e| AppError::Internal(format!("checksum task failed: {e}")))
+}
+
 pub async fn publish_crate(
     State(state): State<AppState>,
     Path(repo_name): Path<String>,
@@ -55,60 +66,66 @@ pub async fn publish_crate(
     let user = require_user(auth_user)?;
     let repo = load_hosted(&state, &repo_name, &user).await?;
     let (meta, crate_data) = parse_publish_body(&body)?;
-    crate::registry::validate_package_name("cargo", &meta.name)?;
-    crate::registry::validate_version(&meta.vers)?;
+    crate::domain::validate_package_name("cargo", &meta.name)?;
+    crate::domain::validate_version(&meta.vers)?;
 
-    let sha256_hex = {
-        let data = crate_data.clone();
-        tokio::task::spawn_blocking(move || hex_encode(sha2::Sha256::digest(&data)))
-            .await
-            .map_err(|e| AppError::Internal(format!("checksum task failed: {e}")))?
-    };
+    let sha256_hex = checksum(&crate_data).await?;
     let metadata_json = serde_json::to_string(&meta)?;
-    let pre_scan =
-        crate::registry::publish::publish_gate(&state, Format::Cargo, &metadata_json).await?;
+    let pre_scan = state
+        .publish_gate()
+        .run(Format::Cargo, &metadata_json)
+        .await?;
 
-    let package = get_or_create_package(&state, repo.id, &meta).await?;
-    if crate::db::get_version(&state.db, package.id, &meta.vers)
-        .await?
-        .is_some()
-    {
-        return Err(AppError::Conflict(format!(
-            "version {} already exists for {}",
-            meta.vers, meta.name
-        )));
-    }
+    // Read before write, as before: the store's own conflict is the safety
+    // net for the race, but without this a duplicate publish would overwrite
+    // the stored artifact of the version it is about to be refused for.
+    refuse_duplicate(&state, repo.id, &meta).await?;
+
     let storage_path = format!(
         "cargo/{repo_name}/{}/{}-{}.crate",
         meta.name, meta.name, meta.vers
     );
-    state.storage.put(&storage_path, crate_data.clone()).await?;
     let size = crate_data.len() as i64;
-    let version_id = crate::db::create_version(
-        &state.db,
-        package.id,
-        &meta.vers,
-        &metadata_json,
-        None,
-        Some(&sha256_hex),
-        None,
-        size,
-        &storage_path,
-    )
-    .await?;
-    record_dependencies(&state, package.id, version_id, &meta.deps).await;
-    crate::registry::publish::finalize_publish(
-        &state,
-        Format::Cargo,
-        &repo_name,
-        &meta.name,
-        &meta.vers,
-        Some(version_id),
-        &metadata_json,
-        &user.username,
-        pre_scan,
-    )
-    .await?;
+    let landed = PublishVersion::new(state.packages.clone(), state.storage.clone())
+        .run(
+            Artifact {
+                repository: repo.id,
+                package: &meta.name,
+                // Crate names are unique whatever case a client sends.
+                match_name: NameMatch::Insensitive,
+                description: meta.description.as_deref(),
+                readme: None,
+                version: &meta.vers,
+                metadata_json: &metadata_json,
+                checksum_sha1: None,
+                checksum_sha256: Some(&sha256_hex),
+                integrity: None,
+                storage_path: &storage_path,
+                dist_tags: &[],
+                bytes: crate_data,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|err| duplicate_named(err, &meta.name, &meta.vers))?;
+    let version_id = landed.version.id;
+    record_dependencies(&state, landed.package.id, version_id, &meta.deps).await;
+    state
+        .publish_tail()
+        .run(
+            &Published {
+                format: Format::Cargo,
+                repository: &repo_name,
+                package: &meta.name,
+                version: &meta.vers,
+                version_id: Some(version_id),
+                metadata_json: &metadata_json,
+                published_by: &user.username,
+            },
+            pre_scan,
+            chrono::Utc::now(),
+        )
+        .await;
 
     info!(crate_name = %meta.name, version = %meta.vers, size, repo = %repo_name, "Cargo crate published");
     Ok((
@@ -145,13 +162,9 @@ async fn set_yanked(
 ) -> AppResult<Json<Value>> {
     let user = require_user(auth_user)?;
     let repo = load_hosted(state, repo_name, &user).await?;
-    let package = crate::db::get_package_nocase(&state.db, repo.id, name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("crate not found: {name}")))?;
-    let row = crate::db::get_version(&state.db, package.id, version)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("version not found: {name}@{version}")))?;
-    crate::db::set_yanked(&state.db, row.id, yanked).await?;
+    Yank::new(state.packages.clone())
+        .run(repo.id, name, version, yanked)
+        .await?;
     let action = if yanked { "yanked" } else { "unyanked" };
     info!(crate_name = %name, version = %version, repo = %repo_name, "Cargo crate version {action}");
     Ok(Json(json!({"ok": true})))
@@ -165,10 +178,10 @@ fn require_user(auth_user: Option<axum::Extension<AuthUser>>) -> AppResult<AuthU
 
 /// Writes go to hosted cargo repositories the caller may write to.
 async fn load_hosted(state: &AppState, repo_name: &str, user: &AuthUser) -> AppResult<Repository> {
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Cargo)?;
-    crate::registry::ensure_can_write(&state.db, &repo, user).await?;
+    crate::registry::ensure_can_write(&*state.permissions, &repo, user).await?;
     Ok(repo)
 }
 
@@ -195,18 +208,42 @@ fn read_len(data: &[u8], at: usize) -> Option<usize> {
     Some(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as usize)
 }
 
-async fn get_or_create_package(
+async fn refuse_duplicate(
     state: &AppState,
     repo_id: i64,
     meta: &CargoPublishMeta,
-) -> AppResult<Package> {
-    if let Some(p) = crate::db::get_package_nocase(&state.db, repo_id, &meta.name).await? {
-        return Ok(p);
-    }
-    crate::db::create_package(&state.db, repo_id, &meta.name, meta.description.as_deref()).await?;
-    crate::db::get_package(&state.db, repo_id, &meta.name)
+) -> AppResult<()> {
+    let Some(package) = state
+        .packages
+        .package(repo_id, &meta.name, NameMatch::Insensitive)
         .await?
-        .ok_or_else(|| AppError::Internal(format!("failed to create package: {}", meta.name)))
+    else {
+        return Ok(());
+    };
+    match state.packages.version(package.id, &meta.vers).await? {
+        Some(_) => Err(AppError::Conflict(format!(
+            "version {} already exists for {}",
+            meta.vers, meta.name
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// The store's bare conflict, back in cargo's words: the pre-insert read this
+/// replaced named the crate and the version it refused.
+fn duplicate_named(
+    err: crate::app::publish::PublishError,
+    name: &str,
+    version: &str,
+) -> AppError {
+    use crate::app::publish::PublishError;
+    use crate::error::StoreError;
+    match err {
+        PublishError::Store(StoreError::Conflict) => AppError::Conflict(format!(
+            "version {version} already exists for {name}"
+        )),
+        other => other.into(),
+    }
 }
 
 async fn record_dependencies(state: &AppState, package_id: i64, version_id: i64, deps: &Value) {
@@ -224,9 +261,14 @@ async fn record_dependencies(state: &AppState, package_id: i64, version_id: i64,
             Some("build") => "build",
             _ => "normal",
         };
-        if let Err(e) =
-            crate::db::insert_dependency(&state.db, package_id, version_id, name, req, kind).await
-        {
+        let dep = crate::ports::deps::NewDependency {
+            package: package_id,
+            version: version_id,
+            name,
+            requirement: req,
+            kind,
+        };
+        if let Err(e) = state.deps.record(&dep, chrono::Utc::now()).await {
             tracing::warn!(dependency = %name, "failed to record dependency (graph may be incomplete): {e}");
         }
     }

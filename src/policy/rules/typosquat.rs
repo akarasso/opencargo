@@ -4,9 +4,10 @@ use std::sync::OnceLock;
 use chrono::{DateTime, Utc};
 
 use super::{PolicyConfig, Rule};
-use crate::db::kinds::Format;
+use crate::domain::Format;
 use crate::policy::distance::{names, normalize, one_edit};
-use crate::policy::{Resolution, RuleVerdict, Verdict};
+use crate::domain::{RuleVerdict, Verdict};
+use crate::policy::Resolution;
 
 const MIN_WORD: usize = 5;
 

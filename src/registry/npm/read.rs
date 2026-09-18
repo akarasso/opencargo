@@ -10,12 +10,12 @@ use axum::{
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::proxy;
-use crate::registry::extract_package_name;
 use crate::registry::resolve::first_hit;
+use crate::registry::{cx, extract_package_name};
 use crate::server::AppState;
 
 use super::leaves::{PackumentLeaf, TarballLeaf};
-use super::{cx, param};
+use super::param;
 
 const ABBREVIATED_TYPE: &str = "application/vnd.npm.install-v1+json";
 
@@ -44,11 +44,11 @@ pub async fn get_package(
 ) -> AppResult<Response> {
     let repo_name = param(&params, "repo")?;
     let package_name = extract_package_name(&params);
-    crate::registry::validate_npm_read_name(&package_name)?;
+    crate::domain::validate_npm_read_name(&package_name)?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
     let abbreviated = headers
         .get(header::ACCEPT)
@@ -85,12 +85,12 @@ pub async fn download_tarball(
     let repo_name = param(&params, "repo")?;
     let package_name = extract_package_name(&params);
     let filename = param(&params, "filename")?;
-    crate::registry::validate_npm_read_name(&package_name)?;
+    crate::domain::validate_npm_read_name(&package_name)?;
     validate_tarball_filename(filename)?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
     let leaf = TarballLeaf {
         name: package_name,

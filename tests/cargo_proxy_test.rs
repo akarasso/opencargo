@@ -1,3 +1,7 @@
+#![allow(clippy::disallowed_types, clippy::disallowed_methods)]
+//! SQLite-only by design: these assertions guarantee the schema, not the
+//! ports (designs-next/ports-and-adapters.md 7.4).
+
 mod common;
 
 use std::io::Write;

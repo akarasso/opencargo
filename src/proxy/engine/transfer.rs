@@ -1,11 +1,12 @@
 use std::future::Future;
 
 use axum::http::{header, HeaderMap, StatusCode};
+use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-use crate::db::proxy_cache::{self, CacheEntry, NewEntry};
+use crate::domain::{CacheEntry, CacheRepo, NewEntry};
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{CacheRepo, Upstream};
+use crate::registry::resolve::Upstream;
 
 use super::super::auth::send_with_auth;
 use super::super::strategy::{Classified, Transfer, UpstreamStrategy};
@@ -36,6 +37,7 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
         stale: Option<&Stale>,
+        now: DateTime<Utc>,
     ) -> AppResult<Reply> {
         let url = self.guarded_url(s, up, a).await?;
         let mut req = self.http.get(url.clone());
@@ -51,7 +53,7 @@ impl ProxyEngine {
             Transfer::Buffered => {
                 let bounded = tokio::time::timeout(
                     self.timeouts.buffered_total,
-                    self.complete(s, member, a, send),
+                    self.complete(s, member, a, send, now),
                 );
                 match bounded.await {
                     Ok(reply) => reply,
@@ -60,7 +62,7 @@ impl ProxyEngine {
                     ))),
                 }
             }
-            Transfer::Streamed => self.complete(s, member, a, send).await,
+            Transfer::Streamed => self.complete(s, member, a, send, now).await,
         }
     }
 
@@ -70,6 +72,7 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
         send: impl Future<Output = AppResult<reqwest::Response>>,
+        now: DateTime<Utc>,
     ) -> AppResult<Reply> {
         let resp = match send.await {
             Ok(resp) => resp,
@@ -89,7 +92,7 @@ impl ProxyEngine {
         }
         let body = self.read_body(s, member, a, resp).await?;
         match body {
-            Ok(body) => self.record(s, member, a, body).await,
+            Ok(body) => self.record(s, member, a, body, now).await,
             Err(why) => Ok(Reply::Failed(why)),
         }
     }
@@ -112,7 +115,7 @@ impl ProxyEngine {
             cache_path(member, &s.cache_key(a)),
             uuid::Uuid::new_v4()
         );
-        let mut part = PartFile::new(&self.storage, part_rel).await?;
+        let mut part = PartFile::new(self.storage.as_ref(), part_rel).await?;
         let mut hasher = Sha256::new();
         let mut size = 0u64;
         loop {
@@ -138,7 +141,7 @@ impl ProxyEngine {
         }
         s.verify_headers(a, &headers, &sha256)?;
         let path = cache_path(member, &s.store_key(a, &sha256));
-        part.commit(&self.storage, &path).await?;
+        part.commit(self.storage.as_ref(), &path).await?;
         Ok(Ok(Body {
             path,
             sha256,
@@ -153,6 +156,7 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
         body: Body,
+        now: DateTime<Utc>,
     ) -> AppResult<Reply> {
         let key = s.cache_key(a);
         let store_key = s.store_key(a, &body.sha256);
@@ -172,7 +176,7 @@ impl ProxyEngine {
             size: body.size as i64,
             ttl_secs: if pointer { None } else { ttl },
         };
-        proxy_cache::upsert_entry(&self.db, &body_row).await?;
+        self.cache.upsert(&body_row, now).await?;
         if pointer {
             let pointer_row = NewEntry {
                 kind: key.kind,
@@ -181,12 +185,13 @@ impl ProxyEngine {
                 ttl_secs: ttl,
                 ..body_row
             };
-            proxy_cache::upsert_entry(&self.db, &pointer_row).await?;
+            self.cache.upsert(&pointer_row, now).await?;
         }
-        let (entry, _) =
-            proxy_cache::get_entry(&self.db, member.0.id, store_key.kind, &store_key.key)
-                .await?
-                .ok_or_else(|| AppError::Internal("cache row vanished after upsert".into()))?;
+        let entry = self
+            .cache
+            .entry(member.0.id, store_key.kind, &store_key.key, now)
+            .await?
+            .ok_or_else(|| AppError::Internal("cache row vanished after upsert".into()))?;
         Ok(Reply::Stored(Box::new(entry)))
     }
 }

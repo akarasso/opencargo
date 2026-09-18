@@ -1,14 +1,17 @@
+use std::sync::Arc;
+
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
-use sqlx::SqlitePool;
 use tracing::{info, warn};
+
+use crate::ports::webhooks::WebhookStore;
 
 type HmacSha256 = Hmac<Sha256>;
 
 #[derive(Clone)]
 pub struct WebhookDispatcher {
     client: reqwest::Client,
-    db: Option<SqlitePool>,
+    store: Option<Arc<dyn WebhookStore>>,
 }
 
 impl WebhookDispatcher {
@@ -24,39 +27,40 @@ impl WebhookDispatcher {
             .expect("failed to build webhook HTTP client")
     }
 
-    pub fn new(db: SqlitePool) -> Self {
+    pub fn new(store: Arc<dyn WebhookStore>) -> Self {
         Self {
             client: Self::build_client(),
-            db: Some(db),
+            store: Some(store),
         }
     }
 
-    /// Create a dispatcher without a database (for testing or when DB is not
-    /// available yet). It will not dispatch any webhooks.
+    /// Create a dispatcher without a store (for testing or when the store is
+    /// not available yet). It will not dispatch any webhooks.
     pub fn new_noop() -> Self {
         Self {
             client: Self::build_client(),
-            db: None,
+            store: None,
         }
     }
 
     /// Dispatch a webhook event to all active webhooks that match the event.
-    /// Loads webhooks from the database on each call.
+    /// Loads webhooks from the store on each call; which of them wants this
+    /// event is the registration's own answer.
     pub async fn dispatch(&self, event: &str, data: &serde_json::Value) {
-        let db = match &self.db {
-            Some(db) => db,
+        let store = match &self.store {
+            Some(store) => store,
             None => return,
         };
 
-        let webhooks = match crate::db::get_active_webhooks(db, event).await {
+        let webhooks = match store.active().await {
             Ok(whs) => whs,
             Err(e) => {
-                warn!(error = %e, "Failed to load webhooks from DB");
+                warn!(error = %e, "Failed to load webhooks from the store");
                 return;
             }
         };
 
-        for webhook in webhooks {
+        for webhook in webhooks.iter().filter(|wh| wh.events.matches(event)) {
             let payload = serde_json::json!({
                 "event": event,
                 "timestamp": chrono::Utc::now().to_rfc3339(),

@@ -1,9 +1,8 @@
-use crate::db::kinds::Format;
-use crate::error::{AppError, AppResult};
+use crate::domain::{CacheRepo, Format, Outcome};
 use crate::policy::{self, Source};
-use crate::proxy::engine::Cached;
+use crate::proxy::engine::{Cached, IntoPayload};
 use crate::proxy::Payload;
-use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
 use super::manifests::resolve_hosted_digest;
 use super::upstream::{upstream_name, OciArtifact, OciUpstream};
@@ -19,10 +18,10 @@ async fn from_engine(
     up: &Upstream,
     a: &OciArtifact,
     head: bool,
-) -> AppResult<Outcome<Payload>> {
-    let engine = &cx.state.proxy;
+) -> Result<Outcome<Payload>, ResolveError> {
+    let engine = cx.proxy;
     if head {
-        engine.head(&OciUpstream, up, member, a).await
+        Ok(engine.head(&OciUpstream, up, member, a).await?)
     } else {
         Ok(engine
             .fetch(&OciUpstream, up, member, a)
@@ -37,8 +36,8 @@ async fn fetch_cached(
     member: CacheRepo<'_>,
     up: &Upstream,
     a: &OciArtifact,
-) -> AppResult<Outcome<Cached>> {
-    cx.state.proxy.fetch(&OciUpstream, up, member, a).await
+) -> Result<Outcome<Cached>, ResolveError> {
+    Ok(cx.proxy.fetch(&OciUpstream, up, member, a).await?)
 }
 
 fn with_digest(mut p: Payload, digest: String) -> Payload {
@@ -56,9 +55,12 @@ pub struct BlobLeaf {
 impl Leaf for BlobLeaf {
     type Out = Payload;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Payload>> {
-        let Some(blob) = crate::db::oci::get_blob(&cx.state.db, member.0.id, &self.digest).await?
-        else {
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Payload>, ResolveError> {
+        let Some(blob) = cx.oci.blob(member.0.id, &self.digest).await? else {
             return Ok(Outcome::NotFound);
         };
         let size = blob.size.max(0) as u64;
@@ -79,7 +81,7 @@ impl Leaf for BlobLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Payload>> {
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let a = OciArtifact::Blob {
             name: upstream_name(up, &self.name),
             digest: self.digest.clone(),
@@ -105,16 +107,17 @@ pub struct ManifestLeaf {
 impl Leaf for ManifestLeaf {
     type Out = Payload;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Payload>> {
-        let db = &cx.state.db;
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let Some(digest) =
-            resolve_hosted_digest(db, member.0.id, &self.name, &self.reference).await?
+            resolve_hosted_digest(cx.oci, member.0.id, &self.name, &self.reference).await?
         else {
             return Ok(Outcome::NotFound);
         };
-        let Some(manifest) =
-            crate::db::oci::get_manifest(db, member.0.id, &self.name, &digest).await?
-        else {
+        let Some(manifest) = cx.oci.manifest(member.0.id, &self.name, &digest).await? else {
             return Ok(Outcome::NotFound);
         };
         let size = manifest.size.max(0) as u64;
@@ -134,7 +137,7 @@ impl Leaf for ManifestLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Payload>> {
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let name = upstream_name(up, &self.name);
         let a = if is_digest(&self.reference) {
             OciArtifact::Manifest {
@@ -184,14 +187,12 @@ pub struct TagsLeaf {
 impl Leaf for TagsLeaf {
     type Out = Vec<String>;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Vec<String>>> {
-        let tags: Vec<String> = sqlx::query_scalar(
-            "SELECT tag FROM oci_tags WHERE repository_id = ?1 AND name = ?2 ORDER BY tag",
-        )
-        .bind(member.0.id)
-        .bind(&self.name)
-        .fetch_all(&cx.state.db)
-        .await?;
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Vec<String>>, ResolveError> {
+        let tags = cx.oci.tags(member.0.id, &self.name).await?;
         Ok(if tags.is_empty() {
             Outcome::NotFound
         } else {
@@ -204,16 +205,16 @@ impl Leaf for TagsLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Vec<String>>> {
+    ) -> Result<Outcome<Vec<String>>, ResolveError> {
         let a = OciArtifact::Tags {
             name: upstream_name(up, &self.name),
         };
-        let engine = &cx.state.proxy;
+        let engine = cx.proxy;
         let Outcome::Found(cached) = engine.fetch(&OciUpstream, up, member, &a).await? else {
             return Ok(Outcome::NotFound);
         };
         let body: serde_json::Value = serde_json::from_slice(&engine.bytes(&cached).await?)
-            .map_err(|e| AppError::BadGateway(format!("invalid tag list from upstream: {e}")))?;
+            .map_err(|e| ResolveError::Upstream(format!("invalid tag list from upstream: {e}")))?;
         let tags = body["tags"]
             .as_array()
             .map(|tags| {
@@ -223,5 +224,125 @@ impl Leaf for TagsLeaf {
             })
             .unwrap_or_default();
         Ok(Outcome::Found(tags))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Format, RepoKind, RepoSpec, Repository, Visibility};
+    use crate::proxy::engine::Src;
+    use crate::testing::fakes::FakeDb;
+    use crate::testing::resolver::Resolver;
+
+    const DIGEST: &str = "sha256:abc";
+
+    async fn hosted_repo(db: &FakeDb) -> Repository {
+        db.repositories()
+            .create(
+                &RepoSpec {
+                    name: "oci-hosted",
+                    kind: RepoKind::Hosted,
+                    format: Format::Oci,
+                    visibility: Visibility::Public,
+                    upstream: None,
+                    members: &[],
+                },
+                chrono::DateTime::UNIX_EPOCH,
+            )
+            .await
+            .unwrap()
+    }
+
+    /// A HEAD answers from the row alone, and a blob with no recorded media
+    /// type is served as opaque bytes rather than as nothing.
+    #[tokio::test]
+    async fn a_hosted_blob_comes_from_the_store_or_is_a_miss() {
+        let fx = Resolver::default();
+        let repo = hosted_repo(&fx.fakes).await;
+        fx.fakes.add_blob(repo.id, DIGEST, 12, None);
+        let cx = fx.cx(None, &repo.name);
+
+        let leaf = BlobLeaf {
+            name: "app".into(),
+            digest: DIGEST.into(),
+            head: true,
+        };
+        let Outcome::Found(payload) = leaf.hosted(&cx, CacheRepo(&repo)).await.unwrap() else {
+            panic!("the seeded blob is there");
+        };
+        assert_eq!(payload.size, 12);
+        assert_eq!(payload.content_type.as_deref(), Some(OCTET_STREAM));
+        assert!(matches!(payload.src, Src::HeadOnly));
+
+        let absent = BlobLeaf {
+            name: "app".into(),
+            digest: "sha256:nope".into(),
+            head: true,
+        };
+        assert!(matches!(
+            absent.hosted(&cx, CacheRepo(&repo)).await.unwrap(),
+            Outcome::NotFound
+        ));
+    }
+
+    /// A tag is resolved to a digest through the store; a digest reference is
+    /// its own answer and never reaches it.
+    #[tokio::test]
+    async fn a_hosted_manifest_is_reached_by_tag_and_by_digest() {
+        let fx = Resolver::default();
+        let repo = hosted_repo(&fx.fakes).await;
+        fx.fakes.add_manifest(repo.id, "app", DIGEST, "application/json", 7);
+        fx.fakes.add_tag(repo.id, "app", "v1", DIGEST);
+        let cx = fx.cx(None, &repo.name);
+
+        for reference in ["v1", DIGEST] {
+            let leaf = ManifestLeaf {
+                name: "app".into(),
+                reference: reference.into(),
+                head: true,
+            };
+            let Outcome::Found(payload) = leaf.hosted(&cx, CacheRepo(&repo)).await.unwrap() else {
+                panic!("{reference}: the seeded manifest is there");
+            };
+            assert_eq!(payload.size, 7);
+            assert_eq!(payload.digest.as_deref(), Some(DIGEST));
+        }
+
+        let unknown = ManifestLeaf {
+            name: "app".into(),
+            reference: "v2".into(),
+            head: true,
+        };
+        assert!(matches!(
+            unknown.hosted(&cx, CacheRepo(&repo)).await.unwrap(),
+            Outcome::NotFound
+        ));
+    }
+
+    /// An image the member holds no tag for is a miss, not an empty hit: an
+    /// empty `Found` would stop a group walk at the first member.
+    #[tokio::test]
+    async fn a_member_without_tags_does_not_answer_the_listing() {
+        let fx = Resolver::default();
+        let repo = hosted_repo(&fx.fakes).await;
+        fx.fakes.add_tag(repo.id, "app", "v2", DIGEST);
+        fx.fakes.add_tag(repo.id, "app", "v1", DIGEST);
+        fx.fakes.add_tag(repo.id, "other", "v1", DIGEST);
+        let cx = fx.cx(None, &repo.name);
+
+        let leaf = TagsLeaf { name: "app".into() };
+        let Outcome::Found(tags) = leaf.hosted(&cx, CacheRepo(&repo)).await.unwrap() else {
+            panic!("the image has tags");
+        };
+        assert_eq!(tags, vec!["v1", "v2"], "in tag order");
+
+        let empty = TagsLeaf {
+            name: "absent".into(),
+        };
+        assert!(matches!(
+            empty.hosted(&cx, CacheRepo(&repo)).await.unwrap(),
+            Outcome::NotFound
+        ));
     }
 }

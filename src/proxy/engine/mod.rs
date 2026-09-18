@@ -7,19 +7,20 @@ use std::time::Duration;
 use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
-use sqlx::SqlitePool;
+use chrono::{DateTime, Utc};
 use tracing::warn;
 
-use crate::db::proxy_cache::{self, CacheEntry, NewEntry};
+use crate::domain::{CacheEntry, CacheRepo, NewEntry, Outcome};
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{CacheRepo, Outcome, Upstream};
-use crate::storage::{FilesystemStorage, StorageBackend};
+use crate::ports::proxy_cache::ProxyCacheStore;
+use crate::registry::resolve::Upstream;
+use crate::storage::StorageBackend;
 
 use super::auth::{send_with_auth, TokenCache};
 use super::singleflight::Singleflight;
 use super::strategy::{CacheKey, CachePolicy, Classified, Ttl, UpstreamStrategy, UrlSource};
 
-pub use payload::{cache_path, Cached, PartFile, Payload, Src};
+pub use payload::{cache_path, Cached, IntoPayload, PartFile, Payload, Src};
 use transfer::Reply;
 
 #[derive(Clone, Copy, Debug)]
@@ -50,8 +51,8 @@ impl Timeouts {
 #[derive(Clone)]
 pub struct ProxyEngine {
     http: reqwest::Client,
-    storage: Arc<FilesystemStorage>,
-    db: SqlitePool,
+    storage: Arc<dyn StorageBackend>,
+    cache: Arc<dyn ProxyCacheStore>,
     tokens: Arc<TokenCache>,
     inflight: Arc<Singleflight>,
     ttl: TtlConfig,
@@ -79,10 +80,31 @@ enum Miss {
     Ignore,
 }
 
+/// One pass through the engine: the instant every row it writes or reads is
+/// judged against, and what a miss means for the caller. Carried together so
+/// a single request never mixes two clocks.
+#[derive(Clone, Copy)]
+struct Pass {
+    now: DateTime<Utc>,
+    miss: Miss,
+    /// Revalidate a fresh `200` row instead of serving it.
+    force_stale: bool,
+}
+
+impl Pass {
+    fn new(miss: Miss, force_stale: bool) -> Self {
+        Self {
+            now: Utc::now(),
+            miss,
+            force_stale,
+        }
+    }
+}
+
 impl ProxyEngine {
     pub fn new(
-        storage: Arc<FilesystemStorage>,
-        db: SqlitePool,
+        storage: Arc<dyn StorageBackend>,
+        cache: Arc<dyn ProxyCacheStore>,
         timeouts: Timeouts,
         ttl: TtlConfig,
     ) -> Self {
@@ -96,7 +118,7 @@ impl ProxyEngine {
         Self {
             http,
             storage,
-            db,
+            cache,
             tokens: Arc::new(TokenCache::default()),
             inflight: Arc::new(Singleflight::default()),
             ttl,
@@ -111,7 +133,8 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Cached>> {
-        self.run(s, up, member, a, false, Miss::Record).await
+        self.run(s, up, member, a, Pass::new(Miss::Record, false))
+            .await
     }
 
     /// `fetch` for a recorder: a fresh row is a hit and a cold key is
@@ -124,7 +147,8 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Cached>> {
-        self.run(s, up, member, a, false, Miss::Ignore).await
+        self.run(s, up, member, a, Pass::new(Miss::Ignore, false))
+            .await
     }
 
     /// A conditional re-fetch of a `status 200` row whatever its freshness,
@@ -137,7 +161,8 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Cached>> {
-        self.run(s, up, member, a, true, Miss::Ignore).await
+        self.run(s, up, member, a, Pass::new(Miss::Ignore, true))
+            .await
     }
 
     /// Lookup, singleflight, exchange, settle; cache hit and miss are
@@ -148,13 +173,12 @@ impl ProxyEngine {
         up: &Upstream,
         member: CacheRepo<'_>,
         a: &S::Artifact,
-        force_stale: bool,
-        miss: Miss,
+        pass: Pass,
     ) -> AppResult<Outcome<Cached>> {
         let key = s.cache_key(a);
-        let _guard = self.lock(member, &key, force_stale).await;
-        let counted = miss == Miss::Record;
-        let stale = match self.lookup(s, member, a, &key, force_stale).await? {
+        let _guard = self.lock(member, &key, pass.force_stale).await;
+        let counted = pass.miss == Miss::Record;
+        let stale = match self.lookup(s, member, a, &key, pass).await? {
             Lookup::Fresh(cached) => {
                 if counted {
                     crate::telemetry::record_cache_hit(&member.0.name);
@@ -173,8 +197,10 @@ impl ProxyEngine {
         if counted {
             crate::telemetry::record_cache_miss(&member.0.name);
         }
-        let reply = self.exchange(s, up, member, a, stale.as_ref()).await;
-        self.settle(s, member, a, reply, stale, miss).await
+        let reply = self
+            .exchange(s, up, member, a, stale.as_ref(), pass.now)
+            .await;
+        self.settle(s, member, a, reply, stale, pass).await
     }
 
     /// The cached body, fresh or stale, with no upstream request and no
@@ -185,19 +211,31 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Option<Cached>> {
+        let now = Utc::now();
         let key = s.cache_key(a);
-        let Some((row, fresh)) =
-            proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?
-        else {
+        let Some(row) = self.row(member, &key, now).await? else {
             return Ok(None);
         };
         if row.status != 200 {
             return Ok(None);
         }
-        Ok(self.resolve_row(s, a, row).await.map(|entry| Cached {
+        let fresh = row.fresh;
+        Ok(self.resolve_row(s, a, row, now).await.map(|entry| Cached {
             entry,
             stale: !fresh,
         }))
+    }
+
+    async fn row(
+        &self,
+        member: CacheRepo<'_>,
+        key: &CacheKey,
+        now: DateTime<Utc>,
+    ) -> AppResult<Option<CacheEntry>> {
+        Ok(self
+            .cache
+            .entry(member.0.id, key.kind, &key.key, now)
+            .await?)
     }
 
     /// Refreshes coalesce among themselves in their own namespace: a
@@ -224,25 +262,23 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
         key: &CacheKey,
-        force_stale: bool,
+        pass: Pass,
     ) -> AppResult<Lookup> {
-        let Some((row, fresh)) =
-            proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?
-        else {
+        let Some(row) = self.row(member, key, pass.now).await? else {
             return Ok(Lookup::Cold);
         };
         if row.status != 200 {
-            return Ok(if fresh {
+            return Ok(if row.fresh {
                 Lookup::Negative
             } else {
                 Lookup::Cold
             });
         }
-        let Some(target) = self.resolve_row(s, a, row.clone()).await else {
+        let Some(target) = self.resolve_row(s, a, row.clone(), pass.now).await else {
             return Ok(Lookup::Cold);
         };
-        if fresh && !force_stale {
-            return Ok(Lookup::Fresh(self.hit(&row, target).await?));
+        if row.fresh && !pass.force_stale {
+            return Ok(Lookup::Fresh(self.hit(&row, target, pass.now).await?));
         }
         Ok(Lookup::Stale(Stale { row, target }))
     }
@@ -254,17 +290,17 @@ impl ProxyEngine {
         a: &S::Artifact,
         reply: AppResult<Reply>,
         stale: Option<Stale>,
-        miss: Miss,
+        pass: Pass,
     ) -> AppResult<Outcome<Cached>> {
         let key = s.cache_key(a);
         match reply {
             Ok(Reply::NotModified) => match stale {
                 Some(Stale { row, target }) => {
-                    let ttl = self.ttl_secs(s.cache_policy(a));
-                    proxy_cache::touch_entry(&self.db, row.id, ttl).await?;
+                    let ttl = self.ttl(s.cache_policy(a));
+                    self.cache.touch(row.id, ttl, pass.now).await?;
                     // A content-addressed target keeps its own (immutable) policy.
                     if target.id != row.id {
-                        proxy_cache::touch_entry(&self.db, target.id, None).await?;
+                        self.cache.touch(target.id, None, pass.now).await?;
                     }
                     Ok(Outcome::Found(Cached {
                         entry: target,
@@ -279,14 +315,14 @@ impl ProxyEngine {
                 entry: *entry,
                 stale: false,
             })),
-            Ok(Reply::Miss(status)) if miss == Miss::Record => {
-                self.record_miss(member, &key, status, stale.as_ref())
+            Ok(Reply::Miss(status)) if pass.miss == Miss::Record => {
+                self.record_miss(member, &key, status, stale.as_ref(), pass.now)
                     .await?;
                 Ok(Outcome::NotFound)
             }
             Ok(Reply::Miss(_)) | Ok(Reply::Refused) => Ok(Outcome::NotFound),
             Ok(Reply::Failed(why)) => match stale {
-                Some(Stale { target, .. }) if miss == Miss::Record => {
+                Some(Stale { target, .. }) if pass.miss == Miss::Record => {
                     warn!(key = %key.key, error = %why, "upstream failed; serving stale cache");
                     Ok(Outcome::Found(Cached {
                         entry: target,
@@ -296,7 +332,7 @@ impl ProxyEngine {
                 Some(_) => Ok(Outcome::NotFound),
                 None => Err(AppError::BadGateway(why)),
             },
-            Err(e) if miss == Miss::Ignore => {
+            Err(e) if pass.miss == Miss::Ignore => {
                 warn!(key = %key.key, error = %e, "refresh failed; cache left as is");
                 Ok(Outcome::NotFound)
             }
@@ -311,14 +347,15 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
     ) -> AppResult<Outcome<Payload>> {
+        let now = Utc::now();
         let key = s.cache_key(a);
-        let row = proxy_cache::get_entry(&self.db, member.0.id, key.kind, &key.key).await?;
-        if let Some((row, true)) = row {
+        let row = self.row(member, &key, now).await?;
+        if let Some(row) = row.filter(|row| row.fresh) {
             if row.status != 200 {
                 return Ok(Outcome::NotFound);
             }
-            if let Some(target) = self.resolve_row(s, a, row.clone()).await {
-                let e = self.hit(&row, target).await?.entry;
+            if let Some(target) = self.resolve_row(s, a, row.clone(), now).await {
+                let e = self.hit(&row, target, now).await?.entry;
                 let size = e.size.max(0) as u64;
                 return Ok(Outcome::Found(Payload::head_only(
                     size,
@@ -350,15 +387,15 @@ impl ProxyEngine {
         p: &Payload,
         extra: Vec<(HeaderName, HeaderValue)>,
     ) -> AppResult<Response> {
-        p.to_response(&self.storage, extra).await
+        p.to_response(self.storage.as_ref(), extra).await
     }
 
     pub async fn purge_repo(&self, member: CacheRepo<'_>) -> AppResult<()> {
-        proxy_cache::delete_entries(&self.db, member.0.id).await?;
-        proxy_cache::delete_legacy_meta(&self.db, member.0.id).await?;
+        self.cache.delete_for_repo(member.0.id).await?;
         self.storage
             .delete_prefix(&format!("_proxy_cache/{}", member.0.name))
-            .await
+            .await?;
+        Ok(())
     }
 
     /// A negative row under `cache_key`, never `store_key`: no body, no sha256.
@@ -370,6 +407,7 @@ impl ProxyEngine {
         key: &CacheKey,
         status: StatusCode,
         stale: Option<&Stale>,
+        now: DateTime<Utc>,
     ) -> AppResult<()> {
         if let Some(path) = stale.and_then(|st| st.row.storage_path.as_deref()) {
             self.storage.delete(path).await?;
@@ -386,7 +424,7 @@ impl ProxyEngine {
             size: 0,
             ttl_secs: Some(self.ttl.negative_secs),
         };
-        proxy_cache::upsert_entry(&self.db, &entry).await?;
+        self.cache.upsert(&entry, now).await?;
         Ok(())
     }
 
@@ -396,16 +434,17 @@ impl ProxyEngine {
         s: &S,
         a: &S::Artifact,
         row: CacheEntry,
+        now: DateTime<Utc>,
     ) -> Option<CacheEntry> {
         let target = match (&row.storage_path, &row.digest) {
             (Some(_), _) => row,
             (None, Some(digest)) => {
                 let key = s.store_key(a, digest);
-                proxy_cache::get_entry(&self.db, row.repository_id, key.kind, &key.key)
+                self.cache
+                    .entry(row.repository_id, key.kind, &key.key, now)
                     .await
                     .ok()
-                    .flatten()
-                    .map(|(target, _)| target)?
+                    .flatten()?
             }
             (None, None) => return None,
         };
@@ -414,10 +453,15 @@ impl ProxyEngine {
     }
 
     // An untouched pointer would be evicted under a hot tag.
-    async fn hit(&self, row: &CacheEntry, target: CacheEntry) -> AppResult<Cached> {
-        proxy_cache::touch_entry(&self.db, row.id, None).await?;
+    async fn hit(
+        &self,
+        row: &CacheEntry,
+        target: CacheEntry,
+        now: DateTime<Utc>,
+    ) -> AppResult<Cached> {
+        self.cache.touch(row.id, None, now).await?;
         if target.id != row.id {
-            proxy_cache::touch_entry(&self.db, target.id, None).await?;
+            self.cache.touch(target.id, None, now).await?;
         }
         Ok(Cached {
             entry: target,
@@ -501,9 +545,11 @@ impl ProxyEngine {
             CachePolicy::Ttl(Ttl::Secs(n)) => Some(n),
         }
     }
+
+    fn ttl(&self, policy: CachePolicy) -> Option<Duration> {
+        self.ttl_secs(policy).map(Duration::from_secs)
+    }
 }
 
-#[cfg(test)]
-pub(crate) mod fixture;
 #[cfg(test)]
 mod tests;

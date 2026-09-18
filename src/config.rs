@@ -231,18 +231,11 @@ pub struct RepositoryConfig {
     pub dl_allow_private: bool,
 }
 
-/// Aliases kept so existing config and test code keep compiling; the enums
-/// themselves live next to the rows they are round-tripped from.
-pub type RepositoryType = crate::db::kinds::RepoKind;
-pub type RepositoryFormat = crate::db::kinds::Format;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
-#[serde(rename_all = "lowercase")]
-pub enum Visibility {
-    Public,
-    #[default]
-    Private,
-}
+/// Aliases kept so existing config and test code keep compiling; the types
+/// themselves are registry vocabulary and live in the domain.
+pub type RepositoryType = crate::domain::RepoKind;
+pub type RepositoryFormat = crate::domain::Format;
+pub use crate::domain::Visibility;
 
 // ---------------------------------------------------------------------------
 // Loader

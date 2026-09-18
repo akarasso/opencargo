@@ -1,10 +1,10 @@
 use serde_json::Value;
 
-use crate::db::kinds::Format;
-use crate::error::{AppError, AppResult};
+use crate::domain::{CacheRepo, Format, Outcome};
 use crate::policy::{self, Source};
-use crate::proxy::Payload;
-use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
+use crate::ports::packages::NameMatch;
+use crate::proxy::{IntoPayload, Payload};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
 use super::packument::{
     dist_tags_map, hosted_packument, strip_versions_to_abbreviated, Packument,
@@ -21,8 +21,12 @@ pub struct PackumentLeaf {
 impl Leaf for PackumentLeaf {
     type Out = Packument;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Packument>> {
-        let built = hosted_packument(&cx.state.db, member, &self.name, self.abbreviated).await?;
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Packument>, ResolveError> {
+        let built = hosted_packument(cx.packages, member, &self.name, self.abbreviated).await?;
         Ok(match built {
             Outcome::Found(json) => Outcome::Found(Packument { json, stale: false }),
             Outcome::NotFound => Outcome::NotFound,
@@ -34,17 +38,17 @@ impl Leaf for PackumentLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Packument>> {
+    ) -> Result<Outcome<Packument>, ResolveError> {
         let artifact = NpmArtifact::Metadata {
             name: self.name.clone(),
         };
-        let engine = &cx.state.proxy;
+        let engine = cx.proxy;
         let Outcome::Found(cached) = engine.fetch(&NpmUpstream, up, member, &artifact).await? else {
             return Ok(Outcome::NotFound);
         };
         let bytes = engine.bytes(&cached).await?;
         let mut json: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| AppError::BadGateway(format!("invalid packument from upstream: {e}")))?;
+            .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
         if self.abbreviated {
             strip_versions_to_abbreviated(&mut json);
         }
@@ -64,19 +68,26 @@ pub struct TarballLeaf {
 impl Leaf for TarballLeaf {
     type Out = Payload;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Payload>> {
-        let db = &cx.state.db;
-        let Some(package) = crate::db::get_package(db, member.0.id, &self.name).await? else {
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Payload>, ResolveError> {
+        let found = cx
+            .packages
+            .package(member.0.id, &self.name, NameMatch::Exact)
+            .await?;
+        let Some(package) = found else {
             return Ok(Outcome::NotFound);
         };
-        let versions = crate::db::get_versions(db, package.id).await?;
+        let versions = cx.packages.versions(package.id).await?;
         let Some(version) = versions
             .iter()
             .find(|v| v.tarball_path.ends_with(&self.filename))
         else {
             return Ok(Outcome::NotFound);
         };
-        let _ = crate::db::record_download(db, version.id).await;
+        let _ = cx.packages.record_download(version.id).await;
         crate::telemetry::record_download(&member.0.name, &self.name);
         Ok(Outcome::Found(Payload::file(
             version.tarball_path.clone(),
@@ -89,12 +100,12 @@ impl Leaf for TarballLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Payload>> {
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let artifact = NpmArtifact::Tarball {
             name: self.name.clone(),
             filename: self.filename.clone(),
         };
-        let cached = cx.state.proxy.fetch(&NpmUpstream, up, member, &artifact).await?;
+        let cached = cx.proxy.fetch(&NpmUpstream, up, member, &artifact).await?;
         if let Outcome::Found(c) = &cached {
             policy::record(cx, member, up, Format::Npm, &self.name, None, || Source::Npm {
                 filename: self.filename.clone(),
@@ -115,14 +126,23 @@ pub struct DistTagsLeaf {
 impl Leaf for DistTagsLeaf {
     type Out = Value;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Value>> {
-        let db = &cx.state.db;
-        let Some(package) = crate::db::get_package(db, member.0.id, &self.name).await? else {
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Value>, ResolveError> {
+        let packages = cx.packages;
+        let found = packages
+            .package(member.0.id, &self.name, NameMatch::Exact)
+            .await?;
+        let Some(package) = found else {
             return Ok(Outcome::NotFound);
         };
-        let versions = crate::db::get_versions(db, package.id).await?;
-        let tags = dist_tags_map(db, package.id, &versions).await?;
-        Ok(Outcome::Found(serde_json::to_value(tags)?))
+        let versions = packages.versions(package.id).await?;
+        let tags = dist_tags_map(packages, package.id, &versions).await?;
+        let json = serde_json::to_value(tags)
+            .map_err(|e| ResolveError::Internal(format!("dist-tags are not serializable: {e}")))?;
+        Ok(Outcome::Found(json))
     }
 
     async fn proxy(
@@ -130,7 +150,7 @@ impl Leaf for DistTagsLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Value>> {
+    ) -> Result<Outcome<Value>, ResolveError> {
         let packument = PackumentLeaf {
             name: self.name.clone(),
             abbreviated: true,
@@ -158,8 +178,13 @@ pub struct SearchLeaf {
 impl Leaf for SearchLeaf {
     type Out = Vec<Value>;
 
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Vec<Value>>> {
-        let objects = search_in_repo(cx.state, member.0.id, &self.text, self.limit).await?;
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Vec<Value>>, ResolveError> {
+        let objects =
+            search_in_repo(cx.search, cx.packages, member.0.id, &self.text, self.limit).await?;
         Ok(Outcome::Found(objects))
     }
 
@@ -168,7 +193,7 @@ impl Leaf for SearchLeaf {
         _cx: &Cx<'_>,
         _member: CacheRepo<'_>,
         _up: &Upstream,
-    ) -> AppResult<Outcome<Vec<Value>>> {
+    ) -> Result<Outcome<Vec<Value>>, ResolveError> {
         Ok(Outcome::NotFound)
     }
 }

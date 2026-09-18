@@ -1,11 +1,10 @@
 use axum::http::{header, HeaderMap, HeaderName, HeaderValue, StatusCode};
 
-use crate::error::{AppError, AppResult};
 use crate::proxy::auth::is_docker_hub_host;
 use crate::proxy::strategy::{
     CacheKey, CachePolicy, Classified, Transfer, Ttl, UpstreamStrategy, MAX_METADATA_BYTES,
 };
-use crate::registry::resolve::Upstream;
+use crate::registry::resolve::{ResolveError, Upstream};
 
 use super::MAX_TAGS;
 
@@ -77,11 +76,11 @@ pub struct OciUpstream;
 impl UpstreamStrategy for OciUpstream {
     type Artifact = OciArtifact;
 
-    fn upstream_url(&self, up: &Upstream, a: &OciArtifact) -> AppResult<reqwest::Url> {
+    fn upstream_url(&self, up: &Upstream, a: &OciArtifact) -> Result<url::Url, ResolveError> {
         let mut url = up.base.clone();
         if is_hub(up) {
             url.set_host(Some(HUB_REGISTRY))
-                .map_err(|e| AppError::Internal(format!("hub host rewrite failed: {e}")))?;
+                .map_err(|e| ResolveError::Internal(format!("hub host rewrite failed: {e}")))?;
         }
         let prefix = up.base.path().trim_matches('/');
         let path = if prefix.is_empty() {
@@ -128,10 +127,10 @@ impl UpstreamStrategy for OciUpstream {
         }
     }
 
-    fn verify_headers(&self, _a: &OciArtifact, h: &HeaderMap, body_sha256: &str) -> AppResult<()> {
+    fn verify_headers(&self, _a: &OciArtifact, h: &HeaderMap, body_sha256: &str) -> Result<(), ResolveError> {
         match h.get(DOCKER_CONTENT_DIGEST).and_then(|v| v.to_str().ok()) {
             Some(claimed) if claimed != format!("sha256:{body_sha256}") => {
-                Err(AppError::BadGateway(format!(
+                Err(ResolveError::Upstream(format!(
                     "upstream Docker-Content-Digest {claimed} does not match the body"
                 )))
             }
@@ -202,7 +201,7 @@ mod tests {
 
     fn upstream(base: &str) -> Upstream {
         Upstream {
-            base: reqwest::Url::parse(base).unwrap(),
+            base: url::Url::parse(base).unwrap(),
             auth: None,
             token_realms: Vec::new(),
             dl_allow_private: false,

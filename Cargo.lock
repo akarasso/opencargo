@@ -1674,6 +1674,7 @@ dependencies = [
  "metrics",
  "metrics-exporter-prometheus",
  "mime_guess",
+ "opencargo-domain",
  "pulldown-cmark",
  "rand 0.8.5",
  "rcgen",
@@ -1698,8 +1699,19 @@ dependencies = [
  "tower-http",
  "tracing",
  "tracing-subscriber",
+ "url",
  "uuid",
  "zip",
+]
+
+[[package]]
+name = "opencargo-domain"
+version = "0.1.0-rc.1"
+dependencies = [
+ "chrono",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

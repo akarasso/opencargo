@@ -19,7 +19,12 @@ for t in "${TARGETS[@]}"; do
   name=opencargo-$version-$t
   "$tool/cargo-cyclonedx" cyclonedx --manifest-path Cargo.toml -q -f json --spec-version 1.5 \
     --no-build-deps --target "$t" --override-filename "$name.cdx"
+  # cargo-cyclonedx 0.5.9 has no package selector: it emits one document per
+  # workspace member, each beside its own manifest and all under
+  # --override-filename. The release artifact is the binary's, which already
+  # carries every member as a component; the rest are duplicates.
   mv "$name.cdx.json" "$out/$name.cdx.json"
+  find crates -name "$name.cdx.json" -delete
   got=$(jq -r '.metadata.component.version' "$out/$name.cdx.json")
   if [[ $got != "$version" ]]; then
     echo "sbom: $name.cdx.json root version is '$got', expected '$version'" >&2

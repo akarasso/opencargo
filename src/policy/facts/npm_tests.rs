@@ -7,7 +7,7 @@ use serde_json::json;
 use super::*;
 use crate::policy::testing::{engine_over, fast};
 use crate::policy::Tuning;
-use crate::proxy::engine::fixture::Fx;
+use crate::testing::fixture::Fx;
 
 fn packument(versions: &[(&str, &str)]) -> Value {
     let mut v = json!({ "name": "widget", "versions": {}, "time": {} });
@@ -114,6 +114,35 @@ async fn facts_for(
     .await
 }
 
+/// Re-write the cached packument row under a later clock and a different
+/// digest: the memo keys on that stamp, so this is what "the row moved on"
+/// looks like from outside the proxy.
+async fn bump_cached_packument(fx: &Fx) {
+    let now = chrono::Utc::now();
+    let row = fx
+        .cache
+        .entry(fx.repo.id, "npm-metadata", "widget", now)
+        .await
+        .unwrap()
+        .expect("the packument was cached");
+    let bumped = crate::domain::NewEntry {
+        repository_id: fx.repo.id,
+        kind: "npm-metadata",
+        cache_key: "widget",
+        status: row.status,
+        storage_path: row.storage_path.as_deref(),
+        content_type: row.content_type.as_deref(),
+        etag: row.etag.as_deref(),
+        digest: Some("bumped"),
+        size: row.size,
+        ttl_secs: Some(3600),
+    };
+    fx.cache
+        .upsert(&bumped, now + chrono::TimeDelta::seconds(1))
+        .await
+        .unwrap();
+}
+
 fn if_none_match_count(fx: &Fx) -> usize {
     fx.hits()
         .iter()
@@ -153,10 +182,7 @@ async fn package_facts_parses_once_per_row() {
     assert_eq!(source, "cache");
     assert_eq!(parses(), 1);
 
-    sqlx::query("UPDATE proxy_cache_entries SET fetched_at = datetime('now', '+1 second'), digest = 'bumped'")
-        .execute(&fx.pool)
-        .await
-        .unwrap();
+    bump_cached_packument(&fx).await;
     let (bumped, _) = facts_for(&shared, &fx, "widget-1.0.0.tgz").await;
     assert!(
         !Arc::ptr_eq(&bumped.unwrap(), &first),

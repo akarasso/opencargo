@@ -1,6 +1,5 @@
-use crate::error::{AppError, AppResult};
 use crate::proxy::strategy::{CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy};
-use crate::registry::resolve::Upstream;
+use crate::registry::resolve::{ResolveError, Upstream};
 
 #[derive(Debug)]
 pub enum NpmArtifact {
@@ -13,14 +12,14 @@ pub struct NpmUpstream;
 impl UpstreamStrategy for NpmUpstream {
     type Artifact = NpmArtifact;
 
-    fn upstream_url(&self, up: &Upstream, a: &NpmArtifact) -> AppResult<reqwest::Url> {
+    fn upstream_url(&self, up: &Upstream, a: &NpmArtifact) -> Result<url::Url, ResolveError> {
         let base = up.base.as_str().trim_end_matches('/');
         let url = match a {
             NpmArtifact::Metadata { name } => format!("{base}/{name}"),
             NpmArtifact::Tarball { name, filename } => format!("{base}/{name}/-/{filename}"),
         };
-        reqwest::Url::parse(&url)
-            .map_err(|e| AppError::BadGateway(format!("invalid upstream URL {url}: {e}")))
+        url::Url::parse(&url)
+            .map_err(|e| ResolveError::Upstream(format!("invalid upstream URL {url}: {e}")))
     }
 
     fn cache_key(&self, a: &NpmArtifact) -> CacheKey {

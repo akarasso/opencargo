@@ -1,3 +1,7 @@
+#![allow(clippy::disallowed_types, clippy::disallowed_methods)]
+//! SQLite-only by design: these assertions guarantee the schema, not the
+//! ports (designs-next/ports-and-adapters.md 7.4).
+
 mod common;
 
 use reqwest::StatusCode;
@@ -723,8 +727,10 @@ async fn purge_group_purges_proxy_members_only() {
 async fn migrate_013_twice_is_noop() {
     let tmp = tempfile::TempDir::new().unwrap();
     let url = format!("sqlite:{}?mode=rwc", tmp.path().join("m.db").display());
-    let pool = opencargo::db::connect(&url).await.unwrap();
-    opencargo::db::migrate(&pool).await.unwrap();
+    let pool = opencargo::adapters::sqlite::connect(&url).await.unwrap();
+    opencargo::adapters::sqlite::migrate::run_all(&pool)
+        .await
+        .unwrap();
 
     sqlx::query(
         "INSERT INTO repositories (name, repo_type, format, upstream_url)
@@ -741,7 +747,9 @@ async fn migrate_013_twice_is_noop() {
     .await
     .unwrap();
 
-    opencargo::db::migrate(&pool).await.unwrap();
+    opencargo::adapters::sqlite::migrate::run_all(&pool)
+        .await
+        .unwrap();
 
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await,

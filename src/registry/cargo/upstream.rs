@@ -1,11 +1,10 @@
 use axum::http::{header, HeaderName, HeaderValue};
 
-use crate::error::{AppError, AppResult};
 use crate::proxy::strategy::{
     CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
     MAX_METADATA_BYTES,
 };
-use crate::registry::resolve::Upstream;
+use crate::registry::resolve::{ResolveError, Upstream};
 
 use super::{compute_prefix, prefix_of};
 
@@ -33,7 +32,7 @@ pub enum CargoArtifact {
     /// `{api}/api/v1/crates/{name}/{version}`: the only source of a
     /// publish date, an upstream-chosen host like `dl`.
     VersionMeta {
-        api: reqwest::Url,
+        api: url::Url,
         name: String,
         version: String,
     },
@@ -44,7 +43,7 @@ pub struct CargoUpstream;
 impl UpstreamStrategy for CargoUpstream {
     type Artifact = CargoArtifact;
 
-    fn upstream_url(&self, up: &Upstream, a: &CargoArtifact) -> AppResult<reqwest::Url> {
+    fn upstream_url(&self, up: &Upstream, a: &CargoArtifact) -> Result<url::Url, ResolveError> {
         let base = up.base.as_str().trim_end_matches('/');
         let url = match a {
             CargoArtifact::Config => format!("{base}/config.json"),
@@ -161,13 +160,13 @@ fn download_url(
     version: &str,
     cksum: &str,
     up: &Upstream,
-) -> AppResult<reqwest::Url> {
+) -> Result<url::Url, ResolveError> {
     let expanded = expand_dl_template(dl, name, version, cksum);
     crate::proxy::validate_upstream_url(&expanded)
-        .map_err(|e| AppError::BadGateway(format!("upstream dl {expanded} refused: {e}")))?;
+        .map_err(|e| ResolveError::Upstream(format!("upstream dl {expanded} refused: {e}")))?;
     let url = parse_url(&expanded)?;
     if up.auth.is_some() && !may_see_credentials(&url, up) {
-        return Err(AppError::BadGateway(format!(
+        return Err(ResolveError::Upstream(format!(
             "upstream dl {expanded} is off the index host {}; upstream_auth stays on that host (list the dl host in token_realms to allow it)",
             up.base.host_str().unwrap_or_default()
         )));
@@ -176,21 +175,21 @@ fn download_url(
 }
 
 // The engine sends `up.auth` with every fetch; a hostile index must not redirect it.
-fn may_see_credentials(url: &reqwest::Url, up: &Upstream) -> bool {
+fn may_see_credentials(url: &url::Url, up: &Upstream) -> bool {
     std::iter::once(&up.base)
         .chain(&up.token_realms)
         .any(|allowed| same_origin(url, allowed))
 }
 
-fn same_origin(a: &reqwest::Url, b: &reqwest::Url) -> bool {
+fn same_origin(a: &url::Url, b: &url::Url) -> bool {
     a.scheme() == b.scheme()
         && a.host_str() == b.host_str()
         && a.port_or_known_default() == b.port_or_known_default()
 }
 
-fn parse_url(url: &str) -> AppResult<reqwest::Url> {
-    reqwest::Url::parse(url)
-        .map_err(|e| AppError::BadGateway(format!("invalid upstream URL {url}: {e}")))
+fn parse_url(url: &str) -> Result<url::Url, ResolveError> {
+    url::Url::parse(url)
+        .map_err(|e| ResolveError::Upstream(format!("invalid upstream URL {url}: {e}")))
 }
 
 #[cfg(test)]
@@ -199,7 +198,7 @@ mod tests {
 
     fn upstream(dl_allow_private: bool) -> Upstream {
         Upstream {
-            base: reqwest::Url::parse("http://127.0.0.1:1/cargo-up/index").unwrap(),
+            base: url::Url::parse("http://127.0.0.1:1/cargo-up/index").unwrap(),
             auth: None,
             token_realms: Vec::new(),
             dl_allow_private,
@@ -265,13 +264,13 @@ mod tests {
         assert!(
             matches!(
                 s.upstream_url(&upstream(true), &link_local),
-                Err(AppError::BadGateway(_))
+                Err(ResolveError::Upstream(_))
             ),
             "link-local is refused even with the opt-in"
         );
         assert!(matches!(
             s.upstream_url(&upstream(true), &crate_at("ftp://h/x")),
-            Err(AppError::BadGateway(_))
+            Err(ResolveError::Upstream(_))
         ));
     }
 
@@ -287,10 +286,10 @@ mod tests {
         let off_host = crate_at("https://static.crates.io/crates");
         let err = s.upstream_url(&up, &off_host).unwrap_err();
         assert!(
-            matches!(err, AppError::BadGateway(ref m) if m.contains("static.crates.io") && m.contains("token_realms")),
+            matches!(err, ResolveError::Upstream(ref m) if m.contains("static.crates.io") && m.contains("token_realms")),
             "{err}"
         );
-        up.token_realms = vec![reqwest::Url::parse("https://static.crates.io/token").unwrap()];
+        up.token_realms = vec![url::Url::parse("https://static.crates.io/token").unwrap()];
         assert!(
             s.upstream_url(&up, &off_host).is_ok(),
             "a host listed in token_realms may see the credentials"
@@ -299,7 +298,7 @@ mod tests {
         assert!(
             matches!(
                 s.upstream_url(&up, &plaintext),
-                Err(AppError::BadGateway(_))
+                Err(ResolveError::Upstream(_))
             ),
             "the same host over another scheme is another origin"
         );
@@ -346,7 +345,7 @@ mod tests {
     fn version_meta_is_paced_api_content_with_an_agent() {
         let s = CargoUpstream;
         let meta = CargoArtifact::VersionMeta {
-            api: reqwest::Url::parse("https://crates.io/").unwrap(),
+            api: url::Url::parse("https://crates.io/").unwrap(),
             name: "Serde".into(),
             version: "1.0.0".into(),
         };

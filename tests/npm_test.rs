@@ -622,3 +622,62 @@ async fn unscoped_dist_tags_get_put_delete() {
         .expect("anonymous put dist-tag failed");
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "dist-tag writes need a token");
 }
+
+/// npm's *browse*: a client calling `/-/v1/search` with no `text` lists the
+/// repository. It is the endpoint's default path, and the only reason a
+/// missing query is not an empty result.
+#[tokio::test]
+async fn search_with_no_text_browses_the_repository() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    let pkg_json = r#"{"name":"@test/browsable","version":"1.0.0","main":"index.js"}"#;
+    let tarball = build_tarball(pkg_json);
+    let body = build_npm_publish_body("@test/browsable", "1.0.0", "browsable", &tarball);
+    let resp = client
+        .put(format!("{}/test-npm/@test/browsable", base_url))
+        .bearer_auth("test-token")
+        .json(&body)
+        .send()
+        .await
+        .expect("publish request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+
+    let resp = client
+        .get(format!("{}/test-npm/-/v1/search?size=20", base_url))
+        .send()
+        .await
+        .expect("search request failed");
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data: Value = resp.json().await.expect("invalid json");
+    let objects = data["objects"].as_array().expect("objects is an array");
+    assert!(
+        objects
+            .iter()
+            .any(|o| o["package"]["name"].as_str() == Some("@test/browsable")),
+        "a search with no text lists the repository, got: {data}"
+    );
+}
+
+/// A query that sanitises away matches nothing and never reaches the index:
+/// handed to FTS5 verbatim these are `MATCH ''`, which it refuses.
+#[tokio::test]
+async fn a_query_that_sanitises_away_is_empty_not_a_failure() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+
+    for query in ["text=%20", "text=%22", "text=%20%20%22"] {
+        let resp = client
+            .get(format!("{}/test-npm/-/v1/search?{query}", base_url))
+            .send()
+            .await
+            .expect("search request failed");
+        assert_eq!(resp.status(), StatusCode::OK, "{query}");
+        let data: Value = resp.json().await.expect("invalid json");
+        assert_eq!(
+            data["objects"].as_array().map(Vec::len),
+            Some(0),
+            "{query} matches nothing"
+        );
+    }
+}

@@ -5,7 +5,8 @@ use serde_json::Value;
 
 use crate::proxy::engine::Cached;
 use crate::registry::oci::upstream::{upstream_name, OciArtifact, OciUpstream};
-use crate::registry::resolve::{CacheRepo, Upstream};
+use crate::domain::CacheRepo;
+use crate::registry::resolve::Upstream;
 
 use super::super::rules::PolicyConfig;
 use super::super::{Pending, Shared, Source};

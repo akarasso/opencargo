@@ -3,9 +3,9 @@ use std::time::Duration;
 use axum::http::{header, Method};
 use tokio::io::AsyncReadExt;
 
-use super::fixture::*;
 use super::*;
-use crate::db::Repository;
+use crate::testing::fixture::*;
+use crate::domain::{Repository, Visibility};
 use crate::proxy::strategy::{CacheKey, Transfer, UrlSource};
 
 fn found(o: AppResult<Outcome<Cached>>) -> Cached {
@@ -22,11 +22,11 @@ fn prefix_keys_do_not_collide() {
         name: "p".into(),
         repo_type: "proxy".into(),
         format: "go".into(),
-        visibility: "public".into(),
+        visibility: Visibility::Public,
         upstream_url: None,
-        config_json: None,
-        created_at: String::new(),
-        updated_at: String::new(),
+        config: None,
+        created_at: chrono::DateTime::UNIX_EPOCH,
+        updated_at: chrono::DateTime::UNIX_EPOCH,
     };
     let short = cache_path(
         CacheRepo(&repo),
@@ -91,7 +91,7 @@ async fn singleflight_wait_timeout_proceeds_unlocked() {
 #[tokio::test]
 async fn part_file_unlinked_on_drop_and_cap() {
     let fx = Fx::new().await;
-    let mut part = PartFile::new(&fx.storage, "_proxy_cache/p/x.part-1".into())
+    let mut part = PartFile::new(fx.storage.as_ref(), "_proxy_cache/p/x.part-1".into())
         .await
         .unwrap();
     part.write_chunk(b"abc").await.unwrap();
@@ -128,12 +128,12 @@ async fn part_file_unlinked_on_drop_and_cap() {
 #[tokio::test]
 async fn part_file_commit_keeps_file() {
     let fx = Fx::new().await;
-    let mut part = PartFile::new(&fx.storage, "_proxy_cache/p/k/x.part-1".into())
+    let mut part = PartFile::new(fx.storage.as_ref(), "_proxy_cache/p/k/x.part-1".into())
         .await
         .unwrap();
     part.write_chunk(b"abc").await.unwrap();
     part.write_chunk(b"def").await.unwrap();
-    part.commit(&fx.storage, "_proxy_cache/p/k/x")
+    part.commit(fx.storage.as_ref(), "_proxy_cache/p/k/x")
         .await
         .unwrap();
     assert!(!fx
@@ -145,6 +145,36 @@ async fn part_file_commit_keeps_file() {
         fx.storage.get("_proxy_cache/p/k/x").await.unwrap().as_ref(),
         b"abcdef"
     );
+}
+
+/// The ttl is a fact about time, not about a row: nothing is rewritten, no
+/// test sleeps, and no entry is stored with a zero ttl, which would take a
+/// different path through the engine than the one the server takes.
+#[tokio::test]
+async fn a_row_goes_stale_when_now_passes_its_expiry() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let (strat, art) = (Strat::default(), "art/x".to_string());
+    found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    let fresh = fx.row("t-item", "art/x").await.unwrap();
+    assert!(fresh.fresh, "a row just written is fresh");
+    assert_eq!(fx.hits().len(), 1);
+
+    // Well inside the fixture's 3600s ttl: still a hit. The margin is wide on
+    // purpose: the shift adds to a real clock that moves between the two reads.
+    fx.advance(Duration::from_secs(3000));
+    assert!(fx.row("t-item", "art/x").await.unwrap().fresh);
+    found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 1, "a fresh row asks nobody");
+
+    fx.advance(Duration::from_secs(700));
+    let expired = fx.row("t-item", "art/x").await.unwrap();
+    assert!(!expired.fresh, "stale once the expiry has passed");
+    assert_eq!(expired.id, fresh.id);
+    let served = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 2, "an expired row is revalidated");
+    assert!(!served.stale, "and serves fresh again afterwards");
+    assert!(fx.row("t-item", "art/x").await.unwrap().fresh);
 }
 
 #[tokio::test]
@@ -161,7 +191,7 @@ async fn buffered_refresh_never_truncates_reader() {
     let (len, mut reader) = fx.storage.read_stream(&path).await.unwrap();
     assert_eq!(len, 5);
 
-    fx.expire().await;
+    fx.expire();
     fx.set(|s| s.body = b"a much longer body than before".to_vec());
     let second = found(
         engine
@@ -242,10 +272,8 @@ async fn pointer_row_touched_with_target() {
             )
             .await,
     );
-    sqlx::query("UPDATE proxy_cache_entries SET last_used_at = datetime('now', '-1 day')")
-        .execute(&fx.pool)
-        .await
-        .unwrap();
+    // Far enough that a touch writes a later second, well short of the ttl.
+    fx.advance(Duration::from_secs(60));
     let before = fx.row("t-item", "art/tag").await.unwrap().last_used_at;
     found(
         engine
@@ -285,7 +313,7 @@ async fn stale_pointer_served_on_upstream_error() {
             .await,
     );
     assert!(!fresh.stale);
-    fx.expire().await;
+    fx.expire();
     fx.set(|s| s.fail = true);
     let stale = found(
         engine
@@ -341,7 +369,7 @@ async fn stale_pointer_without_target_regets_without_if_none_match() {
             .await,
     );
 
-    fx.expire().await;
+    fx.expire();
     let revalidated = found(
         engine
             .fetch(
@@ -356,7 +384,7 @@ async fn stale_pointer_without_target_regets_without_if_none_match() {
     assert!(!revalidated.stale, "a 304 refreshes the pointer");
     assert_eq!(fx.hits()[1].2.get(header::IF_NONE_MATCH).unwrap(), "\"v1\"");
 
-    fx.expire().await;
+    fx.expire();
     fx.storage
         .delete(first.entry.storage_path.as_deref().unwrap())
         .await
@@ -650,7 +678,7 @@ async fn revalidated_pointer_keeps_its_target_immutable() {
     );
     assert_eq!(first.entry.expires_at, None);
 
-    fx.expire().await;
+    fx.expire();
     let revalidated = found(
         engine
             .fetch(&pointer_strat(), &fx.up, fx.member(), &art)
@@ -680,7 +708,7 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
     let path = cached.entry.storage_path.unwrap();
     assert!(fx.storage.exists(&path).await.unwrap());
 
-    fx.expire().await;
+    fx.expire();
     fx.set(|s| s.gone = true);
     let res = engine
         .fetch(&Strat::default(), &fx.up, fx.member(), &art)
@@ -706,7 +734,7 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
             .await,
     );
     let body_path = shared.entry.storage_path.unwrap();
-    fx.expire().await;
+    fx.expire();
     fx.set(|s| s.gone = true);
     let res = engine
         .fetch(
@@ -736,10 +764,8 @@ async fn peek_never_hits_upstream() {
     assert!(fx.hits().is_empty(), "a cold peek asks nobody");
 
     let first = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
-    sqlx::query("UPDATE proxy_cache_entries SET last_used_at = datetime('now', '-1 day')")
-        .execute(&fx.pool)
-        .await
-        .unwrap();
+    // Far enough that a touch writes a later second, well short of the ttl.
+    fx.advance(Duration::from_secs(60));
     let before = fx.row("t-item", "art/x").await.unwrap();
     let peeked = engine
         .peek(&strat, fx.member(), &art)
@@ -751,7 +777,7 @@ async fn peek_never_hits_upstream() {
     let after = fx.row("t-item", "art/x").await.unwrap();
     assert_eq!(after.last_used_at, before.last_used_at, "no row touched");
 
-    fx.expire().await;
+    fx.expire();
     let stale = engine
         .peek(&strat, fx.member(), &art)
         .await
@@ -877,7 +903,7 @@ async fn refresh_never_records_a_miss() {
     );
 
     fx.set(|s| s.gone = true);
-    fx.expire().await;
+    fx.expire();
     let res = engine.fetch(&strat, &fx.up, fx.member(), &art).await;
     assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
     let row = fx.row("t-item", "art/x").await.unwrap();

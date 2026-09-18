@@ -1,11 +1,11 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use sqlx::SqlitePool;
 
-use crate::db::Version;
-use crate::error::AppResult;
-use crate::registry::resolve::{CacheRepo, Outcome};
+use crate::domain::{CacheRepo, Outcome, Version};
+use crate::error::StoreError;
+use crate::ports::packages::{NameMatch, PackageStore};
+use crate::wire::wire_ts;
 
 /// A packument before the handler rewrites its tarball URLs.
 pub struct Packument {
@@ -16,27 +16,30 @@ pub struct Packument {
 /// Build the packument of a hosted member from its own rows; tarball URLs
 /// still carry the member name and are rewritten by the handler.
 pub async fn hosted_packument(
-    db: &SqlitePool,
+    packages: &dyn PackageStore,
     member: CacheRepo<'_>,
     package_name: &str,
     abbreviated: bool,
-) -> AppResult<Outcome<Value>> {
-    let Some(package) = crate::db::get_package(db, member.0.id, package_name).await? else {
+) -> Result<Outcome<Value>, StoreError> {
+    let found = packages
+        .package(member.0.id, package_name, NameMatch::Exact)
+        .await?;
+    let Some(package) = found else {
         return Ok(Outcome::NotFound);
     };
-    let versions = crate::db::get_versions(db, package.id).await?;
-    let dist_tags_map = dist_tags_map(db, package.id, &versions).await?;
+    let versions = packages.versions(package.id).await?;
+    let dist_tags_map = dist_tags_map(packages, package.id, &versions).await?;
 
     let mut versions_map: HashMap<String, Value> = HashMap::new();
     let mut time_map: HashMap<String, String> = HashMap::new();
-    time_map.insert("created".to_string(), package.created_at.clone());
-    time_map.insert("modified".to_string(), package.updated_at.clone());
+    time_map.insert("created".to_string(), wire_ts(package.created_at));
+    time_map.insert("modified".to_string(), wire_ts(package.updated_at));
     for v in &versions {
         let mut meta: Value = serde_json::from_str(&v.metadata_json).unwrap_or(json!({}));
         if abbreviated {
             strip_to_abbreviated(&mut meta);
         }
-        time_map.insert(v.version.clone(), v.published_at.clone());
+        time_map.insert(v.version.clone(), wire_ts(v.published_at));
         versions_map.insert(v.version.clone(), meta);
     }
 
@@ -52,11 +55,11 @@ pub async fn hosted_packument(
 
 /// `tag -> version` from the `dist_tags` rows of a hosted package.
 pub async fn dist_tags_map(
-    db: &SqlitePool,
+    packages: &dyn PackageStore,
     package_id: i64,
     versions: &[Version],
-) -> AppResult<HashMap<String, String>> {
-    let dist_tags = crate::db::get_dist_tags(db, package_id).await?;
+) -> Result<HashMap<String, String>, StoreError> {
+    let dist_tags = packages.dist_tags(package_id).await?;
     Ok(dist_tags
         .iter()
         .filter_map(|dt| {

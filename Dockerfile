@@ -12,10 +12,18 @@ FROM rust:1.93-alpine AS builder
 RUN apk add --no-cache musl-dev
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
-RUN mkdir -p src frontend/dist && echo "fn main() {}" > src/main.rs && cargo build --release 2>/dev/null || true && rm -rf src
+# The manifest declares a workspace, so every member's manifest must be present
+# before cargo can even resolve: the priming build stubs the domain crate the
+# same way it stubs the binary.
+COPY crates/domain/Cargo.toml crates/domain/
+RUN mkdir -p src crates/domain/src frontend/dist \
+  && echo "fn main() {}" > src/main.rs && : > crates/domain/src/lib.rs \
+  && cargo build --release 2>/dev/null || true \
+  && rm -rf src crates
 COPY src ./src
+COPY crates ./crates
 COPY --from=frontend /app/frontend/dist ./frontend/dist
-RUN touch src/main.rs && cargo build --release --locked
+RUN touch src/main.rs crates/domain/src/lib.rs && cargo build --release --locked
 
 # Stage 3: Runtime
 FROM alpine:3.21

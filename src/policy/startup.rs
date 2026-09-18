@@ -1,5 +1,5 @@
 use crate::config::Config;
-use crate::db::kinds::{Format, RepoKind};
+use crate::domain::{Format, RepoKind};
 
 /// What `build_state` says about `[policy.*]` before serving: `recording`
 /// names the members whose downloads are recorded, `unknown` the keys

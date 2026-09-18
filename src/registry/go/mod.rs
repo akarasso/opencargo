@@ -7,18 +7,8 @@ pub mod upstream;
 
 use serde_json::{json, Value};
 
-use crate::db::Version;
-
-/// SQLite's `datetime('now')` is `YYYY-MM-DD HH:MM:SS` UTC; the go tool only
-/// accepts RFC 3339 in `Time`.
-fn rfc3339(published_at: &str) -> String {
-    chrono::NaiveDateTime::parse_from_str(published_at, "%Y-%m-%d %H:%M:%S")
-        .map(|t| {
-            t.and_utc()
-                .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        })
-        .unwrap_or_else(|_| published_at.to_string())
-}
+use crate::domain::Version;
+use crate::wire::wire_ts;
 
 /// `v` stripped and parsed as semver (pseudo-versions are pre-releases);
 /// unparseable versions rank below every parseable one and compare lexically.
@@ -42,20 +32,14 @@ fn latest_of(versions: &[Version]) -> Option<&Version> {
 fn info_json(version: &Version) -> Value {
     json!({
         "Version": version.version,
-        "Time": rfc3339(&version.published_at),
+        "Time": wire_ts(version.published_at),
     })
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{compare_versions, rfc3339};
+    use super::compare_versions;
     use std::cmp::Ordering;
-
-    #[test]
-    fn time_is_rfc3339_utc() {
-        assert_eq!(rfc3339("2026-09-17 10:02:03"), "2026-09-17T10:02:03Z");
-        assert_eq!(rfc3339("2026-09-17T10:02:03Z"), "2026-09-17T10:02:03Z");
-    }
 
     #[test]
     fn versions_order_by_semver_then_lexically() {

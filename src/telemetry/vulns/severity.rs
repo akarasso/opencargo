@@ -1,6 +1,15 @@
+//! How an OSV record's scoring vectors become a [`Severity`].
+//!
+//! The enum itself is the domain's; what is here is the CVSS parsing and the
+//! precedence rule, which are the feed's own vocabulary.
+
 use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
+
+/// The enum is the domain's; re-exported because this is the path the OSV
+/// client and the report tests name it by.
+pub use crate::domain::Severity;
 
 /// One entry of an OSV record's `severity` array: a typed scoring vector.
 #[derive(Debug, Clone, Deserialize)]
@@ -10,51 +19,13 @@ pub struct OsvSeverityEntry {
     pub score: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Severity {
-    Unknown,
-    Low,
-    Medium,
-    High,
-    Critical,
-}
-
-impl Severity {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Unknown => "unknown",
-            Self::Low => "low",
-            Self::Medium => "medium",
-            Self::High => "high",
-            Self::Critical => "critical",
-        }
-    }
-
-    fn from_label(label: &str) -> Option<Self> {
-        match label.to_ascii_lowercase().as_str() {
-            "critical" => Some(Self::Critical),
-            "high" => Some(Self::High),
-            "moderate" | "medium" => Some(Self::Medium),
-            "low" => Some(Self::Low),
-            _ => None,
-        }
-    }
-
-    fn from_cvss(s: cvss::Severity) -> Self {
-        match s {
-            cvss::Severity::Critical => Self::Critical,
-            cvss::Severity::High => Self::High,
-            cvss::Severity::Medium => Self::Medium,
-            cvss::Severity::Low => Self::Low,
-            cvss::Severity::None => Self::Unknown,
-        }
-    }
-}
-
-impl std::fmt::Display for Severity {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
+fn from_cvss(s: cvss::Severity) -> Severity {
+    match s {
+        cvss::Severity::Critical => Severity::Critical,
+        cvss::Severity::High => Severity::High,
+        cvss::Severity::Medium => Severity::Medium,
+        cvss::Severity::Low => Severity::Low,
+        cvss::Severity::None => Severity::Unknown,
     }
 }
 
@@ -87,13 +58,16 @@ fn best_vector(entries: &[OsvSeverityEntry]) -> Option<(Severity, f64)> {
         .iter()
         .filter(|e| matches!(e.kind.as_deref(), Some("CVSS_V4" | "CVSS_V3")))
         .filter_map(|e| cvss::Cvss::from_str(e.score.as_deref()?).ok())
-        .map(|v| (Severity::from_cvss(v.severity()), v.score()))
+        .map(|v| (from_cvss(v.severity()), v.score()))
         .max_by(|a, b| a.1.total_cmp(&b.1))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The enum is the domain's; re-exported because this is the path the OSV
+/// client and the report tests name it by.
+pub use crate::domain::Severity;
     use serde_json::json;
 
     fn entry(kind: &str, score: &str) -> OsvSeverityEntry {

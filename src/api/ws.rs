@@ -9,8 +9,10 @@
 //! ```
 //!
 //! Server replies `{"type":"hello", ...}` then streams events filtered by the
-//! connection's visibility level (see [`crate::events::Visibility`]):
-//! anonymous ⇒ Public, logged-in ⇒ Authenticated, admin ⇒ Admin.
+//! connection's audience (see [`crate::domain::Audience`]): anonymous ⇒
+//! Public, logged-in ⇒ Authenticated, admin ⇒ Admin. Which audience an event
+//! has is decided where the repository is in hand, never here; this module
+//! applies the `<=` and encodes the JSON.
 //!
 //! Keepalive: the client may send `{"type":"ping"}` and gets `{"type":"pong"}`;
 //! the server also sends protocol-level Ping frames every 30s. Tokens are
@@ -25,10 +27,12 @@ use axum::{
     },
     response::IntoResponse,
 };
+use serde::Serialize;
 use serde_json::json;
 
 use crate::auth::middleware::{authenticate_bearer, AuthUser};
-use crate::events::Visibility;
+use crate::domain::{Audience, DomainEvent};
+use crate::ports::events::{Emitted, Received};
 use crate::server::AppState;
 
 /// How long the client has to send its auth frame.
@@ -54,7 +58,7 @@ pub async fn ws_handler(
 
 /// Identity attached to one WebSocket connection.
 struct WsIdentity {
-    level: Visibility,
+    level: Audience,
     username: String,
     role: String,
     /// Raw bearer token (empty for anonymous) — kept for re-validation.
@@ -86,20 +90,17 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
     loop {
         tokio::select! {
             event = rx.recv() => match event {
-                Ok(ev) => {
-                    if ev.visibility <= identity.level {
-                        let frame = match serde_json::to_string(&*ev) {
-                            Ok(f) => f,
-                            Err(_) => continue,
-                        };
-                        if socket.send(Message::text(frame)).await.is_err() {
+                Received::Event(ev) => {
+                    if ev.audience <= identity.level {
+                        let Some(text) = frame(&ev) else { continue };
+                        if socket.send(Message::text(text)).await.is_err() {
                             break;
                         }
                     }
                 }
                 // Subscriber fell behind and missed events: tell the client to
                 // refetch what it displays instead of trusting the stream.
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                Received::Lagged => {
                     if socket
                         .send(Message::text(r#"{"type":"resync"}"#.to_string()))
                         .await
@@ -108,7 +109,7 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
                         break;
                     }
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                Received::Closed => break,
             },
 
             msg = socket.recv() => match msg {
@@ -156,9 +157,9 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
                             }
                             Ok(Some(user)) => {
                                 let fresh_level = if user.role == "admin" {
-                                    Visibility::Admin
+                                    Audience::Admin
                                 } else {
-                                    Visibility::Authenticated
+                                    Audience::Authenticated
                                 };
                                 if fresh_level != identity.level {
                                     Some((CLOSE_UNAUTHORIZED, "access level changed — reconnect"))
@@ -220,9 +221,9 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<WsIden
             }
             Ok(Some(user)) => {
                 let level = if user.role == "admin" {
-                    Visibility::Admin
+                    Audience::Admin
                 } else {
-                    Visibility::Authenticated
+                    Audience::Authenticated
                 };
                 Some(WsIdentity {
                     level,
@@ -246,7 +247,7 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<WsIden
         None => {
             if state.auth.anonymous_read {
                 Some(WsIdentity {
-                    level: Visibility::Public,
+                    level: Audience::Public,
                     username: "anonymous".to_string(),
                     role: "anonymous".to_string(),
                     token: None,
@@ -266,4 +267,173 @@ async fn close(socket: &mut WebSocket, code: u16, reason: &str) {
             reason: reason.to_string().into(),
         })))
         .await;
+}
+
+// ---------------------------------------------------------------------------
+// Wire encoding
+// ---------------------------------------------------------------------------
+
+/// The envelope every event has always gone out in: the dotted name, the
+/// payload, and the emission timestamp in RFC 3339 with milliseconds.
+#[derive(Serialize)]
+struct Frame<'a> {
+    #[serde(rename = "type")]
+    event_type: &'a str,
+    data: serde_json::Value,
+    ts: String,
+}
+
+/// `None` for a payload that will not serialize, which is a frame skipped
+/// rather than a connection dropped.
+fn frame(emitted: &Emitted) -> Option<String> {
+    serde_json::to_string(&Frame {
+        event_type: emitted.event.kind(),
+        data: payload(&emitted.event),
+        ts: emitted
+            .at
+            .to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
+    })
+    .ok()
+}
+
+/// The `data` object of each event. This is the one place the registry's
+/// vocabulary becomes a client's, so the shapes are written out rather than
+/// derived: a renamed field here is a broken UI.
+fn payload(event: &DomainEvent) -> serde_json::Value {
+    match event {
+        DomainEvent::PackagePublished(r) => json!({
+            "package": r.package,
+            "version": r.version,
+            "repository": r.repository,
+            "format": r.format.as_str(),
+            "published_by": r.published_by,
+        }),
+        DomainEvent::PackagePromoted(p) => {
+            let mut data = json!({
+                "package": p.package,
+                "version": p.version,
+                "to": p.to,
+                "repository": p.to,
+                "promoted_by": p.promoted_by,
+            });
+            if let Some(from) = &p.from {
+                data["from"] = json!(from);
+            }
+            data
+        }
+        DomainEvent::RegistryChanged { repository } => json!({ "repository": repository }),
+        DomainEvent::RepositoriesChanged => json!({}),
+        DomainEvent::PermissionsChanged { username } => json!({ "username": username }),
+        DomainEvent::AuditEntry {
+            username,
+            action,
+            target,
+        } => json!({ "username": username, "action": action, "target": target }),
+        DomainEvent::PolicyResolution(c) => json!({
+            "repo": c.repo,
+            "member": c.member,
+            "count": c.count,
+            "would_block": c.would_block,
+            "unknown": c.unknown,
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::domain::{Format, PackagePromotion, PackageRelease, ResolutionCounts};
+
+    fn at() -> chrono::DateTime<chrono::Utc> {
+        chrono::DateTime::parse_from_rfc3339("2026-09-18T09:00:00.123Z")
+            .unwrap()
+            .with_timezone(&chrono::Utc)
+    }
+
+    fn sent(event: DomainEvent) -> String {
+        frame(&Emitted {
+            event,
+            audience: Audience::Public,
+            at: at(),
+        })
+        .expect("the envelope always serializes")
+    }
+
+    /// The envelope, field for field and byte for byte: a client parses this
+    /// string, so the refactor that produced it may not reshape it.
+    #[test]
+    fn a_publish_goes_out_in_the_envelope_it_always_has() {
+        assert_eq!(
+            sent(DomainEvent::PackagePublished(PackageRelease {
+                package: "@sec/hidden".to_string(),
+                version: "1.0.0".to_string(),
+                repository: "npm-secret".to_string(),
+                format: Format::Cargo,
+                published_by: "alice".to_string(),
+            })),
+            r#"{"type":"package.published","data":{"format":"cargo","package":"@sec/hidden","published_by":"alice","repository":"npm-secret","version":"1.0.0"},"ts":"2026-09-18T09:00:00.123Z"}"#
+        );
+    }
+
+    /// `from` names a repository the receiver may not be able to read, so it
+    /// is present only when the caller decided it was safe.
+    #[test]
+    fn a_promotion_carries_its_source_only_when_it_was_given_one() {
+        let mut promotion = PackagePromotion {
+            package: "left-pad".to_string(),
+            version: "1.0.0".to_string(),
+            to: "npm-prod".to_string(),
+            promoted_by: "alice".to_string(),
+            from: None,
+        };
+        let without = sent(DomainEvent::PackagePromoted(promotion.clone()));
+        assert!(!without.contains("\"from\""), "{without}");
+
+        promotion.from = Some("npm-staging".to_string());
+        let with = sent(DomainEvent::PackagePromoted(promotion));
+        assert!(with.contains(r#""from":"npm-staging""#), "{with}");
+        assert!(with.contains(r#""repository":"npm-prod""#), "{with}");
+    }
+
+    #[test]
+    fn every_other_event_keeps_its_dotted_name_and_payload() {
+        for (event, expected) in [
+            (
+                DomainEvent::RegistryChanged {
+                    repository: "npm-secret".to_string(),
+                },
+                r#"{"type":"registry.changed","data":{"repository":"npm-secret"},"ts":"2026-09-18T09:00:00.123Z"}"#,
+            ),
+            (
+                DomainEvent::RepositoriesChanged,
+                r#"{"type":"repositories.changed","data":{},"ts":"2026-09-18T09:00:00.123Z"}"#,
+            ),
+            (
+                DomainEvent::PermissionsChanged {
+                    username: "bob".to_string(),
+                },
+                r#"{"type":"permissions.changed","data":{"username":"bob"},"ts":"2026-09-18T09:00:00.123Z"}"#,
+            ),
+            (
+                DomainEvent::AuditEntry {
+                    username: "alice".to_string(),
+                    action: "user.delete".to_string(),
+                    target: None,
+                },
+                r#"{"type":"audit.entry","data":{"action":"user.delete","target":null,"username":"alice"},"ts":"2026-09-18T09:00:00.123Z"}"#,
+            ),
+            (
+                DomainEvent::PolicyResolution(ResolutionCounts {
+                    repo: "npm-all".to_string(),
+                    member: "npm-proxy".to_string(),
+                    count: 3,
+                    would_block: 1,
+                    unknown: 0,
+                }),
+                r#"{"type":"policy.resolution","data":{"count":3,"member":"npm-proxy","repo":"npm-all","unknown":0,"would_block":1},"ts":"2026-09-18T09:00:00.123Z"}"#,
+            ),
+        ] {
+            assert_eq!(sent(event), expected);
+        }
+    }
 }

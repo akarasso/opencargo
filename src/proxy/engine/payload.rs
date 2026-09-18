@@ -8,10 +8,9 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
-use crate::db::proxy_cache::CacheEntry;
+use crate::domain::{CacheEntry, CacheRepo, Outcome};
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{CacheRepo, Outcome};
-use crate::storage::{FilesystemStorage, StorageBackend};
+use crate::storage::{StorageBackend, StorageError};
 
 use super::super::strategy::CacheKey;
 
@@ -36,8 +35,15 @@ impl Cached {
     }
 }
 
-impl Outcome<Cached> {
-    pub fn into_payload(self) -> Outcome<Payload> {
+/// `Outcome` is the domain's word and `Payload` the proxy's, so the map from
+/// one to the other is an extension trait here, never an inherent `impl` on a
+/// type this layer does not own.
+pub trait IntoPayload {
+    fn into_payload(self) -> Outcome<Payload>;
+}
+
+impl IntoPayload for Outcome<Cached> {
+    fn into_payload(self) -> Outcome<Payload> {
         match self {
             Outcome::Found(c) => Outcome::Found(c.into_payload()),
             Outcome::NotFound => Outcome::NotFound,
@@ -99,7 +105,7 @@ impl Payload {
     /// that a refresh may have outrun.
     pub(super) async fn to_response(
         &self,
-        storage: &FilesystemStorage,
+        storage: &dyn StorageBackend,
         extra: Vec<(HeaderName, HeaderValue)>,
     ) -> AppResult<Response> {
         let (length, body) = match &self.src {
@@ -129,9 +135,9 @@ impl Payload {
 }
 
 /// A missing file stays a 404; any other local fault is ours, not the upstream's.
-fn unreadable(e: AppError) -> AppError {
+fn unreadable(e: StorageError) -> AppError {
     match e {
-        AppError::NotFound(_) => e,
+        StorageError::NotFound => AppError::NotFound(e.to_string()),
         other => AppError::Internal(format!("stored file unreadable: {other}")),
     }
 }
@@ -158,7 +164,7 @@ pub struct PartFile {
 }
 
 impl PartFile {
-    pub async fn new(storage: &FilesystemStorage, rel: String) -> AppResult<Self> {
+    pub async fn new(storage: &dyn StorageBackend, rel: String) -> AppResult<Self> {
         let resolved = storage.resolve(&rel)?;
         if let Some(parent) = resolved.parent() {
             tokio::fs::create_dir_all(parent).await?;
@@ -181,7 +187,7 @@ impl PartFile {
         Ok(())
     }
 
-    pub async fn commit(mut self, storage: &FilesystemStorage, final_rel: &str) -> AppResult<()> {
+    pub async fn commit(mut self, storage: &dyn StorageBackend, final_rel: &str) -> AppResult<()> {
         if let Some(mut file) = self.file.take() {
             file.flush().await?;
             file.sync_data().await?;

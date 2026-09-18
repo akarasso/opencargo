@@ -6,7 +6,9 @@ use axum::{
 use serde::Deserialize;
 use serde_json::json;
 
-use crate::api::{require_admin, require_auth};
+use crate::api::{actor, require_admin, require_auth};
+use crate::app::permissions::{RevokePermission, SetPermission};
+use crate::domain::{Rights, User};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 
@@ -35,33 +37,24 @@ pub async fn list_permissions(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))?;
+    let user = load_user(&state, &username).await?;
+    let grants = state.permissions.of_user(user.id).await?;
 
-    let perms = crate::db::list_user_permissions(&state.db, user.id).await?;
-
-    // Enrich with repository names
-    let mut result = Vec::new();
-    for perm in perms {
-        // Look up repository name
-        let repo_name = sqlx::query_scalar::<_, String>(
-            "SELECT name FROM repositories WHERE id = ?1",
-        )
-        .bind(perm.repository_id)
-        .fetch_optional(&state.db)
-        .await?
-        .unwrap_or_else(|| format!("(deleted repo id={})", perm.repository_id));
-
-        result.push(json!({
-            "repository": repo_name,
-            "repository_id": perm.repository_id,
-            "can_read": perm.can_read != 0,
-            "can_write": perm.can_write != 0,
-            "can_delete": perm.can_delete != 0,
-            "can_admin": perm.can_admin != 0,
-        }));
-    }
+    let result: Vec<serde_json::Value> = grants
+        .iter()
+        .map(|grant| {
+            json!({
+                "repository": grant.repository.clone().unwrap_or_else(|| {
+                    format!("(deleted repo id={})", grant.repository_id)
+                }),
+                "repository_id": grant.repository_id,
+                "can_read": grant.rights.read,
+                "can_write": grant.rights.write,
+                "can_delete": grant.rights.delete,
+                "can_admin": grant.rights.admin,
+            })
+        })
+        .collect();
 
     Ok(Json(json!({ "permissions": result })))
 }
@@ -82,37 +75,36 @@ pub async fn set_permission(
         serde_json::from_slice(&bytes)?
     };
 
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))?;
-
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
-
-    crate::db::set_user_permission(
-        &state.db,
-        user.id,
-        repo.id,
-        body.can_read.unwrap_or(true),
-        body.can_write.unwrap_or(false),
-        body.can_delete.unwrap_or(false),
-        body.can_admin.unwrap_or(false),
+    let rights = Rights {
+        read: body.can_read.unwrap_or(true),
+        write: body.can_write.unwrap_or(false),
+        delete: body.can_delete.unwrap_or(false),
+        admin: body.can_admin.unwrap_or(false),
+    };
+    SetPermission::new(
+        state.users.clone(),
+        state.repos.clone(),
+        state.permissions.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+    )
+    .run(
+        &username,
+        &repo_name,
+        rights,
+        &actor(&caller),
+        chrono::Utc::now(),
     )
     .await?;
-
-    let audit_target = format!("{username} on {repo_name}");
-    crate::api::record_audit(&state, &caller, "permission.set", Some(&audit_target)).await;
-    emit_permissions_changed(&state, &username);
 
     Ok(Json(json!({
         "ok": true,
         "username": username,
         "repository": repo_name,
-        "can_read": body.can_read.unwrap_or(true),
-        "can_write": body.can_write.unwrap_or(false),
-        "can_delete": body.can_delete.unwrap_or(false),
-        "can_admin": body.can_admin.unwrap_or(false),
+        "can_read": rights.read,
+        "can_write": rights.write,
+        "can_delete": rights.delete,
+        "can_admin": rights.admin,
     })))
 }
 
@@ -125,30 +117,23 @@ pub async fn delete_permission(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))?;
-
-    let repo = crate::db::get_repository_by_name(&state.db, &repo_name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {repo_name}")))?;
-
-    crate::db::delete_user_permission(&state.db, user.id, repo.id).await?;
-
-    let audit_target = format!("{username} on {repo_name}");
-    crate::api::record_audit(&state, &caller, "permission.remove", Some(&audit_target)).await;
-    emit_permissions_changed(&state, &username);
+    RevokePermission::new(
+        state.users.clone(),
+        state.repos.clone(),
+        state.permissions.clone(),
+        state.audit.clone(),
+        state.events.clone(),
+    )
+    .run(&username, &repo_name, &actor(&caller), chrono::Utc::now())
+    .await?;
 
     Ok(Json(json!({"ok": true})))
 }
 
-/// Notify open sessions that a user's effective rights changed so they can
-/// refetch `/api/v1/me/permissions` (and admins their permission editors).
-/// Carries only the username — the actual rights stay behind the REST API.
-fn emit_permissions_changed(state: &AppState, username: &str) {
-    state.events.emit(
-        "permissions.changed",
-        crate::events::Visibility::Authenticated,
-        json!({ "username": username }),
-    );
+async fn load_user(state: &AppState, username: &str) -> AppResult<User> {
+    state
+        .users
+        .by_name(username)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))
 }

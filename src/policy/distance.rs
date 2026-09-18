@@ -1,6 +1,6 @@
 use std::collections::HashSet;
 
-use crate::db::kinds::Format;
+use crate::domain::Format;
 
 /// The one edit that turns a top name into the candidate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,0 +1,49 @@
+# The boundary's lints, added one entry at a time as each ratchet reaches zero:
+# `disallowed_types` fires per use site, so an entry that lands before the code
+# moves turns CI red on the first commit (designs-next/ports-and-adapters.md
+# 4.1). A path's first segment is a crate name -- `crate` is not special-cased --
+# so a local type is spelled `opencargo::`.
+#
+# Silencing is per lint, not per path: a file-level allow of these two lints
+# means exactly one thing, "this file is an adapter for what is on the list",
+# because axum is deliberately absent from both. `src/adapters/sqlite/mod.rs`
+# carries it for the whole adapter subtree; the nine `tests/` files of section
+# 7.4 carry it because they assert the SQLite schema by design and say so on
+# the line. `src/storage/filesystem.rs` is the fs adapter of 4.1's list --
+# `src/adapters/fs/mod.rs` under another name until s3.md's second backend
+# arrives -- and it carries item-level allows instead, so that the sqlx entries
+# below are not silenced in it too.
+#
+# `reqwest::Client` is on 4.1's end-state list and is NOT here. It cannot be:
+# the transport stays concrete (2.5, 6.3) at 8 live sites in three files that
+# are not adapters of anything on this list -- src/proxy/engine/mod.rs,
+# src/telemetry/webhooks.rs, src/telemetry/vulns/osv.rs -- and at ~150 more
+# under tests/, which `--all-targets` compiles. Landing it would mean
+# file-level allows in all of them, which is the per-lint-not-per-path bypass
+# this file exists to avoid. Referred to the design owner before step 9 closes
+# the plan: either drop the entry from 4.1, or name those three types and the
+# tests/ targets as its explicit exceptions.
+disallowed-types = [
+  # Step 8e. SqlitePool is an *alias* for Pool<Sqlite> and clippy matches the
+  # resolved path, so every spelling is listed: one entry short is a bypass.
+  { path = "sqlx::SqlitePool", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::Pool", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::Sqlite", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::SqliteConnection", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::Transaction", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::sqlite::SqlitePoolOptions", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::sqlite::SqliteRow", reason = "persistence adapter only: src/adapters/sqlite" },
+  # Step 2a. A backstop only: the lint sees field types, `use` items and type
+  # positions, never `FilesystemStorage::new(..)` in expression position, so
+  # scripts/boundary.sh's concrete-fs row (== 0) is the real check.
+  { path = "opencargo::storage::FilesystemStorage", reason = "storage is reached through Arc<dyn StorageBackend>; the concrete backend is named in src/storage/ alone" },
+]
+
+# Step 8e. The greps of 4.2 stay alongside: they catch a spelling nobody
+# thought of, and they are scoped where a crate-wide lint cannot be.
+disallowed-methods = [
+  { path = "sqlx::query", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::query_as", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::query_scalar", reason = "persistence adapter only: src/adapters/sqlite" },
+  { path = "sqlx::raw_sql", reason = "persistence adapter only: src/adapters/sqlite" },
+]

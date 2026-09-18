@@ -11,18 +11,39 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use serde_json::json;
-use sqlx::SqlitePool;
 use tracing::{info, warn};
 
+use crate::adapters::sqlite::SqliteStores;
+use crate::app::events::Announce;
+use crate::app::publish_tail::{PublishGate, PublishTail};
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::auth::rate_limit::RateLimiter;
-use crate::config::{Config, RepositoryConfig};
+use crate::config::{Config, RepositoryConfig, WebhookConfig};
+use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
+use crate::ports::audit::AuditStore;
+use crate::ports::clock::Clock;
+use crate::ports::dashboard::DashboardRead;
+use crate::ports::deps::DependencyStore;
+use crate::ports::events::Events;
+use crate::ports::ids::Ids;
+use crate::ports::oci::OciStore;
+use crate::ports::packages::PackageStore;
+use crate::ports::permissions::PermissionStore;
+use crate::ports::policy::PolicyStore;
+use crate::ports::proxy_cache::ProxyCacheStore;
+use crate::ports::repositories::RepositoryStore;
+use crate::ports::search::SearchIndex;
+use crate::ports::tokens::{NewToken, TokenStore};
+use crate::ports::users::{NewUser, UserPatch, UserStore};
+use crate::ports::webhooks::{NewWebhook, WebhookStore};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
-use crate::storage::FilesystemStorage;
+use crate::storage::StorageBackend;
+use crate::ports::vulns::{VulnFeed, VulnStore};
 use crate::telemetry;
 use crate::telemetry::vulns::VulnScanner;
 use crate::telemetry::webhooks::WebhookDispatcher;
@@ -40,8 +61,10 @@ const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 
 #[derive(Clone)]
 pub struct AppState {
-    pub db: SqlitePool,
-    pub storage: Arc<FilesystemStorage>,
+    pub storage: Arc<dyn StorageBackend>,
+    /// What the proxy remembers; the engine holds it too, and the background
+    /// sweep needs it without going through the engine.
+    pub cache: Arc<dyn ProxyCacheStore>,
     pub auth: Arc<AuthState>,
     pub proxy: ProxyEngine,
     /// Per-repository upstream credentials, keyed by name; a missing key is the default.
@@ -52,156 +75,138 @@ pub struct AppState {
     pub publish_rate_limiter: Arc<RateLimiter>,
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
-    pub vuln_scanner: Arc<VulnScanner>,
+    pub webhooks: Arc<dyn WebhookStore>,
+    pub users: Arc<dyn UserStore>,
+    pub tokens: Arc<dyn TokenStore>,
+    pub permissions: Arc<dyn PermissionStore>,
+    pub repos: Arc<dyn RepositoryStore>,
+    pub packages: Arc<dyn PackageStore>,
+    pub search: Arc<dyn SearchIndex>,
+    pub oci: Arc<dyn OciStore>,
+    pub audit: Arc<dyn AuditStore>,
+    pub deps: Arc<dyn DependencyStore>,
+    pub vulns: Arc<dyn VulnStore>,
+    /// The report's rows; the engine beside it owns the writing and the
+    /// totals cache, and holds the same store.
+    pub policy_store: Arc<dyn PolicyStore>,
+    /// The web UI's read model: one method per panel, and the only reader of
+    /// the joins no store owns.
+    pub dashboard: Arc<dyn DashboardRead>,
+    pub vuln_scanner: Arc<dyn VulnFeed>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
-    pub events: Arc<crate::events::EventBus>,
+    pub events: Arc<dyn Events>,
+    /// The wall clock, for the two callers that cannot be handed a `now`.
+    pub clock: Arc<dyn Clock>,
+    /// The generated identifiers that reach a client.
+    pub ids: Arc<dyn Ids>,
     /// Records proxy resolutions for the policy report; off until a rule is on.
     pub policy: PolicyEngine,
+}
+
+impl AppState {
+    /// The gate every publish passes before its first write.
+    pub fn publish_gate(&self) -> PublishGate {
+        PublishGate::new(self.vuln_scanner.clone(), self.vuln_scan_config.clone())
+    }
+
+    /// The tail every publish runs once its version is serveable: the
+    /// webhook, the event and its audience, then the scan.
+    pub fn publish_tail(&self) -> PublishTail {
+        PublishTail::new(
+            self.announce(),
+            self.webhook_dispatcher.clone(),
+            self.vuln_scanner.clone(),
+            self.vulns.clone(),
+        )
+    }
+
+    /// The audience decision, for the one caller outside a publish: a
+    /// promotion announces the same way.
+    pub fn announce(&self) -> Announce {
+        Announce::new(self.events.clone(), self.repos.clone())
+    }
+}
+
+/// Migrate a database and nothing else: the `opencargo migrate` subcommand, so
+/// the binary reaches the adapter through the composition root rather than
+/// importing it.
+pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
+    let db = crate::adapters::sqlite::connect(&config.database.url).await?;
+    crate::adapters::sqlite::migrate::run_all(&db).await?;
+    Ok(())
+}
+
+/// A database URL turned into ports: the pool, migrated, with every store
+/// over it and the stored names checked. The other half of the composition
+/// root, so `main.rs` and the fixtures never name the adapter themselves.
+pub async fn connect_stores(config: &Config) -> anyhow::Result<SqliteStores> {
+    let db = crate::adapters::sqlite::connect(&config.database.url).await?;
+    crate::adapters::sqlite::migrate::run_all(&db).await?;
+    let stores = SqliteStores::new(db);
+    crate::app::repo_spec::check_repository_names(stores.repositories().as_ref()).await?;
+    Ok(stores)
+}
+
+/// A migrated database of its own, with every store over it: what the
+/// temp-database fixtures open, so they reach the adapter through the
+/// composition root instead of naming a pool themselves.
+pub async fn open_stores(path: &std::path::Path) -> anyhow::Result<SqliteStores> {
+    SqliteStores::open(path).await
+}
+
+/// The real-time bus, for the same reason: `src/policy/`'s fixtures need one
+/// and may not name an adapter.
+pub fn event_bus() -> Arc<dyn Events> {
+    Arc::new(crate::adapters::events::BroadcastEvents::new())
 }
 
 pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
-    // Ensure storage directory exists
-    std::fs::create_dir_all(&config.server.storage_path)?;
+    ensure_directories(config)?;
+    let stores = connect_stores(config).await?;
+    let repos = stores.repositories();
+    seed_repositories(repos.as_ref(), &config.repositories, Utc::now()).await?;
 
-    // Ensure database directory exists
-    if let Some(path) = config.database.url.strip_prefix("sqlite:") {
-        let path = path.split('?').next().unwrap_or(path);
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
-    let db = crate::db::connect(&config.database.url).await?;
-    crate::db::migrate(&db).await?;
-    crate::db::kinds::check_repository_names(&db).await?;
-    crate::db::init_repositories(&db, &config.repositories).await?;
-
-    let storage = Arc::new(FilesystemStorage::new(&config.server.storage_path));
+    let storage = crate::storage::filesystem(&config.server.storage_path);
 
     // Shared between AuthState (Basic Auth throttling) and AppState (npm login).
     let login_rate_limiter = Arc::new(RateLimiter::new(5, 60));
 
-    let auth = Arc::new(AuthState {
-        static_tokens: config.auth.static_tokens.clone(),
-        anonymous_read: config.auth.anonymous_read,
-        db: db.clone(),
-        login_rate_limiter: login_rate_limiter.clone(),
-        base_url: config.server.base_url.clone(),
-        registry_tokens: crate::registry::oci::token::TokenSigner::random(),
-    });
+    let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 
-    // Create admin user from config if it doesn't exist
-    if !config.auth.admin.username.is_empty() {
-        let admin_username = &config.auth.admin.username;
+    let auth = auth_state(config, &users, &tokens, &login_rate_limiter);
 
-        // Determine the password file path
-        let password_file = {
-            let storage = std::path::Path::new(&config.server.storage_path);
-            let data_dir = storage.parent().unwrap_or(std::path::Path::new("data"));
-            data_dir.join("admin.password")
-        };
+    ensure_admin_user(users.as_ref(), config).await?;
 
-        match crate::db::get_user_by_username(&db, admin_username).await? {
-            None => {
-                // Admin user does not exist yet — create it
-                // Priority: env var > config > random
-                let raw_password = if let Ok(env_pw) = std::env::var("OPENCARGO_ADMIN_PASSWORD") {
-                    if !env_pw.is_empty() { env_pw } else { crate::auth::users::generate_random_password() }
-                } else if !config.auth.admin.password.is_empty()
-                    && config.auth.admin.password != "admin"
-                    && config.auth.admin.password != "changeme"
-                {
-                    config.auth.admin.password.clone()
-                } else {
-                    crate::auth::users::generate_random_password()
-                };
+    let cache = stores.proxy_cache();
+    let proxy = proxy_engine(config, storage.clone(), cache.clone());
+    let upstream_auth = Arc::new(upstream_creds(repos.as_ref(), config).await?);
 
-                let from_env = std::env::var("OPENCARGO_ADMIN_PASSWORD").is_ok();
-
-                let password_hash = crate::auth::users::hash_password(&raw_password)
-                    .map_err(|e| anyhow::anyhow!("failed to hash admin password: {e}"))?;
-
-                crate::db::create_user(&db, admin_username, None, &password_hash, "admin").await?;
-
-                if from_env {
-                    // Password from env var (k8s Secret) — no file, no forced change
-                    info!(username = %admin_username, "Admin user created with password from OPENCARGO_ADMIN_PASSWORD");
-                } else {
-                    // Generated password — write to file and force change
-                    if let Some(user) = crate::db::get_user_by_username(&db, admin_username).await? {
-                        crate::db::set_must_change_password(&db, user.id, true).await?;
-                    }
-                    if let Some(parent) = password_file.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&password_file, &raw_password)?;
-                    warn!(
-                        "Initial admin password written to {} — change it on first login",
-                        password_file.display()
-                    );
-                }
-                info!(username = %admin_username, "Initial admin user created");
-            }
-            Some(user) => {
-                // Admin user already exists
-                if password_file.exists() && user.must_change_password == 1 {
-                    warn!(
-                        "Admin password has not been changed yet. Initial password is still in {}",
-                        password_file.display()
-                    );
-                }
-            }
-        }
-    }
-
-    let connect_timeout_secs = parse_duration_secs(&config.proxy.connect_timeout);
-    let ttl = TtlConfig {
-        default_secs: parse_duration_secs(&config.proxy.default_ttl),
-        negative_secs: parse_duration_secs(&config.proxy.negative_cache_ttl),
-    };
-    let proxy = ProxyEngine::new(
-        storage.clone(),
-        db.clone(),
-        Timeouts::from_connect_secs(connect_timeout_secs),
-        ttl,
-    );
-    let upstream_auth = Arc::new(upstream_creds(&db, config).await?);
-
-    // Initialize Prometheus metrics
     let metrics_handle = telemetry::init_metrics();
 
-    // Seed webhooks from config into DB (only if no webhooks exist yet)
-    crate::db::seed_webhooks(&db, &config.webhooks).await?;
+    let webhooks = stores.webhooks();
+    seed_webhooks(webhooks.as_ref(), &config.webhooks, Utc::now()).await?;
 
-    // Initialize webhook dispatcher (DB-backed)
-    let webhook_dispatcher = Arc::new(WebhookDispatcher::new(db.clone()));
+    let webhook_dispatcher = Arc::new(WebhookDispatcher::new(webhooks.clone()));
 
-    // Initialize vulnerability scanner
-    let vuln_scanner = Arc::new(VulnScanner::new(&config.vuln_scan)?);
+    let vuln_scanner: Arc<dyn VulnFeed> = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
-    let events = Arc::new(crate::events::EventBus::new());
+    let events = event_bus();
+    let policy_store = stores.policy();
     let policy = PolicyEngine::new(
-        db.clone(),
+        policy_store.clone(),
         &config.policy,
         vuln_scanner.clone(),
         events.clone(),
         proxy.clone(),
     );
-    warn_policy_notes(&policy_notes);
-
-    info!(
-        storage_path = %config.server.storage_path,
-        base_url = %config.server.base_url,
-        repos = config.repositories.len(),
-        "Application state initialized"
-    );
+    report_ready(config, &policy_notes);
 
     Ok(AppState {
-        db,
         storage,
+        cache,
         auth,
         proxy,
         upstream_auth,
@@ -211,14 +216,242 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         publish_rate_limiter: Arc::new(RateLimiter::new(30, 60)),
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
+        webhooks,
+        users,
+        tokens,
+        permissions,
+        repos,
+        packages: stores.packages(),
+        search: stores.search(),
+        oci: stores.oci(),
+        audit: stores.audit(),
+        deps: stores.dependencies(),
+        vulns: stores.vulns(),
+        policy_store,
+        dashboard: stores.dashboard(),
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,
+        clock: Arc::new(crate::adapters::system::SystemClock),
+        ids: Arc::new(crate::adapters::system::UuidIds),
         policy,
     })
 }
 
+/// What the auth middleware needs, which is two stores and the login
+/// throttle it shares with the npm login route.
+fn auth_state(
+    config: &Config,
+    users: &Arc<dyn UserStore>,
+    tokens: &Arc<dyn TokenStore>,
+    login_rate_limiter: &Arc<RateLimiter>,
+) -> Arc<AuthState> {
+    Arc::new(AuthState {
+        static_tokens: config.auth.static_tokens.clone(),
+        anonymous_read: config.auth.anonymous_read,
+        users: users.clone(),
+        tokens: tokens.clone(),
+        login_rate_limiter: login_rate_limiter.clone(),
+        base_url: config.server.base_url.clone(),
+        registry_tokens: Arc::new(crate::registry::oci::token::TokenSigner::random()),
+    })
+}
+
+/// The two directories the server writes into: the blob store, and the one
+/// holding a SQLite file when that is where the database lives.
+fn ensure_directories(config: &Config) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&config.server.storage_path)?;
+    if let Some(path) = config.database.url.strip_prefix("sqlite:") {
+        let path = path.split('?').next().unwrap_or(path);
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// The proxy engine over its two ports, with the configured timeouts.
+fn proxy_engine(
+    config: &Config,
+    storage: Arc<dyn StorageBackend>,
+    cache: Arc<dyn ProxyCacheStore>,
+) -> ProxyEngine {
+    let ttl = TtlConfig {
+        default_secs: parse_duration_secs(&config.proxy.default_ttl),
+        negative_secs: parse_duration_secs(&config.proxy.negative_cache_ttl),
+    };
+    let connect_timeout_secs = parse_duration_secs(&config.proxy.connect_timeout);
+    ProxyEngine::new(
+        storage,
+        cache,
+        Timeouts::from_connect_secs(connect_timeout_secs),
+        ttl,
+    )
+}
+
+/// Create the configured admin account on a fresh install, and warn on every
+/// later boot while its generated password is still the one on disk.
+async fn ensure_admin_user(users: &dyn UserStore, config: &Config) -> anyhow::Result<()> {
+    let admin_username = &config.auth.admin.username;
+    if admin_username.is_empty() {
+        return Ok(());
+    }
+    let password_file = {
+        let storage = std::path::Path::new(&config.server.storage_path);
+        let data_dir = storage.parent().unwrap_or(std::path::Path::new("data"));
+        data_dir.join("admin.password")
+    };
+
+    if let Some(user) = users.by_name(admin_username).await? {
+        if password_file.exists() && user.must_change_password {
+            warn!(
+                "Admin password has not been changed yet. Initial password is still in {}",
+                password_file.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let from_env = std::env::var("OPENCARGO_ADMIN_PASSWORD").is_ok();
+    let raw_password = initial_admin_password(config);
+    let password_hash = crate::auth::users::hash_password(&raw_password)
+        .map_err(|e| anyhow::anyhow!("failed to hash admin password: {e}"))?;
+    let admin = users
+        .create(
+            &NewUser {
+                username: admin_username,
+                email: None,
+                password_hash: &password_hash,
+                role: "admin",
+            },
+            Utc::now(),
+        )
+        .await?;
+
+    if from_env {
+        // Password from a k8s Secret: no file to leave behind, no forced change.
+        info!(username = %admin_username, "Admin user created with password from OPENCARGO_ADMIN_PASSWORD");
+    } else {
+        users
+            .update(
+                &admin.username,
+                &UserPatch {
+                    must_change_password: Some(true),
+                    ..UserPatch::default()
+                },
+                Utc::now(),
+            )
+            .await?;
+        if let Some(parent) = password_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&password_file, &raw_password)?;
+        warn!(
+            "Initial admin password written to {} — change it on first login",
+            password_file.display()
+        );
+    }
+    info!(username = %admin_username, "Initial admin user created");
+    Ok(())
+}
+
+/// Env var, then a config value that is not one of the two placeholders, then
+/// a random one. Setting the variable at all means the config file's value is
+/// not wanted, so an empty one falls through to random rather than to it.
+fn initial_admin_password(config: &Config) -> String {
+    if let Ok(env_pw) = std::env::var("OPENCARGO_ADMIN_PASSWORD") {
+        if !env_pw.is_empty() {
+            return env_pw;
+        }
+    } else if !config.auth.admin.password.is_empty()
+        && config.auth.admin.password != "admin"
+        && config.auth.admin.password != "changeme"
+    {
+        return config.auth.admin.password.clone();
+    }
+    crate::auth::users::generate_random_password()
+}
+
+/// The configured repositories, validated as an API write would validate
+/// them and then seeded: the config file starts a deployment, it does not own
+/// it afterwards.
+///
+/// The whole list is `pending`, so a group may name a member declared further
+/// down the file.
+async fn seed_repositories(
+    store: &dyn RepositoryStore,
+    configured: &[RepositoryConfig],
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let empty: Vec<String> = Vec::new();
+    let pending: Vec<crate::domain::Pending<'_>> = configured
+        .iter()
+        .map(|repo| crate::domain::Pending {
+            name: &repo.name,
+            kind: repo.repo_type,
+            format: repo.format,
+            members: repo.members.as_deref().unwrap_or(&empty),
+        })
+        .collect();
+    let specs: Vec<crate::domain::RepoSpec<'_>> = configured
+        .iter()
+        .map(|repo| crate::domain::RepoSpec {
+            name: &repo.name,
+            kind: repo.repo_type,
+            format: repo.format,
+            visibility: repo.visibility,
+            upstream: repo.upstream.as_deref(),
+            members: repo.members.as_deref().unwrap_or(&empty),
+        })
+        .collect();
+    // One at a time, validated against what is already stored: a group that
+    // names a member seeded earlier in this same pass must see its row, or a
+    // mutual membership would validate as two pending entries and be seeded.
+    for spec in &specs {
+        crate::app::repo_spec::validate_spec(store, spec, &pending)
+            .await
+            .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;
+        store.ensure_seeded(std::slice::from_ref(spec), now).await?;
+    }
+    info!("Repository seeding complete ({} configured)", specs.len());
+    Ok(())
+}
+
+/// The configured registrations, in the port's vocabulary: the config file
+/// seeds a deployment and the store owns them afterwards.
+async fn seed_webhooks(
+    store: &dyn WebhookStore,
+    configured: &[WebhookConfig],
+    now: DateTime<Utc>,
+) -> Result<(), crate::error::StoreError> {
+    let events: Vec<Subscription> = configured
+        .iter()
+        .map(|hook| Subscription::of_names(&hook.events))
+        .collect();
+    let hooks: Vec<NewWebhook<'_>> = configured
+        .iter()
+        .zip(&events)
+        .map(|(hook, events)| NewWebhook {
+            url: &hook.url,
+            events,
+            secret: hook.secret.as_deref(),
+        })
+        .collect();
+    store.ensure_seeded(&hooks, now).await
+}
+
 /// Recording is personal data: say which members do it, at startup.
+/// What booted, and every configuration note worth a warning about it.
+fn report_ready(config: &Config, notes: &crate::policy::startup::StartupNotes) {
+    info!(
+        storage_path = %config.server.storage_path,
+        base_url = %config.server.base_url,
+        repos = config.repositories.len(),
+        "Application state initialized"
+    );
+    warn_policy_notes(notes);
+}
+
 fn warn_policy_notes(notes: &crate::policy::startup::StartupNotes) {
     if !notes.recording.is_empty() {
         warn!(
@@ -484,8 +717,13 @@ async fn health_live() -> impl IntoResponse {
 async fn health_ready(
     axum::extract::State(state): axum::extract::State<AppState>,
 ) -> impl IntoResponse {
-    // Check DB connectivity
-    match sqlx::query("SELECT 1").execute(&state.db).await {
+    // Reachability, asked of a port rather than of a pool: a repository
+    // nobody can be called is one index lookup answering `None`, and a store
+    // that cannot answer it is a store the server is not ready to serve from.
+    // Wider than the `SELECT 1` this replaced, on purpose: a pool that is up
+    // over a database with no `repositories` table is not ready either, and
+    // used to report itself healthy.
+    match state.repos.by_name("").await {
         Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))),
         Err(_) => (
             StatusCode::SERVICE_UNAVAILABLE,
@@ -552,7 +790,7 @@ async fn npm_login(
     };
 
     // Look up the user
-    let user = match crate::db::get_user_by_username(&state.db, &login.name).await {
+    let user = match state.users.by_name(&login.name).await {
         Ok(Some(u)) => u,
         _ => {
             return (
@@ -579,39 +817,42 @@ async fn npm_login(
             .into_response();
     }
 
-    let must_change = user.must_change_password == 1;
+    let must_change = user.must_change_password;
 
-    // Create a new API token for this login session
-    let token_id = uuid::Uuid::new_v4().to_string();
-    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_");
-    let prefix = &raw_token[..16];
-
-    // Token expires in 30 days by default for npm login
-    let expires_at = {
-        let expiry = chrono::Utc::now() + chrono::Duration::days(30);
-        expiry.format("%Y-%m-%d %H:%M:%S").to_string()
-    };
-
-    if crate::db::create_api_token(
-        &state.db,
-        &token_id,
-        user.id,
-        "npm-login",
-        prefix,
-        &token_hash,
-        Some(&expires_at),
-    )
-    .await
-    .is_err()
-    {
+    let Ok(raw_token) = issue_login_token(&state, user.id).await else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to create token"})),
         )
             .into_response();
-    }
+    };
 
     (StatusCode::CREATED, Json(json!({"ok": true, "token": raw_token, "must_change_password": must_change}))).into_response()
+}
+
+/// The session token an `npm login` walks away with: 30 days by default, like
+/// every other credential this endpoint has ever issued.
+async fn issue_login_token(
+    state: &AppState,
+    user_id: i64,
+) -> Result<String, crate::error::StoreError> {
+    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_");
+    let now = state.clock.now();
+    state
+        .tokens
+        .create(
+            &NewToken {
+                id: &uuid::Uuid::new_v4().to_string(),
+                user_id,
+                name: "npm-login",
+                prefix: &raw_token[..16],
+                token_hash: &token_hash,
+                expires_at: Some(now + chrono::Duration::days(30)),
+            },
+            now,
+        )
+        .await?;
+    Ok(raw_token)
 }
 
 const ENV_UPSTREAM_AUTH: &str = "OPENCARGO_UPSTREAM_AUTH_";
@@ -633,14 +874,10 @@ pub(crate) fn env_repo_key(name: &str) -> String {
 
 /// The credentials of every repository row, seeded or API-created.
 async fn upstream_creds(
-    db: &SqlitePool,
+    repos: &dyn RepositoryStore,
     config: &Config,
 ) -> anyhow::Result<HashMap<String, UpstreamCreds>> {
-    let known: Vec<String> = crate::db::get_all_repositories(db)
-        .await?
-        .into_iter()
-        .map(|r| r.name)
-        .collect();
+    let known: Vec<String> = repos.all().await?.into_iter().map(|r| r.name).collect();
     load_upstream_creds(&config.repositories, &known, std::env::vars())
 }
 
@@ -763,7 +1000,7 @@ mod tests {
     fn proxy(name: &str) -> RepositoryConfig {
         RepositoryConfig {
             name: name.to_string(),
-            repo_type: crate::db::kinds::RepoKind::Proxy,
+            repo_type: crate::domain::RepoKind::Proxy,
             upstream: Some("https://registry.npmjs.org".to_string()),
             ..Default::default()
         }

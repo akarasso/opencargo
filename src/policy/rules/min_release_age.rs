@@ -3,7 +3,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::{PolicyConfig, Rule};
-use crate::policy::{Age, Resolution, RuleVerdict, Verdict};
+use crate::domain::{RuleVerdict, Verdict};
+use crate::policy::{Age, Resolution};
 
 pub struct MinReleaseAge;
 
@@ -60,7 +61,7 @@ fn dated(rule: &'static str, min: Age, at: DateTime<Utc>, now: DateTime<Utc>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::kinds::Format;
+    use crate::domain::Format;
     use crate::policy::{Actor, Facts};
 
     fn resolution(published_at: Option<DateTime<Utc>>, date_source: &'static str) -> Resolution {

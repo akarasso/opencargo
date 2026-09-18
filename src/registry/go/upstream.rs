@@ -1,8 +1,7 @@
-use crate::error::{AppError, AppResult};
 use crate::proxy::strategy::{
     CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, MAX_METADATA_BYTES,
 };
-use crate::registry::resolve::Upstream;
+use crate::registry::resolve::{ResolveError, Upstream};
 
 use super::escape::{is_canonical_version, unescape};
 
@@ -77,7 +76,7 @@ pub struct GoUpstream;
 impl UpstreamStrategy for GoUpstream {
     type Artifact = GoArtifact;
 
-    fn upstream_url(&self, up: &Upstream, a: &GoArtifact) -> AppResult<reqwest::Url> {
+    fn upstream_url(&self, up: &Upstream, a: &GoArtifact) -> Result<url::Url, ResolveError> {
         let base = up.base.as_str().trim_end_matches('/');
         let url = match a {
             GoArtifact::List { module } => format!("{base}/{module}/@v/list"),
@@ -88,8 +87,8 @@ impl UpstreamStrategy for GoUpstream {
                 kind,
             } => format!("{base}/{module}/@v/{version}.{}", kind.ext()),
         };
-        reqwest::Url::parse(&url)
-            .map_err(|e| AppError::BadGateway(format!("invalid upstream URL {url}: {e}")))
+        url::Url::parse(&url)
+            .map_err(|e| ResolveError::Upstream(format!("invalid upstream URL {url}: {e}")))
     }
 
     fn cache_key(&self, a: &GoArtifact) -> CacheKey {

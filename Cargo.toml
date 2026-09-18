@@ -1,3 +1,12 @@
+# The domain is a crate of its own, so its purity is a resolution error rather
+# than a grep (designs-next/ports-and-adapters.md 4.3). Application and adapters
+# stay modules of the binary crate. `default-members` lists both, or a bare
+# `cargo test` at the root would silently stop running the domain's unit tests.
+[workspace]
+members = ["crates/domain", "."]
+default-members = [".", "crates/domain"]
+resolver = "2"
+
 [package]
 name = "opencargo"
 version = "0.1.0-rc.1"
@@ -10,6 +19,9 @@ name = "opencargo"
 path = "src/main.rs"
 
 [dependencies]
+# Registry semantics, with vocabulary crates as its only dependencies
+opencargo-domain = { path = "crates/domain" }
+
 # HTTP server
 axum = { version = "0.8", features = ["macros", "ws"] }
 tokio = { version = "1", features = ["full"] }
@@ -66,6 +78,10 @@ dirs = "6"
 
 # HTTP client (proxy upstream)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+
+# URLs: the upstream vocabulary of the strategy port, which must not name the
+# HTTP client it happens to be re-exported from.
+url = "2"
 
 # Auth (password hashing)
 argon2 = "0.5"

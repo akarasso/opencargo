@@ -6,21 +6,13 @@ use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use anyhow::Context;
-use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
-use tracing::{info, warn};
+use async_trait::async_trait;
+use tracing::warn;
 
 use crate::config::VulnScanConfig;
+use crate::domain::{ScanResult, Severity, VulnDetail};
+use crate::ports::vulns::{ScanError, VulnFeed};
 use osv::{Advisory, OsvClient};
-use severity::Severity;
-
-#[derive(Debug, thiserror::Error)]
-pub enum ScanError {
-    #[error("OSV query failed: {0}")]
-    Upstream(String),
-    #[error(transparent)]
-    Db(#[from] sqlx::Error),
-}
 
 /// `osv` is `None` while scanning is disabled: assess reports clean, nothing is recorded.
 #[derive(Clone)]
@@ -28,45 +20,15 @@ pub struct VulnScanner {
     osv: Option<OsvClient>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ScanResult {
-    pub total_deps: usize,
-    pub vulnerable_deps: usize,
-    pub status: String,
-    pub details: Vec<VulnDetail>,
-}
-
-impl ScanResult {
-    fn clean() -> Self {
-        Self {
-            total_deps: 0,
-            vulnerable_deps: 0,
-            status: "clean".to_string(),
-            details: vec![],
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct VulnDetail {
-    pub dependency: String,
-    pub version: String,
-    pub vuln_id: String,
-    pub summary: String,
-    pub severity: Severity,
-    pub score: Option<f64>,
-}
-
-impl VulnDetail {
-    fn new(dependency: &str, version: &str, id: &str, advisory: Option<&Advisory>) -> Self {
-        Self {
-            dependency: dependency.to_string(),
-            version: version.to_string(),
-            vuln_id: id.to_string(),
-            summary: advisory.and_then(|a| a.summary.clone()).unwrap_or_default(),
-            severity: advisory.map_or(Severity::Unknown, |a| a.severity),
-            score: advisory.and_then(|a| a.score),
-        }
+/// One detail the feed produced, which the domain owns as a value.
+fn detail(dependency: &str, version: &str, id: &str, advisory: Option<&Advisory>) -> VulnDetail {
+    VulnDetail {
+        dependency: dependency.to_string(),
+        version: version.to_string(),
+        vuln_id: id.to_string(),
+        summary: advisory.and_then(|a| a.summary.clone()).unwrap_or_default(),
+        severity: advisory.map_or(Severity::Unknown, |a| a.severity),
+        score: advisory.and_then(|a| a.score),
     }
 }
 
@@ -80,14 +42,15 @@ impl VulnScanner {
                 .then(|| OsvClient::new(base, cfg.max_concurrency)),
         })
     }
+}
 
-    pub fn enabled(&self) -> bool {
+#[async_trait]
+impl VulnFeed for VulnScanner {
+    fn enabled(&self) -> bool {
         self.osv.is_some()
     }
 
-    /// The advisories of each `(name, version)` itself, one `querybatch`
-    /// under the scanner's permit; a disabled scanner finds nothing.
-    pub async fn assess_batch(
+    async fn assess_batch(
         &self,
         ecosystem: &str,
         deps: &[(String, String)],
@@ -96,19 +59,11 @@ impl VulnScanner {
             return Ok(vec![Vec::new(); deps.len()]);
         };
         let hits = osv.query_batch(ecosystem, deps).await?;
-        let ids: Vec<String> = hits
-            .iter()
-            .flatten()
-            .cloned()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let advisories = osv.advisories(&ids).await;
+        let advisories = osv.advisories(&ids_of(&hits)).await;
         Ok(details_per_dep(deps, &hits, &advisories))
     }
 
-    /// Query OSV for the dependencies of `metadata_json`; pure, no DB.
-    pub async fn assess(
+    async fn assess(
         &self,
         metadata_json: &str,
         ecosystem: &str,
@@ -121,59 +76,19 @@ impl VulnScanner {
             return Ok(ScanResult::clean());
         }
         let hits = osv.query_batch(ecosystem, &deps).await?;
-        let ids: Vec<String> = hits
-            .iter()
-            .flatten()
-            .cloned()
-            .collect::<HashSet<_>>()
-            .into_iter()
-            .collect();
-        let advisories = osv.advisories(&ids).await;
+        let advisories = osv.advisories(&ids_of(&hits)).await;
         Ok(summarize(&deps, &hits, &advisories))
     }
+}
 
-    /// Record a scan result against a version row.
-    pub async fn persist(
-        &self,
-        db: &SqlitePool,
-        version_id: i64,
-        r: &ScanResult,
-    ) -> Result<(), sqlx::Error> {
-        let results_json =
-            serde_json::to_string(r).map_err(|e| sqlx::Error::Encode(Box::new(e)))?;
-        crate::db::insert_vulnerability_scan(
-            db,
-            version_id,
-            r.total_deps as i64,
-            r.vulnerable_deps as i64,
-            Some(&results_json),
-            &r.status,
-        )
-        .await?;
-        info!(
-            version_id,
-            total_deps = r.total_deps,
-            vulnerable_deps = r.vulnerable_deps,
-            status = %r.status,
-            "Vulnerability scan completed"
-        );
-        Ok(())
-    }
-
-    /// `assess` then `persist`; a disabled scanner reports clean and records nothing.
-    pub async fn scan_version(
-        &self,
-        db: &SqlitePool,
-        version_id: i64,
-        metadata_json: &str,
-        ecosystem: &str,
-    ) -> Result<ScanResult, ScanError> {
-        let result = self.assess(metadata_json, ecosystem).await?;
-        if self.osv.is_some() {
-            self.persist(db, version_id, &result).await?;
-        }
-        Ok(result)
-    }
+/// The advisory ids a batch of hits names, each one once.
+fn ids_of(hits: &[Vec<String>]) -> Vec<String> {
+    hits.iter()
+        .flatten()
+        .cloned()
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect()
 }
 
 /// One detail per (dependency, advisory); a record that could not be fetched
@@ -196,7 +111,7 @@ fn details_per_dep(
                         }
                         None => None,
                     };
-                    VulnDetail::new(name, version, id, advisory)
+                    detail(name, version, id, advisory)
                 })
                 .collect()
         })

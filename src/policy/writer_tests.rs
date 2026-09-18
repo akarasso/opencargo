@@ -3,22 +3,45 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
+use chrono::{DateTime, Utc};
 use serde_json::{json, Value};
 
 use super::*;
-use crate::db::proxy_cache::CacheEntry;
+use crate::domain::{CacheEntry, CacheRepo, Outcome};
 use crate::policy::rules::PolicyConfig;
 use crate::policy::testing::{engine_over, engine_with, fast, pending, repo, scanner, FakeOsv};
 use crate::policy::{PolicyEngine, Source, Tuning, QUEUE};
-use crate::proxy::engine::fixture::Fx;
+use crate::domain::{Audience, DomainEvent, ResolutionCounts};
+use crate::ports::events::{Received, Subscriber};
+use crate::ports::policy::{ReportFilter, ResolutionRow};
+use crate::testing::fixture::Fx;
 use crate::proxy::engine::Cached;
 use crate::proxy::UpstreamStrategy;
 use crate::registry::oci::upstream::{OciArtifact, OciUpstream};
-use crate::registry::resolve::{CacheRepo, Outcome};
-use crate::telemetry::vulns::severity::Severity;
+use crate::domain::Severity;
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
+
+/// The next event, or `None` once the bus has gone quiet. The port has no
+/// `try_recv` — a subscriber's only question is "what is next" — so a short
+/// timeout stands in for one.
+async fn next_event(
+    bus: &mut Box<dyn Subscriber>,
+    within: Duration,
+) -> Option<(DateTime<Utc>, ResolutionCounts)> {
+    match tokio::time::timeout(within, bus.recv()).await {
+        Ok(Received::Event(emitted)) => {
+            assert_eq!(emitted.audience, Audience::Admin);
+            match &emitted.event {
+                DomainEvent::PolicyResolution(counts) => Some((emitted.at, counts.clone())),
+                other => panic!("expected a policy resolution, got {other:?}"),
+            }
+        }
+        Ok(other) => panic!("expected an event, got {other:?}"),
+        Err(_) => None,
+    }
+}
 
 fn squat() -> PolicyConfig {
     PolicyConfig {
@@ -34,13 +57,33 @@ fn aged() -> PolicyConfig {
     }
 }
 
+/// Every recorded resolution, oldest first, through the port the writer
+/// wrote them with.
+async fn recorded(fx: &Fx) -> Vec<ResolutionRow> {
+    let mut all = fx
+        .policy_store()
+        .resolutions(&everything(), 1, 100_000)
+        .await
+        .unwrap();
+    all.reverse();
+    all
+}
+
+fn everything() -> ReportFilter<'static> {
+    ReportFilter {
+        since: DateTime::UNIX_EPOCH,
+        repo: None,
+        rule: None,
+        subject: None,
+    }
+}
+
 async fn rows(fx: &Fx) -> Vec<(String, Option<String>, String)> {
-    sqlx::query_as::<_, (String, Option<String>, String)>(
-        "SELECT name, version, date_source FROM policy_resolutions ORDER BY id",
-    )
-    .fetch_all(&fx.pool)
-    .await
-    .unwrap()
+    recorded(fx)
+        .await
+        .into_iter()
+        .map(|r| (r.name, r.version, r.date_source))
+        .collect()
 }
 
 async fn wait_rows(fx: &Fx, n: usize) -> Vec<(String, Option<String>, String)> {
@@ -129,10 +172,7 @@ fn oci(fx: &Fx, name: &str, version: &str, body: &Cached) -> Pending {
 }
 
 async fn served_digests(fx: &Fx) -> Vec<Option<String>> {
-    sqlx::query_scalar::<_, Option<String>>("SELECT digest FROM policy_resolutions ORDER BY id")
-        .fetch_all(&fx.pool)
-        .await
-        .unwrap()
+    recorded(fx).await.into_iter().map(|r| r.digest).collect()
 }
 
 #[tokio::test]
@@ -170,11 +210,9 @@ async fn flush_emits_one_coalesced_event() {
     tokio::time::sleep(Duration::from_millis(400)).await;
     let mut frames = Vec::new();
     let mut stamps = Vec::new();
-    while let Ok(event) = bus.try_recv() {
-        assert_eq!(event.event_type, "policy.resolution");
-        assert_eq!(event.visibility, Visibility::Admin);
-        frames.push(event.data.clone());
-        stamps.push(chrono::DateTime::parse_from_rfc3339(&event.ts).unwrap());
+    while let Some((at, counts)) = next_event(&mut bus, Duration::from_millis(50)).await {
+        stamps.push(at);
+        frames.push(counts);
     }
     assert!(frames.len() >= 2, "an immediate and a trailing frame: {frames:?}");
     for pair in stamps.windows(2) {
@@ -183,18 +221,19 @@ async fn flush_emits_one_coalesced_event() {
             "one frame per notify period at most: {stamps:?}"
         );
     }
-    let total: u64 = frames.iter().map(|f| f["count"].as_u64().unwrap()).sum();
+    let total: u64 = frames.iter().map(|f| f.count).sum();
     assert_eq!(total, 300);
     assert!(frames
         .iter()
-        .all(|f| f["repo"] == "requested" && f["member"] == fx.repo.name));
+        .all(|f| f.repo == "requested" && f.member == fx.repo.name));
     tokio::time::sleep(Duration::from_secs(1)).await;
     engine.record(cargo(&fx, "later"));
     wait_rows(&fx, 301).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
-    let event = bus.try_recv().unwrap();
-    assert_eq!(event.data["count"], 1);
-    assert!(bus.try_recv().is_err());
+    let (_, late) = next_event(&mut bus, Duration::from_millis(500))
+        .await
+        .expect("the trailing frame for the late resolution");
+    assert_eq!(late.count, 1);
+    assert!(next_event(&mut bus, Duration::from_millis(50)).await.is_none());
 }
 
 #[tokio::test]
@@ -354,12 +393,7 @@ async fn parked_index_released_at_ttl() {
     let rows = wait_rows(&fx, 1).await;
     assert!(started.elapsed() >= Duration::from_millis(100));
     assert_eq!(rows[0].2, "index-unpulled");
-    let published: Option<String> =
-        sqlx::query_scalar("SELECT published_at FROM policy_resolutions")
-            .fetch_one(&fx.pool)
-            .await
-            .unwrap();
-    assert_eq!(published, None);
+    assert_eq!(recorded(&fx).await[0].published_at, None);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !engine.shared().holds_oci_state(),
@@ -461,11 +495,10 @@ async fn full_slots_never_stall_the_tick() {
     tokio::spawn(writer);
     engine.record(cargo(&fx, "first"));
     wait_rows(&fx, 1).await;
-    let first = tokio::time::timeout(Duration::from_secs(1), bus.recv())
+    let (_, first) = next_event(&mut bus, Duration::from_secs(1))
         .await
-        .expect("the first flush emits at once")
-        .unwrap();
-    assert_eq!(first.data["count"], 1);
+        .expect("the first flush emits at once");
+    assert_eq!(first.count, 1);
     engine.record(cargo(&fx, "second"));
     wait_rows(&fx, 2).await;
 
@@ -483,11 +516,10 @@ async fn full_slots_never_stall_the_tick() {
             },
         ));
     }
-    let trailing = tokio::time::timeout(Duration::from_secs(2), bus.recv())
+    let (_, trailing) = next_event(&mut bus, Duration::from_secs(2))
         .await
-        .expect("the pending frame goes out on the tick while every slot is held")
-        .unwrap();
-    assert_eq!(trailing.data["count"], 1);
+        .expect("the pending frame goes out on the tick while every slot is held");
+    assert_eq!(trailing.count, 1);
     assert_eq!(engine.shared().inflight.available_permits(), 0);
     let rows = wait_rows(&fx, 2 + crate::policy::INFLIGHT + 1).await;
     let sources: Vec<&str> = rows[2..].iter().map(|(_, _, s)| s.as_str()).collect();
@@ -528,12 +560,20 @@ async fn flush_never_blocks_receive() {
     assert!(osv.batches().iter().all(|n| *n <= BATCH));
     wait_rows(&fx, 301).await;
     assert!(started.elapsed() >= Duration::from_secs(2));
-    let verdicts: Vec<(String, String)> = sqlx::query_as(
-        "SELECT rule, verdict FROM policy_verdicts v JOIN policy_resolutions r ON r.id = v.resolution_id WHERE r.name = 'held'",
-    )
-    .fetch_all(&fx.pool)
-    .await
-    .unwrap();
+    let held: Vec<i64> = recorded(&fx)
+        .await
+        .into_iter()
+        .filter(|r| r.name == "held")
+        .map(|r| r.id)
+        .collect();
+    let verdicts: Vec<(String, String)> = fx
+        .policy_store()
+        .verdicts_for(&held, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.rule, v.verdict))
+        .collect();
     assert_eq!(verdicts, [("osv_severity".to_string(), "pass".to_string())]);
 }
 
@@ -584,9 +624,10 @@ fn cache_entry_shape_pins_the_served_digest_column() {
         etag: None,
         digest: Some("aa".into()),
         size: 0,
-        fetched_at: String::new(),
+        fetched_at: DateTime::UNIX_EPOCH,
         expires_at: None,
-        last_used_at: String::new(),
+        last_used_at: DateTime::UNIX_EPOCH,
+        fresh: true,
     };
     let key = OciUpstream.cache_key(&OciArtifact::Manifest {
         name: "app".into(),

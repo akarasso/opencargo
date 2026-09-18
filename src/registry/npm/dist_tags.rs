@@ -8,16 +8,17 @@ use axum::{
 };
 use serde_json::json;
 
+use crate::app::releases::{ClearDistTag, SetDistTag};
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
-use crate::db::Package;
+use crate::domain::{Format, Package};
 use crate::error::{AppError, AppResult};
-use crate::registry::extract_package_name;
+use crate::ports::packages::NameMatch;
 use crate::registry::resolve::first_hit;
+use crate::registry::{cx, extract_package_name};
 use crate::server::AppState;
 
 use super::leaves::DistTagsLeaf;
-use super::{cx, param};
+use super::param;
 
 pub async fn get_dist_tags(
     State(state): State<AppState>,
@@ -27,11 +28,11 @@ pub async fn get_dist_tags(
     let repo_name = param(&params, "repo")?;
     let package_name = extract_package_name(&params);
 
-    crate::registry::validate_npm_read_name(&package_name)?;
+    crate::domain::validate_npm_read_name(&package_name)?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
     let leaf = DistTagsLeaf { name: package_name };
     let tags = first_hit(&cx(&state, auth, &repo), &repo, &leaf).await?;
@@ -55,12 +56,14 @@ async fn writable_tag_target(
     let package_name = extract_package_name(params);
     let tag = param(params, "tag")?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Npm)?;
-    crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
+    crate::registry::ensure_can_write(&*state.permissions, &repo, &user).await?;
 
-    let package = crate::db::get_package(&state.db, repo.id, &package_name)
+    let package = state
+        .packages
+        .package(repo.id, &package_name, NameMatch::Exact)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("package not found: {package_name}")))?;
     Ok(TagTarget {
@@ -76,15 +79,13 @@ pub async fn put_dist_tag(
     body: Bytes,
 ) -> AppResult<impl IntoResponse> {
     // Body is the version string, JSON-encoded (e.g., "\"1.0.0\"")
-    let version_str: String = serde_json::from_slice(&body)
+    let version: String = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("invalid version string".to_string()))?;
     let target = writable_tag_target(&state, &params, auth_user).await?;
 
-    let version = crate::db::get_version(&state.db, target.package.id, &version_str)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("version not found: {version_str}")))?;
-
-    crate::db::set_dist_tag(&state.db, target.package.id, &target.tag, version.id).await?;
+    SetDistTag::new(state.packages.clone())
+        .run(target.package.id, &target.tag, &version)
+        .await?;
 
     Ok(Json(json!({"ok": true})))
 }
@@ -96,10 +97,8 @@ pub async fn delete_dist_tag(
 ) -> AppResult<impl IntoResponse> {
     let target = writable_tag_target(&state, &params, auth_user).await?;
 
-    sqlx::query("DELETE FROM dist_tags WHERE package_id = ?1 AND tag = ?2")
-        .bind(target.package.id)
-        .bind(target.tag.as_str())
-        .execute(&state.db)
+    ClearDistTag::new(state.packages.clone())
+        .run(target.package.id, &target.tag)
         .await?;
 
     Ok(Json(json!({"ok": true})))

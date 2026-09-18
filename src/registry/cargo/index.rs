@@ -12,9 +12,10 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
+use crate::domain::{Format, UrlRepo, Visibility};
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{collect, Cx, UrlRepo};
+use crate::registry::cx;
+use crate::registry::resolve::collect;
 use crate::server::AppState;
 
 use super::leaves::{IndexLeaf, IndexLines};
@@ -29,21 +30,17 @@ pub async fn config_json(
     Path(repo_name): Path<String>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Cargo)?;
     let auth = auth.as_ref().map(|e| &e.0);
     if auth.is_some() {
-        crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+        crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
     }
-    let cx = Cx {
-        state: &state,
-        auth,
-        url: UrlRepo(&repo.name),
-    };
+    let cx = cx(&state, auth, &repo);
     Ok(Json(config_body(
-        &cx.state.base_url,
+        cx.base_url,
         cx.url,
-        repo.visibility != "public",
+        repo.visibility != Visibility::Public,
     )))
 }
 
@@ -69,19 +66,15 @@ pub async fn get_index_entry(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response<Body>> {
     let (repo_name, name) = index_params(&params)?;
-    crate::registry::validate_package_name("cargo", name)?;
+    crate::domain::validate_package_name("cargo", name)?;
     if index_prefix(uri.path()) != Some(compute_prefix(name)) {
         return Err(AppError::NotFound(format!("crate not found: {name}")));
     }
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
-    let cx = Cx {
-        state: &state,
-        auth,
-        url: UrlRepo(&repo.name),
-    };
+    let cx = cx(&state, auth, &repo);
     let leaf = IndexLeaf {
         name: name.to_string(),
     };
