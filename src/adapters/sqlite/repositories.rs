@@ -87,6 +87,17 @@ impl RepositoryStore for SqliteRepositoryStore {
         self.row(name).await
     }
 
+    async fn by_id(&self, id: i64) -> Result<Option<Repository>, StoreError> {
+        let row: Option<RepositoryRow> = sqlx::query_as(&format!(
+            "SELECT {COLUMNS} FROM repositories WHERE id = ?1"
+        ))
+        .bind(id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_error)?;
+        decode(row.into_iter()).map(|mut all| all.pop())
+    }
+
     async fn all(&self) -> Result<Vec<Repository>, StoreError> {
         let rows: Vec<RepositoryRow> = sqlx::query_as(&format!(
             "SELECT {COLUMNS} FROM repositories ORDER BY name"

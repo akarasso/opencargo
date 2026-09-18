@@ -156,7 +156,7 @@ async fn memo_hit_is_not_deferred() {
     assert!(osv.batches().is_empty(), "evaluate never queries");
 }
 
-fn batch_rows(osv: &FakeOsv) -> (Arc<VulnScanner>, Vec<Row>) {
+fn batch_rows(osv: &FakeOsv) -> (Arc<dyn VulnFeed>, Vec<Row>) {
     let mut rows: Vec<Row> = (0..64)
         .map(|i| {
             (
@@ -181,7 +181,7 @@ async fn batch_groups_by_ecosystem_and_dedupes() {
     osv.affect("crates.io", "serde", "1.0.2", "GHSA-b", V3_MEDIUM);
     let (scanner, mut rows) = batch_rows(&osv);
     let memo = new_memo();
-    evaluate_batch(&scanner, &memo, |_| Some(Severity::High), &mut rows).await;
+    evaluate_batch(scanner.as_ref(), &memo, |_| Some(Severity::High), &mut rows).await;
     let mut batches = osv.batches();
     batches.sort();
     assert_eq!(batches, [3, 3], "one POST per ecosystem, deduplicated");
@@ -222,7 +222,7 @@ async fn batch_groups_by_ecosystem_and_dedupes() {
         Some(("GHSA-b".into(), Severity::Medium))
     );
     let (_, mut again) = batch_rows(&osv);
-    evaluate_batch(&scanner, &memo, |_| Some(Severity::High), &mut again).await;
+    evaluate_batch(scanner.as_ref(), &memo, |_| Some(Severity::High), &mut again).await;
     assert_eq!(osv.batches().len(), 2, "the memo answers the next flush");
     assert!(again.iter().all(|(_, v)| v[0].is_some()));
 }
@@ -233,7 +233,7 @@ async fn batch_error_marks_every_row_unknown() {
     osv.set_down(true);
     let (scanner, mut rows) = batch_rows(&osv);
     let memo = new_memo();
-    evaluate_batch(&scanner, &memo, |_| Some(Severity::High), &mut rows).await;
+    evaluate_batch(scanner.as_ref(), &memo, |_| Some(Severity::High), &mut rows).await;
     assert_eq!(osv.batches().len(), 2);
     for (_, verdicts) in &rows {
         let v = verdicts[0].as_ref().unwrap();

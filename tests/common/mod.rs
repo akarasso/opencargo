@@ -121,7 +121,7 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
         .expect("failed to build app state");
     if let Some(tuning) = tuning {
         state.policy = PolicyEngine::new_tuned(
-            state.db.clone(),
+            state.policy_store.clone(),
             &config.policy,
             state.vuln_scanner.clone(),
             state.events.clone(),

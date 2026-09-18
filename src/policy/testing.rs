@@ -52,11 +52,11 @@ pub fn engine_with(
     fx: &Fx,
     cfg: PolicyConfig,
     tuning: Tuning,
-    scanner: Arc<VulnScanner>,
+    scanner: Arc<dyn VulnFeed>,
 ) -> (PolicyEngine, impl Future<Output = ()>) {
     let config = HashMap::from([(fx.repo.name.clone(), cfg)]);
     PolicyEngine::unspawned(
-        fx.pool.clone(),
+        fx.policy_store(),
         &config,
         scanner,
         Arc::new(EventBus::new()),
@@ -66,7 +66,7 @@ pub fn engine_with(
 }
 
 /// A scanner over `osv`, disabled when `None`.
-pub fn scanner(osv: Option<&FakeOsv>) -> Arc<VulnScanner> {
+pub fn scanner(osv: Option<&FakeOsv>) -> Arc<dyn VulnFeed> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let cfg = crate::config::VulnScanConfig {
         enabled: osv.is_some(),
@@ -74,7 +74,7 @@ pub fn scanner(osv: Option<&FakeOsv>) -> Arc<VulnScanner> {
         max_concurrency: 8,
         ..Default::default()
     };
-    Arc::new(VulnScanner::new(&cfg).unwrap())
+    Arc::new(crate::telemetry::vulns::VulnScanner::new(&cfg).unwrap())
 }
 
 pub fn fast() -> Tuning {

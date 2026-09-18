@@ -6,9 +6,11 @@ use chrono::{DateTime, Utc};
 
 use super::{PolicyConfig, Rule};
 use crate::policy::memo::Memo;
-use crate::policy::{Resolution, RuleVerdict, Verdict};
-use crate::telemetry::vulns::severity::Severity;
-use crate::telemetry::vulns::{VulnDetail, VulnScanner};
+use crate::domain::{RuleVerdict, Verdict};
+use crate::policy::Resolution;
+use crate::domain::Severity;
+use crate::domain::VulnDetail;
+use crate::ports::vulns::VulnFeed;
 
 pub const OSV_MEMO: usize = 4096;
 const OSV_TTL: Duration = Duration::from_secs(3600);
@@ -75,12 +77,12 @@ pub fn verdict(level: Severity, finding: &OsvFinding) -> RuleVerdict {
 
 /// Per event: applicability and the memo; a miss defers to the flush.
 pub struct OsvSeverity {
-    scanner: Arc<VulnScanner>,
+    scanner: Arc<dyn VulnFeed>,
     memo: Arc<OsvMemo>,
 }
 
 impl OsvSeverity {
-    pub fn new(scanner: Arc<VulnScanner>, memo: Arc<OsvMemo>) -> Self {
+    pub fn new(scanner: Arc<dyn VulnFeed>, memo: Arc<OsvMemo>) -> Self {
         Self { scanner, memo }
     }
 }
@@ -131,7 +133,7 @@ type Row = (Resolution, Vec<Option<RuleVerdict>>);
 /// Per flush: the deferred triples, deduplicated and grouped by ecosystem,
 /// one `assess_batch` per group; an error marks its group `unknown`.
 pub async fn evaluate_batch(
-    scanner: &VulnScanner,
+    scanner: &dyn VulnFeed,
     memo: &OsvMemo,
     level_of: impl Fn(&Resolution) -> Option<Severity>,
     rows: &mut [Row],

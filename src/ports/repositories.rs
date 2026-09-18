@@ -33,6 +33,9 @@ pub trait RepositoryStore: Send + Sync {
     /// the name is a storage segment.
     async fn by_name(&self, name: &str) -> Result<Option<Repository>, StoreError>;
 
+    /// The repository a package belongs to, by the id the package carries.
+    async fn by_id(&self, id: i64) -> Result<Option<Repository>, StoreError>;
+
     /// Every repository, by name: the admin list, and the group-membership
     /// scan a delete runs before it refuses.
     async fn all(&self) -> Result<Vec<Repository>, StoreError>;

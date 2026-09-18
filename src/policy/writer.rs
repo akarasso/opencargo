@@ -9,11 +9,12 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::error;
 
-use crate::domain::Format;
+use crate::domain::{Format, RuleVerdict, Verdict};
 use crate::events::{EventBus, Visibility};
+use crate::ports::policy::NewResolution;
 
 use super::rules::osv_severity;
-use super::{facts, rules, store, Pending, Resolution, RuleVerdict, Shared, Verdict, BATCH};
+use super::{facts, rules, Pending, Resolution, Shared, BATCH};
 
 type Done = (Resolution, Vec<Option<RuleVerdict>>);
 
@@ -186,7 +187,7 @@ fn flush(shared: &Arc<Shared>, ready: &mut Vec<Done>, flushes: &mut JoinSet<()>)
     let shared = shared.clone();
     flushes.spawn(async move {
         osv_severity::evaluate_batch(
-            &shared.scanner,
+            shared.scanner.as_ref(),
             &shared.osv_memo,
             |r| shared.config_for(&r.member_repo).osv_severity,
             &mut batch,
@@ -196,7 +197,8 @@ fn flush(shared: &Arc<Shared>, ready: &mut Vec<Done>, flushes: &mut JoinSet<()>)
             .into_iter()
             .map(|(r, verdicts)| (r, verdicts.into_iter().flatten().collect()))
             .collect();
-        match store::insert_batch(&shared.db, &rows).await {
+        let commands: Vec<NewResolution<'_>> = rows.iter().map(command).collect();
+        match shared.store.insert_batch(&commands, Utc::now()).await {
             Ok(_) => shared.notify.lock().unwrap().offer(
                 &rows,
                 &shared.events,
@@ -207,6 +209,25 @@ fn flush(shared: &Arc<Shared>, ready: &mut Vec<Done>, flushes: &mut JoinSet<()>)
             }
         }
     });
+}
+
+/// One gathered resolution as the store takes it: borrowed, so a batch of
+/// sixty-four costs no second copy of what the rules already produced.
+fn command<'a>((r, verdicts): &'a (Resolution, Vec<RuleVerdict>)) -> NewResolution<'a> {
+    NewResolution {
+        requested_repo: &r.requested_repo,
+        member_repo: &r.member_repo,
+        format: r.format.as_str(),
+        name: &r.name,
+        version: r.version.as_deref(),
+        digest: r.digest.as_deref(),
+        published_at: r.published_at,
+        date_source: r.facts.date_source,
+        actor: &r.actor.name,
+        actor_kind: r.actor.kind.as_str(),
+        user_id: r.actor.user_id,
+        verdicts,
+    }
 }
 
 #[cfg(test)]

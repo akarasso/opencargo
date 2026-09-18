@@ -11,7 +11,6 @@ use base64::Engine;
 use serde::Deserialize;
 use serde_json::{json, Value};
 use sha1::Digest;
-use sqlx::SqlitePool;
 use tracing::info;
 
 use crate::app::publish::{Artifact, PublishVersion};
@@ -297,7 +296,7 @@ async fn store_version(
         .await?;
 
     let (package, version_id) = (landed.package, landed.version.id);
-    record_dependencies(&state.db, package.id, version_id, &v.meta).await;
+    record_dependencies(state.deps.as_ref(), package.id, version_id, &v.meta).await;
 
     finalize_publish(
         state,
@@ -331,7 +330,12 @@ fn tags_for(dist_tags: &HashMap<String, String>, version: &str) -> Vec<String> {
         .collect()
 }
 
-async fn record_dependencies(db: &SqlitePool, package_id: i64, version_id: i64, meta: &Value) {
+async fn record_dependencies(
+    deps: &dyn crate::ports::deps::DependencyStore,
+    package_id: i64,
+    version_id: i64,
+    meta: &Value,
+) {
     const DEP_TYPES: [(&str, &str); 4] = [
         ("dependencies", "runtime"),
         ("devDependencies", "dev"),
@@ -339,16 +343,18 @@ async fn record_dependencies(db: &SqlitePool, package_id: i64, version_id: i64, 
         ("optionalDependencies", "optional"),
     ];
     for (field, dep_type) in DEP_TYPES {
-        let Some(deps) = meta.get(field).and_then(|v| v.as_object()) else {
+        let Some(entries) = meta.get(field).and_then(|v| v.as_object()) else {
             continue;
         };
-        for (dep_name, dep_version) in deps {
-            let version_req = dep_version.as_str().unwrap_or("*");
-            let recorded = crate::db::insert_dependency(
-                db, package_id, version_id, dep_name, version_req, dep_type,
-            )
-            .await;
-            if let Err(e) = recorded {
+        for (dep_name, dep_version) in entries {
+            let dep = crate::ports::deps::NewDependency {
+                package: package_id,
+                version: version_id,
+                name: dep_name,
+                requirement: dep_version.as_str().unwrap_or("*"),
+                kind: dep_type,
+            };
+            if let Err(e) = deps.record(&dep, chrono::Utc::now()).await {
                 tracing::warn!(
                     dependency = %dep_name,
                     "failed to record dependency (graph may be incomplete): {e}"

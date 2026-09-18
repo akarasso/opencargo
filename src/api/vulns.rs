@@ -5,42 +5,39 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use chrono::Utc;
 use serde_json::json;
 
+use crate::app::scan::ScanVersion;
 use crate::auth::middleware::AuthUser;
+use crate::domain::Repository;
 use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;
 use crate::server::AppState;
+use crate::wire::wire_ts;
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Find a package across all repositories by name.
-async fn find_package_by_name(
-    db: &sqlx::SqlitePool,
-    name: &str,
-) -> AppResult<Option<crate::domain::Package>> {
-    let row: Option<crate::db::PackageRow> =
-        sqlx::query_as("SELECT * FROM packages WHERE name = ?1 LIMIT 1")
-            .bind(name)
-            .fetch_optional(db)
-            .await?;
-    Ok(row.map(TryInto::try_into).transpose()?)
+/// The repository hosting a package. A package always has one, so its
+/// absence is this server's inconsistency, not the caller's mistake.
+async fn load_repository(state: &AppState, repository_id: i64) -> AppResult<Repository> {
+    state
+        .repos
+        .by_id(repository_id)
+        .await?
+        .ok_or_else(|| AppError::Internal("failed to fetch repository".to_string()))
 }
 
-/// Load the repository hosting a package.
-async fn load_repository(
-    db: &sqlx::SqlitePool,
-    repository_id: i64,
-) -> AppResult<crate::domain::Repository> {
-    let row: crate::db::RepositoryRow =
-        sqlx::query_as("SELECT * FROM repositories WHERE id = ?1")
-            .bind(repository_id)
-            .fetch_one(db)
-            .await
-            .map_err(|_| AppError::Internal("failed to fetch repository".to_string()))?;
-    Ok(row.try_into()?)
+/// The version, or the same 404 a missing package answers with.
+async fn version_of(
+    state: &AppState,
+    package: i64,
+    name: &str,
+    version: &str,
+) -> AppResult<crate::domain::Version> {
+    state
+        .packages
+        .version(package, version)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("version not found: {name}@{version}")))
 }
 
 /// Read-access gate shared by the vulns read and rescan paths. A package whose
@@ -89,39 +86,28 @@ async fn get_vulns_impl(
     version_str: String,
     auth_user: Option<AuthUser>,
 ) -> AppResult<impl IntoResponse> {
-    let pkg = find_package_by_name(&state.db, &name)
+    let pkg = state
+        .packages
+        .anywhere(&name, false)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
 
-    let repo = load_repository(&state.db, pkg.repository_id).await?;
+    let repo = load_repository(&state, pkg.repository_id).await?;
     ensure_readable_or_not_found(&*state.permissions, &repo, auth_user.as_ref(), &name).await?;
 
-    let version = crate::db::get_version(&state.db, pkg.id, &version_str)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("version not found: {name}@{version_str}"))
-        })?;
-
-    let scan = crate::db::get_vulnerability_scan(&state.db, version.id).await?;
+    let version = version_of(&state, pkg.id, &name, &version_str).await?;
+    let scan = state.vulns.latest(version.id).await?;
 
     match scan {
         Some(s) => {
-            // The stored JSON is the whole ScanResult; pre-upgrade rows keep their old detail shape.
-            let details: serde_json::Value = s
-                .scan_results_json
-                .as_deref()
-                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok())
-                .and_then(|mut r| r.get_mut("details").map(serde_json::Value::take))
-                .unwrap_or(json!(null));
-
             Ok(Json(json!({
                 "package": name,
                 "version": version_str,
-                "scanned_at": s.scanned_at,
+                "scanned_at": wire_ts(s.scanned_at),
                 "total_deps": s.total_deps,
                 "vulnerable_deps": s.vulnerable_deps,
                 "status": s.status,
-                "details": details,
+                "details": s.details.unwrap_or(json!(null)),
             })))
         }
         None => Ok(Json(json!({
@@ -168,11 +154,13 @@ async fn rescan_impl(
     version_str: String,
     auth_user: Option<AuthUser>,
 ) -> AppResult<impl IntoResponse> {
-    let pkg = find_package_by_name(&state.db, &name)
+    let pkg = state
+        .packages
+        .anywhere(&name, false)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
 
-    let repo = load_repository(&state.db, pkg.repository_id).await?;
+    let repo = load_repository(&state, pkg.repository_id).await?;
     ensure_readable_or_not_found(&*state.permissions, &repo, auth_user.as_ref(), &name).await?;
 
     // Rescan destroys the stored scan results and triggers outbound OSV
@@ -184,11 +172,7 @@ async fn rescan_impl(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
     crate::registry::ensure_can_write(&*state.permissions, &repo, caller).await?;
 
-    let version = crate::db::get_version(&state.db, pkg.id, &version_str)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("version not found: {name}@{version_str}"))
-        })?;
+    let version = version_of(&state, pkg.id, &name, &version_str).await?;
 
     let format = repo.fmt()?;
     let ecosystem = format.osv_ecosystem().ok_or_else(|| {
@@ -198,13 +182,10 @@ async fn rescan_impl(
         ))
     })?;
 
-    // Delete old scan results
-    crate::db::delete_vulnerability_scans(&state.db, version.id).await?;
-
-    // Run the scan
-    let result = state
-        .vuln_scanner
-        .scan_version(&state.db, version.id, &version.metadata_json, ecosystem)
+    let scan = ScanVersion::new(state.vuln_scanner.clone(), state.vulns.clone());
+    scan.forget(version.id).await?;
+    let result = scan
+        .run(version.id, &version.metadata_json, ecosystem, Utc::now())
         .await
         .map_err(|e| AppError::ServiceUnavailable(format!("scan failed: {e}")))?;
 

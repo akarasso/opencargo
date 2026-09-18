@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 
-use super::severity::{classify, OsvSeverityEntry, Severity};
+use crate::domain::Severity;
+
+use super::severity::{classify, OsvSeverityEntry};
 use super::ScanError;
 
 const BATCH_TIMEOUT: Duration = Duration::from_secs(30);

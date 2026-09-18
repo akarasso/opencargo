@@ -3,7 +3,8 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::{PolicyConfig, Rule};
-use crate::policy::{Age, Resolution, RuleVerdict, Verdict};
+use crate::domain::{RuleVerdict, Verdict};
+use crate::policy::{Age, Resolution};
 
 pub struct MinReleaseAge;
 

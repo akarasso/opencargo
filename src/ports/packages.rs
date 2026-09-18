@@ -90,6 +90,16 @@ pub trait PackageStore: Send + Sync {
         how: NameMatch,
     ) -> Result<Option<Package>, StoreError>;
 
+    /// The first package of that name in any repository, which is how the
+    /// dependency graph and the vulnerability screens address one: they are
+    /// given a bare name, with no repository in the path. `public_only`
+    /// restricts the search to publicly-visible repositories.
+    async fn anywhere(
+        &self,
+        name: &str,
+        public_only: bool,
+    ) -> Result<Option<Package>, StoreError>;
+
     /// In publication order, which is the order every format's index serves.
     async fn versions(&self, package: i64) -> Result<Vec<Version>, StoreError>;
 

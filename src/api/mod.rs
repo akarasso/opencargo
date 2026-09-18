@@ -56,19 +56,17 @@ pub(crate) async fn record_audit(
     action: &str,
     target: Option<&str>,
 ) {
-    if let Err(e) = crate::db::create_audit_entry(
-        &state.db,
-        caller.user_id,
-        Some(caller.username.as_str()),
+    let entry = crate::ports::audit::NewAuditEntry {
+        user_id: caller.user_id,
+        username: Some(caller.username.as_str()),
         action,
         target,
-        None,
-        None,
-        None,
-        None,
-    )
-    .await
-    {
+        repository: None,
+        ip: None,
+        user_agent: None,
+        details_json: None,
+    };
+    if let Err(e) = state.audit.append(&entry, chrono::Utc::now()).await {
         tracing::warn!(error = %e, action, "failed to write audit log entry");
     }
 

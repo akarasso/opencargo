@@ -11,11 +11,12 @@ use crate::domain::{CacheEntry, CacheRepo, Outcome};
 use crate::policy::rules::PolicyConfig;
 use crate::policy::testing::{engine_over, engine_with, fast, pending, repo, scanner, FakeOsv};
 use crate::policy::{PolicyEngine, Source, Tuning, QUEUE};
+use crate::ports::policy::{ReportFilter, ResolutionRow};
 use crate::testing::fixture::Fx;
 use crate::proxy::engine::Cached;
 use crate::proxy::UpstreamStrategy;
 use crate::registry::oci::upstream::{OciArtifact, OciUpstream};
-use crate::telemetry::vulns::severity::Severity;
+use crate::domain::Severity;
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 const INDEX_TYPE: &str = "application/vnd.oci.image.index.v1+json";
@@ -34,13 +35,33 @@ fn aged() -> PolicyConfig {
     }
 }
 
+/// Every recorded resolution, oldest first, through the port the writer
+/// wrote them with.
+async fn recorded(fx: &Fx) -> Vec<ResolutionRow> {
+    let mut all = fx
+        .policy_store()
+        .resolutions(&everything(), 1, 100_000)
+        .await
+        .unwrap();
+    all.reverse();
+    all
+}
+
+fn everything() -> ReportFilter<'static> {
+    ReportFilter {
+        since: DateTime::UNIX_EPOCH,
+        repo: None,
+        rule: None,
+        subject: None,
+    }
+}
+
 async fn rows(fx: &Fx) -> Vec<(String, Option<String>, String)> {
-    sqlx::query_as::<_, (String, Option<String>, String)>(
-        "SELECT name, version, date_source FROM policy_resolutions ORDER BY id",
-    )
-    .fetch_all(&fx.pool)
-    .await
-    .unwrap()
+    recorded(fx)
+        .await
+        .into_iter()
+        .map(|r| (r.name, r.version, r.date_source))
+        .collect()
 }
 
 async fn wait_rows(fx: &Fx, n: usize) -> Vec<(String, Option<String>, String)> {
@@ -129,10 +150,7 @@ fn oci(fx: &Fx, name: &str, version: &str, body: &Cached) -> Pending {
 }
 
 async fn served_digests(fx: &Fx) -> Vec<Option<String>> {
-    sqlx::query_scalar::<_, Option<String>>("SELECT digest FROM policy_resolutions ORDER BY id")
-        .fetch_all(&fx.pool)
-        .await
-        .unwrap()
+    recorded(fx).await.into_iter().map(|r| r.digest).collect()
 }
 
 #[tokio::test]
@@ -354,12 +372,7 @@ async fn parked_index_released_at_ttl() {
     let rows = wait_rows(&fx, 1).await;
     assert!(started.elapsed() >= Duration::from_millis(100));
     assert_eq!(rows[0].2, "index-unpulled");
-    let published: Option<String> =
-        sqlx::query_scalar("SELECT published_at FROM policy_resolutions")
-            .fetch_one(&fx.pool)
-            .await
-            .unwrap();
-    assert_eq!(published, None);
+    assert_eq!(recorded(&fx).await[0].published_at, None);
     tokio::time::sleep(Duration::from_millis(300)).await;
     assert!(
         !engine.shared().holds_oci_state(),
@@ -528,12 +541,20 @@ async fn flush_never_blocks_receive() {
     assert!(osv.batches().iter().all(|n| *n <= BATCH));
     wait_rows(&fx, 301).await;
     assert!(started.elapsed() >= Duration::from_secs(2));
-    let verdicts: Vec<(String, String)> = sqlx::query_as(
-        "SELECT rule, verdict FROM policy_verdicts v JOIN policy_resolutions r ON r.id = v.resolution_id WHERE r.name = 'held'",
-    )
-    .fetch_all(&fx.pool)
-    .await
-    .unwrap();
+    let held: Vec<i64> = recorded(&fx)
+        .await
+        .into_iter()
+        .filter(|r| r.name == "held")
+        .map(|r| r.id)
+        .collect();
+    let verdicts: Vec<(String, String)> = fx
+        .policy_store()
+        .verdicts_for(&held, None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|v| (v.rule, v.verdict))
+        .collect();
     assert_eq!(verdicts, [("osv_severity".to_string(), "pass".to_string())]);
 }
 

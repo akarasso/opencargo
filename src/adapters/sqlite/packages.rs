@@ -256,6 +256,26 @@ impl PackageStore for SqlitePackageStore {
         row.map(package_of).transpose()
     }
 
+    async fn anywhere(
+        &self,
+        name: &str,
+        public_only: bool,
+    ) -> Result<Option<Package>, StoreError> {
+        let visible = if public_only {
+            " AND repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
+        } else {
+            ""
+        };
+        let row: Option<PackageRow> = sqlx::query_as(&format!(
+            "SELECT {PACKAGE_COLUMNS} FROM packages WHERE name = ?1{visible} LIMIT 1"
+        ))
+        .bind(name)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_error)?;
+        row.map(package_of).transpose()
+    }
+
     async fn versions(&self, package: i64) -> Result<Vec<Version>, StoreError> {
         let rows: Vec<VersionRow> = sqlx::query_as(&format!(
             "SELECT {VERSION_COLUMNS} FROM versions WHERE package_id = ?1 ORDER BY id"

@@ -412,13 +412,7 @@ async fn list_promotions_impl(
 
     let target_str = format!("{}@{}", name, version);
 
-    // Query the audit log for package.promote actions targeting this package+version
-    let entries: Vec<crate::db::AuditEntry> = sqlx::query_as(
-        "SELECT * FROM audit_log WHERE action = 'package.promote' AND target = ?1 ORDER BY created_at DESC",
-    )
-    .bind(&target_str)
-    .fetch_all(&state.db)
-    .await?;
+    let entries = state.audit.of_target("package.promote", &target_str).await?;
 
     let promotions: Vec<Value> = entries
         .iter()
@@ -436,7 +430,7 @@ async fn list_promotions_impl(
                 "from": details.get("from").and_then(|v| v.as_str()).unwrap_or(""),
                 "to": details.get("to").and_then(|v| v.as_str()).unwrap_or(""),
                 "promoted_by": e.username,
-                "promoted_at": e.created_at,
+                "promoted_at": crate::wire::wire_ts(e.created_at),
             })
         })
         .collect();

@@ -257,9 +257,14 @@ async fn record_dependencies(state: &AppState, package_id: i64, version_id: i64,
             Some("build") => "build",
             _ => "normal",
         };
-        if let Err(e) =
-            crate::db::insert_dependency(&state.db, package_id, version_id, name, req, kind).await
-        {
+        let dep = crate::ports::deps::NewDependency {
+            package: package_id,
+            version: version_id,
+            name,
+            requirement: req,
+            kind,
+        };
+        if let Err(e) = state.deps.record(&dep, chrono::Utc::now()).await {
             tracing::warn!(dependency = %name, "failed to record dependency (graph may be incomplete): {e}");
         }
     }

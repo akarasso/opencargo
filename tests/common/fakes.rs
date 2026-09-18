@@ -21,10 +21,16 @@ use chrono::{DateTime, Utc};
 
 use opencargo::domain::{
     ApiToken, CacheEntry, CacheEntryId, DistTag, NewEntry, Package, RepoConfig, RepoId, RepoSpec,
-    Repository, Rights, User, Version, Visibility, Webhook,
+    Repository, Rights, ScanResult, User, Verdict, Version, Visibility, Webhook,
 };
 use opencargo::error::StoreError;
+use opencargo::ports::audit::{AuditEntry, AuditStore, NewAuditEntry};
+use opencargo::ports::deps::{Dependency, DependencyStore, Dependent, NewDependency};
 use opencargo::ports::oci::{Blob, Manifest, OciStore};
+use opencargo::ports::policy::{
+    IdRange, NewResolution, PolicyStore, ReportFilter, ResolutionRow, RuleTotals, Subject, Totals,
+    VerdictRow,
+};
 use opencargo::ports::packages::{NameMatch, NewRelease, PackageStore, Promotion, Release};
 use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::ports::proxy_cache::ProxyCacheStore;
@@ -32,6 +38,7 @@ use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
 use opencargo::ports::search::{SearchIndex, SearchQuery, SearchScope};
 use opencargo::ports::tokens::{NewToken, TokenStore};
 use opencargo::ports::users::{NewUser, UserPatch, UserStore};
+use opencargo::ports::vulns::{VulnScan, VulnStore};
 use opencargo::ports::webhooks::{NewWebhook, WebhookPatch, WebhookStore};
 
 /// Which port a queued failure belongs to.
@@ -46,6 +53,10 @@ pub enum PortId {
     Tokens,
     Permissions,
     Oci,
+    Audit,
+    Dependencies,
+    Vulns,
+    Policy,
 }
 
 /// One grant, keyed the way the table is.
@@ -84,16 +95,29 @@ struct TagRow {
     manifest_digest: String,
 }
 
-/// One audit row, kept because a promotion writes it in the same transaction
-/// as the version it records.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AuditRow {
-    pub user_id: Option<i64>,
-    pub username: String,
-    pub action: String,
-    pub target: String,
-    pub repository: String,
-    pub details_json: String,
+/// One recorded edge of the dependency graph.
+#[derive(Clone)]
+struct DependencyRow {
+    version_id: i64,
+    name: String,
+    requirement: String,
+    kind: String,
+}
+
+/// One recorded scan.
+#[derive(Clone)]
+struct ScanRow {
+    version_id: i64,
+    scanned_at: DateTime<Utc>,
+    result: ScanResult,
+}
+
+/// One recorded resolution, kept with its verdicts: they are written
+/// together and erased together, which is the whole of what the port owes.
+#[derive(Clone)]
+struct ResolutionEntry {
+    row: ResolutionRow,
+    verdicts: Vec<VerdictRow>,
 }
 
 #[derive(Default)]
@@ -103,7 +127,10 @@ struct State {
     packages: Vec<Package>,
     versions: Vec<Version>,
     dist_tags: Vec<DistTag>,
-    audit: Vec<AuditRow>,
+    audit: Vec<AuditEntry>,
+    dependencies: Vec<DependencyRow>,
+    scans: Vec<ScanRow>,
+    resolutions: Vec<ResolutionEntry>,
     cache: Vec<CacheEntry>,
     users: Vec<User>,
     tokens: Vec<ApiToken>,
@@ -219,9 +246,38 @@ impl FakeDb {
         self.0.lock().unwrap().failures.push((port, err));
     }
 
-    /// What a promotion recorded, which no port reads back yet.
-    pub fn audit(&self) -> Vec<AuditRow> {
-        self.0.lock().unwrap().audit.clone()
+    pub fn audit(&self) -> Arc<dyn AuditStore> {
+        Arc::new(Audit(self.0.clone()))
+    }
+
+    pub fn dependencies(&self) -> Arc<dyn DependencyStore> {
+        Arc::new(Dependencies(self.0.clone()))
+    }
+
+    pub fn vulns(&self) -> Arc<dyn VulnStore> {
+        Arc::new(Vulns(self.0.clone()))
+    }
+
+    pub fn policy(&self) -> Arc<dyn PolicyStore> {
+        Arc::new(Policy(self.0.clone()))
+    }
+
+    /// The trail as rows, for the assertions that are about what a write
+    /// recorded rather than about what the read method returns.
+    pub fn audit_rows(&self) -> Vec<(Option<i64>, String, String)> {
+        self.0
+            .lock()
+            .unwrap()
+            .audit
+            .iter()
+            .map(|e| {
+                (
+                    e.user_id,
+                    e.action.clone(),
+                    e.target.clone().unwrap_or_default(),
+                )
+            })
+            .collect()
     }
 }
 
@@ -396,6 +452,10 @@ impl Repositories {
 impl RepositoryStore for Repositories {
     async fn by_name(&self, name: &str) -> Result<Option<Repository>, StoreError> {
         self.with(|state| Ok(found(state, name).cloned()))
+    }
+
+    async fn by_id(&self, id: i64) -> Result<Option<Repository>, StoreError> {
+        self.with(|state| Ok(state.repositories.iter().find(|r| r.id == id).cloned()))
     }
 
     async fn all(&self) -> Result<Vec<Repository>, StoreError> {
@@ -622,6 +682,28 @@ impl PackageStore for Packages {
         self.with(|state| Ok(Self::lookup(state, repository, name, how)))
     }
 
+    async fn anywhere(
+        &self,
+        name: &str,
+        public_only: bool,
+    ) -> Result<Option<Package>, StoreError> {
+        self.with(|state| {
+            let public: Vec<i64> = state
+                .repositories
+                .iter()
+                .filter(|repo| repo.visibility == Visibility::Public)
+                .map(|repo| repo.id)
+                .collect();
+            Ok(state
+                .packages
+                .iter()
+                .find(|pkg| {
+                    pkg.name == name && (!public_only || public.contains(&pkg.repository_id))
+                })
+                .cloned())
+        })
+    }
+
     async fn versions(&self, package: i64) -> Result<Vec<Version>, StoreError> {
         self.with(|state| {
             Ok(state
@@ -703,13 +785,18 @@ impl PackageStore for Packages {
         };
         self.with(|state| {
             let (_, version) = Self::write_release(state, &spec)?;
-            state.audit.push(AuditRow {
+            let id = state.id();
+            state.audit.push(AuditEntry {
+                id,
                 user_id: promotion.audit.user_id,
-                username: promotion.audit.username.to_string(),
+                username: Some(promotion.audit.username.to_string()),
                 action: "package.promote".to_string(),
-                target: promotion.audit.target.to_string(),
-                repository: promotion.audit.repository.to_string(),
-                details_json: promotion.audit.details_json.to_string(),
+                target: Some(promotion.audit.target.to_string()),
+                repository: Some(promotion.audit.repository.to_string()),
+                ip: None,
+                user_agent: None,
+                details_json: Some(promotion.audit.details_json.to_string()),
+                created_at: promotion.now,
             });
             Ok(version)
         })
@@ -1275,6 +1362,432 @@ impl OciStore for Oci {
                 .collect();
             tags.sort();
             Ok(tags)
+        })
+    }
+}
+
+struct Audit(Arc<Mutex<State>>);
+
+/// Newest first, then the page, exactly as the adapter's `ORDER BY
+/// created_at DESC LIMIT ?1 OFFSET ?2` does.
+fn page_of(mut rows: Vec<AuditEntry>, page: i64, size: i64) -> Vec<AuditEntry> {
+    rows.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(b.id.cmp(&a.id)));
+    let offset = page.saturating_sub(1).max(0).saturating_mul(size.max(0));
+    rows.into_iter()
+        .skip(offset.max(0) as usize)
+        .take(size.max(0) as usize)
+        .collect()
+}
+
+fn clone_entry(entry: &AuditEntry) -> AuditEntry {
+    AuditEntry {
+        id: entry.id,
+        user_id: entry.user_id,
+        username: entry.username.clone(),
+        action: entry.action.clone(),
+        target: entry.target.clone(),
+        repository: entry.repository.clone(),
+        ip: entry.ip.clone(),
+        user_agent: entry.user_agent.clone(),
+        details_json: entry.details_json.clone(),
+        created_at: entry.created_at,
+    }
+}
+
+#[async_trait]
+impl AuditStore for Audit {
+    async fn append(
+        &self,
+        entry: &NewAuditEntry<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Audit, |state| {
+            let id = state.id();
+            state.audit.push(AuditEntry {
+                id,
+                user_id: entry.user_id,
+                username: entry.username.map(str::to_string),
+                action: entry.action.to_string(),
+                target: entry.target.map(str::to_string),
+                repository: entry.repository.map(str::to_string),
+                ip: entry.ip.map(str::to_string),
+                user_agent: entry.user_agent.map(str::to_string),
+                details_json: entry.details_json.map(str::to_string),
+                created_at: now,
+            });
+            Ok(())
+        })
+    }
+
+    async fn recent(&self, page: i64, size: i64) -> Result<Vec<AuditEntry>, StoreError> {
+        with(&self.0, PortId::Audit, |state| {
+            Ok(page_of(
+                state.audit.iter().map(clone_entry).collect(),
+                page,
+                size,
+            ))
+        })
+    }
+
+    async fn of_target(
+        &self,
+        action: &str,
+        target: &str,
+    ) -> Result<Vec<AuditEntry>, StoreError> {
+        with(&self.0, PortId::Audit, |state| {
+            let matching: Vec<AuditEntry> = state
+                .audit
+                .iter()
+                .filter(|e| e.action == action && e.target.as_deref() == Some(target))
+                .map(clone_entry)
+                .collect();
+            Ok(page_of(matching, 1, i64::MAX))
+        })
+    }
+}
+
+struct Dependencies(Arc<Mutex<State>>);
+
+#[async_trait]
+impl DependencyStore for Dependencies {
+    async fn record(
+        &self,
+        dep: &NewDependency<'_>,
+        _now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Dependencies, |state| {
+            state.dependencies.push(DependencyRow {
+                version_id: dep.version,
+                name: dep.name.to_string(),
+                requirement: dep.requirement.to_string(),
+                kind: dep.kind.to_string(),
+            });
+            Ok(())
+        })
+    }
+
+    async fn of_version(&self, version: i64) -> Result<Vec<Dependency>, StoreError> {
+        with(&self.0, PortId::Dependencies, |state| {
+            Ok(state
+                .dependencies
+                .iter()
+                .filter(|row| row.version_id == version)
+                .map(|row| Dependency {
+                    name: row.name.clone(),
+                    requirement: row.requirement.clone(),
+                    kind: row.kind.clone(),
+                })
+                .collect())
+        })
+    }
+
+    async fn dependents(
+        &self,
+        name: &str,
+        public_only: bool,
+    ) -> Result<Vec<Dependent>, StoreError> {
+        with(&self.0, PortId::Dependencies, |state| {
+            let public: Vec<i64> = state
+                .repositories
+                .iter()
+                .filter(|repo| repo.visibility == Visibility::Public)
+                .map(|repo| repo.id)
+                .collect();
+            let mut found: Vec<Dependent> = Vec::new();
+            for row in state
+                .dependencies
+                .iter()
+                .filter(|r| r.name == name)
+            {
+                let Some(version) = state.versions.iter().find(|v| v.id == row.version_id) else {
+                    continue;
+                };
+                let Some(package) = state.packages.iter().find(|p| p.id == version.package_id)
+                else {
+                    continue;
+                };
+                if public_only && !public.contains(&package.repository_id) {
+                    continue;
+                }
+                let hit = Dependent {
+                    name: package.name.clone(),
+                    version: version.version.clone(),
+                };
+                if !found
+                    .iter()
+                    .any(|d| d.name == hit.name && d.version == hit.version)
+                {
+                    found.push(hit);
+                }
+            }
+            Ok(found)
+        })
+    }
+}
+
+struct Vulns(Arc<Mutex<State>>);
+
+#[async_trait]
+impl VulnStore for Vulns {
+    async fn latest(&self, version: i64) -> Result<Option<VulnScan>, StoreError> {
+        with(&self.0, PortId::Vulns, |state| {
+            Ok(state
+                .scans
+                .iter()
+                .filter(|row| row.version_id == version)
+                .max_by_key(|row| row.scanned_at)
+                .map(|row| VulnScan {
+                    scanned_at: row.scanned_at,
+                    total_deps: row.result.total_deps as i64,
+                    vulnerable_deps: row.result.vulnerable_deps as i64,
+                    status: row.result.status.clone(),
+                    details: serde_json::to_value(&row.result.details).ok(),
+                }))
+        })
+    }
+
+    async fn record(
+        &self,
+        version: i64,
+        result: &ScanResult,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Vulns, |state| {
+            state.scans.push(ScanRow {
+                version_id: version,
+                scanned_at: now,
+                result: result.clone(),
+            });
+            Ok(())
+        })
+    }
+
+    async fn forget(&self, version: i64) -> Result<(), StoreError> {
+        with(&self.0, PortId::Vulns, |state| {
+            state.scans.retain(|row| row.version_id != version);
+            Ok(())
+        })
+    }
+}
+
+struct Policy(Arc<Mutex<State>>);
+
+/// The window predicate every report query shares, spelled once.
+fn in_window(entry: &ResolutionEntry, f: &ReportFilter<'_>, range: Option<IdRange>) -> bool {
+    let row = &entry.row;
+    if row.created_at < f.since {
+        return false;
+    }
+    if let Some(range) = range {
+        if row.id <= range.after || row.id > range.upto {
+            return false;
+        }
+    }
+    if let Some(repo) = f.repo {
+        if row.requested_repo != repo && row.member_repo != repo {
+            return false;
+        }
+    }
+    match f.subject {
+        Some(Subject::User(id)) => row.user_id == Some(id),
+        Some(Subject::Static) => row.actor_kind == "static",
+        None => true,
+    }
+}
+
+/// The rows a filter selects, with the flags the report reads: narrowed to
+/// one rule, they are that rule's verdict rather than the row's own.
+fn selected<'a>(
+    state: &'a State,
+    f: &ReportFilter<'_>,
+    range: Option<IdRange>,
+) -> Vec<(&'a ResolutionEntry, bool, bool)> {
+    state
+        .resolutions
+        .iter()
+        .filter(|entry| in_window(entry, f, range))
+        .filter_map(|entry| match f.rule {
+            Some(rule) => entry
+                .verdicts
+                .iter()
+                .find(|v| v.rule == rule)
+                .map(|v| (entry, v.verdict == "would_block", v.verdict == "unknown")),
+            None => Some((entry, entry.row.would_block, entry.row.unknown)),
+        })
+        .collect()
+}
+
+#[async_trait]
+impl PolicyStore for Policy {
+    async fn insert_batch(
+        &self,
+        rows: &[NewResolution<'_>],
+        now: DateTime<Utc>,
+    ) -> Result<Vec<i64>, StoreError> {
+        with(&self.0, PortId::Policy, |state| {
+            let mut ids = Vec::with_capacity(rows.len());
+            for row in rows {
+                let id = state.id();
+                let would_block = row
+                    .verdicts
+                    .iter()
+                    .any(|v| v.verdict == Verdict::WouldBlock);
+                let unknown =
+                    !would_block && row.verdicts.iter().any(|v| v.verdict == Verdict::Unknown);
+                state.resolutions.push(ResolutionEntry {
+                    row: ResolutionRow {
+                        id,
+                        created_at: now,
+                        requested_repo: row.requested_repo.to_string(),
+                        member_repo: row.member_repo.to_string(),
+                        format: row.format.to_string(),
+                        name: row.name.to_string(),
+                        version: row.version.map(str::to_string),
+                        digest: row.digest.map(str::to_string),
+                        date_source: row.date_source.to_string(),
+                        actor: row.actor.to_string(),
+                        actor_kind: row.actor_kind.to_string(),
+                        user_id: row.user_id,
+                        published_at: row.published_at,
+                        would_block,
+                        unknown,
+                    },
+                    verdicts: row
+                        .verdicts
+                        .iter()
+                        .map(|v| VerdictRow {
+                            resolution_id: id,
+                            rule: v.rule.to_string(),
+                            verdict: v.verdict.as_str().to_string(),
+                            reason: v.reason.clone(),
+                        })
+                        .collect(),
+                });
+                ids.push(id);
+            }
+            Ok(ids)
+        })
+    }
+
+    async fn max_id(&self) -> Result<i64, StoreError> {
+        with(&self.0, PortId::Policy, |state| {
+            Ok(state
+                .resolutions
+                .iter()
+                .map(|entry| entry.row.id)
+                .max()
+                .unwrap_or(0))
+        })
+    }
+
+    async fn totals(
+        &self,
+        filter: &ReportFilter<'_>,
+        range: IdRange,
+    ) -> Result<Totals, StoreError> {
+        with(&self.0, PortId::Policy, |state| {
+            let hits = selected(state, filter, Some(range));
+            let mut totals = Totals {
+                resolutions: hits.len() as u64,
+                ..Totals::default()
+            };
+            for (entry, would_block, unknown) in hits {
+                totals.would_block += u64::from(would_block);
+                totals.unknown += u64::from(unknown);
+                for verdict in entry
+                    .verdicts
+                    .iter()
+                    .filter(|v| filter.rule.is_none_or(|rule| v.rule == rule))
+                {
+                    let counts: &mut RuleTotals =
+                        totals.by_rule.entry(verdict.rule.clone()).or_default();
+                    match verdict.verdict.as_str() {
+                        "would_block" => counts.would_block += 1,
+                        "unknown" => counts.unknown += 1,
+                        "pass" => counts.pass += 1,
+                        _ => counts.not_applicable += 1,
+                    }
+                }
+            }
+            Ok(totals)
+        })
+    }
+
+    async fn resolutions(
+        &self,
+        filter: &ReportFilter<'_>,
+        page: i64,
+        size: i64,
+    ) -> Result<Vec<ResolutionRow>, StoreError> {
+        with(&self.0, PortId::Policy, |state| {
+            let mut rows: Vec<ResolutionRow> = selected(state, filter, None)
+                .into_iter()
+                .map(|(entry, would_block, unknown)| ResolutionRow {
+                    would_block,
+                    unknown,
+                    ..entry.row.clone()
+                })
+                .collect();
+            rows.sort_by(|a, b| b.id.cmp(&a.id));
+            let offset = page.saturating_sub(1).max(0).saturating_mul(size.max(0));
+            Ok(rows
+                .into_iter()
+                .skip(offset.max(0) as usize)
+                .take(size.max(0) as usize)
+                .collect())
+        })
+    }
+
+    async fn verdicts_for(
+        &self,
+        ids: &[i64],
+        rule: Option<&str>,
+    ) -> Result<Vec<VerdictRow>, StoreError> {
+        with(&self.0, PortId::Policy, |state| {
+            let mut found: Vec<VerdictRow> = state
+                .resolutions
+                .iter()
+                .filter(|entry| ids.contains(&entry.row.id))
+                .flat_map(|entry| entry.verdicts.iter())
+                .filter(|v| rule.is_none_or(|wanted| v.rule == wanted))
+                .map(|v| VerdictRow {
+                    resolution_id: v.resolution_id,
+                    rule: v.rule.clone(),
+                    verdict: v.verdict.clone(),
+                    reason: v.reason.clone(),
+                })
+                .collect();
+            found.sort_by(|a, b| {
+                a.resolution_id
+                    .cmp(&b.resolution_id)
+                    .then(a.rule.cmp(&b.rule))
+            });
+            Ok(found)
+        })
+    }
+
+    async fn delete_older_than(
+        &self,
+        days: u64,
+        now: DateTime<Utc>,
+    ) -> Result<u64, StoreError> {
+        with(&self.0, PortId::Policy, |state| {
+            let cutoff = i64::try_from(days)
+                .ok()
+                .and_then(chrono::Duration::try_days)
+                .and_then(|span| now.checked_sub_signed(span))
+                .unwrap_or(DateTime::<Utc>::MIN_UTC);
+            let before = state.resolutions.len();
+            state.resolutions.retain(|e| e.row.created_at >= cutoff);
+            Ok((before - state.resolutions.len()) as u64)
+        })
+    }
+
+    async fn erase_user(&self, user_id: i64) -> Result<u64, StoreError> {
+        with(&self.0, PortId::Policy, |state| {
+            let before = state.resolutions.len();
+            state.resolutions.retain(|e| e.row.user_id != Some(user_id));
+            Ok((before - state.resolutions.len()) as u64)
         })
     }
 }

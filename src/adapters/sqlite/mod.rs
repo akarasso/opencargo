@@ -12,26 +12,34 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::domain::DomainError;
 use crate::error::StoreError;
+use crate::ports::audit::AuditStore;
+use crate::ports::deps::DependencyStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
+use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::SearchIndex;
 use crate::ports::tokens::TokenStore;
 use crate::ports::users::UserStore;
+use crate::ports::vulns::VulnStore;
 use crate::ports::webhooks::WebhookStore;
 
+pub mod audit;
+pub mod deps;
 pub mod migrate;
 pub mod multipart;
 pub mod oci;
 pub mod packages;
 pub mod permissions;
+pub mod policy;
 pub mod proxy_cache;
 pub mod repositories;
 pub mod search;
 pub mod tokens;
 pub mod users;
+pub mod vulns;
 pub mod webhooks;
 
 /// This adapter's stored timestamp: UTC, second precision.
@@ -224,5 +232,21 @@ impl SqliteStores {
 
     pub fn oci(&self) -> Arc<dyn OciStore> {
         Arc::new(oci::SqliteOciStore::new(self.pool.clone()))
+    }
+
+    pub fn audit(&self) -> Arc<dyn AuditStore> {
+        Arc::new(audit::SqliteAuditStore::new(self.pool.clone()))
+    }
+
+    pub fn dependencies(&self) -> Arc<dyn DependencyStore> {
+        Arc::new(deps::SqliteDependencyStore::new(self.pool.clone()))
+    }
+
+    pub fn vulns(&self) -> Arc<dyn VulnStore> {
+        Arc::new(vulns::SqliteVulnStore::new(self.pool.clone()))
+    }
+
+    pub fn policy(&self) -> Arc<dyn PolicyStore> {
+        Arc::new(policy::SqlitePolicyStore::new(self.pool.clone()))
     }
 }

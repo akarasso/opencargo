@@ -320,6 +320,12 @@ impl Fx {
         }
     }
 
+    /// The policy report store over this fixture's database, reached through
+    /// the composition root like the cache store beside it.
+    pub fn policy_store(&self) -> Arc<dyn crate::ports::policy::PolicyStore> {
+        crate::server::policy_store(&self.pool)
+    }
+
     pub fn engine(&self, timeouts: Timeouts) -> ProxyEngine {
         let ttl = TtlConfig {
             default_secs: 3600,

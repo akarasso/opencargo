@@ -11,9 +11,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::error::{AppError, AppResult};
-use crate::policy::store::{self, ReportFilter, Subject};
 use crate::policy::Age;
+use crate::ports::policy::{ReportFilter, ResolutionRow, Subject, VerdictRow};
 use crate::server::AppState;
+use crate::wire::wire_ts;
 
 use super::{record_audit, require_admin, require_auth};
 
@@ -111,19 +112,15 @@ async fn render(
         rule.unwrap_or("")
     );
     let totals = state.policy.totals(&filter, key).await?;
-    let rows = store::list_resolutions(&state.db, &filter, page, size).await?;
+    let rows = state.policy_store.resolutions(&filter, page, size).await?;
     let ids: Vec<i64> = rows.iter().map(|r| r.id).collect();
-    let mut verdicts: BTreeMap<i64, Vec<store::VerdictRow>> = BTreeMap::new();
-    for v in store::verdicts_for(&state.db, &ids, rule).await? {
+    let mut verdicts: BTreeMap<i64, Vec<VerdictRow>> = BTreeMap::new();
+    for v in state.policy_store.verdicts_for(&ids, rule).await? {
         verdicts.entry(v.resolution_id).or_default().push(v);
     }
     let entries: Vec<Value> = rows
-        .into_iter()
-        .map(|r| {
-            let mut entry = serde_json::to_value(&r).unwrap_or_default();
-            entry["verdicts"] = json!(verdicts.remove(&r.id).unwrap_or_default());
-            entry
-        })
+        .iter()
+        .map(|r| entry(r, verdicts.remove(&r.id).unwrap_or_default()))
         .collect();
     let mut body = json!({
         "since": since.to_rfc3339_opts(SecondsFormat::Secs, true),
@@ -136,6 +133,31 @@ async fn render(
         body["process"] = json!({ "dropped_since_start": state.policy.dropped() });
     }
     Ok(Json(body))
+}
+
+/// One listed resolution as the report serves it: timestamps RFC 3339, not
+/// the storage format, and the row's verdicts beside it.
+fn entry(row: &ResolutionRow, verdicts: Vec<VerdictRow>) -> Value {
+    json!({
+        "id": row.id,
+        "created_at": wire_ts(row.created_at),
+        "requested_repo": row.requested_repo,
+        "member_repo": row.member_repo,
+        "format": row.format,
+        "name": row.name,
+        "version": row.version,
+        "digest": row.digest,
+        "actor": row.actor,
+        "actor_kind": row.actor_kind,
+        "user_id": row.user_id,
+        "published_at": row.published_at.map(wire_ts),
+        "would_block": row.would_block,
+        "unknown": row.unknown,
+        "verdicts": verdicts
+            .into_iter()
+            .map(|v| json!({ "rule": v.rule, "verdict": v.verdict, "reason": v.reason }))
+            .collect::<Vec<Value>>(),
+    })
 }
 
 /// DELETE /api/v1/policy/report?user=|user_id= (admin): erases one user's
@@ -161,7 +183,7 @@ pub async fn erase(
             ))
         }
     };
-    let deleted = store::delete_by_user(&state.db, user_id).await?;
+    let deleted = state.policy_store.erase_user(user_id).await?;
     state.policy.forget_totals();
     record_audit(
         &state,
@@ -183,7 +205,7 @@ pub async fn rules(
     require_admin(&caller)?;
     let mut recording = Vec::new();
     let mut repositories = serde_json::Map::new();
-    for repo in crate::db::get_all_repositories(&state.db).await? {
+    for repo in state.repos.all().await? {
         if repo.repo_type != "proxy" {
             continue;
         }
