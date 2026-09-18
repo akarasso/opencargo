@@ -5,7 +5,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use base64::Engine as _;
@@ -224,8 +224,6 @@ pub struct GateConfig {
     pub timeout: Duration,
 }
 
-type Observer = Arc<dyn Fn(&Method, &Url, bool) + Send + Sync>;
-
 pub struct Gate {
     client: reqwest::Client,
     from: Url,
@@ -238,7 +236,6 @@ pub struct Gate {
     max_artifact_size: u64,
     spool_dir: PathBuf,
     bearer: Mutex<HashMap<String, Secret>>,
-    observer: Option<Observer>,
 }
 
 /// A request the gate sends: the body is cloned per attempt.
@@ -287,11 +284,6 @@ impl Spooled {
 
     pub async fn bytes(&self) -> std::io::Result<Vec<u8>> {
         tokio::fs::read(&self.path).await
-    }
-
-    pub async fn body(&self) -> std::io::Result<reqwest::Body> {
-        let f = tokio::fs::File::open(&self.path).await?;
-        Ok(reqwest::Body::wrap_stream(tokio_util::io::ReaderStream::new(f)))
     }
 }
 
@@ -355,14 +347,7 @@ impl Gate {
             max_artifact_size: cfg.max_artifact_size,
             spool_dir: cfg.spool_dir,
             bearer: Mutex::new(HashMap::new()),
-            observer: None,
         })
-    }
-
-    /// Records every request the gate sends: `(method, url, credentialed)`.
-    pub fn observe(mut self, f: impl Fn(&Method, &Url, bool) + Send + Sync + 'static) -> Self {
-        self.observer = Some(Arc::new(f));
-        self
     }
 
     pub fn from(&self) -> &Url {
@@ -423,9 +408,6 @@ impl Gate {
                 req = req.header(reqwest::header::AUTHORIZATION, h);
             }
         }
-        if let Some(obs) = &self.observer {
-            obs(&Method::GET, &realm, credentialed);
-        }
         let resp = req.send().await.map_err(|e| transport(&realm, e))?;
         if !resp.status().is_success() {
             return Err(FetchError::Auth(format!("token realm {} answered {}", redact(&realm), resp.status())));
@@ -458,22 +440,14 @@ impl Gate {
             if let Some(b) = &r.body {
                 req = req.body(b.clone());
             }
-            let sent_auth = match (&bearer, credentialed) {
-                (Some(t), _) => {
-                    req = req.bearer_auth(t.expose());
-                    true
-                }
-                (None, true) => match self.credential.header() {
-                    Some(h) => {
+            match (&bearer, credentialed) {
+                (Some(t), _) => req = req.bearer_auth(t.expose()),
+                (None, true) => {
+                    if let Some(h) = self.credential.header() {
                         req = req.header(reqwest::header::AUTHORIZATION, h);
-                        true
                     }
-                    None => false,
-                },
-                (None, false) => false,
-            };
-            if let Some(obs) = &self.observer {
-                obs(&r.method, &r.url, sent_auth);
+                }
+                (None, false) => {}
             }
             let outcome = req.send().await;
             let resp = match outcome {
@@ -691,6 +665,7 @@ pub fn admin_url(raw: &str, flag: &str, env_hint: &str) -> Result<Url, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     #[test]
     fn link_header_rfc5988() {

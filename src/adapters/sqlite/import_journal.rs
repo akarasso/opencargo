@@ -1,7 +1,7 @@
 //! The importer's resume journal: one SQLite file of its own, never the
 //! registry's database, and never a secret.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::str::FromStr;
 
 use async_trait::async_trait;
@@ -40,7 +40,6 @@ CREATE TABLE IF NOT EXISTS gap (scope TEXT NOT NULL, kind TEXT NOT NULL, source_
 
 pub struct SqliteImportJournal {
     pool: SqlitePool,
-    path: PathBuf,
 }
 
 fn io(e: impl std::fmt::Display) -> JournalError {
@@ -112,11 +111,7 @@ impl SqliteImportJournal {
             .execute(&pool)
             .await
             .map_err(io)?;
-        Ok(Self { pool, path: path.to_path_buf() })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
+        Ok(Self { pool })
     }
 
     pub async fn close(self) {
@@ -569,14 +564,6 @@ impl ImportJournal for SqliteImportJournal {
         .await
         .map_err(io)?;
         rows.iter().map(|r| Ok((gap_of(r)?, r.get::<i64, _>("n") as u64))).collect()
-    }
-
-    async fn pending(&self) -> Result<u64, JournalError> {
-        let n: i64 = sqlx::query_scalar("SELECT count(*) FROM item WHERE status IN ('pending', 'running')")
-            .fetch_one(&self.pool)
-            .await
-            .map_err(io)?;
-        Ok(n as u64)
     }
 }
 

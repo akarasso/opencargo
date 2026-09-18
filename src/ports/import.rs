@@ -310,16 +310,6 @@ pub enum Lane {
     File,
 }
 
-impl Lane {
-    pub fn of(format: Format) -> Lane {
-        if format == Format::Oci {
-            Lane::Blob
-        } else {
-            Lane::File
-        }
-    }
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunHeader {
     pub source: String,
@@ -437,8 +427,6 @@ pub trait ImportJournal: Send + Sync {
 
     /// Every stored gap once, with how many times its fact was recorded.
     async fn gaps(&self) -> Result<Vec<(Gap, u64)>, JournalError>;
-
-    async fn pending(&self) -> Result<u64, JournalError>;
 }
 
 /// A URL as it may be stored or printed: no credentials, no query string,

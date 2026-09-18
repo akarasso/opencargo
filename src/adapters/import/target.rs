@@ -147,8 +147,6 @@ pub struct LaneConfig {
     pub timeout: Duration,
 }
 
-type Observer = Arc<dyn Fn(&Method, &Url) + Send + Sync>;
-
 /// The target-side chokepoint: the pooled client, the publish window, the
 /// cooldown every worker parks on after a 429 or 503.
 pub struct TargetLane {
@@ -161,7 +159,6 @@ pub struct TargetLane {
     stall_after: u32,
     cooling_until: Mutex<Option<Instant>>,
     episodes: AtomicU32,
-    observer: Option<Observer>,
 }
 
 impl TargetLane {
@@ -183,13 +180,7 @@ impl TargetLane {
             stall_after: cfg.stall_after,
             cooling_until: Mutex::new(None),
             episodes: AtomicU32::new(0),
-            observer: None,
         })
-    }
-
-    pub fn observe(mut self, f: impl Fn(&Method, &Url) + Send + Sync + 'static) -> Self {
-        self.observer = Some(Arc::new(f));
-        self
     }
 
     pub fn base(&self) -> &Url {
@@ -258,9 +249,6 @@ impl TargetLane {
             }
             for (n, v) in &r.headers {
                 req = req.header(*n, v);
-            }
-            if let Some(obs) = &self.observer {
-                obs(&r.method, &r.url);
             }
             let resp = req.send().await.map_err(|e| {
                 CopyError::Transient(format!("target {}: {}", redact(&r.url), e.without_url()))
