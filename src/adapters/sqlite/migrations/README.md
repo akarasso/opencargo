@@ -39,7 +39,7 @@ checksum in the same commit.
 | 018 | - | s3.md (oci_upload_progress) | - |
 | 019 | - | pypi.md (pypi_files) | - |
 | 020 | - | nuget.md (nuget_format + its Step::Rust rebuild) | - |
-| 021 | - | sso.md (sso) | - |
+| 021 | 021_sso.sql | sso.md (sso, server_secrets) | 56921514f38896bf6ac419d884a164839bc5521afa1bca372fdcf8376185d62c |
 | 022 | - | ha-options.md (server_leases) | - |
 | 023 | - | mcp-governance.md (mcp, reusing 020's rebuild) | - |
 | 024 | - | maven.md (maven format, through the shared rebuild helper) | - |

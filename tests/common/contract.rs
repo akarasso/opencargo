@@ -589,8 +589,10 @@ macro_rules! package_contract {
                     .search(SearchScope::Repo(repo.id), None, 20)
                     .await
                     .unwrap();
-                let mut names: Vec<&str> =
-                    browsed.iter().map(|package| package.name.as_str()).collect();
+                let mut names: Vec<&str> = browsed
+                    .iter()
+                    .map(|package| package.name.as_str())
+                    .collect();
                 names.sort();
                 assert_eq!(
                     names,
@@ -641,7 +643,11 @@ macro_rules! package_contract {
                     .unwrap();
 
                 assert!(matches!(
-                    handles.repos.retire("npm-hosted", at(10)).await.unwrap_err(),
+                    handles
+                        .repos
+                        .retire("npm-hosted", at(10))
+                        .await
+                        .unwrap_err(),
                     StoreError::Conflict
                 ));
                 assert_eq!(
@@ -659,7 +665,11 @@ macro_rules! package_contract {
                 handles.repos.retire("npm-hosted", at(10)).await.unwrap();
                 assert!(handles.repos.by_name("npm-hosted").await.unwrap().is_none());
                 assert!(matches!(
-                    handles.repos.retire("npm-hosted", at(10)).await.unwrap_err(),
+                    handles
+                        .repos
+                        .retire("npm-hosted", at(10))
+                        .await
+                        .unwrap_err(),
                     StoreError::NotFound
                 ));
             }
@@ -821,7 +831,10 @@ macro_rules! package_contract {
                     .unwrap();
                 store.record_download(landed.version.id).await.unwrap();
 
-                store.delete_version(landed.version.id, at(10)).await.unwrap();
+                store
+                    .delete_version(landed.version.id, at(10))
+                    .await
+                    .unwrap();
 
                 assert!(store
                     .version(landed.package.id, "1.0.0")
@@ -829,11 +842,7 @@ macro_rules! package_contract {
                     .unwrap()
                     .is_none());
                 assert!(
-                    store
-                        .dist_tags(landed.package.id)
-                        .await
-                        .unwrap()
-                        .is_empty(),
+                    store.dist_tags(landed.package.id).await.unwrap().is_empty(),
                     "the tag that pointed at it goes with it"
                 );
                 assert_eq!(
@@ -848,7 +857,10 @@ macro_rules! package_contract {
                     "a sibling version is untouched"
                 );
                 assert!(matches!(
-                    store.delete_version(landed.version.id, at(10)).await.unwrap_err(),
+                    store
+                        .delete_version(landed.version.id, at(10))
+                        .await
+                        .unwrap_err(),
                     StoreError::NotFound
                 ));
             }
@@ -997,7 +1009,10 @@ macro_rules! proxy_cache_contract {
                     .unwrap()
                     .is_none());
 
-                store.upsert(&entry("lodash", 200, Some(3600)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, Some(3600)), at(9))
+                    .await
+                    .unwrap();
                 let row = read(store, "lodash", at(9)).await;
 
                 assert_eq!((row.status, row.size), (200, 42));
@@ -1021,22 +1036,39 @@ macro_rules! proxy_cache_contract {
             async fn an_entry_is_stale_at_exactly_its_expiry() {
                 let handles = $open().await;
                 let store = &handles.cache;
-                store.upsert(&entry("lodash", 200, Some(3600)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, Some(3600)), at(9))
+                    .await
+                    .unwrap();
                 let expires = at(9) + TimeDelta::seconds(3600);
 
-                assert!(read(store, "lodash", expires - TimeDelta::seconds(1)).await.fresh);
+                assert!(
+                    read(store, "lodash", expires - TimeDelta::seconds(1))
+                        .await
+                        .fresh
+                );
                 assert!(!read(store, "lodash", expires).await.fresh);
-                assert!(!read(store, "lodash", expires + TimeDelta::seconds(1)).await.fresh);
+                assert!(
+                    !read(store, "lodash", expires + TimeDelta::seconds(1))
+                        .await
+                        .fresh
+                );
             }
 
             #[tokio::test]
             async fn an_immutable_answer_never_expires_and_upserts_in_place() {
                 let handles = $open().await;
                 let store = &handles.cache;
-                store.upsert(&entry("lodash", 200, Some(60)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, Some(60)), at(9))
+                    .await
+                    .unwrap();
                 let first = read(store, "lodash", at(9)).await;
 
-                store.upsert(&entry("lodash", 200, None), at(11)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, None), at(11))
+                    .await
+                    .unwrap();
                 let again = read(store, "lodash", at(23)).await;
 
                 assert_eq!(again.id, first.id, "one key is one row");
@@ -1048,12 +1080,18 @@ macro_rules! proxy_cache_contract {
             async fn a_touch_moves_the_use_and_only_a_revalidation_moves_the_expiry() {
                 let handles = $open().await;
                 let store = &handles.cache;
-                store.upsert(&entry("lodash", 200, Some(3600)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, Some(3600)), at(9))
+                    .await
+                    .unwrap();
                 let row = read(store, "lodash", at(9)).await;
 
                 store.touch(row.id, None, at(10)).await.unwrap();
                 let touched = read(store, "lodash", at(10)).await;
-                assert_eq!(touched.last_used_at.trunc_subsecs(0), at(10).trunc_subsecs(0));
+                assert_eq!(
+                    touched.last_used_at.trunc_subsecs(0),
+                    at(10).trunc_subsecs(0)
+                );
                 assert_eq!(touched.expires_at, row.expires_at, "a hit is not a refresh");
 
                 store
@@ -1076,10 +1114,22 @@ macro_rules! proxy_cache_contract {
                 let handles = $open().await;
                 let store = &handles.cache;
                 let day = Duration::from_secs(86_400);
-                store.upsert(&entry("idle", 200, None), at(9)).await.unwrap();
-                store.upsert(&entry("gone", 404, Some(60)), at(9)).await.unwrap();
-                store.upsert(&entry("stale", 200, Some(60)), at(9)).await.unwrap();
-                store.upsert(&entry("fresh-negative", 404, Some(3600)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("idle", 200, None), at(9))
+                    .await
+                    .unwrap();
+                store
+                    .upsert(&entry("gone", 404, Some(60)), at(9))
+                    .await
+                    .unwrap();
+                store
+                    .upsert(&entry("stale", 200, Some(60)), at(9))
+                    .await
+                    .unwrap();
+                store
+                    .upsert(&entry("fresh-negative", 404, Some(3600)), at(9))
+                    .await
+                    .unwrap();
 
                 let now = at(9) + TimeDelta::seconds(1800);
                 let soon: Vec<String> = store
@@ -1107,16 +1157,30 @@ macro_rules! proxy_cache_contract {
             async fn forgetting_is_by_row_or_by_repository() {
                 let handles = $open().await;
                 let store = &handles.cache;
-                store.upsert(&entry("a", 200, Some(60)), at(9)).await.unwrap();
-                store.upsert(&entry("b", 200, Some(60)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("a", 200, Some(60)), at(9))
+                    .await
+                    .unwrap();
+                store
+                    .upsert(&entry("b", 200, Some(60)), at(9))
+                    .await
+                    .unwrap();
                 let a = read(store, "a", at(9)).await;
 
                 store.delete(a.id).await.unwrap();
-                assert!(store.entry(REPO, "npm-metadata", "a", at(9)).await.unwrap().is_none());
+                assert!(store
+                    .entry(REPO, "npm-metadata", "a", at(9))
+                    .await
+                    .unwrap()
+                    .is_none());
                 store.delete(a.id).await.unwrap();
 
                 assert_eq!(store.delete_for_repo(REPO).await.unwrap(), 1);
-                assert!(store.entry(REPO, "npm-metadata", "b", at(9)).await.unwrap().is_none());
+                assert!(store
+                    .entry(REPO, "npm-metadata", "b", at(9))
+                    .await
+                    .unwrap()
+                    .is_none());
                 assert_eq!(store.delete_for_repo(REPO).await.unwrap(), 0);
             }
         }
@@ -1213,7 +1277,11 @@ macro_rules! cascade_contract {
             }
 
             fn verdicts() -> Vec<RuleVerdict> {
-                vec![RuleVerdict::new("typosquat", Verdict::WouldBlock, "looks like left-pad")]
+                vec![RuleVerdict::new(
+                    "typosquat",
+                    Verdict::WouldBlock,
+                    "looks like left-pad",
+                )]
             }
 
             /// Two callers spelled the same and identified differently: the
@@ -1282,10 +1350,7 @@ macro_rules! cascade_contract {
                 let verdicts = verdicts();
                 handles
                     .policy
-                    .insert_batch(
-                        &[resolution(&verdicts, 7), resolution(&verdicts, 8)],
-                        at(9),
-                    )
+                    .insert_batch(&[resolution(&verdicts, 7), resolution(&verdicts, 8)], at(9))
                     .await
                     .unwrap();
 
@@ -1314,7 +1379,10 @@ macro_rules! cascade_contract {
                 let verdicts = verdicts();
                 handles
                     .policy
-                    .insert_batch(&[resolution(&verdicts, 7)], at(9) - ::chrono::Duration::days(100))
+                    .insert_batch(
+                        &[resolution(&verdicts, 7)],
+                        at(9) - ::chrono::Duration::days(100),
+                    )
                     .await
                     .unwrap();
                 handles
@@ -1323,12 +1391,23 @@ macro_rules! cascade_contract {
                     .await
                     .unwrap();
 
-                assert_eq!(handles.policy.delete_older_than(30, at(9)).await.unwrap(), 1);
                 assert_eq!(
-                    handles.policy.resolutions(&window(), 1, 10).await.unwrap().len(),
+                    handles.policy.delete_older_than(30, at(9)).await.unwrap(),
                     1
                 );
-                assert_eq!(handles.policy.delete_older_than(30, at(9)).await.unwrap(), 0);
+                assert_eq!(
+                    handles
+                        .policy
+                        .resolutions(&window(), 1, 10)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    handles.policy.delete_older_than(30, at(9)).await.unwrap(),
+                    0
+                );
             }
 
             /// The trail is read back newest first, under the caller's clock,
@@ -1362,7 +1441,10 @@ macro_rules! cascade_contract {
                     vec!["user.delete", "user.create"],
                     "newest first"
                 );
-                assert_eq!(listed[0].created_at.trunc_subsecs(0), at(10).trunc_subsecs(0));
+                assert_eq!(
+                    listed[0].created_at.trunc_subsecs(0),
+                    at(10).trunc_subsecs(0)
+                );
                 assert_eq!(listed[0].username.as_deref(), Some("ci"));
                 assert_eq!(handles.audit.recent(2, 1).await.unwrap().len(), 1);
 
@@ -1395,20 +1477,43 @@ macro_rules! cascade_contract {
                     }],
                 };
 
-                assert!(handles.vulns.latest(handles.release.version).await.unwrap().is_none());
-                handles.vulns.record(handles.release.version, &result, at(9)).await.unwrap();
+                assert!(handles
+                    .vulns
+                    .latest(handles.release.version)
+                    .await
+                    .unwrap()
+                    .is_none());
+                handles
+                    .vulns
+                    .record(handles.release.version, &result, at(9))
+                    .await
+                    .unwrap();
 
-                let stored = handles.vulns.latest(handles.release.version).await.unwrap().unwrap();
+                let stored = handles
+                    .vulns
+                    .latest(handles.release.version)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(stored.scanned_at.trunc_subsecs(0), at(9).trunc_subsecs(0));
                 assert_eq!((stored.total_deps, stored.vulnerable_deps), (3, 1));
                 assert_eq!(stored.status, "warning");
                 assert_eq!(
-                    stored.details.as_ref().and_then(|d| d.get(0)).and_then(|d| d["vuln_id"].as_str()),
+                    stored
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get(0))
+                        .and_then(|d| d["vuln_id"].as_str()),
                     Some("GHSA-x")
                 );
 
                 handles.vulns.forget(handles.release.version).await.unwrap();
-                assert!(handles.vulns.latest(handles.release.version).await.unwrap().is_none());
+                assert!(handles
+                    .vulns
+                    .latest(handles.release.version)
+                    .await
+                    .unwrap()
+                    .is_none());
                 handles.vulns.forget(handles.release.version).await.unwrap();
             }
 
@@ -1416,10 +1521,9 @@ macro_rules! cascade_contract {
             #[tokio::test]
             async fn a_versions_edges_come_back_in_the_order_they_were_recorded() {
                 let handles = $open().await;
-                for (name, requirement, kind) in [
-                    ("left-pad", "^1.0.0", "runtime"),
-                    ("tape", "^5.0.0", "dev"),
-                ] {
+                for (name, requirement, kind) in
+                    [("left-pad", "^1.0.0", "runtime"), ("tape", "^5.0.0", "dev")]
+                {
                     handles
                         .deps
                         .record(
@@ -1436,18 +1540,24 @@ macro_rules! cascade_contract {
                         .unwrap();
                 }
 
-                let edges = handles.deps.of_version(handles.release.version).await.unwrap();
+                let edges = handles
+                    .deps
+                    .of_version(handles.release.version)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     edges
                         .iter()
                         .map(|d| (d.name.as_str(), d.requirement.as_str(), d.kind.as_str()))
                         .collect::<Vec<_>>(),
-                    vec![
-                        ("left-pad", "^1.0.0", "runtime"),
-                        ("tape", "^5.0.0", "dev"),
-                    ]
+                    vec![("left-pad", "^1.0.0", "runtime"), ("tape", "^5.0.0", "dev"),]
                 );
-                assert!(handles.deps.of_version(handles.release.version + 1).await.unwrap().is_empty());
+                assert!(handles
+                    .deps
+                    .of_version(handles.release.version + 1)
+                    .await
+                    .unwrap()
+                    .is_empty());
             }
 
             fn manifest<'a>(
@@ -1478,12 +1588,22 @@ macro_rules! cascade_contract {
                 let (shared, only) = ("sha256:cc".to_string(), "sha256:bb".to_string());
                 handles
                     .oci
-                    .put_manifest(manifest(repo, "sha256:aa", &[only.clone(), shared.clone()], Some("v1")))
+                    .put_manifest(manifest(
+                        repo,
+                        "sha256:aa",
+                        &[only.clone(), shared.clone()],
+                        Some("v1"),
+                    ))
                     .await
                     .unwrap();
                 handles
                     .oci
-                    .put_manifest(manifest(repo, "sha256:dd", std::slice::from_ref(&shared), Some("v2")))
+                    .put_manifest(manifest(
+                        repo,
+                        "sha256:dd",
+                        std::slice::from_ref(&shared),
+                        Some("v2"),
+                    ))
                     .await
                     .unwrap();
 
@@ -1494,11 +1614,29 @@ macro_rules! cascade_contract {
                     .unwrap()
                     .expect("the manifest was there");
 
-                assert_eq!(orphaned, Orphaned { blob_digests: vec![only] });
-                assert!(handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().is_none());
-                assert!(handles.oci.digest_for_ref(repo, "app", "v1").await.unwrap().is_none());
+                assert_eq!(
+                    orphaned,
+                    Orphaned {
+                        blob_digests: vec![only]
+                    }
+                );
+                assert!(handles
+                    .oci
+                    .manifest(repo, "app", "sha256:aa")
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(handles
+                    .oci
+                    .digest_for_ref(repo, "app", "v1")
+                    .await
+                    .unwrap()
+                    .is_none());
                 assert_eq!(handles.oci.blob_references(repo, &shared).await.unwrap(), 1);
-                assert_eq!(handles.oci.tags(repo, "app").await.unwrap(), vec!["v2".to_string()]);
+                assert_eq!(
+                    handles.oci.tags(repo, "app").await.unwrap(),
+                    vec!["v2".to_string()]
+                );
             }
 
             /// Nothing to delete is `None`, not an empty orphan set: the
@@ -1524,18 +1662,31 @@ macro_rules! cascade_contract {
                 let (old, new) = ("sha256:bb".to_string(), "sha256:cc".to_string());
                 handles
                     .oci
-                    .put_manifest(manifest(repo, "sha256:aa", std::slice::from_ref(&old), Some("v1")))
+                    .put_manifest(manifest(
+                        repo,
+                        "sha256:aa",
+                        std::slice::from_ref(&old),
+                        Some("v1"),
+                    ))
                     .await
                     .unwrap();
                 handles
                     .oci
-                    .put_manifest(manifest(repo, "sha256:aa", std::slice::from_ref(&new), Some("v1")))
+                    .put_manifest(manifest(
+                        repo,
+                        "sha256:aa",
+                        std::slice::from_ref(&new),
+                        Some("v1"),
+                    ))
                     .await
                     .unwrap();
 
                 assert_eq!(handles.oci.blob_references(repo, &old).await.unwrap(), 0);
                 assert_eq!(handles.oci.blob_references(repo, &new).await.unwrap(), 1);
-                assert_eq!(handles.oci.tags(repo, "app").await.unwrap(), vec!["v1".to_string()]);
+                assert_eq!(
+                    handles.oci.tags(repo, "app").await.unwrap(),
+                    vec!["v1".to_string()]
+                );
             }
 
             /// The ledger is what tells a chunk which repository it belongs
@@ -1563,7 +1714,16 @@ macro_rules! cascade_contract {
                     .unwrap();
 
                 assert!(handles.oci.upload_owner("u1").await.unwrap().is_none());
-                assert_eq!(handles.oci.blob(repo, "sha256:bb").await.unwrap().unwrap().size, 5);
+                assert_eq!(
+                    handles
+                        .oci
+                        .blob(repo, "sha256:bb")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .size,
+                    5
+                );
                 assert!(handles.oci.delete_blob(repo, "sha256:bb").await.unwrap());
                 assert!(!handles.oci.delete_blob(repo, "sha256:bb").await.unwrap());
             }
@@ -1646,7 +1806,12 @@ macro_rules! reclaim_contract {
                 (repo, layout::incarnation_prefix(&incarnation))
             }
 
-            async fn pin(h: &ReclaimHandles, prefix: &str, keys: &[&str], until: u32) -> Vec<PinToken> {
+            async fn pin(
+                h: &ReclaimHandles,
+                prefix: &str,
+                keys: &[&str],
+                until: u32,
+            ) -> Vec<PinToken> {
                 let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
                 match h.reclaim.pin(prefix, &keys, at(until)).await.unwrap() {
                     Pinned::Tokens(tokens) => tokens,
@@ -1689,7 +1854,10 @@ macro_rules! reclaim_contract {
             }
 
             async fn claim(h: &ReclaimHandles, key: &str, now: u32) -> Claim {
-                h.reclaim.claim(key, GRACE, at(now), at(now + 1)).await.unwrap()
+                h.reclaim
+                    .claim(key, GRACE, at(now), at(now + 1))
+                    .await
+                    .unwrap()
             }
 
             #[tokio::test]
@@ -1698,9 +1866,19 @@ macro_rules! reclaim_contract {
                 let (_, prefix) = repo(&h, "r").await;
                 let first = pin(&h, &prefix, &["r/x"], 2).await;
                 let key = first[0].physical_key.clone();
-                h.reclaim.enqueue(std::slice::from_ref(&key), at(1)).await.unwrap();
-                assert_eq!(claim(&h, &key, 2).await, Claim::Pinned, "a live pin protects");
-                assert!(matches!(claim(&h, &key, 5).await, Claim::Claimed(_)), "expired past the grace");
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&key), at(1))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    claim(&h, &key, 2).await,
+                    Claim::Pinned,
+                    "a live pin protects"
+                );
+                assert!(
+                    matches!(claim(&h, &key, 5).await, Claim::Claimed(_)),
+                    "expired past the grace"
+                );
                 assert!(!listed(&h, 5).await.contains(&key));
             }
 
@@ -1710,9 +1888,19 @@ macro_rules! reclaim_contract {
                 let (_, prefix) = repo(&h, "r").await;
                 let tokens = pin(&h, &prefix, &["r/x"], 4).await;
                 let key = tokens[0].physical_key.clone();
-                h.reclaim.enqueue(std::slice::from_ref(&key), at(1)).await.unwrap();
-                assert_eq!(claim(&h, &key, 4).await, Claim::Pinned, "expired at the instant, inside the grace");
-                assert!(listed(&h, 4).await.contains(&key), "protecting pins are listed");
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&key), at(1))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    claim(&h, &key, 4).await,
+                    Claim::Pinned,
+                    "expired at the instant, inside the grace"
+                );
+                assert!(
+                    listed(&h, 4).await.contains(&key),
+                    "protecting pins are listed"
+                );
             }
 
             #[tokio::test]
@@ -1721,11 +1909,17 @@ macro_rules! reclaim_contract {
                 let (r, prefix) = repo(&h, "r").await;
                 let first = pin(&h, &prefix, &["r/x"], 2).await;
                 let key = first[0].physical_key.clone();
-                h.reclaim.enqueue(std::slice::from_ref(&key), at(1)).await.unwrap();
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&key), at(1))
+                    .await
+                    .unwrap();
                 assert!(matches!(claim(&h, &key, 5).await, Claim::Claimed(_)));
                 publish(&h, r.id, "1.0.0", &key).await;
                 let again = pin(&h, &prefix, &["r/x"], 9).await;
-                assert_ne!(again[0].physical_key, key, "a claimed generation is never reused");
+                assert_ne!(
+                    again[0].physical_key, key,
+                    "a claimed generation is never reused"
+                );
             }
 
             #[tokio::test]
@@ -1734,7 +1928,10 @@ macro_rules! reclaim_contract {
                 let (r, prefix) = repo(&h, "r").await;
                 let fresh = pin(&h, &prefix, &["r/x"], 2).await;
                 let other = pin(&h, &prefix, &["r/x"], 2).await;
-                assert_ne!(fresh[0].physical_key, other[0].physical_key, "unreferenced: fresh each time");
+                assert_ne!(
+                    fresh[0].physical_key, other[0].physical_key,
+                    "unreferenced: fresh each time"
+                );
                 publish(&h, r.id, "1.0.0", &fresh[0].physical_key).await;
                 let reused = pin(&h, &prefix, &["r/x"], 2).await;
                 assert_eq!(reused[0].physical_key, fresh[0].physical_key);
@@ -1750,7 +1947,10 @@ macro_rules! reclaim_contract {
                 let (_, sibling) = repo(&h, "r2").await;
                 h.repos.retire("r", at(2)).await.unwrap();
                 let keys = vec!["k".to_string()];
-                assert_eq!(h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(), Pinned::Retired);
+                assert_eq!(
+                    h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(),
+                    Pinned::Retired
+                );
                 assert!(matches!(
                     h.reclaim.pin(&sibling, &keys, at(3)).await.unwrap(),
                     Pinned::Tokens(_)
@@ -1776,7 +1976,10 @@ macro_rules! reclaim_contract {
                     "the pin taken before retire is revoked"
                 );
                 let due = h.reclaim.due(GRACE, at(2), 10).await.unwrap();
-                assert!(due.iter().any(|c| c.key == prefix && c.prefix), "claimable without the grace");
+                assert!(
+                    due.iter().any(|c| c.key == prefix && c.prefix),
+                    "claimable without the grace"
+                );
                 assert!(matches!(claim(&h, &prefix, 2).await, Claim::Claimed(_)));
             }
 
@@ -1785,8 +1988,14 @@ macro_rules! reclaim_contract {
                 let h = $open().await;
                 let (r, _) = repo(&h, "r").await;
                 let v = publish(&h, r.id, "1.0.0", "npm/r/p/p.tgz").await;
-                assert!(matches!(h.repos.retire("r", at(2)).await, Err(StoreError::Conflict)));
-                assert!(h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty(), "a refusal enqueues nothing");
+                assert!(matches!(
+                    h.repos.retire("r", at(2)).await,
+                    Err(StoreError::Conflict)
+                ));
+                assert!(
+                    h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty(),
+                    "a refusal enqueues nothing"
+                );
                 h.packages.delete_version(v, at(3)).await.unwrap();
                 h.repos
                     .create(
@@ -1802,7 +2011,10 @@ macro_rules! reclaim_contract {
                     )
                     .await
                     .unwrap();
-                assert!(matches!(h.repos.retire("r", at(4)).await, Err(StoreError::Conflict)));
+                assert!(matches!(
+                    h.repos.retire("r", at(4)).await,
+                    Err(StoreError::Conflict)
+                ));
             }
 
             #[tokio::test]
@@ -1832,9 +2044,17 @@ macro_rules! reclaim_contract {
                 repo(&h, "r").await;
                 h.repos.retire("r", at(2)).await.unwrap();
                 repo(&h, "r").await;
-                assert_eq!(claim(&h, "npm/r", 9).await, Claim::NotDue, "the candidate went with the recreation");
+                assert_eq!(
+                    claim(&h, "npm/r", 9).await,
+                    Claim::NotDue,
+                    "the candidate went with the recreation"
+                );
                 h.reclaim.enqueue_prefix("npm/r", at(3)).await.unwrap();
-                assert_eq!(claim(&h, "npm/r", 9).await, Claim::Referenced, "a live incarnation's prefix is never claimed");
+                assert_eq!(
+                    claim(&h, "npm/r", 9).await,
+                    Claim::Referenced,
+                    "a live incarnation's prefix is never claimed"
+                );
             }
 
             #[tokio::test]
@@ -1851,7 +2071,10 @@ macro_rules! reclaim_contract {
                     upstream: None,
                     members: &[],
                 };
-                assert!(matches!(h.repos.create(&spec, at(2)).await, Err(StoreError::Conflict)));
+                assert!(matches!(
+                    h.repos.create(&spec, at(2)).await,
+                    Err(StoreError::Conflict)
+                ));
             }
 
             #[tokio::test]
@@ -1859,13 +2082,23 @@ macro_rules! reclaim_contract {
                 let h = $open().await;
                 let (r, _) = repo(&h, "r").await;
                 let v = publish(&h, r.id, "1.0.0", "npm/r/p/p.tgz").await;
-                assert_eq!(claim(&h, "npm/r/p/p.tgz", 9).await, Claim::NotDue, "nothing queued yet");
+                assert_eq!(
+                    claim(&h, "npm/r/p/p.tgz", 9).await,
+                    Claim::NotDue,
+                    "nothing queued yet"
+                );
                 h.packages.delete_version(v, at(3)).await.unwrap();
-                assert!(matches!(h.packages.delete_version(v, at(3)).await, Err(StoreError::NotFound)));
+                assert!(matches!(
+                    h.packages.delete_version(v, at(3)).await,
+                    Err(StoreError::NotFound)
+                ));
                 let due = h.reclaim.due(GRACE, at(5), 10).await.unwrap();
                 assert_eq!(due.len(), 1);
                 assert_eq!(due[0].key, "npm/r/p/p.tgz");
-                assert!(matches!(claim(&h, "npm/r/p/p.tgz", 5).await, Claim::Claimed(_)));
+                assert!(matches!(
+                    claim(&h, "npm/r/p/p.tgz", 5).await,
+                    Claim::Claimed(_)
+                ));
             }
 
             #[tokio::test]
@@ -1873,11 +2106,20 @@ macro_rules! reclaim_contract {
                 let h = $open().await;
                 let (r, _) = repo(&h, "r").await;
                 publish(&h, r.id, "1.0.0", "npm/r/p/a.tgz").await;
-                h.reclaim.enqueue(&["npm/r/p/a.tgz".to_string()], at(1)).await.unwrap();
-                h.reclaim.enqueue(&["npm/r/p/a.tgz".to_string()], at(1)).await.unwrap();
+                h.reclaim
+                    .enqueue(&["npm/r/p/a.tgz".to_string()], at(1))
+                    .await
+                    .unwrap();
+                h.reclaim
+                    .enqueue(&["npm/r/p/a.tgz".to_string()], at(1))
+                    .await
+                    .unwrap();
                 assert!(listed(&h, 5).await.contains(&"npm/r/p/a.tgz".to_string()));
                 assert_eq!(claim(&h, "npm/r/p/a.tgz", 5).await, Claim::Referenced);
-                assert!(h.reclaim.due(GRACE, at(5), 10).await.unwrap().is_empty(), "Referenced drops the candidate");
+                assert!(
+                    h.reclaim.due(GRACE, at(5), 10).await.unwrap().is_empty(),
+                    "Referenced drops the candidate"
+                );
             }
 
             #[tokio::test]
@@ -1886,9 +2128,17 @@ macro_rules! reclaim_contract {
                 let (r, _) = repo(&h, "r").await;
                 h.oci.start_upload("u1", r.id, "app").await.unwrap();
                 let segment = "oci/_uploads/u1/00000000000000000000".to_string();
-                h.reclaim.enqueue(std::slice::from_ref(&segment), at(1)).await.unwrap();
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&segment), at(1))
+                    .await
+                    .unwrap();
                 assert_eq!(claim(&h, &segment, 20).await, Claim::Referenced);
-                let refs: Vec<_> = h.referenced.referenced(GRACE, at(20)).try_collect().await.unwrap();
+                let refs: Vec<_> = h
+                    .referenced
+                    .referenced(GRACE, at(20))
+                    .try_collect()
+                    .await
+                    .unwrap();
                 assert!(refs.iter().any(|r| r.key == "oci/_uploads/u1" && r.prefix));
             }
 
@@ -1896,15 +2146,31 @@ macro_rules! reclaim_contract {
             async fn renew_after_takeover_is_superseded() {
                 let h = $open().await;
                 h.reclaim.enqueue(&["k".to_string()], at(1)).await.unwrap();
-                let Claim::Claimed(first) = claim(&h, "k", 3).await else { panic!("due") };
-                assert_eq!(claim(&h, "k", 3).await, Claim::NotDue, "a live claim is exclusive");
+                let Claim::Claimed(first) = claim(&h, "k", 3).await else {
+                    panic!("due")
+                };
+                assert_eq!(
+                    claim(&h, "k", 3).await,
+                    Claim::NotDue,
+                    "a live claim is exclusive"
+                );
                 let Claim::Claimed(second) = claim(&h, "k", 6).await else {
                     panic!("an expired claim is taken over")
                 };
-                assert_eq!(h.reclaim.renew(&first, at(6), at(7)).await.unwrap(), Renewal::Superseded);
-                assert_eq!(h.reclaim.renew(&second, at(6), at(7)).await.unwrap(), Renewal::Renewed);
+                assert_eq!(
+                    h.reclaim.renew(&first, at(6), at(7)).await.unwrap(),
+                    Renewal::Superseded
+                );
+                assert_eq!(
+                    h.reclaim.renew(&second, at(6), at(7)).await.unwrap(),
+                    Renewal::Renewed
+                );
                 h.reclaim.release(&first).await.unwrap();
-                assert_eq!(claim(&h, "k", 6).await, Claim::NotDue, "a stale release is a no-op");
+                assert_eq!(
+                    claim(&h, "k", 6).await,
+                    Claim::NotDue,
+                    "a stale release is a no-op"
+                );
                 h.reclaim.release(&second).await.unwrap();
                 assert!(h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty());
             }
@@ -1916,7 +2182,11 @@ macro_rules! reclaim_contract {
                 pin(&h, &prefix, &["a", "b", "c"], 2).await;
                 let live = pin(&h, &prefix, &["d"], 9).await;
                 assert_eq!(h.reclaim.prune_pins(GRACE, at(2), 10).await.unwrap(), 0);
-                assert_eq!(h.reclaim.prune_pins(GRACE, at(4), 2).await.unwrap(), 2, "bounded");
+                assert_eq!(
+                    h.reclaim.prune_pins(GRACE, at(4), 2).await.unwrap(),
+                    2,
+                    "bounded"
+                );
                 assert_eq!(h.reclaim.prune_pins(GRACE, at(4), 10).await.unwrap(), 1);
                 assert_eq!(listed(&h, 4).await, vec![live[0].physical_key.clone()]);
             }
@@ -1955,7 +2225,10 @@ macro_rules! reclaim_contract {
                     .enqueue(std::slice::from_ref(&tokens[0].physical_key), at(1))
                     .await
                     .unwrap();
-                assert!(matches!(claim(&h, &tokens[0].physical_key, 5).await, Claim::Claimed(_)));
+                assert!(matches!(
+                    claim(&h, &tokens[0].physical_key, 5).await,
+                    Claim::Claimed(_)
+                ));
                 let refused = h
                     .packages
                     .publish_version(&release_with(r.id, "1.0.0", &tokens))
@@ -1967,7 +2240,11 @@ macro_rules! reclaim_contract {
                     other => panic!("{other:?}"),
                 }
                 assert!(
-                    h.packages.package(r.id, "p", NameMatch::Exact).await.unwrap().is_none(),
+                    h.packages
+                        .package(r.id, "p", NameMatch::Exact)
+                        .await
+                        .unwrap()
+                        .is_none(),
                     "nothing written"
                 );
 
@@ -1983,7 +2260,10 @@ macro_rules! reclaim_contract {
                     .enqueue(std::slice::from_ref(&revoked[0].physical_key), at(1))
                     .await
                     .unwrap();
-                assert!(matches!(claim(&h, &revoked[0].physical_key, 5).await, Claim::Claimed(_)));
+                assert!(matches!(
+                    claim(&h, &revoked[0].physical_key, 5).await,
+                    Claim::Claimed(_)
+                ));
                 let promoted = h
                     .packages
                     .promote_metadata(&Promotion {
@@ -2005,7 +2285,10 @@ macro_rules! reclaim_contract {
                         now: at(6),
                     })
                     .await;
-                assert!(matches!(promoted, Err(StoreError::Superseded(_))), "{promoted:?}");
+                assert!(
+                    matches!(promoted, Err(StoreError::Superseded(_))),
+                    "{promoted:?}"
+                );
                 assert!(h
                     .packages
                     .package(target.id, "p", NameMatch::Exact)
@@ -2027,12 +2310,18 @@ macro_rules! reclaim_contract {
                     .packages
                     .publish_version(&release_with(r.id, "1.0.1", &tokens))
                     .await;
-                assert!(matches!(again, Err(StoreError::Superseded(_))), "a token is spent once");
+                assert!(
+                    matches!(again, Err(StoreError::Superseded(_))),
+                    "a token is spent once"
+                );
                 h.reclaim
                     .enqueue(std::slice::from_ref(&tokens[0].physical_key), at(1))
                     .await
                     .unwrap();
-                assert_eq!(claim(&h, &tokens[0].physical_key, 5).await, Claim::Referenced);
+                assert_eq!(
+                    claim(&h, &tokens[0].physical_key, 5).await,
+                    Claim::Referenced
+                );
             }
 
             #[tokio::test]
@@ -2045,7 +2334,10 @@ macro_rules! reclaim_contract {
                     .packages
                     .publish_version(&release_with(r.id, "1.0.0", &tokens))
                     .await;
-                assert!(matches!(refused, Err(StoreError::Superseded(_))), "{refused:?}");
+                assert!(
+                    matches!(refused, Err(StoreError::Superseded(_))),
+                    "{refused:?}"
+                );
             }
 
             #[tokio::test]
@@ -2055,7 +2347,10 @@ macro_rules! reclaim_contract {
                 h.repos.retire("r", at(2)).await.unwrap();
                 h.reclaim.forget_retired("npm/r").await.unwrap();
                 let keys = vec!["k".to_string()];
-                assert_eq!(h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(), Pinned::Retired);
+                assert_eq!(
+                    h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(),
+                    Pinned::Retired
+                );
             }
         }
     };

@@ -276,8 +276,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 
-    let secrets: Arc<dyn ServerSecretStore> =
-        Arc::new(crate::adapters::system::ProcessSecrets::default());
+    let secrets: Arc<dyn ServerSecretStore> = stores.secrets();
     let registry_tokens: Arc<dyn RegistryTokenSigner> = Arc::new(
         crate::registry::oci::token::TokenSigner::from_store(secrets.as_ref()).await?,
     );

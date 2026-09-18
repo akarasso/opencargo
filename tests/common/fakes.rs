@@ -19,6 +19,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use opencargo::domain::identity::{Authority, IdentityKey, LinkState, LoginState, Outage};
+use opencargo::domain::layout;
 use opencargo::domain::{
     ApiToken, CacheEntry, CacheEntryId, DistTag, NewEntry, Package, RepoConfig, RepoId, RepoSpec,
     Repository, Rights, ScanResult, User, Verdict, Version, Visibility, Webhook,
@@ -26,16 +28,17 @@ use opencargo::domain::{
 use opencargo::error::StoreError;
 use opencargo::ports::audit::{AuditEntry, AuditStore, NewAuditEntry};
 use opencargo::ports::deps::{Dependency, DependencyStore, Dependent, NewDependency};
+use opencargo::ports::handoffs::{Consumption, LoginHandoffStore, NewHandoff};
+use opencargo::ports::identities::{Admission, DisabledBy, IdentityLink, IdentityStore};
 use opencargo::ports::oci::{Blob, Manifest, NewBlob, NewManifest, OciStore, Orphaned};
 use opencargo::ports::packages::{
     NameMatch, NewRelease, PackageStore, Promotion, Release, StalePrerelease,
 };
+use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::ports::policy::{
     IdRange, NewResolution, PolicyStore, ReportFilter, ResolutionRow, RuleTotals, Subject, Totals,
     VerdictRow,
 };
-use opencargo::ports::permissions::{PermissionStore, RepoRights};
-use opencargo::domain::layout;
 use opencargo::ports::proxy_cache::ProxyCacheStore;
 use opencargo::ports::reclaim::{
     Candidate, Claim, ClaimToken, PinToken, Pinned, ReclaimStore, Renewal,
@@ -43,6 +46,7 @@ use opencargo::ports::reclaim::{
 use opencargo::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
 use opencargo::ports::search::{SearchIndex, SearchQuery, SearchScope};
+use opencargo::ports::secrets::ServerSecretStore;
 use opencargo::ports::tokens::{NewToken, TokenStore};
 use opencargo::ports::users::{NewUser, UserPatch, UserStore};
 use opencargo::ports::vulns::{VulnScan, VulnStore};
@@ -65,6 +69,8 @@ pub enum PortId {
     Vulns,
     Policy,
     Reclaim,
+    Identities,
+    Handoffs,
 }
 
 /// One grant, keyed the way the table is.
@@ -164,6 +170,7 @@ struct State {
     oci_links: Vec<LinkRow>,
     oci_uploads: Vec<UploadRow>,
     reclaim: ReclaimState,
+    sso: SsoState,
     next_id: i64,
     next_cache_id: i64,
     /// Queued refusals: a fake that cannot fail only ever proves the happy
@@ -485,10 +492,16 @@ impl Repositories {
         };
         state.repositories.push(stored.clone());
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
-        state.reclaim.incarnations.push((stored.id, incarnation.clone()));
+        state
+            .reclaim
+            .incarnations
+            .push((stored.id, incarnation.clone()));
         let legacy = layout::name_keyed_prefixes(spec.format.as_str(), spec.name);
         for prefix in &legacy {
-            state.reclaim.candidates.retain(|c| !(c.prefix && c.key == *prefix));
+            state
+                .reclaim
+                .candidates
+                .retain(|c| !(c.prefix && c.key == *prefix));
             state.reclaim.claims.retain(|c| c.key != *prefix);
         }
         let own = std::iter::once(layout::incarnation_prefix(&incarnation));
@@ -538,7 +551,13 @@ impl RepositoryStore for Repositories {
             }
             let claimed = layout::name_keyed_prefixes(spec.format.as_str(), spec.name)
                 .iter()
-                .any(|p| state.reclaim.claims.iter().any(|c| c.key == *p && c.until > now));
+                .any(|p| {
+                    state
+                        .reclaim
+                        .claims
+                        .iter()
+                        .any(|c| c.key == *p && c.until > now)
+                });
             if claimed {
                 return Err(StoreError::Conflict);
             }
@@ -575,7 +594,11 @@ impl RepositoryStore for Repositories {
     async fn retire(&self, name: &str, now: DateTime<Utc>) -> Result<Vec<String>, StoreError> {
         self.with(|state| {
             let repo = found(state, name).ok_or(StoreError::NotFound)?.clone();
-            if state.packages.iter().any(|pkg| pkg.repository_id == repo.id) {
+            if state
+                .packages
+                .iter()
+                .any(|pkg| pkg.repository_id == repo.id)
+            {
                 return Err(StoreError::Conflict);
             }
             let held = state
@@ -815,11 +838,7 @@ impl PackageStore for Packages {
         self.with(|state| Ok(Self::lookup(state, repository, name, how)))
     }
 
-    async fn anywhere(
-        &self,
-        name: &str,
-        public_only: bool,
-    ) -> Result<Option<Package>, StoreError> {
+    async fn anywhere(&self, name: &str, public_only: bool) -> Result<Option<Package>, StoreError> {
         self.with(|state| {
             let public: Vec<i64> = state
                 .repositories
@@ -848,11 +867,7 @@ impl PackageStore for Packages {
         })
     }
 
-    async fn version(
-        &self,
-        package: i64,
-        version: &str,
-    ) -> Result<Option<Version>, StoreError> {
+    async fn version(&self, package: i64, version: &str) -> Result<Option<Version>, StoreError> {
         self.with(|state| {
             Ok(state
                 .versions
@@ -898,10 +913,7 @@ impl PackageStore for Packages {
         })
     }
 
-    async fn promote_metadata(
-        &self,
-        promotion: &Promotion<'_>,
-    ) -> Result<Version, StoreError> {
+    async fn promote_metadata(&self, promotion: &Promotion<'_>) -> Result<Version, StoreError> {
         let mut version = blank_version(&promotion.source.version, promotion.metadata_json);
         version.checksum_sha1 = promotion.source.checksum_sha1.clone();
         version.checksum_sha256 = promotion.source.checksum_sha256.clone();
@@ -939,12 +951,7 @@ impl PackageStore for Packages {
         })
     }
 
-    async fn set_dist_tag(
-        &self,
-        package: i64,
-        tag: &str,
-        version: i64,
-    ) -> Result<(), StoreError> {
+    async fn set_dist_tag(&self, package: i64, tag: &str, version: i64) -> Result<(), StoreError> {
         self.with(|state| {
             tag_version(state, package, tag, version);
             Ok(())
@@ -1274,11 +1281,7 @@ struct Permissions(Arc<Mutex<State>>);
 
 #[async_trait]
 impl PermissionStore for Permissions {
-    async fn rights(
-        &self,
-        user_id: i64,
-        repository_id: i64,
-    ) -> Result<Option<Rights>, StoreError> {
+    async fn rights(&self, user_id: i64, repository_id: i64) -> Result<Option<Rights>, StoreError> {
         with(&self.0, PortId::Permissions, |state| {
             Ok(state
                 .grants
@@ -1333,9 +1336,9 @@ impl PermissionStore for Permissions {
 
     async fn revoke(&self, user_id: i64, repository_id: i64) -> Result<(), StoreError> {
         with(&self.0, PortId::Permissions, |state| {
-            state
-                .grants
-                .retain(|grant| !(grant.user_id == user_id && grant.repository_id == repository_id));
+            state.grants.retain(|grant| {
+                !(grant.user_id == user_id && grant.repository_id == repository_id)
+            });
             Ok(())
         })
     }
@@ -1535,9 +1538,7 @@ impl OciStore for Oci {
     async fn put_manifest(&self, m: NewManifest<'_>) -> Result<(), StoreError> {
         with(&self.0, PortId::Oci, |state| {
             state.oci_manifests.retain(|row| {
-                !(row.repository_id == m.repository
-                    && row.name == m.name
-                    && row.digest == m.digest)
+                !(row.repository_id == m.repository && row.name == m.name && row.digest == m.digest)
             });
             state.oci_manifests.push(ManifestRow {
                 repository_id: m.repository,
@@ -1617,12 +1618,7 @@ impl OciStore for Oci {
         })
     }
 
-    async fn start_upload(
-        &self,
-        id: &str,
-        repository: i64,
-        _name: &str,
-    ) -> Result<(), StoreError> {
+    async fn start_upload(&self, id: &str, repository: i64, _name: &str) -> Result<(), StoreError> {
         with(&self.0, PortId::Oci, |state| {
             state.oci_uploads.push(UploadRow {
                 id: id.to_string(),
@@ -1745,11 +1741,7 @@ impl AuditStore for Audit {
         })
     }
 
-    async fn of_target(
-        &self,
-        action: &str,
-        target: &str,
-    ) -> Result<Vec<AuditEntry>, StoreError> {
+    async fn of_target(&self, action: &str, target: &str) -> Result<Vec<AuditEntry>, StoreError> {
         with(&self.0, PortId::Audit, |state| {
             let matching: Vec<AuditEntry> = state
                 .audit
@@ -1766,11 +1758,7 @@ struct Dependencies(Arc<Mutex<State>>);
 
 #[async_trait]
 impl DependencyStore for Dependencies {
-    async fn record(
-        &self,
-        dep: &NewDependency<'_>,
-        _now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
+    async fn record(&self, dep: &NewDependency<'_>, _now: DateTime<Utc>) -> Result<(), StoreError> {
         with(&self.0, PortId::Dependencies, |state| {
             state.dependencies.push(DependencyRow {
                 version_id: dep.version,
@@ -1810,11 +1798,7 @@ impl DependencyStore for Dependencies {
                 .map(|repo| repo.id)
                 .collect();
             let mut found: Vec<Dependent> = Vec::new();
-            for row in state
-                .dependencies
-                .iter()
-                .filter(|r| r.name == name)
-            {
+            for row in state.dependencies.iter().filter(|r| r.name == name) {
                 let Some(version) = state.versions.iter().find(|v| v.id == row.version_id) else {
                     continue;
                 };
@@ -2082,11 +2066,7 @@ impl PolicyStore for Policy {
         })
     }
 
-    async fn delete_older_than(
-        &self,
-        days: u64,
-        now: DateTime<Utc>,
-    ) -> Result<u64, StoreError> {
+    async fn delete_older_than(&self, days: u64, now: DateTime<Utc>) -> Result<u64, StoreError> {
         with(&self.0, PortId::Policy, |state| {
             let cutoff = i64::try_from(days)
                 .ok()
@@ -2173,7 +2153,8 @@ impl ReclaimState {
     }
 
     fn spend(&mut self, tokens: &[PinToken]) {
-        self.pins.retain(|p| !tokens.iter().any(|t| t.token == p.token));
+        self.pins
+            .retain(|p| !tokens.iter().any(|t| t.token == p.token));
     }
 
     fn revoke_under(&mut self, prefix: &str) {
@@ -2209,7 +2190,12 @@ fn row_references(state: &State) -> Vec<(String, bool)> {
             .map(|r| r.name.clone())
     };
     let mut refs: Vec<(String, bool)> = Vec::new();
-    refs.extend(state.versions.iter().map(|v| (v.tarball_path.clone(), false)));
+    refs.extend(
+        state
+            .versions
+            .iter()
+            .map(|v| (v.tarball_path.clone(), false)),
+    );
     refs.extend(
         state
             .cache
@@ -2227,7 +2213,10 @@ fn row_references(state: &State) -> Vec<(String, bool)> {
         if let Some(repo) = name(m.repository_id) {
             let hex = m.digest.trim_start_matches("sha256:");
             let image = &m.name;
-            refs.push((format!("oci/{repo}/{image}/manifests/{image}/sha256/{hex}"), false));
+            refs.push((
+                format!("oci/{repo}/{image}/manifests/{image}/sha256/{hex}"),
+                false,
+            ));
         }
     }
     refs.extend(
@@ -2411,15 +2400,15 @@ impl ReclaimStore for Reclaim {
         _now: DateTime<Utc>,
         until: DateTime<Utc>,
     ) -> Result<Renewal, StoreError> {
-        self.with(|state| {
-            match state.reclaim.claims.iter_mut().find(|c| c.token == token.0) {
+        self.with(
+            |state| match state.reclaim.claims.iter_mut().find(|c| c.token == token.0) {
                 Some(claim) => {
                     claim.until = until;
                     Ok(Renewal::Renewed)
                 }
                 None => Ok(Renewal::Superseded),
-            }
-        })
+            },
+        )
     }
 
     async fn release(&self, token: &ClaimToken) -> Result<(), StoreError> {
@@ -2504,5 +2493,524 @@ impl ReferencedKeys for Reclaim {
         );
         all.sort();
         Box::pin(futures_util::stream::iter(all.into_iter().map(Ok)))
+    }
+}
+
+/// Ports 19-21 in memory: the same state as every other fake, so a revoked
+/// token disappears from `Tokens` exactly as the SQLite cascade removes it.
+#[derive(Default)]
+struct SsoState {
+    links: Vec<(IdentityLink, Option<String>)>,
+    disabled_users: Vec<(i64, DisabledBy)>,
+    provenance: Vec<(String, IdentityKey)>,
+    outages: Vec<(Authority, Outage)>,
+    handoffs: Vec<HandoffRow>,
+    secrets: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Clone)]
+struct HandoffRow {
+    code_hash: String,
+    binding: String,
+    payload: String,
+    expires_at: DateTime<Utc>,
+    consumed: bool,
+}
+
+impl FakeDb {
+    pub fn identities(&self) -> Arc<dyn IdentityStore> {
+        Arc::new(Identities(self.0.clone()))
+    }
+
+    pub fn handoffs(&self) -> Arc<dyn LoginHandoffStore> {
+        Arc::new(Identities(self.0.clone()))
+    }
+
+    pub fn secrets(&self) -> Arc<dyn ServerSecretStore> {
+        Arc::new(Identities(self.0.clone()))
+    }
+}
+
+struct Identities(Arc<Mutex<State>>);
+
+fn revoke_where(state: &mut State, hit: impl Fn(&IdentityKey) -> bool) -> u64 {
+    let gone: Vec<String> = state
+        .sso
+        .provenance
+        .iter()
+        .filter(|(_, k)| hit(k))
+        .map(|(t, _)| t.clone())
+        .collect();
+    let before = state.tokens.len();
+    state.tokens.retain(|t| !gone.contains(&t.id));
+    state.sso.provenance.retain(|(t, _)| !gone.contains(t));
+    (before - state.tokens.len()) as u64
+}
+
+fn fake_grants(state: &mut State, user_id: i64, a: &Admission<'_>) {
+    for repo in a.managed {
+        state
+            .grants
+            .retain(|g| !(g.user_id == user_id && g.repository_id == *repo));
+        if let Some((_, rights)) = a.grants.iter().find(|(r, _)| r == repo) {
+            state.grants.push(Grant {
+                user_id,
+                repository_id: *repo,
+                rights: *rights,
+            });
+        }
+    }
+}
+
+fn fake_disable(state: &mut State, user_id: i64, by: DisabledBy) -> Result<(), StoreError> {
+    if !state.users.iter().any(|u| u.id == user_id) {
+        return Err(StoreError::NotFound);
+    }
+    match state
+        .sso
+        .disabled_users
+        .iter_mut()
+        .find(|(u, _)| *u == user_id)
+    {
+        Some((_, current)) if *current == DisabledBy::Admin => {}
+        Some((_, current)) => *current = by,
+        None => state.sso.disabled_users.push((user_id, by)),
+    }
+    let keys: Vec<IdentityKey> = state
+        .sso
+        .links
+        .iter()
+        .filter(|(l, _)| l.user_id == user_id)
+        .map(|(l, _)| l.key.clone())
+        .collect();
+    revoke_where(state, |k| keys.contains(k));
+    Ok(())
+}
+
+#[async_trait]
+impl IdentityStore for Identities {
+    async fn find(&self, key: &IdentityKey) -> Result<Option<IdentityLink>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            Ok(state
+                .sso
+                .links
+                .iter()
+                .find(|(l, _)| &l.key == key)
+                .map(|(l, _)| l.clone()))
+        })
+    }
+
+    async fn of_user(&self, user_id: i64) -> Result<Vec<IdentityLink>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            Ok(state
+                .sso
+                .links
+                .iter()
+                .filter(|(l, _)| l.user_id == user_id)
+                .map(|(l, _)| l.clone())
+                .collect())
+        })
+    }
+
+    async fn provision(
+        &self,
+        user: &NewUser<'_>,
+        a: &Admission<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<User, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            if state.users.iter().any(|u| u.username == user.username) {
+                return Err(StoreError::Conflict);
+            }
+            let id = state.id();
+            let created = User {
+                id,
+                username: user.username.to_string(),
+                email: user.email.map(str::to_string),
+                password_hash: user.password_hash.to_string(),
+                role: user.role.to_string(),
+                must_change_password: false,
+                created_at: now,
+                updated_at: now,
+            };
+            state.users.push(created.clone());
+            state.sso.links.push((
+                IdentityLink {
+                    key: a.key.clone(),
+                    user_id: id,
+                    email: a.email.map(str::to_string),
+                    provisioned: true,
+                    disabled: false,
+                    linked_at: now,
+                    last_login_at: now,
+                },
+                None,
+            ));
+            fake_grants(state, id, a);
+            Ok(created)
+        })
+    }
+
+    async fn admit(&self, a: &Admission<'_>, now: DateTime<Utc>) -> Result<User, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let Some((link, _)) = state
+                .sso
+                .links
+                .iter_mut()
+                .find(|(l, _)| &l.key == a.key && !l.disabled)
+            else {
+                return Err(StoreError::NotFound);
+            };
+            link.email = a.email.map(str::to_string);
+            link.last_login_at = now;
+            let (user_id, provisioned) = (link.user_id, link.provisioned);
+            state
+                .sso
+                .disabled_users
+                .retain(|(u, by)| !(*u == user_id && *by == DisabledBy::Denied));
+            let user = state
+                .users
+                .iter_mut()
+                .find(|u| u.id == user_id)
+                .ok_or(StoreError::NotFound)?;
+            if provisioned {
+                user.role = a.role.to_string();
+                user.updated_at = now;
+            }
+            let user = user.clone();
+            fake_grants(state, user_id, a);
+            Ok(user)
+        })
+    }
+
+    async fn attach(
+        &self,
+        user_id: i64,
+        key: &IdentityKey,
+        email: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let role = state
+                .users
+                .iter()
+                .find(|u| u.id == user_id)
+                .map(|u| u.role.clone())
+                .ok_or(StoreError::NotFound)?;
+            if state.sso.links.iter().any(|(l, _)| &l.key == key) {
+                return Err(StoreError::Conflict);
+            }
+            state.sso.links.push((
+                IdentityLink {
+                    key: key.clone(),
+                    user_id,
+                    email: email.map(str::to_string),
+                    provisioned: false,
+                    disabled: false,
+                    linked_at: now,
+                    last_login_at: now,
+                },
+                Some(role),
+            ));
+            Ok(())
+        })
+    }
+
+    async fn detach(&self, user_id: i64, key: &IdentityKey) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let at = state
+                .sso
+                .links
+                .iter()
+                .position(|(l, _)| &l.key == key && l.user_id == user_id)
+                .ok_or(StoreError::NotFound)?;
+            let (_, before) = state.sso.links.remove(at);
+            revoke_where(state, |k| k == key);
+            if let (Some(role), Some(user)) =
+                (before, state.users.iter_mut().find(|u| u.id == user_id))
+            {
+                user.role = role;
+            }
+            Ok(())
+        })
+    }
+
+    async fn disable_link(&self, key: &IdentityKey) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let (link, _) = state
+                .sso
+                .links
+                .iter_mut()
+                .find(|(l, _)| &l.key == key)
+                .ok_or(StoreError::NotFound)?;
+            link.disabled = true;
+            revoke_where(state, |k| k == key);
+            Ok(())
+        })
+    }
+
+    async fn disable_user(
+        &self,
+        user_id: i64,
+        by: DisabledBy,
+        _now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            fake_disable(state, user_id, by)
+        })
+    }
+
+    async fn enable_user(&self, user_id: i64) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            state.sso.disabled_users.retain(|(u, _)| *u != user_id);
+            Ok(())
+        })
+    }
+
+    async fn deprovision(&self, key: &IdentityKey, _now: DateTime<Utc>) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let user_id = state
+                .sso
+                .links
+                .iter()
+                .find(|(l, _)| &l.key == key)
+                .map(|(l, _)| l.user_id)
+                .ok_or(StoreError::NotFound)?;
+            fake_disable(state, user_id, DisabledBy::Denied)
+        })
+    }
+
+    async fn revoke_authority(&self, authority: &Authority) -> Result<u64, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            for (l, _) in state.sso.links.iter_mut() {
+                if &l.key.authority == authority {
+                    l.disabled = true;
+                }
+            }
+            Ok(revoke_where(state, |k| &k.authority == authority))
+        })
+    }
+
+    async fn migrate_authority(&self, from: &Authority, to: &Authority) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            for (l, _) in state.sso.links.iter_mut() {
+                if &l.key.authority == from {
+                    l.key.authority = to.clone();
+                }
+            }
+            for (_, k) in state.sso.provenance.iter_mut() {
+                if &k.authority == from {
+                    k.authority = to.clone();
+                }
+            }
+            for (a, _) in state.sso.outages.iter_mut() {
+                if a == from {
+                    *a = to.clone();
+                }
+            }
+            Ok(())
+        })
+    }
+
+    async fn authorities(&self) -> Result<Vec<Authority>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let mut all: Vec<Authority> = state
+                .sso
+                .links
+                .iter()
+                .filter(|(l, _)| !l.disabled)
+                .map(|(l, _)| l.key.authority.clone())
+                .collect();
+            all.sort();
+            all.dedup();
+            Ok(all)
+        })
+    }
+
+    async fn mark_provenance(&self, token_id: &str, key: &IdentityKey) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            if !state.tokens.iter().any(|t| t.id == token_id) {
+                return Err(StoreError::NotFound);
+            }
+            state
+                .sso
+                .provenance
+                .push((token_id.to_string(), key.clone()));
+            Ok(())
+        })
+    }
+
+    async fn provenance(&self, token_id: &str) -> Result<Option<IdentityKey>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            Ok(state
+                .sso
+                .provenance
+                .iter()
+                .find(|(t, _)| t == token_id)
+                .map(|(_, k)| k.clone()))
+        })
+    }
+
+    async fn login_state(&self, user_id: i64) -> Result<LoginState, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let links = state
+                .sso
+                .links
+                .iter()
+                .filter(|(l, _)| l.user_id == user_id && !l.disabled)
+                .map(|(l, _)| LinkState {
+                    last_login: l.last_login_at,
+                    outages: state
+                        .sso
+                        .outages
+                        .iter()
+                        .filter(|(a, _)| a == &l.key.authority)
+                        .map(|(_, o)| *o)
+                        .collect(),
+                })
+                .collect();
+            Ok(LoginState {
+                disabled: state.sso.disabled_users.iter().any(|(u, _)| *u == user_id),
+                bootstrap: false,
+                links,
+            })
+        })
+    }
+
+    async fn record_probe(
+        &self,
+        authority: &Authority,
+        reachable: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let open = state
+                .sso
+                .outages
+                .iter_mut()
+                .find(|(a, o)| a == authority && o.end.is_none());
+            match (open, reachable) {
+                (Some((_, o)), true) => o.end = Some(now),
+                (None, false) => state.sso.outages.push((
+                    authority.clone(),
+                    Outage {
+                        start: now,
+                        end: None,
+                    },
+                )),
+                _ => {}
+            }
+            Ok(())
+        })
+    }
+
+    async fn outages(&self, authority: &Authority) -> Result<Vec<Outage>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            Ok(state
+                .sso
+                .outages
+                .iter()
+                .filter(|(a, _)| a == authority)
+                .map(|(_, o)| *o)
+                .collect())
+        })
+    }
+}
+
+#[async_trait]
+impl LoginHandoffStore for Identities {
+    async fn deposit(&self, h: &NewHandoff<'_>) -> Result<(), StoreError> {
+        with(&self.0, PortId::Handoffs, |state| {
+            if state
+                .sso
+                .handoffs
+                .iter()
+                .any(|r| r.code_hash == h.code_hash)
+            {
+                return Err(StoreError::Conflict);
+            }
+            state.sso.handoffs.push(HandoffRow {
+                code_hash: h.code_hash.to_string(),
+                binding: h.binding.to_string(),
+                payload: h.payload.to_string(),
+                expires_at: h.expires_at,
+                consumed: false,
+            });
+            Ok(())
+        })
+    }
+
+    async fn consume(
+        &self,
+        code_hash: &str,
+        binding: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Consumption, StoreError> {
+        with(&self.0, PortId::Handoffs, |state| {
+            let Some(row) = state
+                .sso
+                .handoffs
+                .iter_mut()
+                .find(|r| r.code_hash == code_hash)
+            else {
+                return Ok(Consumption::Unknown);
+            };
+            if row.consumed {
+                return Ok(Consumption::AlreadyConsumed);
+            }
+            row.consumed = true;
+            if row.expires_at < now {
+                return Ok(Consumption::Expired);
+            }
+            if row.binding != binding {
+                return Ok(Consumption::BindingMismatch);
+            }
+            Ok(Consumption::Consumed(row.payload.clone()))
+        })
+    }
+
+    async fn peek(
+        &self,
+        code_hash: &str,
+        binding: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>, StoreError> {
+        with(&self.0, PortId::Handoffs, |state| {
+            Ok(state
+                .sso
+                .handoffs
+                .iter()
+                .find(|r| {
+                    r.code_hash == code_hash
+                        && !r.consumed
+                        && r.binding == binding
+                        && r.expires_at >= now
+                })
+                .map(|r| r.payload.clone()))
+        })
+    }
+
+    async fn purge_expired(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
+        with(&self.0, PortId::Handoffs, |state| {
+            let before = state.sso.handoffs.len();
+            state.sso.handoffs.retain(|r| r.expires_at >= now);
+            Ok((before - state.sso.handoffs.len()) as u64)
+        })
+    }
+}
+
+#[async_trait]
+impl ServerSecretStore for Identities {
+    async fn get_or_init(&self, name: &str, candidate: &[u8]) -> Result<Vec<u8>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            if let Some((_, v)) = state.sso.secrets.iter().find(|(n, _)| n == name) {
+                return Ok(v.clone());
+            }
+            state
+                .sso
+                .secrets
+                .push((name.to_string(), candidate.to_vec()));
+            Ok(candidate.to_vec())
+        })
     }
 }

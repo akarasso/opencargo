@@ -134,6 +134,7 @@ pub const MIGRATIONS: &[Migration] = &[
         "017_storage_multipart.sql",
         Sentinel::Object("idx_storage_multipart_touched")
     ),
+    sql_migration!("021", "021_sso.sql", Sentinel::Object("idx_login_handoffs_expires")),
     sql_migration!(
         "025",
         "025_reclaim.sql",

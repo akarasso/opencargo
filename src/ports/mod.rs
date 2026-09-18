@@ -8,6 +8,8 @@ pub mod clock;
 pub mod dashboard;
 pub mod deps;
 pub mod events;
+pub mod handoffs;
+pub mod identities;
 pub mod ids;
 pub mod multipart;
 pub mod oci;
