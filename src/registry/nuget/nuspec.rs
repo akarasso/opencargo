@@ -5,8 +5,9 @@
 
 use std::io::Read as _;
 
+use quick_xml::escape::resolve_predefined_entity;
 use quick_xml::events::{BytesStart, Event};
-use quick_xml::Reader;
+use quick_xml::{Reader, XmlVersion};
 use serde::{Deserialize, Serialize};
 
 pub const MAX_NUSPEC_BYTES: u64 = 1024 * 1024;
@@ -92,7 +93,11 @@ fn attr(e: &BytesStart<'_>, name: &[u8]) -> Result<Option<String>, NuspecError> 
     for a in e.attributes() {
         let a = a.map_err(xml)?;
         if a.key.local_name().as_ref() == name {
-            return Ok(Some(a.unescape_value().map_err(xml)?.into_owned()));
+            return Ok(Some(
+                a.normalized_value(XmlVersion::default())
+                    .map_err(xml)?
+                    .into_owned(),
+            ));
         }
     }
     Ok(None)
@@ -191,23 +196,39 @@ pub fn parse(bytes: &[u8]) -> Result<Nuspec, NuspecError> {
         return Err(xml("the nuspec exceeds its size cap"));
     }
     let mut reader = Reader::from_reader(bytes);
-    reader.config_mut().trim_text(true);
     let mut n = Nuspec::default();
     let mut path: Vec<String> = Vec::new();
     let mut buf = Vec::new();
+    let mut content = String::new();
     loop {
         match reader.read_event_into(&mut buf).map_err(xml)? {
             Event::DocType(_) => return Err(xml("a DTD is not accepted")),
             Event::Start(e) => {
+                content.clear();
                 open_element(&mut n, &path, &e)?;
                 path.push(String::from_utf8_lossy(e.local_name().as_ref()).into_owned());
             }
             Event::Empty(e) => open_element(&mut n, &path, &e)?,
             Event::End(_) => {
+                let value = content.trim();
+                if !value.is_empty() {
+                    text(&mut n, &path, value.to_string());
+                }
+                content.clear();
                 path.pop();
             }
-            Event::Text(t) => text(&mut n, &path, t.unescape().map_err(xml)?.into_owned()),
-            Event::CData(t) => text(&mut n, &path, String::from_utf8_lossy(&t).into_owned()),
+            Event::Text(t) => content.push_str(&t.xml_content(XmlVersion::default()).map_err(xml)?),
+            Event::CData(t) => content.push_str(&String::from_utf8_lossy(&t)),
+            Event::GeneralRef(r) => {
+                if let Some(c) = r.resolve_char_ref().map_err(xml)? {
+                    content.push(c);
+                } else {
+                    let name = r.decode().map_err(xml)?;
+                    let resolved = resolve_predefined_entity(&name)
+                        .ok_or_else(|| xml(format!("unknown entity &{name};")))?;
+                    content.push_str(resolved);
+                }
+            }
             Event::Eof => break,
             _ => {}
         }
