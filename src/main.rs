@@ -81,10 +81,13 @@ enum StorageCommand {
     /// Probe the store and exercise every operation on its reserved tree
     Check,
     /// List keys rows reference with no object, and with --orphans the
-    /// objects nothing references
+    /// objects nothing references; --repair puts back the last noncurrent
+    /// version of a missing key, on a store that keeps them
     Verify {
         #[arg(long)]
         orphans: bool,
+        #[arg(long)]
+        repair: bool,
     },
     /// Copy every object into the store another config file declares
     Migrate {
@@ -115,21 +118,41 @@ async fn storage(cfg: &config::Config, command: StorageCommand) -> anyhow::Resul
                 anyhow::bail!("storage check failed");
             }
         }
-        StorageCommand::Verify { orphans } => {
-            let report = server::storage_verify(cfg, orphans, now).await?;
+        StorageCommand::Verify { orphans, repair } => {
+            let options = opencargo::app::storage_ops::Verify {
+                orphans,
+                repair,
+                enqueue: false,
+            };
+            let report = server::storage_verify(cfg, options, now).await?;
+            for key in &report.repaired {
+                println!("repaired {key}");
+            }
             for key in &report.missing {
                 println!("missing  {key}");
             }
             for key in &report.orphans {
                 println!("orphan   {key}");
             }
+            for key in &report.enqueued {
+                println!("queued   {key}");
+            }
             println!(
-                "{} objects, {} missing, {} orphans",
+                "{} objects, {} missing, {} orphans, {} queued, {} repaired",
                 report.objects,
                 report.missing.len(),
-                report.orphans.len()
+                report.orphans.len(),
+                report.enqueued.len(),
+                report.repaired.len(),
             );
             if !report.missing.is_empty() {
+                if !repair {
+                    println!(
+                        "a store that keeps noncurrent versions puts these back with \
+                         `opencargo storage verify --repair`; otherwise delete the version, \
+                         manifest or file that references each key, and publish it again"
+                    );
+                }
                 anyhow::bail!("rows reference missing objects");
             }
         }
@@ -202,6 +225,18 @@ async fn main() -> anyhow::Result<()> {
             let grace = cfg.server.shutdown_grace()?;
             let server::Started { state: app_state, lease, lock } =
                 server::build_state(&cfg, srv.clone(), shutdown.clone()).await?;
+            let settling = app_state.settle_epoch();
+            tokio::spawn(async move {
+                match settling.run(chrono::Utc::now()).await {
+                    Ok(Some(report)) => info!(
+                        missing = report.missing.len(),
+                        queued = report.enqueued.len(),
+                        "the artifact store was verified after a rollback"
+                    ),
+                    Ok(None) => {}
+                    Err(e) => tracing::warn!(error = %e, "the high-water mark is unsettled: reclamation stays refused"),
+                }
+            });
             if let Some(schedule) = server::backup_schedule(&cfg, &app_state)? {
                 tokio::spawn(schedule);
             }
@@ -235,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
 
             tokio::spawn(opencargo::app::sweep_storage::start_storage_sweep(
                 opencargo::app::sweep_storage::SweepStorage::new(app_state.storage.clone())
+                    .settling(app_state.settle_epoch())
                     .reclaiming(app_state.reclaim_orphans())
                     .reaping_uploads(app_state.oci.clone()),
                 app_state.clock.clone(),

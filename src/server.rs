@@ -253,6 +253,16 @@ impl AppState {
         )
     }
 
+    /// The epoch guard of this state's stores.
+    pub fn settle_epoch(&self) -> crate::app::storage_ops::SettleEpoch {
+        crate::app::storage_ops::SettleEpoch::new(
+            self.reclaim.clone(),
+            self.referenced.clone(),
+            self.storage.clone(),
+            ReclaimPolicy::default().grace,
+        )
+    }
+
     /// The only deleter of shared keys, over this state's stores.
     pub fn reclaim_orphans(&self) -> ReclaimOrphans {
         ReclaimOrphans::new(
@@ -375,21 +385,40 @@ pub async fn storage_check(config: &Config) -> anyhow::Result<crate::storage::Ch
     Ok(report)
 }
 
-/// `opencargo storage verify [--orphans]`.
+/// `opencargo storage verify [--orphans] [--repair]`: the gate after any
+/// rollback. It queues what a rollback left behind when the epoch owes a
+/// verify, and lifts that refusal when it ends.
 pub async fn storage_verify(
     config: &Config,
-    orphans: bool,
+    options: crate::app::storage_ops::Verify,
     now: chrono::DateTime<Utc>,
 ) -> anyhow::Result<crate::app::storage_ops::VerifyReport> {
     config.validate()?;
     let stores = connect_stores(config).await?;
     let storage = storage_for(config, stores.multipart())?;
+    let state = stores.reclaim().epoch().await?;
     let verify = crate::app::storage_ops::VerifyStorage::new(
         stores.referenced(),
+        stores.reclaim(),
         storage,
         ReclaimPolicy::default().grace,
     );
-    Ok(verify.run(orphans, now).await?)
+    let options = crate::app::storage_ops::Verify {
+        enqueue: options.enqueue || state.verify_pending,
+        ..options
+    };
+    let report = verify.run(options, now).await?;
+    stores.reclaim().verified(&state.epoch).await?;
+    Ok(report)
+}
+
+/// The epoch settled against the artifact store: run once at startup and
+/// before every sweep, never on a request path.
+pub async fn settle_epoch(
+    state: &AppState,
+    now: chrono::DateTime<Utc>,
+) -> Result<Option<crate::app::storage_ops::VerifyReport>, crate::app::storage_ops::OpsError> {
+    state.settle_epoch().run(now).await
 }
 
 /// `opencargo storage migrate --to <config>`: the server stopped, the two
@@ -885,6 +914,9 @@ pub async fn run_restore(
     files.replace(&db_path, &crate::backup::database_file(from)).await?;
     let reopened = open_unmigrated(config).await?;
     reopened.migrate().await?;
+    // I6: the restored database is a branch of its own, so nothing it
+    // references may be reused, and the verify below is owed.
+    reopened.reclaim().new_epoch(0).await?;
     reopened.close().await;
     std::fs::remove_file(&marker)?;
     Ok(RestoreReport {
