@@ -68,6 +68,7 @@ pub struct Resolver {
     perms: Arc<dyn crate::ports::permissions::PermissionStore>,
     packages: Arc<dyn crate::ports::packages::PackageStore>,
     oci: Arc<dyn crate::ports::oci::OciStore>,
+    maven: Arc<dyn crate::ports::maven::MavenFileStore>,
     search: Arc<dyn crate::ports::search::SearchIndex>,
     proxy: ProxyEngine,
 }
@@ -100,6 +101,7 @@ impl Resolver {
             perms: db.perms(),
             packages: db.packages(),
             oci: db.oci(),
+            maven: db.maven(),
             search: db.search(),
             proxy,
             fakes: db,
@@ -112,6 +114,7 @@ impl Resolver {
             perms: self.perms.as_ref(),
             packages: self.packages.as_ref(),
             oci: self.oci.as_ref(),
+            maven: self.maven.as_ref(),
             search: self.search.as_ref(),
             proxy: &self.proxy,
             policy: &self.policy,

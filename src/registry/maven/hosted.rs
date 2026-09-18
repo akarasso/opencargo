@@ -5,7 +5,7 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 
 use super::metadata::{stamp, ArtifactLevel, GroupLevel, SnapshotEntry, SnapshotLevel};
-use super::path::{is_snapshot, parse_build, Gav, MavenPath, Target};
+use super::path::{parse_build, Gav, MavenPath, Target};
 use crate::error::StoreError;
 use crate::ports::maven::{MavenFileStore, StoredFile, UnitKey, UnitView};
 use crate::ports::packages::{NameMatch, PackageStore};
@@ -18,6 +18,8 @@ pub struct Rendered {
     pub body: Bytes,
     pub etag: String,
     pub last_modified: Option<DateTime<Utc>>,
+    /// Served from an expired copy while its upstream failed.
+    pub stale: bool,
 }
 
 pub fn scope_artifact(ga: &str) -> String {
@@ -73,6 +75,7 @@ async fn rendered(
         body: Bytes::from(body),
         etag: format!("\"{stamp}.{}\"", counter.value),
         last_modified: published.max(counter.updated_at),
+        stale: false,
     })
 }
 
@@ -244,10 +247,4 @@ pub async fn visible_file(
     Ok(unit
         .filter(|u| u.visible())
         .and_then(|u| u.file(filename).cloned()))
-}
-
-/// Whether a snapshot's metadata is refreshed like one: every version under a
-/// `-SNAPSHOT` directory.
-pub fn is_snapshot_dir(dir: &[String]) -> bool {
-    dir.last().is_some_and(|v| is_snapshot(v))
 }

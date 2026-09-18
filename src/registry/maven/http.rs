@@ -9,7 +9,9 @@ use axum::{
 use bytes::Bytes;
 use futures_util::StreamExt;
 
+use super::group;
 use super::hosted::{self, scope_group, scopes_of, Rendered};
+use super::leaves::{FileLeaf, MetadataLeaf, SumLeaf};
 use super::metadata;
 use super::path::{ArtifactFile, MavenPath, MetadataLevel, Target};
 use crate::app::maven::deposit::{self, digests_of, Deposited};
@@ -17,7 +19,7 @@ use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, RepoKind, Repository};
 use crate::error::{AppError, AppResult};
 use crate::ports::maven::{ClientMetadata, SumAlgorithm, UnitKey};
-use crate::proxy::Payload;
+use crate::registry::resolve::{collect, first_hit, Collected};
 use crate::server::AppState;
 
 const MAX_SUM_BYTES: usize = 4 * 1024;
@@ -77,6 +79,11 @@ pub(super) fn document(doc: &Rendered, sum: Option<SumAlgorithm>, headers: &Head
     if let Ok(etag) = HeaderValue::from_str(&doc.etag) {
         response.headers_mut().insert(header::ETAG, etag);
     }
+    if doc.stale {
+        response
+            .headers_mut()
+            .insert(header::WARNING, HeaderValue::from_static("110 - \"Response is Stale\""));
+    }
     if let Some(at) = doc.last_modified {
         let http_date = at.format("%a, %d %b %Y %H:%M:%S GMT").to_string();
         if let Ok(value) = HeaderValue::from_str(&http_date) {
@@ -86,7 +93,17 @@ pub(super) fn document(doc: &Rendered, sum: Option<SumAlgorithm>, headers: &Head
     response
 }
 
-/// GET and HEAD.
+fn with_warning(mut response: Response, degraded: Option<String>) -> Response {
+    let warning = degraded.and_then(|why| HeaderValue::from_str(&format!("199 - \"{why}\"")).ok());
+    if let Some(value) = warning {
+        response.headers_mut().insert(header::WARNING, value);
+    }
+    response
+}
+
+/// GET and HEAD, on any kind of repository: a hosted one renders from its
+/// units, a proxy relays its upstream through the cache, a group walks its
+/// members.
 pub async fn read(
     State(state): State<AppState>,
     Path((repo_name, path)): Path<(String, String)>,
@@ -97,30 +114,28 @@ pub async fn read(
     let parsed = MavenPath::parse(&path)?;
     let repo = open(&state, &repo_name).await?;
     crate::registry::ensure_can_read(state.permissions.as_ref(), &repo, auth).await?;
-    if repo.kind()? != RepoKind::Hosted {
-        return Err(not_found(&path));
-    }
+    let cx = crate::registry::cx(&state, auth, &repo);
     match &parsed.target {
         Target::Metadata(dir) => {
-            let doc = hosted::metadata(state.maven.as_ref(), state.packages.as_ref(), repo.id, dir)
-                .await?
-                .ok_or_else(|| not_found(&path))?;
+            let leaf = MetadataLeaf { dir: dir.clone() };
+            if repo.kind()? == RepoKind::Group {
+                let Collected { hits, degraded } = collect(&cx, &repo, &leaf).await?;
+                let doc = group::merge(dir, &hits).ok_or_else(|| not_found(&path))?;
+                return Ok(with_warning(document(&doc, parsed.sum, &headers), degraded));
+            }
+            let doc: Rendered = first_hit(&cx, &repo, &leaf).await?.into();
             Ok(document(&doc, parsed.sum, &headers))
         }
         Target::File(file) => {
-            let stored = hosted::visible_file(
-                state.maven.as_ref(),
-                repo.id,
-                &file.gav,
-                &file.build,
-                &file.filename,
-            )
-            .await?
-            .ok_or_else(|| not_found(&path))?;
             if let Some(algorithm) = parsed.sum {
-                return Ok(sum_response(stored.digests.get(algorithm)));
+                let leaf = SumLeaf {
+                    file: file.clone(),
+                    algorithm,
+                };
+                return Ok(sum_response(&first_hit(&cx, &repo, &leaf).await?));
             }
-            let mut payload = Payload::file(stored.physical_key, stored.size.max(0) as u64);
+            let leaf = FileLeaf { file: file.clone() };
+            let mut payload = first_hit(&cx, &repo, &leaf).await?;
             payload.content_type = Some(content_type(&file.filename).to_string());
             state.proxy.stream_response(&payload, Vec::new()).await
         }

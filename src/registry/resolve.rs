@@ -10,6 +10,7 @@ use crate::domain::{
 };
 use crate::error::{AppError, StoreError};
 use crate::policy::ResolutionRecorder;
+use crate::ports::maven::MavenFileStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
@@ -90,6 +91,7 @@ pub struct Cx<'a> {
     pub perms: &'a dyn PermissionStore,
     pub packages: &'a dyn PackageStore,
     pub oci: &'a dyn OciStore,
+    pub maven: &'a dyn MavenFileStore,
     pub search: &'a dyn SearchIndex,
     pub proxy: &'a ProxyEngine,
     pub policy: &'a dyn ResolutionRecorder,
