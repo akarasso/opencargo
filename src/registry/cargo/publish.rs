@@ -17,7 +17,6 @@ use crate::db::kinds::Format;
 use crate::db::{Package, Repository};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
-use crate::storage::StorageBackend;
 
 /// Cargo publish metadata (the JSON portion of the PUT body).
 #[derive(Debug, Deserialize, Serialize)]

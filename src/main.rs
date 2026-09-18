@@ -78,11 +78,9 @@ async fn main() -> anyhow::Result<()> {
             // Spawn the periodic cleanup/GC task before the router consumes
             // app_state: the pre-release sweep needs cleanup.enabled, the proxy
             // cache sweep runs whenever proxy_cache_older_than_days is set.
-            let cleanup_storage: std::sync::Arc<dyn opencargo::storage::StorageBackend> =
-                app_state.storage.clone();
             tokio::spawn(opencargo::telemetry::cleanup::start_cleanup_task(
                 app_state.db.clone(),
-                cleanup_storage,
+                app_state.storage.clone(),
                 cfg.cleanup.clone(),
             ));
 

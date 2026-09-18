@@ -1,3 +1,7 @@
+// The filesystem adapter: the one file that may name the concrete backend
+// (it becomes src/adapters/fs/ when s3.md's second implementation lands).
+#![allow(clippy::disallowed_types)]
+
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::time::{Duration, SystemTime};
@@ -7,9 +11,7 @@ use bytes::Bytes;
 use tokio::fs;
 use tokio::io::{AsyncRead, AsyncWriteExt};
 
-use crate::error::AppError;
-
-use super::StorageBackend;
+use super::{StorageBackend, StorageError};
 
 pub struct FilesystemStorage {
     base_path: PathBuf,
@@ -25,16 +27,12 @@ impl FilesystemStorage {
         Self { base_path }
     }
 
-    pub fn resolve(&self, path: &str) -> Result<PathBuf, AppError> {
-        self.safe_path(path)
-    }
-
     /// Resolve a relative path and ensure it stays within the base directory.
     /// Prevents path traversal attacks (e.g., "../../etc/passwd").
-    fn safe_path(&self, path: &str) -> Result<PathBuf, AppError> {
+    fn safe_path(&self, path: &str) -> Result<PathBuf, StorageError> {
         // Reject obvious traversal attempts before touching the filesystem
         if path.contains("..") {
-            return Err(AppError::BadRequest(
+            return Err(StorageError::InvalidPath(
                 "path must not contain '..'".to_string(),
             ));
         }
@@ -42,10 +40,10 @@ impl FilesystemStorage {
         // For existing files, canonicalize and verify prefix
         if full_path.exists() {
             let canonical = full_path.canonicalize().map_err(|_| {
-                AppError::BadRequest("invalid storage path".to_string())
+                StorageError::InvalidPath("invalid storage path".to_string())
             })?;
             if !canonical.starts_with(&self.base_path) {
-                return Err(AppError::BadRequest(
+                return Err(StorageError::InvalidPath(
                     "path escapes storage directory".to_string(),
                 ));
             }
@@ -63,7 +61,7 @@ impl FilesystemStorage {
                 acc
             });
         if !normalized.starts_with(&self.base_path) {
-            return Err(AppError::BadRequest(
+            return Err(StorageError::InvalidPath(
                 "path escapes storage directory".to_string(),
             ));
         }
@@ -85,15 +83,15 @@ impl FilesystemStorage {
                     ancestor = parent;
                 }
                 _ => {
-                    return Err(AppError::BadRequest("invalid storage path".to_string()));
+                    return Err(StorageError::InvalidPath("invalid storage path".to_string()));
                 }
             }
         }
         let canonical = ancestor
             .canonicalize()
-            .map_err(|_| AppError::BadRequest("invalid storage path".to_string()))?;
+            .map_err(|_| StorageError::InvalidPath("invalid storage path".to_string()))?;
         if !canonical.starts_with(&self.base_path) {
-            return Err(AppError::BadRequest(
+            return Err(StorageError::InvalidPath(
                 "path escapes storage directory".to_string(),
             ));
         }
@@ -107,10 +105,14 @@ impl FilesystemStorage {
 
 #[async_trait]
 impl StorageBackend for FilesystemStorage {
-    async fn get(&self, path: &str) -> Result<Bytes, AppError> {
+    fn resolve(&self, path: &str) -> Result<PathBuf, StorageError> {
+        self.safe_path(path)
+    }
+
+    async fn get(&self, path: &str) -> Result<Bytes, StorageError> {
         let full_path = self.safe_path(path)?;
         if !full_path.exists() {
-            return Err(AppError::NotFound(format!("file not found: {path}")));
+            return Err(StorageError::NotFound);
         }
         let data = fs::read(&full_path).await?;
         Ok(Bytes::from(data))
@@ -118,7 +120,7 @@ impl StorageBackend for FilesystemStorage {
 
     /// Written next to its destination as `{name}.part-{uuid}` and renamed
     /// over it, so a re-push swaps inodes and never truncates a reader.
-    async fn put(&self, path: &str, data: Bytes) -> Result<(), AppError> {
+    async fn put(&self, path: &str, data: Bytes) -> Result<(), StorageError> {
         let full_path = self.safe_path(path)?;
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -132,7 +134,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
-    async fn append(&self, path: &str, data: Bytes) -> Result<u64, AppError> {
+    async fn append(&self, path: &str, data: Bytes) -> Result<u64, StorageError> {
         let full_path = self.safe_path(path)?;
         if let Some(parent) = full_path.parent() {
             fs::create_dir_all(parent).await?;
@@ -148,7 +150,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(len)
     }
 
-    async fn delete(&self, path: &str) -> Result<(), AppError> {
+    async fn delete(&self, path: &str) -> Result<(), StorageError> {
         let full_path = self.safe_path(path)?;
         if full_path.exists() {
             fs::remove_file(&full_path).await?;
@@ -156,7 +158,7 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
-    async fn delete_prefix(&self, prefix: &str) -> Result<(), AppError> {
+    async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError> {
         let full_path = self.safe_path(prefix)?;
         if full_path.is_dir() {
             fs::remove_dir_all(&full_path).await?;
@@ -166,12 +168,12 @@ impl StorageBackend for FilesystemStorage {
         Ok(())
     }
 
-    async fn exists(&self, path: &str) -> Result<bool, AppError> {
+    async fn exists(&self, path: &str) -> Result<bool, StorageError> {
         let full_path = self.safe_path(path)?;
         Ok(full_path.exists())
     }
 
-    async fn rename(&self, from: &str, to: &str) -> Result<(), AppError> {
+    async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError> {
         let from_path = self.safe_path(from)?;
         let to_path = self.safe_path(to)?;
         if let Some(parent) = to_path.parent() {
@@ -184,12 +186,12 @@ impl StorageBackend for FilesystemStorage {
     async fn read_stream(
         &self,
         path: &str,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send>>), AppError> {
+    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send>>), StorageError> {
         let full_path = self.safe_path(path)?;
         let file = match fs::File::open(&full_path).await {
             Ok(file) => file,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(AppError::NotFound(format!("file not found: {path}")));
+                return Err(StorageError::NotFound);
             }
             Err(e) => return Err(e.into()),
         };
@@ -201,7 +203,7 @@ impl StorageBackend for FilesystemStorage {
         &self,
         prefix: &str,
         older_than: Duration,
-    ) -> Result<u64, AppError> {
+    ) -> Result<u64, StorageError> {
         let root = self.safe_path(prefix)?;
         if !root.is_dir() {
             return Ok(0);
@@ -240,7 +242,7 @@ async fn write_synced(path: &Path, data: &[u8]) -> std::io::Result<()> {
     file.sync_data().await
 }
 
-async fn is_stale_part(path: &Path, cutoff: SystemTime) -> Result<bool, AppError> {
+async fn is_stale_part(path: &Path, cutoff: SystemTime) -> Result<bool, StorageError> {
     let is_part = path
         .file_name()
         .and_then(|n| n.to_str())
@@ -255,7 +257,7 @@ async fn is_stale_part(path: &Path, cutoff: SystemTime) -> Result<bool, AppError
 }
 
 // A part committed (renamed) between the listing and this call is not ours.
-fn vanished_is_fine<T>(res: std::io::Result<T>) -> Result<Option<T>, AppError> {
+fn vanished_is_fine<T>(res: std::io::Result<T>) -> Result<Option<T>, StorageError> {
     match res {
         Ok(v) => Ok(Some(v)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -265,8 +267,7 @@ fn vanished_is_fine<T>(res: std::io::Result<T>) -> Result<Option<T>, AppError> {
 
 #[cfg(test)]
 mod tests {
-    use super::FilesystemStorage;
-    use crate::error::AppError;
+    use super::{FilesystemStorage, StorageError};
 
     /// Storage rooted in a fresh temp dir. The `TempDir` guard must stay
     /// alive for the duration of the test (drop deletes the tree).
@@ -276,8 +277,8 @@ mod tests {
         (tmp, storage)
     }
 
-    fn is_bad_request(res: &Result<std::path::PathBuf, AppError>) -> bool {
-        matches!(res, Err(AppError::BadRequest(_)))
+    fn is_bad_request(res: &Result<std::path::PathBuf, StorageError>) -> bool {
+        matches!(res, Err(StorageError::InvalidPath(_)))
     }
 
     #[tokio::test]
@@ -308,7 +309,7 @@ mod tests {
         assert_eq!(s.get("c/a/blob").await.unwrap().as_ref(), b"second!");
         assert!(matches!(
             s.read_stream("c/missing").await,
-            Err(AppError::NotFound(_))
+            Err(StorageError::NotFound)
         ));
 
         s.put("c/b/x.part-old", bytes::Bytes::from_static(b"o"))

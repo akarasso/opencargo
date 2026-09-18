@@ -8,7 +8,7 @@ cd "$(dirname "${BASH_SOURCE[0]}")/.."
 rows=()
 declare_row() { local IFS=$'\x1f'; rows+=("$*"); }
 
-# declare_row <name> <max|min> <bound> <pattern> <plain|strip> <roots> <glob> [excluded paths...]
+# declare_row <name> <max|min|eq> <bound> <pattern> <plain|strip> <roots> <glob> [excluded paths...]
 # Bounds are measured occurrences at 6c9747a, never lines: `\bdb::` is 232 occurrences over 231
 # lines, so a max fed by a line count licenses one free violation. A raise is an edit to this
 # block, in the commit that needs it, with the reason on the line -- never a silent bump.
@@ -19,7 +19,8 @@ declare_row pool-leak      max  73 'SqlitePool|Pool<Sqlite>' plain src '*.rs' sr
 declare_row context-bypass max  25 'cx\.state\b'             plain src '*.rs'                     # word boundary: `cx.state` is also passed whole
 declare_row dialect-rs     max  22 'datetime\(|julianday\(|strftime\(|AUTOINCREMENT|INSERT OR ' plain src '*.rs' src/db src/adapters/sqlite
 declare_row dialect-sql    max  49 "AUTOINCREMENT|CHECK\(|fts5|CREATE TRIGGER|datetime\('now'\)" plain 'src/db/migrations src/adapters/sqlite/migrations' '*.sql' # scoped, not eliminated: SQLite DDL belongs in a SQLite directory
-declare_row concrete-fs    max  16 'FilesystemStorage'       plain src '*.rs' src/storage src/adapters/fs
+declare_row concrete-fs    eq    0 'FilesystemStorage'       plain src '*.rs' src/storage src/adapters/fs # eq, not max: clippy cannot see `FilesystemStorage::new(..)` in expression position, so this row is the real check (4.1)
+declare_row storage-error  eq    0 '(crate|opencargo)::error' plain 'src/storage src/adapters/fs' '*.rs' # the storage port answers with StorageError; AppError is the layer above's word (2.1)
 declare_row adapter-import max   0 '(crate|opencargo)::adapters::' plain src '*.rs' src/adapters src/server.rs src/main.rs # the composition root is those two files
 declare_row domain-paths   max   0 '(crate|opencargo)::(error|server|db|api|registry|proxy|storage|telemetry|auth|app|adapters)\b' plain src/domain '*.rs'
 declare_row domain-names   max   0 'AppError|AppResult|sqlx|axum|reqwest' plain src/domain '*.rs'
@@ -61,7 +62,8 @@ check() {
   local name=$1 cmp=$2 bound=$3 pat=$4 mode=$5 roots=$6 glob=$7 n verdict=ok hint=
   shift 7
   n=$(files "$roots" "$glob" "$@" | count "$pat" "$mode")
-  if { [ "$cmp" = max ] && [ "$n" -gt "$bound" ]; } || { [ "$cmp" = min ] && [ "$n" -lt "$bound" ]; }; then
+  if { [ "$cmp" = max ] && [ "$n" -gt "$bound" ]; } || { [ "$cmp" = min ] && [ "$n" -lt "$bound" ]; } ||
+    { [ "$cmp" = eq ] && [ "$n" -ne "$bound" ]; }; then
     verdict=FAIL
     fail=1
   elif [ "$n" -ne "$bound" ]; then

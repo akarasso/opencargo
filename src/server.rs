@@ -22,7 +22,7 @@ use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig};
 use crate::policy::PolicyEngine;
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
-use crate::storage::FilesystemStorage;
+use crate::storage::StorageBackend;
 use crate::telemetry;
 use crate::telemetry::vulns::VulnScanner;
 use crate::telemetry::webhooks::WebhookDispatcher;
@@ -41,7 +41,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AppState {
     pub db: SqlitePool,
-    pub storage: Arc<FilesystemStorage>,
+    pub storage: Arc<dyn StorageBackend>,
     pub auth: Arc<AuthState>,
     pub proxy: ProxyEngine,
     /// Per-repository upstream credentials, keyed by name; a missing key is the default.
@@ -95,7 +95,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     crate::db::kinds::check_repository_names(&db).await?;
     crate::db::init_repositories(&db, &config.repositories).await?;
 
-    let storage = Arc::new(FilesystemStorage::new(&config.server.storage_path));
+    let storage = crate::storage::filesystem(&config.server.storage_path);
 
     // Shared between AuthState (Basic Auth throttling) and AppState (npm login).
     let login_rate_limiter = Arc::new(RateLimiter::new(5, 60));

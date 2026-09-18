@@ -11,7 +11,6 @@ use crate::db::kinds::Format;
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::first_hit;
 use crate::server::AppState;
-use crate::storage::StorageBackend;
 
 use super::leaves::BlobLeaf;
 use super::{cx, param, parse_digest, paths, respond, OciRef};

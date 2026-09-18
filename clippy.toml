@@ -1,0 +1,11 @@
+# The boundary's lints, added one entry at a time as each ratchet reaches zero:
+# `disallowed_types` fires per use site, so an entry that lands before the code
+# moves turns CI red on the first commit (designs-next/ports-and-adapters.md
+# 4.1). A path's first segment is a crate name -- `crate` is not special-cased --
+# so a local type is spelled `opencargo::`.
+disallowed-types = [
+  # Step 2a. A backstop only: the lint sees field types, `use` items and type
+  # positions, never `FilesystemStorage::new(..)` in expression position, so
+  # scripts/boundary.sh's concrete-fs row (== 0) is the real check.
+  { path = "opencargo::storage::FilesystemStorage", reason = "storage is reached through Arc<dyn StorageBackend>; the concrete backend is named in src/storage/ alone" },
+]

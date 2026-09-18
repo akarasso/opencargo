@@ -6,6 +6,7 @@ use axum::{
 use serde_json::json;
 
 use crate::domain::DomainError;
+use crate::storage::StorageError;
 
 pub type AppResult<T> = Result<T, AppError>;
 
@@ -136,6 +137,24 @@ impl From<DomainError> for AppError {
     }
 }
 
+/// The storage port's four refusals, each keeping the status the concrete
+/// filesystem backend served before it had a port error of its own —
+/// `InvalidPath` above all, which is the traversal guard's 400.
+impl From<StorageError> for AppError {
+    fn from(err: StorageError) -> Self {
+        let message = err.to_string();
+        match err {
+            StorageError::NotFound => AppError::NotFound(message),
+            StorageError::InvalidPath(_) => AppError::BadRequest(message),
+            StorageError::Unavailable => AppError::ServiceUnavailable(message),
+            StorageError::Other(source) => {
+                tracing::error!("Storage error: {source}");
+                AppError::Internal("internal server error".to_string())
+            }
+        }
+    }
+}
+
 impl From<StoreError> for AppError {
     fn from(err: StoreError) -> Self {
         match &err {
@@ -248,6 +267,40 @@ mod tests {
                 "the store is unavailable, try again".to_string()
             )
         );
+    }
+
+    /// The other half of the guarantee is next to the guard itself, where
+    /// every traversal attempt is asserted to be an `InvalidPath`: this side
+    /// pins the status that variant is served as.
+    #[tokio::test]
+    async fn a_key_the_traversal_guard_rejects_is_still_a_400() {
+        assert_eq!(
+            served(StorageError::InvalidPath("path must not contain '..'".to_string()).into())
+                .await,
+            (
+                StatusCode::BAD_REQUEST,
+                "path must not contain '..'".to_string()
+            )
+        );
+    }
+
+    #[tokio::test]
+    async fn storage_keeps_the_statuses_the_filesystem_backend_served() {
+        assert_eq!(
+            served(StorageError::NotFound.into()).await,
+            (StatusCode::NOT_FOUND, "file not found".to_string())
+        );
+        assert_eq!(
+            served(StorageError::Unavailable.into()).await,
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the storage backend is unavailable, try again".to_string()
+            )
+        );
+        let io = std::io::Error::other("disk on fire");
+        let (status, body) = served(StorageError::from(io).into()).await;
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(body, "internal server error");
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use tracing::warn;
 use crate::db::proxy_cache::{self, CacheEntry, NewEntry};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::{CacheRepo, Outcome, Upstream};
-use crate::storage::{FilesystemStorage, StorageBackend};
+use crate::storage::StorageBackend;
 
 use super::auth::{send_with_auth, TokenCache};
 use super::singleflight::Singleflight;
@@ -50,7 +50,7 @@ impl Timeouts {
 #[derive(Clone)]
 pub struct ProxyEngine {
     http: reqwest::Client,
-    storage: Arc<FilesystemStorage>,
+    storage: Arc<dyn StorageBackend>,
     db: SqlitePool,
     tokens: Arc<TokenCache>,
     inflight: Arc<Singleflight>,
@@ -81,7 +81,7 @@ enum Miss {
 
 impl ProxyEngine {
     pub fn new(
-        storage: Arc<FilesystemStorage>,
+        storage: Arc<dyn StorageBackend>,
         db: SqlitePool,
         timeouts: Timeouts,
         ttl: TtlConfig,
@@ -350,7 +350,7 @@ impl ProxyEngine {
         p: &Payload,
         extra: Vec<(HeaderName, HeaderValue)>,
     ) -> AppResult<Response> {
-        p.to_response(&self.storage, extra).await
+        p.to_response(self.storage.as_ref(), extra).await
     }
 
     pub async fn purge_repo(&self, member: CacheRepo<'_>) -> AppResult<()> {
@@ -358,7 +358,8 @@ impl ProxyEngine {
         proxy_cache::delete_legacy_meta(&self.db, member.0.id).await?;
         self.storage
             .delete_prefix(&format!("_proxy_cache/{}", member.0.name))
-            .await
+            .await?;
+        Ok(())
     }
 
     /// A negative row under `cache_key`, never `store_key`: no body, no sha256.

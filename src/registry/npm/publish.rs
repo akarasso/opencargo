@@ -21,7 +21,6 @@ use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;
 use crate::registry::publish::{finalize_publish, publish_gate, PreScan};
 use crate::server::AppState;
-use crate::storage::StorageBackend;
 
 const MAX_README_BYTES: usize = 256 * 1024;
 

@@ -14,7 +14,6 @@ use crate::db::kinds::Format;
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
-use crate::storage::StorageBackend;
 
 use super::{param, paths, sha256_digest, OciRef};
 

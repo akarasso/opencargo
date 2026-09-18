@@ -16,7 +16,6 @@ use crate::db::kinds::Format;
 use crate::db::Repository;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
-use crate::storage::StorageBackend;
 
 const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
 const MAX_GO_MOD_BYTES: u64 = 1024 * 1024;

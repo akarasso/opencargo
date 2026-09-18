@@ -91,7 +91,7 @@ async fn singleflight_wait_timeout_proceeds_unlocked() {
 #[tokio::test]
 async fn part_file_unlinked_on_drop_and_cap() {
     let fx = Fx::new().await;
-    let mut part = PartFile::new(&fx.storage, "_proxy_cache/p/x.part-1".into())
+    let mut part = PartFile::new(fx.storage.as_ref(), "_proxy_cache/p/x.part-1".into())
         .await
         .unwrap();
     part.write_chunk(b"abc").await.unwrap();
@@ -128,12 +128,12 @@ async fn part_file_unlinked_on_drop_and_cap() {
 #[tokio::test]
 async fn part_file_commit_keeps_file() {
     let fx = Fx::new().await;
-    let mut part = PartFile::new(&fx.storage, "_proxy_cache/p/k/x.part-1".into())
+    let mut part = PartFile::new(fx.storage.as_ref(), "_proxy_cache/p/k/x.part-1".into())
         .await
         .unwrap();
     part.write_chunk(b"abc").await.unwrap();
     part.write_chunk(b"def").await.unwrap();
-    part.commit(&fx.storage, "_proxy_cache/p/k/x")
+    part.commit(fx.storage.as_ref(), "_proxy_cache/p/k/x")
         .await
         .unwrap();
     assert!(!fx

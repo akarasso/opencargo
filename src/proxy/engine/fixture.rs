@@ -12,7 +12,7 @@ use crate::db::Repository;
 use crate::proxy::strategy::{
     CacheKey, CachePolicy, Transfer, Ttl, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
 };
-use crate::storage::FilesystemStorage;
+use crate::storage::StorageBackend;
 
 #[derive(Default)]
 pub(crate) struct FakeState {
@@ -186,7 +186,7 @@ pub(crate) fn pointer_strat() -> Strat {
 pub(crate) struct Fx {
     _tmp: tempfile::TempDir,
     pub pool: SqlitePool,
-    pub storage: Arc<FilesystemStorage>,
+    pub storage: Arc<dyn StorageBackend>,
     pub repo: Repository,
     pub fake: Shared,
     pub up: Upstream,
@@ -226,7 +226,7 @@ impl Fx {
             .await
             .unwrap()
             .unwrap();
-        let storage = Arc::new(FilesystemStorage::new(tmp.path().join("storage")));
+        let storage = crate::storage::filesystem(tmp.path().join("storage"));
         let up = Upstream {
             base,
             auth: None,

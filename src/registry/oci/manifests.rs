@@ -16,7 +16,6 @@ use crate::db::Repository;
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::first_hit;
 use crate::server::AppState;
-use crate::storage::StorageBackend;
 
 use super::leaves::ManifestLeaf;
 use super::{cx, is_digest, param, parse_digest, paths, refs, respond, sha256_digest, OciRef};

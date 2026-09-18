@@ -14,7 +14,6 @@ use crate::auth::permissions::can_admin;
 use crate::db::kinds::RepoKind;
 use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;
-use crate::storage::StorageBackend;
 use crate::server::AppState;
 
 // ---------------------------------------------------------------------------

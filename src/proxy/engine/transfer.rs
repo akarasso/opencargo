@@ -112,7 +112,7 @@ impl ProxyEngine {
             cache_path(member, &s.cache_key(a)),
             uuid::Uuid::new_v4()
         );
-        let mut part = PartFile::new(&self.storage, part_rel).await?;
+        let mut part = PartFile::new(self.storage.as_ref(), part_rel).await?;
         let mut hasher = Sha256::new();
         let mut size = 0u64;
         loop {
@@ -138,7 +138,7 @@ impl ProxyEngine {
         }
         s.verify_headers(a, &headers, &sha256)?;
         let path = cache_path(member, &s.store_key(a, &sha256));
-        part.commit(&self.storage, &path).await?;
+        part.commit(self.storage.as_ref(), &path).await?;
         Ok(Ok(Body {
             path,
             sha256,

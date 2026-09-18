@@ -220,13 +220,11 @@ struct PrereleaseRow {
 mod tests {
     use super::*;
     use crate::db::proxy_cache::NewEntry;
-    use crate::storage::FilesystemStorage;
 
     struct Fx {
         _tmp: tempfile::TempDir,
         pool: SqlitePool,
         storage: Arc<dyn StorageBackend>,
-        fs: Arc<FilesystemStorage>,
     }
 
     async fn fixture() -> Fx {
@@ -242,12 +240,11 @@ mod tests {
         .execute(&pool)
         .await
         .unwrap();
-        let fs = Arc::new(FilesystemStorage::new(tmp.path().join("storage")));
+        let storage = crate::storage::filesystem(tmp.path().join("storage"));
         Fx {
             _tmp: tmp,
             pool,
-            storage: fs.clone(),
-            fs,
+            storage,
         }
     }
 
@@ -378,7 +375,7 @@ mod tests {
         fx.put("_proxy_cache/p/npm-tarball/ab/abc.part-old").await;
         fx.put("_proxy_cache/p/npm-tarball/ab/abc.part-new").await;
         fx.put("_proxy_cache/p/npm-tarball/ab/abc").await;
-        let old = fx.fs.resolve("_proxy_cache/p/npm-tarball/ab/abc.part-old").unwrap();
+        let old = fx.storage.resolve("_proxy_cache/p/npm-tarball/ab/abc.part-old").unwrap();
         let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(7200);
         std::fs::File::options()
             .write(true)
