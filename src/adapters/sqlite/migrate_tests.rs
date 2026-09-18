@@ -950,3 +950,21 @@ async fn migrations_021_and_022_create_server_secrets_in_either_order() {
         normalize(secrets_definition(&second).await)
     );
 }
+
+/// Every shipped format migration together: a fresh database admits each
+/// format the domain knows, and nothing else.
+#[tokio::test]
+async fn a_fully_migrated_database_admits_every_format_together() {
+    let (_tmp, pool) = pool().await;
+    run_all(&pool).await.unwrap();
+    for format in Format::ALL {
+        insert_repository(&pool, &format!("r-{}", format.as_str()), "hosted", format.as_str())
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        admits(&pool).await,
+        set(["npm", "cargo", "oci", "go", "pypi", "maven", "nuget"])
+    );
+    assert!(insert_repository(&pool, "deb", "hosted", "deb").await.is_err());
+}
