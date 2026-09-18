@@ -220,6 +220,10 @@ fn stored_files(dir: &std::path::Path, name: &str, found: &mut Vec<std::path::Pa
 
 #[tokio::test]
 async fn a_hosted_member_storage_fault_is_a_503_not_a_fall_through() {
+    if common::storage_is_s3() {
+        eprintln!("skipped under S3: the fault is a file permission on disk");
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let central = fake::start().await;
     let s = spawn(&central).await;

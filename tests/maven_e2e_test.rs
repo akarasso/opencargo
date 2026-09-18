@@ -346,6 +346,10 @@ async fn mvn_resolves_from_the_proxy_cache_while_central_is_down() {
 
 #[tokio::test]
 async fn mvn_deploy_succeeds_again_once_storage_is_back() {
+    if common::storage_is_s3() {
+        eprintln!("skipped under S3: the fault is a directory permission on disk");
+        return;
+    }
     use std::os::unix::fs::PermissionsExt;
     let Some(bin) = client_bin("MVN_BIN") else { return };
     within(async {

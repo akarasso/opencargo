@@ -295,6 +295,10 @@ fn files_under(dir: &std::path::Path, out: &mut Vec<String>) {
 /// shared key a push places; a second key would escape port 23's clause.
 #[tokio::test]
 async fn a_hosted_push_places_the_nupkg_and_no_other_key() {
+    if common::storage_is_s3() {
+        eprintln!("skipped under S3: the test lists the stored keys on disk");
+        return;
+    }
     let server = setup().await;
     let c = reqwest::Client::new();
     let base = &server.base_url;
@@ -316,6 +320,10 @@ async fn a_hosted_push_places_the_nupkg_and_no_other_key() {
 /// and leaves neither a part, a key, nor a version behind.
 #[tokio::test]
 async fn spool_field_over_cap_is_413_and_removes_part() {
+    if common::storage_is_s3() {
+        eprintln!("skipped under S3: the test lists the stored keys on disk");
+        return;
+    }
     let server = setup().await;
     let c = reqwest::Client::new();
     let base = &server.base_url;
