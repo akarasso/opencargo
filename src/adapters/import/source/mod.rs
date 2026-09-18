@@ -12,6 +12,8 @@ use crate::ports::import::{
 };
 
 pub mod artifactory;
+pub mod distribution;
+pub mod github;
 pub mod nexus;
 pub mod verdaccio;
 

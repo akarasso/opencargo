@@ -81,7 +81,7 @@ fn version_key(v: &str) -> (Option<semver::Version>, String) {
 
 impl Planner<'_> {
     fn target_name(&self, it: &Item, format: Format) -> Result<String, String> {
-        if format != Format::Oci || self.rules.flatten_names {
+        if format != Format::Oci || self.rules.flatten_names || it.coord.repo.is_empty() {
             return Ok(it.coord.name.clone());
         }
         let q = oci_qualifier(&it.coord.repo).ok_or_else(|| {

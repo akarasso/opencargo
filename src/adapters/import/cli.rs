@@ -15,7 +15,10 @@ use super::http::{admin_url, Credential, Gate, GateConfig, HostSet, Secret};
 use super::sink::cargo::CargoSink;
 use super::sink::go::GoSink;
 use super::sink::npm::NpmSink;
+use super::sink::oci::OciSink;
 use super::source::artifactory::Artifactory;
+use super::source::distribution::Distribution;
+use super::source::github::Github;
 use super::source::nexus::Nexus;
 use super::source::verdaccio::Verdaccio;
 use super::target::{HttpTargetAdmin, LaneConfig, TargetLane};
@@ -48,6 +51,8 @@ pub enum SourceKind {
     Nexus,
     Artifactory,
     Verdaccio,
+    Github,
+    Distribution,
 }
 
 impl SourceKind {
@@ -56,6 +61,8 @@ impl SourceKind {
             SourceKind::Nexus => "nexus",
             SourceKind::Artifactory => "artifactory",
             SourceKind::Verdaccio => "verdaccio",
+            SourceKind::Github => "github",
+            SourceKind::Distribution => "distribution",
         }
     }
 }
@@ -121,6 +128,13 @@ pub struct RunArgs {
     pub tuning: Tuning,
     #[arg(long)]
     pub no_retag: bool,
+    /// OCI upload chunk, raised to the target's advertised minimum
+    #[arg(long, default_value = "32MiB")]
+    pub oci_chunk: String,
+    #[arg(long, default_value = "https://npm.pkg.github.com/", hide = true)]
+    pub github_npm_url: String,
+    #[arg(long, default_value = "https://ghcr.io/", hide = true)]
+    pub github_registry_url: String,
     /// Reach this host when the source names it; never sends it credentials
     #[arg(long = "allow-source-host")]
     pub allow_source_hosts: Vec<String>,
@@ -333,11 +347,21 @@ fn compose(
         SourceKind::Verdaccio => Arc::new(Verdaccio::new(gate.clone()).with_page(a.page_size)),
         SourceKind::Nexus => Arc::new(Nexus::new(gate.clone())),
         SourceKind::Artifactory => Arc::new(Artifactory::new(gate.clone()).with_page(a.page_size.min(1000))),
+        SourceKind::Distribution => Arc::new(Distribution::new(gate.clone())),
+        SourceKind::Github => Arc::new(
+            Github::new(
+                gate.clone(),
+                admin_url(&a.github_npm_url, "--github-npm-url", "")?,
+                admin_url(&a.github_registry_url, "--github-registry-url", "")?,
+            )
+            .with_page(a.page_size.min(100) as u32),
+        ),
     };
     let mut sinks: HashMap<Format, Arc<dyn Sink>> = HashMap::new();
     sinks.insert(Format::Npm, Arc::new(NpmSink::new(gate.clone(), lane.clone(), parse_size(&a.max_npm_body)?)));
     sinks.insert(Format::Cargo, Arc::new(CargoSink::new(gate.clone(), lane.clone())));
     sinks.insert(Format::Go, Arc::new(GoSink::new(gate.clone(), lane.clone())));
+    sinks.insert(Format::Oci, Arc::new(OciSink::new(gate.clone(), lane.clone(), parse_size(&a.oci_chunk)?)));
     let mut maps = Vec::new();
     for m in &a.maps {
         maps.push(PlanRules::parse_map(m)?);

@@ -58,7 +58,7 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 		--test maven_test --test maven_proxy_test \
 		--test nuget_test --test nuget_feed_store_test --test nuget_proxy_test --test nuget_group_test \
 		--test sso_test --test sso_store_test \
-		--test import_test --test import_managers_test
+		--test import_test --test import_managers_test --test import_oci_test
 
 test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
 	scripts/test-s3.sh

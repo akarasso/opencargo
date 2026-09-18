@@ -7,6 +7,7 @@ use reqwest::Url;
 pub mod cargo;
 pub mod go;
 pub mod npm;
+pub mod oci;
 
 /// `{base}{name}` with a scoped npm name's `/` kept in one path segment.
 pub fn npm_url(base: &Url, name: &str) -> Url {
