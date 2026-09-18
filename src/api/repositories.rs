@@ -60,13 +60,6 @@ pub async fn create_repository(
     let body: CreateRepositoryRequest = read_json(request).await?;
     let kind: RepoKind = body.repo_type.parse()?;
     let format: Format = body.format.parse()?;
-    // The API never exposes pypi: there is no registry module behind it.
-    if format == Format::Pypi {
-        return Err(AppError::BadRequest(format!(
-            "invalid repository format: {}",
-            body.format
-        )));
-    }
     let visibility: Visibility = body.visibility.parse()?;
     let members = body.members.unwrap_or_default();
 

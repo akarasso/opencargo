@@ -1,6 +1,7 @@
 pub mod cargo;
 pub mod go;
 pub mod npm;
+pub mod archive;
 pub mod oci;
 pub mod pypi;
 pub mod resolve;
