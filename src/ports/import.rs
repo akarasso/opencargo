@@ -353,6 +353,8 @@ pub struct Outcome {
     pub sha256: Option<String>,
     pub error: Option<String>,
     pub note: Option<String>,
+    /// Facts the copy learned, replacing the ones an earlier copy stored.
+    pub gaps: Vec<Gap>,
 }
 
 /// A package whose versions are all terminal and which was never sealed.
@@ -382,9 +384,9 @@ pub enum JournalError {
 pub trait ImportJournal: Send + Sync {
     async fn header(&self) -> Result<Option<RunHeader>, JournalError>;
 
-    /// Claims the journal for `owner`, refusing a live other one. A fresh
-    /// run rewinds every cursor and requeues every failure; a resume only
-    /// requeues the items a dead owner left running.
+    /// Claims the journal for `owner`, refusing a live other one, and
+    /// requeues every failure and every item a dead owner left running. A
+    /// fresh run also rewinds every cursor.
     async fn begin(
         &self,
         header: &RunHeader,
@@ -416,6 +418,13 @@ pub trait ImportJournal: Send + Sync {
 
     /// Gaps no stream owns, replaced as a set.
     async fn replace_run_gaps(&self, gaps: &[Gap]) -> Result<(), JournalError>;
+
+    /// Removes the unfinished items that share a target coordinate with
+    /// another source coordinate, and records a gap naming each group.
+    async fn take_collisions(&self) -> Result<Vec<Gap>, JournalError>;
+
+    /// The target repositories the plan routes to, with their format.
+    async fn targets(&self) -> Result<Vec<(String, Format)>, JournalError>;
 
     async fn claim(&self, lane: Lane, now: DateTime<Utc>) -> Result<Option<Journaled>, JournalError>;
 

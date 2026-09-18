@@ -142,7 +142,11 @@ async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
     if let Some(Commands::Import { command }) = cli.command {
-        let ran = opencargo::adapters::import::cli::execute(command).await;
+        let env = |k: &str| std::env::var(k).ok();
+        let interrupted = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        let ran = opencargo::adapters::import::cli::execute(command, &env, interrupted).await;
         print!("{}", ran.stdout);
         std::process::exit(i32::from(ran.code));
     }

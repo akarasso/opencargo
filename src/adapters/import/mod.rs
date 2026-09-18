@@ -4,4 +4,6 @@
 
 pub mod cli;
 pub mod http;
+pub mod sink;
+pub mod source;
 pub mod target;

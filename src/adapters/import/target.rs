@@ -360,6 +360,12 @@ impl TargetAdmin for HttpTargetAdmin {
         if resp.status() == StatusCode::NOT_FOUND {
             return Err(TargetError::Unsupported("/api/v1/me/permissions".into()));
         }
+        if resp.status() == StatusCode::UNAUTHORIZED {
+            return Err(TargetError::Refused(format!(
+                "the target token is not valid: the target answered {}",
+                error_text(resp).await
+            )));
+        }
         if !resp.status().is_success() {
             return Err(TargetError::Refused(error_text(resp).await));
         }

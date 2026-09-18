@@ -6,11 +6,13 @@
 
 pub mod contract;
 pub mod fake_idp;
+pub mod fake_source;
 pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;
 pub mod pypi;
 pub mod faults;
+pub mod import;
 pub mod nuget;
 pub mod upstream_tap;
 

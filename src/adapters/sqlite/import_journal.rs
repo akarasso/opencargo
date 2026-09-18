@@ -20,6 +20,7 @@ use super::{bind_ts, parse_ts};
 const USER_VERSION: i64 = 1;
 const STALE_OWNER_SECS: i64 = 60;
 const RUN_SCOPE: &str = "run";
+const COLLISION_SCOPE: &str = "collision";
 
 const SCHEMA: &str = "
 CREATE TABLE IF NOT EXISTS run (id INTEGER PRIMARY KEY CHECK (id = 1), source TEXT NOT NULL,
@@ -268,13 +269,19 @@ impl ImportJournal for SqliteImportJournal {
             .execute(&mut *tx)
             .await
             .map_err(io)?;
+        sqlx::query("UPDATE item SET status = 'pending', attempts = 0, error = NULL WHERE status = 'failed'")
+            .execute(&mut *tx)
+            .await
+            .map_err(io)?;
         if fresh {
-            sqlx::query("UPDATE cursor SET token = NULL, done = 0").execute(&mut *tx).await.map_err(io)?;
-            sqlx::query("UPDATE item SET status = 'pending', attempts = 0, error = NULL WHERE status = 'failed'")
-                .execute(&mut *tx)
-                .await
-                .map_err(io)?;
-            sqlx::query("UPDATE pkg SET sealed = 0").execute(&mut *tx).await.map_err(io)?;
+            for stmt in [
+                "UPDATE cursor SET token = NULL, done = 0",
+                "DELETE FROM item",
+                "DELETE FROM pkg",
+                "DELETE FROM gap WHERE scope LIKE 'item:%' OR scope LIKE 'seal:%' OR scope = 'collision'",
+            ] {
+                sqlx::query(stmt).execute(&mut *tx).await.map_err(io)?;
+            }
         }
         tx.commit().await.map_err(io)
     }
@@ -411,6 +418,8 @@ impl ImportJournal for SqliteImportJournal {
     }
 
     async fn complete(&self, source_ref: &str, o: &Outcome) -> Result<(), JournalError> {
+        let scope = format!("item:{source_ref}");
+        let mut tx = self.pool.begin().await.map_err(io)?;
         sqlx::query("UPDATE item SET status = ?, bytes = ?, sha256 = ?, error = ?, note = ? WHERE source_ref = ?")
             .bind(o.status.as_str())
             .bind(o.bytes.map(|b| b as i64))
@@ -418,10 +427,74 @@ impl ImportJournal for SqliteImportJournal {
             .bind(&o.error)
             .bind(&o.note)
             .bind(source_ref)
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(io)?;
-        Ok(())
+        sqlx::query("DELETE FROM gap WHERE scope = ?").bind(&scope).execute(&mut *tx).await.map_err(io)?;
+        insert_gaps(&mut tx, &scope, &o.gaps).await.map_err(io)?;
+        if o.status != ItemStatus::Failed {
+            sqlx::query(
+                "UPDATE pkg SET sealed = 0 WHERE (target_repo, name) IN
+                   (SELECT target_repo, target_name FROM item WHERE source_ref = ?)",
+            )
+            .bind(source_ref)
+            .execute(&mut *tx)
+            .await
+            .map_err(io)?;
+        }
+        tx.commit().await.map_err(io)
+    }
+
+    async fn take_collisions(&self) -> Result<Vec<Gap>, JournalError> {
+        let mut tx = self.pool.begin().await.map_err(io)?;
+        let rows = sqlx::query(
+            "SELECT target_repo, target_name, version, group_concat(source_ref, ' and ') AS refs FROM
+               (SELECT target_repo, target_name, version, source_ref FROM item ORDER BY source_ref)
+             GROUP BY target_repo, target_name, version HAVING count(*) > 1
+             ORDER BY target_repo, target_name, version",
+        )
+        .fetch_all(&mut *tx)
+        .await
+        .map_err(io)?;
+        let mut gaps = Vec::new();
+        for r in rows {
+            let (repo, name, version, refs): (String, String, String, String) =
+                (r.get("target_repo"), r.get("target_name"), r.get("version"), r.get("refs"));
+            sqlx::query(
+                "DELETE FROM item WHERE target_repo = ? AND target_name = ? AND version = ?
+                   AND status IN ('pending', 'running', 'failed')",
+            )
+            .bind(&repo)
+            .bind(&name)
+            .bind(&version)
+            .execute(&mut *tx)
+            .await
+            .map_err(io)?;
+            gaps.push(Gap::new(
+                GapKind::TargetCollision,
+                format!("{repo}/{name}@{version}"),
+                format!("{refs} map to one target coordinate"),
+            ));
+        }
+        insert_gaps(&mut tx, COLLISION_SCOPE, &gaps).await.map_err(io)?;
+        tx.commit().await.map_err(io)?;
+        Ok(gaps)
+    }
+
+    async fn targets(&self) -> Result<Vec<(String, crate::domain::Format)>, JournalError> {
+        let rows = sqlx::query("SELECT DISTINCT target_repo, target_format FROM item ORDER BY target_repo, target_format")
+            .fetch_all(&self.pool)
+            .await
+            .map_err(io)?;
+        rows.iter()
+            .map(|r| {
+                let f: String = r.get("target_format");
+                Ok((
+                    r.get("target_repo"),
+                    crate::domain::Format::from_str(&f).map_err(|e| JournalError::Incompatible(e.to_string()))?,
+                ))
+            })
+            .collect()
     }
 
     async fn unsealed(&self) -> Result<Vec<Unsealed>, JournalError> {
@@ -650,7 +723,7 @@ mod tests {
             planned("a2", "a", "1.1.0", crate::domain::Format::Cargo),
         ];
         j.record("s", true, &items, &[], &None, true).await.unwrap();
-        let done = |status| Outcome { status, bytes: None, sha256: None, error: None, note: None };
+        let done = |status| Outcome { status, bytes: None, sha256: None, error: None, note: None, gaps: Vec::new() };
         let first = j.claim(Lane::File, Utc::now()).await.unwrap().unwrap();
         j.complete(&first.planned.item.source_ref, &done(ItemStatus::Copied)).await.unwrap();
         assert!(j.unsealed().await.unwrap().is_empty());

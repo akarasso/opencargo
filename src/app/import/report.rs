@@ -2,7 +2,6 @@
 //! state rather than accumulated, so a fixed cause leaves it on the next run.
 
 use std::collections::BTreeMap;
-use std::str::FromStr;
 
 use serde::Serialize;
 
@@ -39,16 +38,7 @@ pub struct Report {
     pub exit_code: u8,
 }
 
-/// Failures and annotations carry their kind as a prefix, `Kind: message`,
-/// which is how an item re-derives its gap without a stored row.
-pub fn tagged(kind: GapKind, message: &str) -> String {
-    format!("{}: {message}", kind.as_str())
-}
-
-pub fn untag(s: &str) -> Option<(GapKind, &str)> {
-    let (kind, rest) = s.split_once(": ")?;
-    Some((GapKind::from_str(kind).ok()?, rest))
-}
+pub use crate::domain::import::{tagged, untag};
 
 fn item_gaps(it: &Journaled) -> Vec<Gap> {
     let source_ref = &it.planned.item.source_ref;

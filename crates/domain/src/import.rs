@@ -120,6 +120,17 @@ impl FromStr for GapKind {
     }
 }
 
+/// A failure or annotation carrying its kind, `Kind: message`: how an item
+/// re-derives its gap without a stored row.
+pub fn tagged(kind: GapKind, message: &str) -> String {
+    format!("{}: {message}", kind.as_str())
+}
+
+pub fn untag(s: &str) -> Option<(GapKind, &str)> {
+    let (kind, rest) = s.split_once(": ")?;
+    Some((GapKind::from_str(kind).ok()?, rest))
+}
+
 /// Blocking outranks incomplete outranks informational; an operator who
 /// accepted an incomplete source once, in writing, gets a clean exit for it.
 pub fn exit_code(kinds: impl IntoIterator<Item = GapKind>, allow_incomplete: bool) -> u8 {
