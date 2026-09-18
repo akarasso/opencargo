@@ -412,7 +412,7 @@ async fn forged_callback_flood_does_not_suspend_reauth_after() {
     config.auth.sso.reauth_after = "1h".into();
     config.server.storage_path = tmp.path().join("storage").display().to_string();
     config.database.url = format!("sqlite:{}?mode=rwc", tmp.path().join("db.sqlite").display());
-    let state = opencargo::server::build_state(&config).await.unwrap();
+    let state = common::build_state(&mut config).await.unwrap();
     idp.token_status(429);
     for _ in 0..40 {
         let begun = state.sso.begin_login("corp", "/").await.unwrap();

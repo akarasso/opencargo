@@ -159,7 +159,7 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let app_state = server::build_state(&cfg).await?;
-            let probe_every = config::parse_duration(&cfg.auth.sso.probe_interval)?
+            let probe_every = config::parse_chrono_duration(&cfg.auth.sso.probe_interval)?
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(60));
             tokio::spawn(server::start_sso_probe(app_state.sso.clone(), probe_every));

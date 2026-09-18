@@ -838,7 +838,7 @@ async fn sso_use_cases(
     secrets: &dyn ServerSecretStore,
 ) -> anyhow::Result<crate::app::sso::Sso> {
     use crate::auth::seal::Sealer;
-    use crate::config::parse_duration;
+    use crate::config::parse_chrono_duration;
     let key = secrets
         .get_or_init(SSO_COOKIE_KEY, &Sealer::random_key())
         .await?;
@@ -857,8 +857,8 @@ async fn sso_use_cases(
         sealer: Arc::new(Sealer::new(&key)?),
         settings: crate::app::sso::SsoSettings {
             base_url: config.server.base_url.clone(),
-            session_ttl: parse_duration(&sso.session_ttl)?,
-            handoff_ttl: parse_duration(&sso.handoff_ttl)?,
+            session_ttl: parse_chrono_duration(&sso.session_ttl)?,
+            handoff_ttl: parse_chrono_duration(&sso.handoff_ttl)?,
             attempt_ttl: chrono::Duration::minutes(10),
             bootstrap: Some(config.auth.admin.username.clone()).filter(|b| !b.is_empty()),
         },
@@ -884,18 +884,18 @@ pub async fn start_sso_probe(sso: Arc<crate::app::sso::Sso>, every: std::time::D
 /// The password mode and the reauthentication bounds, refused at startup
 /// when they do not parse.
 pub fn gate_policy(sso: &crate::config::SsoConfig) -> anyhow::Result<crate::domain::identity::GatePolicy> {
-    use crate::config::parse_duration;
+    use crate::config::parse_chrono_duration;
     let password_mode = crate::domain::identity::PasswordMode::parse(&sso.password_mode)
         .ok_or_else(|| anyhow::anyhow!("auth.sso.password_mode: {:?} is not enabled, admins_only or disabled", sso.password_mode))?;
     let reauth_after = if sso.reauth_after.trim().is_empty() {
         None
     } else {
-        Some(parse_duration(&sso.reauth_after)?)
+        Some(parse_chrono_duration(&sso.reauth_after)?)
     };
     Ok(crate::domain::identity::GatePolicy {
         password_mode,
         reauth_after,
-        grace_max: parse_duration(&sso.reauth_grace_max)?,
+        grace_max: parse_chrono_duration(&sso.reauth_grace_max)?,
     })
 }
 

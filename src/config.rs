@@ -343,7 +343,7 @@ impl Default for SsoConfig {
 
 /// `90s`, `15m`, `12h`, `30d` or bare seconds; anything else is refused
 /// rather than defaulted.
-pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
+pub fn parse_chrono_duration(s: &str) -> Result<chrono::Duration> {
     let s = s.trim();
     let (n, unit) = match s.char_indices().last() {
         Some((i, c)) if c.is_ascii_alphabetic() => (&s[..i], c),
