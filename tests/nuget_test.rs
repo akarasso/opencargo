@@ -237,3 +237,44 @@ async fn npm_gains_no_basic_challenge() {
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     assert!(resp.headers().get("www-authenticate").is_none());
 }
+
+#[tokio::test]
+async fn search_filters_before_the_window_and_never_shows_an_unlisted_version() {
+    let server = setup().await;
+    let c = reqwest::Client::new();
+    let base = &server.base_url;
+    push(&c, base, "nuget", nupkg("Alpha.Lib", "1.0.0", &[])).await;
+    push(&c, base, "nuget", nupkg("Alpha.Lib", "2.0.0-rc.1", &[])).await;
+    push(&c, base, "nuget", nupkg("Beta.Lib", "1.0.0-beta", &[])).await;
+    push(&c, base, "nuget", nupkg("Gamma.Lib", "1.0.0", &[])).await;
+    push(&c, base, "nuget", nupkg("Gamma.Lib", "1.1.0", &[])).await;
+    c.delete(format!("{base}/nuget/v3/package/gamma.lib/1.1.0"))
+        .header("X-NuGet-ApiKey", STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+
+    let (_, stable) = get_json(&c, &format!("{base}/nuget/v3/search?q=lib&take=1")).await;
+    assert_eq!(stable["totalHits"], 2, "Beta.Lib has no stable version");
+    assert_eq!(stable["data"].as_array().unwrap().len(), 1);
+    assert_eq!(stable["data"][0]["id"], "Alpha.Lib");
+    assert_eq!(stable["data"][0]["version"], "1.0.0", "semver2 prereleases filtered");
+
+    let (_, second) = get_json(&c, &format!("{base}/nuget/v3/search?q=lib&skip=1&take=1")).await;
+    assert_eq!(second["data"][0]["id"], "Gamma.Lib");
+    let versions: Vec<&str> = second["data"][0]["versions"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["version"].as_str().unwrap())
+        .collect();
+    assert_eq!(versions, ["1.0.0"], "the unlisted 1.1.0 is not searchable");
+
+    let (_, all) = get_json(
+        &c,
+        &format!("{base}/nuget/v3/search?q=lib&prerelease=true&semVerLevel=2.0.0"),
+    )
+    .await;
+    assert_eq!(all["totalHits"], 3);
+    assert_eq!(all["data"][0]["version"], "2.0.0-rc.1");
+}

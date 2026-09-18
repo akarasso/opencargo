@@ -91,6 +91,7 @@ pub struct Cx<'a> {
     pub packages: &'a dyn PackageStore,
     pub oci: &'a dyn OciStore,
     pub search: &'a dyn SearchIndex,
+    pub nuget: &'a dyn crate::ports::nuget::NugetFeedRead,
     pub proxy: &'a ProxyEngine,
     pub policy: &'a dyn ResolutionRecorder,
     pub creds: &'a dyn UpstreamCredsSource,

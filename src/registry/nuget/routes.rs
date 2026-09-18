@@ -13,6 +13,7 @@ use crate::server::AppState;
 pub fn routes() -> Router<AppState> {
     Router::new()
         .route("/{repo}/v3/index.json", get(service_index))
+        .route("/{repo}/v3/search", get(super::search::search))
         .route("/{repo}/v3/package", put(push))
         .route("/{repo}/v3/package/", put(push))
         .route("/{repo}/api/v2/package", put(push))

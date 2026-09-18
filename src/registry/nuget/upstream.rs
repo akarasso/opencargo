@@ -35,3 +35,12 @@ pub async fn nuspec(
 ) -> Result<Outcome<Payload>, ResolveError> {
     Err(unserved())
 }
+
+pub async fn search(
+    _cx: &Cx<'_>,
+    _member: CacheRepo<'_>,
+    _up: &Upstream,
+    _params: &super::search::SearchParams,
+) -> Result<Outcome<super::search::Found>, ResolveError> {
+    Err(unserved())
+}

@@ -69,6 +69,7 @@ pub struct Resolver {
     packages: Arc<dyn crate::ports::packages::PackageStore>,
     oci: Arc<dyn crate::ports::oci::OciStore>,
     search: Arc<dyn crate::ports::search::SearchIndex>,
+    nuget: Arc<dyn crate::ports::nuget::NugetFeedRead>,
     proxy: ProxyEngine,
 }
 
@@ -101,6 +102,7 @@ impl Resolver {
             packages: db.packages(),
             oci: db.oci(),
             search: db.search(),
+            nuget: db.nuget_feed(),
             proxy,
             fakes: db,
         }
@@ -113,6 +115,7 @@ impl Resolver {
             packages: self.packages.as_ref(),
             oci: self.oci.as_ref(),
             search: self.search.as_ref(),
+            nuget: self.nuget.as_ref(),
             proxy: &self.proxy,
             policy: &self.policy,
             creds: &self.creds,

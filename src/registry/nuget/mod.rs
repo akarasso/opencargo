@@ -7,5 +7,6 @@ pub mod read;
 pub mod render;
 pub mod routes;
 pub mod rules;
+pub mod search;
 pub mod upstream;
 pub mod version;
