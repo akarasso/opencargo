@@ -567,6 +567,7 @@ async fn publishing_over_an_existing_base_version_does_not_abandon_the_deposit()
     fx.store
         .packages()
         .publish_version(&crate::ports::packages::NewRelease {
+            dependencies: &[],
             repository: fx.repo,
             package: GA,
             match_name: NameMatch::Exact,

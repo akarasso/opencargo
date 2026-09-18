@@ -33,6 +33,7 @@ async fn publish(fakes: &FakeDb, key: &str) {
     fakes
         .packages()
         .publish_version(&NewRelease {
+            dependencies: &[],
             repository: repo.id,
             package: "p",
             match_name: NameMatch::Exact,

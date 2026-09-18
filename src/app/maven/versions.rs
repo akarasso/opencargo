@@ -113,6 +113,7 @@ impl MavenVersions {
         let published = self
             .packages
             .publish_version(&NewRelease {
+                dependencies: &[],
                 repository,
                 package: ga,
                 match_name: NameMatch::Exact,
