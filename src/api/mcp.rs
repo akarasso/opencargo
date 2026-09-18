@@ -38,6 +38,39 @@ async fn body<T: for<'de> Deserialize<'de> + Default>(request: axum::http::Reque
 }
 
 #[derive(Deserialize, Default)]
+pub struct ProbeRequest {
+    pub name: Option<String>,
+    pub version: Option<String>,
+}
+
+/// POST /api/v1/mcp/{repo}/probe -- probe the latest versions' remotes now,
+/// or one version's; whether or not the repository probes on a schedule.
+pub async fn probe(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    request: axum::http::Request<axum::body::Body>,
+) -> AppResult<Json<Value>> {
+    admin(&request)?;
+    let repo = mcp_repo(&state, &name).await?;
+    let request: ProbeRequest = body(request).await?;
+    let only = match (&request.name, &request.version) {
+        (Some(server), version) => Some(
+            state
+                .mcp
+                .version(repo.id, repo.id, server, version.as_deref())
+                .await?
+                .ok_or_else(|| AppError::NotFound(format!("server not found: {server}")))?
+                .version_id,
+        ),
+        _ => None,
+    };
+    let cfg = state.mcp_settings.get(&name).cloned().unwrap_or_default();
+    let settings = crate::server::probe_settings_of(&cfg).map_err(|e| AppError::Internal(e.to_string()))?;
+    let report = state.probe_mirror().run(repo.id, &settings, true, only).await?;
+    Ok(Json(json!({"repository": name, "report": report})))
+}
+
+#[derive(Deserialize, Default)]
 pub struct SyncRequest {
     #[serde(default)]
     pub full: bool,

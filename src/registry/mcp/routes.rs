@@ -1,6 +1,6 @@
 use axum::{
     http::{header, Method, Request},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use tower_http::cors::{Any, CorsLayer};
@@ -14,6 +14,9 @@ const VERSIONS: [&str; 2] = ["v0.1", "v0"];
 /// handlers; the gallery a browser-hosted client loads answers CORS.
 pub fn routes() -> Router<AppState> {
     let mut router = Router::new();
+    router = router
+        .route("/{repo}/v0.1/publish", post(super::publish::publish))
+        .route("/{repo}/v0.1/surfaces", post(super::publish::attest));
     for v in VERSIONS {
         router = router
             .route(&format!("/{{repo}}/{v}/servers"), get(list_servers))

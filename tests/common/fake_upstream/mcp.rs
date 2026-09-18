@@ -130,6 +130,170 @@ pub async fn start() -> FakeRegistry {
     FakeRegistry { base_url, state }
 }
 
+/// How the fake MCP server speaks.
+#[derive(Clone, Debug, PartialEq)]
+pub enum Speaks {
+    /// 2026-07-28: stateless, `Mcp-Method` and the namespaced `_meta`
+    /// checked against the headers.
+    Modern,
+    /// The initialization era: a session minted on `initialize`, required
+    /// with `MCP-Protocol-Version` afterwards, after the initialized
+    /// notification; `expire_once` answers the first `tools/list` 404.
+    Legacy { expire_once: bool },
+    /// Modern, answered as an event stream that stays open afterwards.
+    StreamOpen,
+    /// A modern request is refused advertising `2025-11-25`, which then
+    /// speaks the initialization era.
+    Unsupported,
+    HeaderMismatch,
+    Redirect(String),
+}
+
+#[derive(Default)]
+pub struct McpState {
+    pub tools: Vec<Value>,
+    pub sessions: std::collections::HashSet<String>,
+    pub initialized: std::collections::HashSet<String>,
+    pub expired: bool,
+    /// Every request: its method and the `_meta` keys it carried.
+    pub log: Vec<(String, Vec<String>)>,
+}
+
+#[derive(Clone)]
+pub struct FakeMcp {
+    pub url: String,
+    pub speaks: Speaks,
+    pub state: Arc<Mutex<McpState>>,
+}
+
+impl FakeMcp {
+    pub fn methods(&self) -> Vec<String> {
+        self.state.lock().unwrap().log.iter().map(|(m, _)| m.clone()).collect()
+    }
+}
+
+fn rpc_error(status: StatusCode, code: i64, message: &str, data: Value) -> Response {
+    (status, Json(json!({"jsonrpc": "2.0", "id": null, "error": {"code": code, "message": message, "data": data}}))).into_response()
+}
+
+fn header<'a>(h: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+    h.get(name).and_then(|v| v.to_str().ok())
+}
+
+fn tools_result(id: &Value, tools: &[Value]) -> Value {
+    json!({"jsonrpc": "2.0", "id": id, "result": {"tools": tools}})
+}
+
+/// `None`: the headers do not match the request, which a modern server
+/// refuses with a header mismatch.
+fn modern(state: &McpState, headers: &axum::http::HeaderMap, body: &Value) -> Option<Value> {
+    let method = body["method"].as_str().unwrap_or_default();
+    let version = body.pointer("/params/_meta/io.modelcontextprotocol~1protocolVersion").and_then(Value::as_str);
+    if header(headers, "mcp-method") != Some(method) || header(headers, "mcp-protocol-version") != version || version.is_none() {
+        return None;
+    }
+    Some(tools_result(&body["id"], &state.tools))
+}
+
+fn mismatch() -> Response {
+    rpc_error(StatusCode::BAD_REQUEST, -32020, "Mcp-Method header is required from 2026-07-28", json!({}))
+}
+
+fn legacy(state: &mut McpState, headers: &axum::http::HeaderMap, body: &Value, expire_once: bool) -> Response {
+    let method = body["method"].as_str().unwrap_or_default().to_string();
+    if method == "initialize" {
+        let session = format!("s{}", state.sessions.len() + 1);
+        state.sessions.insert(session.clone());
+        let result = json!({"jsonrpc": "2.0", "id": body["id"], "result": {
+            "protocolVersion": "2025-06-18", "capabilities": {"tools": {}}, "serverInfo": {"name": "fake", "version": "1"}}});
+        return ([("mcp-session-id", session)], Json(result)).into_response();
+    }
+    let session = header(headers, "mcp-session-id").map(str::to_string);
+    let Some(session) = session.filter(|s| state.sessions.contains(s)) else {
+        let status = if header(headers, "mcp-session-id").is_some() { StatusCode::NOT_FOUND } else { StatusCode::BAD_REQUEST };
+        return rpc_error(status, -32000, "Bad Request: No valid session ID provided", Value::Null);
+    };
+    if header(headers, "mcp-protocol-version").is_none() {
+        return rpc_error(StatusCode::BAD_REQUEST, -32000, "Bad Request: missing MCP-Protocol-Version", Value::Null);
+    }
+    match method.as_str() {
+        "notifications/initialized" => {
+            state.initialized.insert(session);
+            StatusCode::ACCEPTED.into_response()
+        }
+        "tools/list" if !state.initialized.contains(&session) => {
+            rpc_error(StatusCode::BAD_REQUEST, -32000, "Bad Request: not initialized", Value::Null)
+        }
+        "tools/list" if expire_once && !state.expired => {
+            state.expired = true;
+            state.sessions.remove(&session);
+            StatusCode::NOT_FOUND.into_response()
+        }
+        "tools/list" => Json(tools_result(&body["id"], &state.tools)).into_response(),
+        _ => rpc_error(StatusCode::BAD_REQUEST, -32601, "method not found", Value::Null),
+    }
+}
+
+fn open_stream(response: Value) -> Response {
+    let frames: Vec<Result<bytes::Bytes, std::io::Error>> = vec![
+        Ok(": keep-alive\n\n".into()),
+        Ok(format!("data: {}\n\n", json!({"jsonrpc": "2.0", "method": "notifications/progress", "params": {"progress": 1}})).into()),
+        Ok(format!("data: {}\n\n", json!({"jsonrpc": "2.0", "method": "notifications/message", "params": {"level": "info"}})).into()),
+        Ok(format!("data: {response}\n\n").into()),
+    ];
+    let stream = futures_util::StreamExt::chain(futures_util::stream::iter(frames), futures_util::stream::pending());
+    (
+        [(axum::http::header::CONTENT_TYPE, "text/event-stream")],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response()
+}
+
+async fn mcp_endpoint(
+    State((speaks, state)): State<(Speaks, Arc<Mutex<McpState>>)>,
+    headers: axum::http::HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    let mut st = state.lock().unwrap();
+    let keys = body
+        .pointer("/params/_meta")
+        .and_then(Value::as_object)
+        .map(|m| m.keys().cloned().collect())
+        .unwrap_or_default();
+    st.log.push((body["method"].as_str().unwrap_or_default().to_string(), keys));
+    let is_modern = header(&headers, "mcp-method").is_some() && header(&headers, "mcp-protocol-version") == Some("2026-07-28");
+    match &speaks {
+        Speaks::Modern => modern(&st, &headers, &body).map_or_else(mismatch, |r| Json(r).into_response()),
+        Speaks::StreamOpen => modern(&st, &headers, &body).map_or_else(mismatch, open_stream),
+        Speaks::HeaderMismatch => rpc_error(StatusCode::BAD_REQUEST, -32020, "header mismatch", json!({})),
+        Speaks::Unsupported if is_modern => rpc_error(
+            StatusCode::BAD_REQUEST,
+            -32602,
+            "Unsupported protocol version",
+            json!({"supported": ["2025-11-25"]}),
+        ),
+        Speaks::Unsupported => legacy(&mut st, &headers, &body, false),
+        Speaks::Legacy { expire_once } => legacy(&mut st, &headers, &body, *expire_once),
+        Speaks::Redirect(to) => (StatusCode::TEMPORARY_REDIRECT, [(axum::http::header::LOCATION, to.clone())]).into_response(),
+    }
+}
+
+pub async fn start_mcp(speaks: Speaks, tools: Vec<Value>) -> FakeMcp {
+    let state = Arc::new(Mutex::new(McpState {
+        tools,
+        ..McpState::default()
+    }));
+    let app = Router::new()
+        .route("/mcp", axum::routing::post(mcp_endpoint))
+        .with_state((speaks.clone(), state.clone()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/mcp", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.ok();
+    });
+    FakeMcp { url, speaks, state }
+}
+
 pub fn server(name: &str, version: &str) -> Value {
     json!({
         "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",

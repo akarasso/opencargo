@@ -128,6 +128,7 @@ pub struct AppState {
     /// `[mcp.*]` by repository name; a repository with none takes the defaults.
     pub mcp_settings: Arc<HashMap<String, crate::config::McpConfig>>,
     pub mcp_feed: Arc<dyn crate::ports::mcp_feed::RegistryFeed>,
+    pub mcp_probe: Arc<dyn crate::ports::mcp_feed::ToolProbe>,
     /// Each mirror's sync child and run lock; the binary's supervisor fills it.
     pub mcp_sync: Arc<crate::app::mcp::supervisor::SyncHandles>,
     pub vuln_scanner: Arc<dyn VulnFeed>,
@@ -235,13 +236,36 @@ impl AppState {
         )
     }
 
+    pub fn probe_mirror(&self) -> crate::app::mcp::probe::ProbeMirror {
+        crate::app::mcp::probe::ProbeMirror::new(
+            self.mcp.clone(),
+            self.mcp_probe.clone(),
+            self.clock.clone(),
+            crate::registry::mcp::probe::remotes,
+            crate::registry::mcp::probe::surface,
+        )
+    }
+
+    /// `[mcp.<repo>]`'s probe knobs; `None` while probing is off.
+    pub fn probe_settings(&self, repo: &str) -> anyhow::Result<Option<crate::app::mcp::probe::ProbeSettings>> {
+        let cfg = self.mcp_settings.get(repo).cloned().unwrap_or_default();
+        if !cfg.probe_remotes {
+            return Ok(None);
+        }
+        Ok(Some(probe_settings_of(&cfg)?))
+    }
+
     /// The supervisor the binary spawns: a child per mirror, each on its
-    /// configured interval.
+    /// configured interval, probing after each run where configured.
     pub fn sync_supervisor(&self) -> anyhow::Result<crate::app::mcp::supervisor::SyncSupervisor> {
         let mut intervals = HashMap::new();
+        let mut probes = HashMap::new();
         for (name, cfg) in self.mcp_settings.iter() {
             let every = crate::config::parse_chrono_duration(&cfg.sync_interval)?.to_std()?;
             intervals.insert(name.clone(), every.max(std::time::Duration::from_secs(60)));
+            if let Some(settings) = self.probe_settings(name)? {
+                probes.insert(name.clone(), Arc::new(settings));
+            }
         }
         Ok(crate::app::mcp::supervisor::SyncSupervisor::new(
             self.mcp_sync.clone(),
@@ -249,7 +273,8 @@ impl AppState {
             Arc::new(self.sync_mirror()),
             self.events.clone(),
             intervals,
-        ))
+        )
+        .probing(Arc::new(self.probe_mirror()), probes))
     }
 
     /// The only deleter of shared keys, over this state's stores.
@@ -382,6 +407,23 @@ pub async fn storage_reclaim(
             .await?),
         None => Ok(reclaim.run(now).await),
     }
+}
+
+/// The probe knobs of one `[mcp.*]` section, probing on or not.
+pub fn probe_settings_of(cfg: &crate::config::McpConfig) -> anyhow::Result<crate::app::mcp::probe::ProbeSettings> {
+    let auth_header = cfg
+        .probe_auth
+        .as_deref()
+        .and_then(|h| h.split_once(':'))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()));
+    Ok(crate::app::mcp::probe::ProbeSettings {
+        options: crate::ports::mcp_feed::ProbeOptions {
+            allow_private: cfg.probe_allow_private,
+            auth_header,
+        },
+        interval: crate::config::parse_chrono_duration(&cfg.probe_interval)?.to_std()?,
+        concurrency: cfg.probe_concurrency,
+    })
 }
 
 /// `opencargo mcp sync`: one run of one mirror or of every mirror, each
@@ -662,6 +704,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         mcp,
         mcp_settings: Arc::new(config.mcp.clone()),
         mcp_feed: Arc::new(crate::adapters::mcp_http::HttpRegistryFeed::new()?),
+        mcp_probe: Arc::new(crate::adapters::mcp_http::HttpToolProbe::new()),
         mcp_sync: Arc::default(),
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
@@ -1312,6 +1355,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/system/storage", get(crate::api::storage::storage_status))
         .route("/api/v1/maven/{repo}/decide", post(crate::api::maven::decide))
         .route("/api/v1/mcp/{repo}/sync", post(crate::api::mcp::sync))
+        .route("/api/v1/mcp/{repo}/probe", post(crate::api::mcp::probe))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),

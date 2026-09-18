@@ -12,6 +12,7 @@ use tokio::sync::Notify;
 use tokio::task::JoinHandle;
 use tracing::{info, warn};
 
+use super::probe::{ProbeMirror, ProbeSettings};
 use super::sync::{SyncError, SyncMirror, SyncReport};
 use crate::domain::{DomainEvent, Format, RepoKind};
 use crate::error::StoreError;
@@ -76,6 +77,8 @@ pub struct SyncSupervisor {
     events: Arc<dyn Events>,
     intervals: Arc<HashMap<String, Duration>>,
     default_interval: Duration,
+    probe: Option<Arc<ProbeMirror>>,
+    probes: Arc<HashMap<String, Arc<ProbeSettings>>>,
 }
 
 impl SyncSupervisor {
@@ -93,7 +96,16 @@ impl SyncSupervisor {
             events,
             intervals: Arc::new(intervals),
             default_interval: Duration::from_secs(3600),
+            probe: None,
+            probes: Arc::default(),
         }
+    }
+
+    /// Probe the remotes of the named mirrors after each of their runs.
+    pub fn probing(mut self, probe: Arc<ProbeMirror>, settings: HashMap<String, Arc<ProbeSettings>>) -> Self {
+        self.probe = Some(probe);
+        self.probes = Arc::new(settings);
+        self
     }
 
     /// The children the repositories call for, and no others.
@@ -120,13 +132,17 @@ impl SyncSupervisor {
             }
             let notify = Arc::new(Notify::new());
             let interval = self.intervals.get(&name).copied().unwrap_or(self.default_interval);
+            let probe = self.probe.clone().zip(self.probes.get(&name).cloned());
             let handle = tokio::spawn(child(
-                self.handles.clone(),
-                self.sync.clone(),
-                id,
-                name,
-                upstream.clone(),
-                interval,
+                Mirror {
+                    handles: self.handles.clone(),
+                    sync: self.sync.clone(),
+                    probe,
+                    repository: id,
+                    name,
+                    upstream: upstream.clone(),
+                    interval,
+                },
                 notify.clone(),
             ));
             children.insert(id, Child { upstream, notify, handle });
@@ -172,15 +188,26 @@ fn wait_after(interval: Duration, failures: u32, error: Option<&SyncError>) -> D
     interval.saturating_mul(1u32 << failures.min(10)).min(MAX_BACKOFF)
 }
 
-async fn child(
+struct Mirror {
     handles: Arc<SyncHandles>,
     sync: Arc<SyncMirror>,
+    probe: Option<(Arc<ProbeMirror>, Arc<ProbeSettings>)>,
     repository: i64,
     name: String,
     upstream: String,
     interval: Duration,
-    notify: Arc<Notify>,
-) {
+}
+
+async fn child(m: Mirror, notify: Arc<Notify>) {
+    let Mirror {
+        handles,
+        sync,
+        probe,
+        repository,
+        name,
+        upstream,
+        interval,
+    } = m;
     let mut failures = 0u32;
     loop {
         let outcome = run_locked(&handles, &sync, repository, &upstream, false).await;
@@ -188,6 +215,12 @@ async fn child(
             Ok(report) => {
                 failures = 0;
                 info!(repository = %name, pages = report.pages, changed = report.changed, skipped = report.skipped, "MCP mirror synced");
+                if let Some((probe, settings)) = &probe {
+                    match probe.run(repository, settings, false, None).await {
+                        Ok(r) => info!(repository = %name, probed = r.probed, answered = r.answered, "MCP remotes probed"),
+                        Err(e) => warn!(repository = %name, error = %e, "MCP probe run failed"),
+                    }
+                }
                 wait_after(interval, 0, None)
             }
             Err(e) => {
