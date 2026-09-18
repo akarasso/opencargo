@@ -161,8 +161,13 @@ async fn cargo_index_line_and_yank_come_from_the_source_index() {
     assert_eq!(run.count("copied"), 2);
     let lines = index_lines(&t, "cargo", "zl/ib/zlib-sys").await;
     assert_eq!(lines.len(), 2);
-    for (got, want) in lines.iter().zip(&source_lines) {
-        assert_eq!(got["vers"], want["vers"]);
+    // The lanes copy concurrently, so the index file's line order is theirs;
+    // each version is matched by name, not by position.
+    for want in &source_lines {
+        let got = lines
+            .iter()
+            .find(|l| l["vers"] == want["vers"])
+            .unwrap_or_else(|| panic!("no index line for {} in {lines:?}", want["vers"]));
         assert_eq!(got["yanked"], want["yanked"], "{} {}", got["vers"], got["yanked"]);
         assert_eq!(got["cksum"], want["cksum"]);
         for key in ["features", "features2", "v", "links", "rust_version"] {

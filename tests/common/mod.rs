@@ -105,6 +105,9 @@ impl TestServer {
     /// Stop serving and give the lease back, as a clean shutdown would.
     pub async fn stop(&mut self) {
         self.handle.abort();
+        // A barrier, not a request: nothing the server owned outlives `stop`,
+        // so the next door finds no descriptor of its still open.
+        (&mut self.handle).await.ok();
         if let Some(lease) = self.lease.take() {
             lease.release().await;
         }
