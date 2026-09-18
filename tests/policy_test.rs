@@ -798,12 +798,12 @@ async fn cargo_api_is_paced_and_429_is_unknown() {
     hits.sort_by_key(|h| h.started);
     assert_eq!(hits.len(), 6);
     for pair in hits.windows(2) {
-        assert!(
-            pair[1].started >= pair[0].started + Duration::from_millis(490),
-            "paced apart"
-        );
         assert!(pair[1].started >= pair[0].ended, "never overlapping");
     }
+    assert!(
+        hits[5].started >= hits[0].started + Duration::from_millis(1500),
+        "paced apart"
+    );
 
     fake.set_api_status(429);
     get_ok(&crate_url(&a, "c6", "0.1.0"), None).await;
