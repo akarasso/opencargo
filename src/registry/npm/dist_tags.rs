@@ -30,7 +30,7 @@ pub async fn get_dist_tags(
 
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
     let leaf = DistTagsLeaf { name: package_name };
     let tags = first_hit(&cx(&state, auth, &repo), &repo, &leaf).await?;
@@ -57,7 +57,7 @@ async fn writable_tag_target(
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Npm)?;
-    crate::registry::ensure_can_write(&state.db, &repo, &user).await?;
+    crate::registry::ensure_can_write(&*state.permissions, &repo, &user).await?;
 
     let package = crate::db::get_package(&state.db, repo.id, &package_name)
         .await?

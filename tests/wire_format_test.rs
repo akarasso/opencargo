@@ -1,7 +1,7 @@
-//! The three surfaces that serve a stored column verbatim today, pinned
-//! before the row types are retyped: two of them serve SQLite's
-//! `YYYY-MM-DD HH:MM:SS` and must serve RFC 3339, the third serves a hosted
-//! repository's absent config and must keep serving JSON `null`.
+//! The surfaces that serve a stored column verbatim, pinned as each row type
+//! is retyped: most of them served SQLite's `YYYY-MM-DD HH:MM:SS` and must
+//! serve RFC 3339, while a hosted repository's absent config must keep
+//! serving JSON `null`.
 
 mod common;
 
@@ -108,4 +108,84 @@ async fn a_hosted_repository_serves_a_null_config() {
         .expect("repository is not json");
 
     assert_eq!(repo["config"], Value::Null, "{repo}");
+}
+
+/// `GET /api/v1/users/{u}` serves `users.created_at` and `updated_at`, and
+/// nothing in the suite pinned their format before `User` was retyped.
+#[tokio::test]
+async fn user_timestamps_are_rfc_3339() {
+    let srv = server().await;
+    let client = reqwest::Client::new();
+
+    let created: Value = client
+        .post(format!("{}/api/v1/users", srv.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&serde_json::json!({"username": "wire", "role": "reader"}))
+        .send()
+        .await
+        .expect("user creation failed")
+        .json()
+        .await
+        .expect("created user is not json");
+    rfc3339("created_at", &created["created_at"]);
+
+    let user: Value = client
+        .get(format!("{}/api/v1/users/wire", srv.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .expect("user request failed")
+        .json()
+        .await
+        .expect("user is not json");
+
+    rfc3339("created_at", &user["created_at"]);
+    rfc3339("updated_at", &user["updated_at"]);
+}
+
+/// An API token's three timestamps reach the client the same way. The expiry
+/// matters most: it used to be written and read back in one adapter's
+/// spelling, on the path that rejects a credential.
+#[tokio::test]
+async fn token_timestamps_are_rfc_3339() {
+    let srv = server().await;
+    let client = reqwest::Client::new();
+
+    client
+        .post(format!("{}/api/v1/users", srv.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&serde_json::json!({"username": "wire", "role": "reader"}))
+        .send()
+        .await
+        .expect("user creation failed");
+
+    let issued: Value = client
+        .post(format!("{}/api/v1/users/wire/tokens", srv.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&serde_json::json!({"name": "ci", "expires_in_days": 30}))
+        .send()
+        .await
+        .expect("token creation failed")
+        .json()
+        .await
+        .expect("issued token is not json");
+    rfc3339("expires_at", &issued["expires_at"]);
+
+    let listed: Value = client
+        .get(format!("{}/api/v1/users/wire/tokens", srv.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .expect("token list failed")
+        .json()
+        .await
+        .expect("token list is not json");
+    let token = &listed[0];
+    rfc3339("created_at", &token["created_at"]);
+    rfc3339("expires_at", &token["expires_at"]);
+    assert_eq!(
+        token["last_used_at"],
+        Value::Null,
+        "an unused token has no last_used_at: {token}"
+    );
 }

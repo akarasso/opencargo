@@ -23,7 +23,10 @@ use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
+use crate::ports::permissions::PermissionStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
+use crate::ports::tokens::{NewToken, TokenStore};
+use crate::ports::users::{NewUser, UserPatch, UserStore};
 use crate::ports::webhooks::{NewWebhook, WebhookStore};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
 use crate::storage::StorageBackend;
@@ -60,6 +63,9 @@ pub struct AppState {
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
     pub webhooks: Arc<dyn WebhookStore>,
+    pub users: Arc<dyn UserStore>,
+    pub tokens: Arc<dyn TokenStore>,
+    pub permissions: Arc<dyn PermissionStore>,
     pub vuln_scanner: Arc<VulnScanner>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
@@ -115,78 +121,20 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     // Shared between AuthState (Basic Auth throttling) and AppState (npm login).
     let login_rate_limiter = Arc::new(RateLimiter::new(5, 60));
 
+    let stores = crate::adapters::sqlite::SqliteStores::new(db.clone());
+    let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
+
     let auth = Arc::new(AuthState {
         static_tokens: config.auth.static_tokens.clone(),
         anonymous_read: config.auth.anonymous_read,
-        db: db.clone(),
+        users: users.clone(),
+        tokens: tokens.clone(),
         login_rate_limiter: login_rate_limiter.clone(),
         base_url: config.server.base_url.clone(),
         registry_tokens: crate::registry::oci::token::TokenSigner::random(),
     });
 
-    // Create admin user from config if it doesn't exist
-    if !config.auth.admin.username.is_empty() {
-        let admin_username = &config.auth.admin.username;
-
-        // Determine the password file path
-        let password_file = {
-            let storage = std::path::Path::new(&config.server.storage_path);
-            let data_dir = storage.parent().unwrap_or(std::path::Path::new("data"));
-            data_dir.join("admin.password")
-        };
-
-        match crate::db::get_user_by_username(&db, admin_username).await? {
-            None => {
-                // Admin user does not exist yet — create it
-                // Priority: env var > config > random
-                let raw_password = if let Ok(env_pw) = std::env::var("OPENCARGO_ADMIN_PASSWORD") {
-                    if !env_pw.is_empty() { env_pw } else { crate::auth::users::generate_random_password() }
-                } else if !config.auth.admin.password.is_empty()
-                    && config.auth.admin.password != "admin"
-                    && config.auth.admin.password != "changeme"
-                {
-                    config.auth.admin.password.clone()
-                } else {
-                    crate::auth::users::generate_random_password()
-                };
-
-                let from_env = std::env::var("OPENCARGO_ADMIN_PASSWORD").is_ok();
-
-                let password_hash = crate::auth::users::hash_password(&raw_password)
-                    .map_err(|e| anyhow::anyhow!("failed to hash admin password: {e}"))?;
-
-                crate::db::create_user(&db, admin_username, None, &password_hash, "admin").await?;
-
-                if from_env {
-                    // Password from env var (k8s Secret) — no file, no forced change
-                    info!(username = %admin_username, "Admin user created with password from OPENCARGO_ADMIN_PASSWORD");
-                } else {
-                    // Generated password — write to file and force change
-                    if let Some(user) = crate::db::get_user_by_username(&db, admin_username).await? {
-                        crate::db::set_must_change_password(&db, user.id, true).await?;
-                    }
-                    if let Some(parent) = password_file.parent() {
-                        std::fs::create_dir_all(parent)?;
-                    }
-                    std::fs::write(&password_file, &raw_password)?;
-                    warn!(
-                        "Initial admin password written to {} — change it on first login",
-                        password_file.display()
-                    );
-                }
-                info!(username = %admin_username, "Initial admin user created");
-            }
-            Some(user) => {
-                // Admin user already exists
-                if password_file.exists() && user.must_change_password == 1 {
-                    warn!(
-                        "Admin password has not been changed yet. Initial password is still in {}",
-                        password_file.display()
-                    );
-                }
-            }
-        }
-    }
+    ensure_admin_user(users.as_ref(), config).await?;
 
     let connect_timeout_secs = parse_duration_secs(&config.proxy.connect_timeout);
     let ttl = TtlConfig {
@@ -205,7 +153,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     // Initialize Prometheus metrics
     let metrics_handle = telemetry::init_metrics();
 
-    let webhooks = crate::adapters::sqlite::SqliteStores::new(db.clone()).webhooks();
+    let webhooks = stores.webhooks();
     seed_webhooks(webhooks.as_ref(), &config.webhooks, Utc::now()).await?;
 
     let webhook_dispatcher = Arc::new(WebhookDispatcher::new(webhooks.clone()));
@@ -244,11 +192,97 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
         webhooks,
+        users,
+        tokens,
+        permissions,
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,
         policy,
     })
+}
+
+/// Create the configured admin account on a fresh install, and warn on every
+/// later boot while its generated password is still the one on disk.
+async fn ensure_admin_user(users: &dyn UserStore, config: &Config) -> anyhow::Result<()> {
+    let admin_username = &config.auth.admin.username;
+    if admin_username.is_empty() {
+        return Ok(());
+    }
+    let password_file = {
+        let storage = std::path::Path::new(&config.server.storage_path);
+        let data_dir = storage.parent().unwrap_or(std::path::Path::new("data"));
+        data_dir.join("admin.password")
+    };
+
+    if let Some(user) = users.by_name(admin_username).await? {
+        if password_file.exists() && user.must_change_password {
+            warn!(
+                "Admin password has not been changed yet. Initial password is still in {}",
+                password_file.display()
+            );
+        }
+        return Ok(());
+    }
+
+    let from_env = std::env::var("OPENCARGO_ADMIN_PASSWORD").is_ok();
+    let raw_password = initial_admin_password(config);
+    let password_hash = crate::auth::users::hash_password(&raw_password)
+        .map_err(|e| anyhow::anyhow!("failed to hash admin password: {e}"))?;
+    let admin = users
+        .create(
+            &NewUser {
+                username: admin_username,
+                email: None,
+                password_hash: &password_hash,
+                role: "admin",
+            },
+            Utc::now(),
+        )
+        .await?;
+
+    if from_env {
+        // Password from a k8s Secret: no file to leave behind, no forced change.
+        info!(username = %admin_username, "Admin user created with password from OPENCARGO_ADMIN_PASSWORD");
+    } else {
+        users
+            .update(
+                &admin.username,
+                &UserPatch {
+                    must_change_password: Some(true),
+                    ..UserPatch::default()
+                },
+                Utc::now(),
+            )
+            .await?;
+        if let Some(parent) = password_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        std::fs::write(&password_file, &raw_password)?;
+        warn!(
+            "Initial admin password written to {} — change it on first login",
+            password_file.display()
+        );
+    }
+    info!(username = %admin_username, "Initial admin user created");
+    Ok(())
+}
+
+/// Env var, then a config value that is not one of the two placeholders, then
+/// a random one. Setting the variable at all means the config file's value is
+/// not wanted, so an empty one falls through to random rather than to it.
+fn initial_admin_password(config: &Config) -> String {
+    if let Ok(env_pw) = std::env::var("OPENCARGO_ADMIN_PASSWORD") {
+        if !env_pw.is_empty() {
+            return env_pw;
+        }
+    } else if !config.auth.admin.password.is_empty()
+        && config.auth.admin.password != "admin"
+        && config.auth.admin.password != "changeme"
+    {
+        return config.auth.admin.password.clone();
+    }
+    crate::auth::users::generate_random_password()
 }
 
 /// The configured registrations, in the port's vocabulary: the config file
@@ -608,7 +642,7 @@ async fn npm_login(
     };
 
     // Look up the user
-    let user = match crate::db::get_user_by_username(&state.db, &login.name).await {
+    let user = match state.users.by_name(&login.name).await {
         Ok(Some(u)) => u,
         _ => {
             return (
@@ -635,39 +669,42 @@ async fn npm_login(
             .into_response();
     }
 
-    let must_change = user.must_change_password == 1;
+    let must_change = user.must_change_password;
 
-    // Create a new API token for this login session
-    let token_id = uuid::Uuid::new_v4().to_string();
-    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_");
-    let prefix = &raw_token[..16];
-
-    // Token expires in 30 days by default for npm login
-    let expires_at = {
-        let expiry = chrono::Utc::now() + chrono::Duration::days(30);
-        expiry.format("%Y-%m-%d %H:%M:%S").to_string()
-    };
-
-    if crate::db::create_api_token(
-        &state.db,
-        &token_id,
-        user.id,
-        "npm-login",
-        prefix,
-        &token_hash,
-        Some(&expires_at),
-    )
-    .await
-    .is_err()
-    {
+    let Ok(raw_token) = issue_login_token(&state, user.id).await else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to create token"})),
         )
             .into_response();
-    }
+    };
 
     (StatusCode::CREATED, Json(json!({"ok": true, "token": raw_token, "must_change_password": must_change}))).into_response()
+}
+
+/// The session token an `npm login` walks away with: 30 days by default, like
+/// every other credential this endpoint has ever issued.
+async fn issue_login_token(
+    state: &AppState,
+    user_id: i64,
+) -> Result<String, crate::error::StoreError> {
+    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_");
+    let now = Utc::now();
+    state
+        .tokens
+        .create(
+            &NewToken {
+                id: &uuid::Uuid::new_v4().to_string(),
+                user_id,
+                name: "npm-login",
+                prefix: &raw_token[..16],
+                token_hash: &token_hash,
+                expires_at: Some(now + chrono::Duration::days(30)),
+            },
+            now,
+        )
+        .await?;
+    Ok(raw_token)
 }
 
 const ENV_UPSTREAM_AUTH: &str = "OPENCARGO_UPSTREAM_AUTH_";

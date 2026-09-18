@@ -148,7 +148,9 @@ pub async fn erase(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
     let user_id = match (q.user.as_deref(), q.user_id) {
-        (Some(name), None) => crate::db::get_user_by_username(&state.db, name)
+        (Some(name), None) => state
+            .users
+            .by_name(name)
             .await?
             .map(|u| u.id)
             .ok_or_else(|| AppError::NotFound(format!("user not found: {name}")))?,

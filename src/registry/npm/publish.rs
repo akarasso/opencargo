@@ -99,7 +99,7 @@ pub async fn publish_package(
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Npm)?;
-    crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
+    crate::registry::ensure_can_write(&*state.permissions, &repo, &auth_user).await?;
 
     let steps = plan_versions(&state, &repo, &package_name, &body).await?;
 

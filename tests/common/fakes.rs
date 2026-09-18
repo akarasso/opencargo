@@ -13,15 +13,21 @@
 //! CI runs clippy over the test targets with `-D warnings`.
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use opencargo::domain::{CacheEntry, CacheEntryId, NewEntry, RepoId, Webhook};
+use opencargo::domain::{
+    ApiToken, CacheEntry, CacheEntryId, NewEntry, RepoId, Rights, User, Webhook,
+};
 use opencargo::error::StoreError;
+use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::ports::proxy_cache::ProxyCacheStore;
+use opencargo::ports::tokens::{NewToken, TokenStore};
+use opencargo::ports::users::{NewUser, UserPatch, UserStore};
 use opencargo::ports::webhooks::{NewWebhook, WebhookPatch, WebhookStore};
 
 /// Which port a queued failure belongs to.
@@ -29,12 +35,30 @@ use opencargo::ports::webhooks::{NewWebhook, WebhookPatch, WebhookStore};
 pub enum PortId {
     Webhooks,
     ProxyCache,
+    Users,
+    Tokens,
+    Permissions,
+}
+
+/// One grant, keyed the way the table is.
+#[derive(Clone)]
+struct Grant {
+    user_id: i64,
+    repository_id: i64,
+    rights: Rights,
 }
 
 #[derive(Default)]
 struct State {
     webhooks: Vec<Webhook>,
     cache: Vec<CacheEntry>,
+    users: Vec<User>,
+    tokens: Vec<ApiToken>,
+    grants: Vec<Grant>,
+    /// Repository names, so a grant can be listed with the repository it is
+    /// on; a grant whose repository is absent lists with `None`, which is the
+    /// state the admin screen has to show.
+    repo_names: HashMap<i64, String>,
     next_id: i64,
     next_cache_id: i64,
     /// Queued refusals: a fake that cannot fail only ever proves the happy
@@ -68,6 +92,28 @@ impl FakeDb {
         Arc::new(ProxyCache(self.0.clone()))
     }
 
+    pub fn users(&self) -> Arc<dyn UserStore> {
+        Arc::new(Users(self.0.clone()))
+    }
+
+    pub fn tokens(&self) -> Arc<dyn TokenStore> {
+        Arc::new(Tokens(self.0.clone()))
+    }
+
+    pub fn perms(&self) -> Arc<dyn PermissionStore> {
+        Arc::new(Permissions(self.0.clone()))
+    }
+
+    /// Name a repository so grants on it list with that name. The fake holds
+    /// no repository aggregate of its own until `RepositoryStore` lands.
+    pub fn name_repository(&self, id: i64, name: &str) {
+        self.0
+            .lock()
+            .unwrap()
+            .repo_names
+            .insert(id, name.to_string());
+    }
+
     /// Make the next call on `port` fail with `err`.
     pub fn fail_next(&self, port: PortId, err: StoreError) {
         self.0.lock().unwrap().failures.push((port, err));
@@ -82,17 +128,6 @@ impl Webhooks {
     /// an adapter, not about the port.
     fn stamp(now: DateTime<Utc>) -> String {
         now.to_rfc3339()
-    }
-
-    fn with<T>(
-        &self,
-        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
-        let mut state = self.0.lock().unwrap();
-        match state.refusal(PortId::Webhooks) {
-            Some(err) => Err(err),
-            None => act(&mut state),
-        }
     }
 
     fn find(state: &mut State, id: i64) -> Result<&mut Webhook, StoreError> {
@@ -122,11 +157,11 @@ impl Webhooks {
 #[async_trait]
 impl WebhookStore for Webhooks {
     async fn all(&self) -> Result<Vec<Webhook>, StoreError> {
-        self.with(|state| Ok(state.webhooks.clone()))
+        guarded(&self.0, PortId::Webhooks, |state| Ok(state.webhooks.clone()))
     }
 
     async fn by_id(&self, id: i64) -> Result<Option<Webhook>, StoreError> {
-        self.with(|state| Ok(state.webhooks.iter().find(|hook| hook.id == id).cloned()))
+        guarded(&self.0, PortId::Webhooks, |state| Ok(state.webhooks.iter().find(|hook| hook.id == id).cloned()))
     }
 
     async fn create(
@@ -134,7 +169,7 @@ impl WebhookStore for Webhooks {
         hook: &NewWebhook<'_>,
         now: DateTime<Utc>,
     ) -> Result<Webhook, StoreError> {
-        self.with(|state| Ok(Self::insert(state, hook, now)))
+        guarded(&self.0, PortId::Webhooks, |state| Ok(Self::insert(state, hook, now)))
     }
 
     async fn update(
@@ -143,7 +178,7 @@ impl WebhookStore for Webhooks {
         patch: &WebhookPatch<'_>,
         now: DateTime<Utc>,
     ) -> Result<Webhook, StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::Webhooks, |state| {
             let stored = Self::find(state, id)?;
             if patch.touches_nothing() {
                 return Ok(stored.clone());
@@ -166,7 +201,7 @@ impl WebhookStore for Webhooks {
     }
 
     async fn delete(&self, id: i64) -> Result<(), StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::Webhooks, |state| {
             let at = state
                 .webhooks
                 .iter()
@@ -178,7 +213,7 @@ impl WebhookStore for Webhooks {
     }
 
     async fn active(&self) -> Result<Vec<Webhook>, StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::Webhooks, |state| {
             Ok(state
                 .webhooks
                 .iter()
@@ -193,7 +228,7 @@ impl WebhookStore for Webhooks {
         hooks: &[NewWebhook<'_>],
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::Webhooks, |state| {
             if hooks.is_empty() || !state.webhooks.is_empty() {
                 return Ok(());
             }
@@ -205,20 +240,270 @@ impl WebhookStore for Webhooks {
     }
 }
 
+/// The shared guard every handle takes: one queued refusal for this port, or
+/// the action.
+fn guarded<T>(
+    state: &Arc<Mutex<State>>,
+    port: PortId,
+    act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+) -> Result<T, StoreError> {
+    let mut state = state.lock().unwrap();
+    match state.refusal(port) {
+        Some(err) => Err(err),
+        None => act(&mut state),
+    }
+}
+
+struct Users(Arc<Mutex<State>>);
+
+impl Users {
+    fn find<'s>(state: &'s mut State, username: &str) -> Result<&'s mut User, StoreError> {
+        state
+            .users
+            .iter_mut()
+            .find(|user| user.username == username)
+            .ok_or(StoreError::NotFound)
+    }
+}
+
+#[async_trait]
+impl UserStore for Users {
+    async fn by_name(&self, username: &str) -> Result<Option<User>, StoreError> {
+        guarded(&self.0, PortId::Users, |state| {
+            Ok(state
+                .users
+                .iter()
+                .find(|user| user.username == username)
+                .cloned())
+        })
+    }
+
+    async fn by_id(&self, id: i64) -> Result<Option<User>, StoreError> {
+        guarded(&self.0, PortId::Users, |state| {
+            Ok(state.users.iter().find(|user| user.id == id).cloned())
+        })
+    }
+
+    async fn all(&self) -> Result<Vec<User>, StoreError> {
+        guarded(&self.0, PortId::Users, |state| Ok(state.users.clone()))
+    }
+
+    async fn create(&self, user: &NewUser<'_>, now: DateTime<Utc>) -> Result<User, StoreError> {
+        guarded(&self.0, PortId::Users, |state| {
+            if state.users.iter().any(|u| u.username == user.username) {
+                return Err(StoreError::Conflict);
+            }
+            state.next_id += 1;
+            let stored = User {
+                id: state.next_id,
+                username: user.username.to_string(),
+                email: user.email.map(str::to_string),
+                password_hash: user.password_hash.to_string(),
+                role: user.role.to_string(),
+                must_change_password: false,
+                created_at: now,
+                updated_at: now,
+            };
+            state.users.push(stored.clone());
+            Ok(stored)
+        })
+    }
+
+    async fn update(
+        &self,
+        username: &str,
+        patch: &UserPatch<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<User, StoreError> {
+        guarded(&self.0, PortId::Users, |state| {
+            let stored = Self::find(state, username)?;
+            if patch.touches_nothing() {
+                return Ok(stored.clone());
+            }
+            if let Some(email) = patch.email {
+                stored.email = Some(email.to_string());
+            }
+            if let Some(hash) = patch.password_hash {
+                stored.password_hash = hash.to_string();
+            }
+            if let Some(role) = patch.role {
+                stored.role = role.to_string();
+            }
+            if let Some(must_change) = patch.must_change_password {
+                stored.must_change_password = must_change;
+            }
+            stored.updated_at = now;
+            Ok(stored.clone())
+        })
+    }
+
+    async fn delete(&self, username: &str) -> Result<(), StoreError> {
+        guarded(&self.0, PortId::Users, |state| {
+            let at = state
+                .users
+                .iter()
+                .position(|user| user.username == username)
+                .ok_or(StoreError::NotFound)?;
+            let gone = state.users.remove(at).id;
+            state.tokens.retain(|token| token.user_id != gone);
+            state.grants.retain(|grant| grant.user_id != gone);
+            Ok(())
+        })
+    }
+}
+
+struct Tokens(Arc<Mutex<State>>);
+
+#[async_trait]
+impl TokenStore for Tokens {
+    async fn by_prefix(&self, prefix: &str) -> Result<Option<ApiToken>, StoreError> {
+        guarded(&self.0, PortId::Tokens, |state| {
+            Ok(state
+                .tokens
+                .iter()
+                .find(|token| token.prefix == prefix)
+                .cloned())
+        })
+    }
+
+    async fn by_id(&self, id: &str) -> Result<Option<ApiToken>, StoreError> {
+        guarded(&self.0, PortId::Tokens, |state| {
+            Ok(state.tokens.iter().find(|token| token.id == id).cloned())
+        })
+    }
+
+    async fn of_user(&self, user_id: i64) -> Result<Vec<ApiToken>, StoreError> {
+        guarded(&self.0, PortId::Tokens, |state| {
+            let mut mine: Vec<ApiToken> = state
+                .tokens
+                .iter()
+                .filter(|token| token.user_id == user_id)
+                .cloned()
+                .collect();
+            mine.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            Ok(mine)
+        })
+    }
+
+    async fn create(
+        &self,
+        token: &NewToken<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<ApiToken, StoreError> {
+        guarded(&self.0, PortId::Tokens, |state| {
+            if state.tokens.iter().any(|stored| stored.id == token.id) {
+                return Err(StoreError::Conflict);
+            }
+            let stored = ApiToken {
+                id: token.id.to_string(),
+                user_id: token.user_id,
+                name: token.name.to_string(),
+                prefix: token.prefix.to_string(),
+                token_hash: token.token_hash.to_string(),
+                expires_at: token.expires_at,
+                last_used_at: None,
+                created_at: now,
+            };
+            state.tokens.push(stored.clone());
+            Ok(stored)
+        })
+    }
+
+    async fn delete(&self, id: &str) -> Result<(), StoreError> {
+        guarded(&self.0, PortId::Tokens, |state| {
+            let at = state
+                .tokens
+                .iter()
+                .position(|token| token.id == id)
+                .ok_or(StoreError::NotFound)?;
+            state.tokens.remove(at);
+            Ok(())
+        })
+    }
+
+    async fn touch(&self, id: &str, now: DateTime<Utc>) -> Result<(), StoreError> {
+        guarded(&self.0, PortId::Tokens, |state| {
+            let stored = state
+                .tokens
+                .iter_mut()
+                .find(|token| token.id == id)
+                .ok_or(StoreError::NotFound)?;
+            stored.last_used_at = Some(now);
+            Ok(())
+        })
+    }
+}
+
+struct Permissions(Arc<Mutex<State>>);
+
+#[async_trait]
+impl PermissionStore for Permissions {
+    async fn rights(
+        &self,
+        user_id: i64,
+        repository_id: i64,
+    ) -> Result<Option<Rights>, StoreError> {
+        guarded(&self.0, PortId::Permissions, |state| {
+            Ok(state
+                .grants
+                .iter()
+                .find(|grant| grant.user_id == user_id && grant.repository_id == repository_id)
+                .map(|grant| grant.rights))
+        })
+    }
+
+    async fn of_user(&self, user_id: i64) -> Result<Vec<RepoRights>, StoreError> {
+        guarded(&self.0, PortId::Permissions, |state| {
+            Ok(state
+                .grants
+                .iter()
+                .filter(|grant| grant.user_id == user_id)
+                .map(|grant| RepoRights {
+                    repository_id: grant.repository_id,
+                    repository: state.repo_names.get(&grant.repository_id).cloned(),
+                    rights: grant.rights,
+                })
+                .collect())
+        })
+    }
+
+    async fn set(
+        &self,
+        user_id: i64,
+        repository_id: i64,
+        rights: Rights,
+        _now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        guarded(&self.0, PortId::Permissions, |state| {
+            match state
+                .grants
+                .iter_mut()
+                .find(|grant| grant.user_id == user_id && grant.repository_id == repository_id)
+            {
+                Some(grant) => grant.rights = rights,
+                None => state.grants.push(Grant {
+                    user_id,
+                    repository_id,
+                    rights,
+                }),
+            }
+            Ok(())
+        })
+    }
+
+    async fn revoke(&self, user_id: i64, repository_id: i64) -> Result<(), StoreError> {
+        guarded(&self.0, PortId::Permissions, |state| {
+            state
+                .grants
+                .retain(|grant| !(grant.user_id == user_id && grant.repository_id == repository_id));
+            Ok(())
+        })
+    }
+}
+
 struct ProxyCache(Arc<Mutex<State>>);
 
 impl ProxyCache {
-    fn with<T>(
-        &self,
-        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
-    ) -> Result<T, StoreError> {
-        let mut state = self.0.lock().unwrap();
-        match state.refusal(PortId::ProxyCache) {
-            Some(err) => Err(err),
-            None => act(&mut state),
-        }
-    }
-
     fn at(state: &mut State, repo: RepoId, kind: &str, key: &str) -> Option<usize> {
         state
             .cache
@@ -236,7 +521,7 @@ impl ProxyCacheStore for ProxyCache {
         key: &str,
         now: DateTime<Utc>,
     ) -> Result<Option<CacheEntry>, StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::ProxyCache, |state| {
             let found = Self::at(state, repo, kind, key).map(|at| {
                 let mut row = state.cache[at].clone();
                 row.fresh = CacheEntry::fresh_at(row.expires_at, now);
@@ -247,7 +532,7 @@ impl ProxyCacheStore for ProxyCache {
     }
 
     async fn upsert(&self, entry: &NewEntry<'_>, now: DateTime<Utc>) -> Result<(), StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::ProxyCache, |state| {
             let at = Self::at(state, entry.repository_id, entry.kind, entry.cache_key);
             let id = match at {
                 Some(at) => state.cache[at].id,
@@ -286,7 +571,7 @@ impl ProxyCacheStore for ProxyCache {
         ttl: Option<Duration>,
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::ProxyCache, |state| {
             if let Some(row) = state.cache.iter_mut().find(|row| row.id == id) {
                 row.last_used_at = now;
                 if let Some(until) = CacheEntry::expiry(ttl, now) {
@@ -298,7 +583,7 @@ impl ProxyCacheStore for ProxyCache {
     }
 
     async fn delete_for_repo(&self, repo: RepoId) -> Result<u64, StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::ProxyCache, |state| {
             let before = state.cache.len();
             state.cache.retain(|row| row.repository_id != repo);
             Ok((before - state.cache.len()) as u64)
@@ -311,7 +596,7 @@ impl ProxyCacheStore for ProxyCache {
         now: DateTime<Utc>,
         limit: u32,
     ) -> Result<Vec<CacheEntry>, StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::ProxyCache, |state| {
             let unused_since = now - idle;
             let mut rows: Vec<CacheEntry> = state
                 .cache
@@ -333,7 +618,7 @@ impl ProxyCacheStore for ProxyCache {
     }
 
     async fn delete(&self, id: CacheEntryId) -> Result<(), StoreError> {
-        self.with(|state| {
+        guarded(&self.0, PortId::ProxyCache, |state| {
             state.cache.retain(|row| row.id != id);
             Ok(())
         })

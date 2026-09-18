@@ -47,12 +47,12 @@ async fn load_repository(
 /// repository the caller cannot read must be indistinguishable from a package
 /// that does not exist, so the denial maps to the same 404 as the name lookup.
 async fn ensure_readable_or_not_found(
-    db: &sqlx::SqlitePool,
+    perms: &dyn crate::ports::permissions::PermissionStore,
     repo: &crate::domain::Repository,
     auth_user: Option<&AuthUser>,
     name: &str,
 ) -> AppResult<()> {
-    crate::registry::ensure_can_read(db, repo, auth_user)
+    crate::registry::ensure_can_read(perms, repo, auth_user)
         .await
         .map_err(|_| AppError::NotFound(format!("package not found: {name}")))
 }
@@ -94,7 +94,7 @@ async fn get_vulns_impl(
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
 
     let repo = load_repository(&state.db, pkg.repository_id).await?;
-    ensure_readable_or_not_found(&state.db, &repo, auth_user.as_ref(), &name).await?;
+    ensure_readable_or_not_found(&*state.permissions, &repo, auth_user.as_ref(), &name).await?;
 
     let version = crate::db::get_version(&state.db, pkg.id, &version_str)
         .await?
@@ -173,7 +173,7 @@ async fn rescan_impl(
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
 
     let repo = load_repository(&state.db, pkg.repository_id).await?;
-    ensure_readable_or_not_found(&state.db, &repo, auth_user.as_ref(), &name).await?;
+    ensure_readable_or_not_found(&*state.permissions, &repo, auth_user.as_ref(), &name).await?;
 
     // Rescan destroys the stored scan results and triggers outbound OSV
     // queries, so it requires write access on the repo, like publish. The
@@ -182,7 +182,7 @@ async fn rescan_impl(
     let caller = auth_user
         .as_ref()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    crate::registry::ensure_can_write(&state.db, &repo, caller).await?;
+    crate::registry::ensure_can_write(&*state.permissions, &repo, caller).await?;
 
     let version = crate::db::get_version(&state.db, pkg.id, &version_str)
         .await?

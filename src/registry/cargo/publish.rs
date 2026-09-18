@@ -166,7 +166,7 @@ async fn load_hosted(state: &AppState, repo_name: &str, user: &AuthUser) -> AppR
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Cargo)?;
-    crate::registry::ensure_can_write(&state.db, &repo, user).await?;
+    crate::registry::ensure_can_write(&*state.permissions, &repo, user).await?;
     Ok(repo)
 }
 
