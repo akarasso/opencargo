@@ -105,7 +105,7 @@ async fn a_digest_mismatch_is_a_bad_gateway_and_nothing_is_served() {
         let resp = get(&nupkg_url(&server, "bad", "1.0.0")).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
-    assert_eq!(up.count("/bad.1.0.0.nupkg"), 2, "a refused body is never cached");
+    assert_eq!(up.count("/bad.1.0.0.nupkg"), 1, "quarantined on its announced digest, not fetched again (C6)");
 }
 
 #[tokio::test]
