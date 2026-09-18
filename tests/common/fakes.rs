@@ -2857,10 +2857,11 @@ impl ReclaimStore for Reclaim {
         self.with(|state| Ok(state.reclaim.state().clone()))
     }
 
-    async fn new_epoch(&self) -> Result<Epoch, StoreError> {
+    async fn new_epoch(&self, counter: u64) -> Result<Epoch, StoreError> {
         self.with(|state| {
             let current = state.reclaim.state();
             current.epoch = uuid::Uuid::new_v4().simple().to_string();
+            current.counter = current.counter.max(counter);
             current.verify_pending = true;
             Ok(current.clone())
         })

@@ -2194,7 +2194,7 @@ macro_rules! reclaim_contract {
                     before[0].physical_key
                 );
 
-                let drawn = h.reclaim.new_epoch().await.unwrap();
+                let drawn = h.reclaim.new_epoch(0).await.unwrap();
                 assert_ne!(drawn.epoch, first.epoch, "an epoch is opaque and freshly drawn");
                 assert_eq!(drawn.installation, first.installation, "the installation outlives it");
                 assert!(drawn.verify_pending, "a new epoch owes a verify");
@@ -2204,7 +2204,7 @@ macro_rules! reclaim_contract {
                     "a generation of another epoch is never reusable"
                 );
 
-                let again = h.reclaim.new_epoch().await.unwrap();
+                let again = h.reclaim.new_epoch(0).await.unwrap();
                 assert_ne!(again.epoch, drawn.epoch, "two draws never collide");
                 h.reclaim.verified(&drawn.epoch).await.unwrap();
                 assert!(

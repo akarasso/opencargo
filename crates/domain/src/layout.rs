@@ -2,6 +2,18 @@
 //! Every new key of a repository lies under its incarnation's prefix, so a
 //! retired name and its recreation share nothing.
 
+/// The store's own tree: the high-water mark and nothing else. No row ever
+/// references a key under it, and no scan ever proposes one.
+pub const RESERVED: &str = "_opencargo";
+
+/// Where the high-water mark lives.
+pub const MARK: &str = "_opencargo/mark";
+
+/// Whether a key belongs to the store's own tree.
+pub fn reserved(key: &str) -> bool {
+    under(key, RESERVED)
+}
+
 /// The prefix every new key of an incarnation lies under.
 pub fn incarnation_prefix(incarnation: &str) -> String {
     format!("r/{incarnation}")
@@ -127,6 +139,12 @@ mod tests {
         assert_eq!(generation_epoch("r/i/p/f~deadbeef"), None, "minted before epochs");
         assert_eq!(generation_epoch("npm/r/p/f.tgz"), None);
         assert_eq!(generation_epoch("r/i/p/f~e1-"), None);
+    }
+
+    #[test]
+    fn the_reserved_tree_is_the_stores_own() {
+        assert!(reserved(MARK) && reserved(RESERVED));
+        assert!(!reserved("_opencargoing/x") && !reserved("r/i/p/f"));
     }
 
     #[test]

@@ -79,8 +79,9 @@ pub trait ReclaimStore: Send + Sync {
     async fn epoch(&self) -> Result<Epoch, StoreError>;
 
     /// Draws a fresh opaque epoch — never a counter, so two branches of one
-    /// backup never draw the same — and refuses reclamation until verified.
-    async fn new_epoch(&self) -> Result<Epoch, StoreError>;
+    /// backup never draw the same — adopts `counter` when it is ahead of
+    /// what the database holds, and refuses reclamation until verified.
+    async fn new_epoch(&self, counter: u64) -> Result<Epoch, StoreError>;
 
     /// Refuses reclamation until verified, under the same epoch.
     async fn require_verify(&self) -> Result<(), StoreError>;

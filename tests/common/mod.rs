@@ -240,13 +240,14 @@ pub fn config_of(server: &TestServer) -> Config {
     config
 }
 
-/// Every key the server's store holds, sorted.
+/// Every key the server's store holds but its own reserved tree, sorted.
 pub async fn stored_keys(server: &TestServer) -> Vec<String> {
     use futures_util::TryStreamExt;
     let mut keys: Vec<String> = storage_of(server)
         .await
         .list("")
         .map_ok(|meta| meta.key)
+        .try_filter(|key| std::future::ready(!opencargo::domain::layout::reserved(key)))
         .try_collect()
         .await
         .expect("failed to list the server's store");

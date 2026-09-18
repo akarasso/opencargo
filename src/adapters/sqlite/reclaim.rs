@@ -368,15 +368,19 @@ impl ReclaimStore for SqliteReclaimStore {
         .await
     }
 
-    async fn new_epoch(&self) -> Result<Epoch, StoreError> {
-        immediate(&self.pool, |mut tx| {
+    async fn new_epoch(&self, counter: u64) -> Result<Epoch, StoreError> {
+        let counter = i64::try_from(counter).unwrap_or(i64::MAX);
+        immediate(&self.pool, move |mut tx| {
             Box::pin(async move {
                 let drawn = async {
                     sqlx::query(
                         "UPDATE reclaim_epoch
-                         SET epoch = lower(hex(randomblob(16))), verify_pending = 1
+                         SET epoch = lower(hex(randomblob(16))),
+                             counter = max(counter, ?1),
+                             verify_pending = 1
                          WHERE id = 1",
                     )
+                    .bind(counter)
                     .execute(&mut *tx)
                     .await?;
                     Ok(Ok(current_epoch(&mut tx).await?))
