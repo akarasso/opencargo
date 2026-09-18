@@ -24,6 +24,7 @@ use crate::app::promote::PromoteVersion;
 use crate::app::publish::PublishVersion;
 use crate::app::publish_tail::{PublishGate, PublishTail};
 use crate::app::reclaim::{ReclaimOrphans, ReclaimPolicy};
+use crate::ports::multipart::MultipartLedger;
 use crate::ports::reclaim::ReclaimStore;
 use crate::ports::referenced::ReferencedKeys;
 use crate::app::authenticate::{Authenticate, AuthenticateDeps, OpenGate, Refusal};
@@ -214,6 +215,9 @@ impl Role {
 pub struct ResolvedLocation {
     backend: &'static str,
     root: std::path::PathBuf,
+    /// Endpoint, region and bucket of an S3 store, compared as a tuple
+    /// before its prefix.
+    service: Option<(String, String, String)>,
 }
 
 impl std::fmt::Debug for ResolvedLocation {
@@ -227,6 +231,7 @@ impl ResolvedLocation {
     /// which contains the other.
     pub fn disjoint(&self, other: &ResolvedLocation) -> bool {
         self.backend != other.backend
+            || self.service != other.service
             || !(self.root.starts_with(&other.root) || other.root.starts_with(&self.root))
     }
 }
@@ -238,17 +243,58 @@ pub struct BuiltStorage {
 }
 
 pub fn build_storage(root: impl Into<std::path::PathBuf>, role: Role) -> BuiltStorage {
-    let identity = StoreIdentity(role.name().to_string());
+    filesystem_store(root, StoreIdentity(role.name().to_string()))
+}
+
+fn filesystem_store(root: impl Into<std::path::PathBuf>, identity: StoreIdentity) -> BuiltStorage {
     #[allow(clippy::disallowed_types)]
     let fs = crate::adapters::fs::FilesystemStorage::new(root, identity.clone());
     let location = ResolvedLocation {
         backend: "fs",
         root: fs.root().to_path_buf(),
+        service: None,
     };
     BuiltStorage {
         backend: Arc::new(fs),
         identity,
         location,
+    }
+}
+
+/// The store `config` declares for `role`: the filesystem under the storage
+/// path, or S3 with its multipart uploads recorded in `ledger`.
+pub fn build_configured_storage(
+    config: &Config,
+    role: Role,
+    ledger: Arc<dyn MultipartLedger>,
+    clock: Arc<dyn Clock>,
+) -> anyhow::Result<BuiltStorage> {
+    let identity = StoreIdentity(
+        config
+            .storage
+            .id
+            .clone()
+            .unwrap_or_else(|| role.name().to_string()),
+    );
+    match config.storage.backend {
+        crate::config::StorageKind::Fs => Ok(filesystem_store(&config.server.storage_path, identity)),
+        crate::config::StorageKind::S3 => {
+            let settings = crate::adapters::s3::settings::S3Settings::from_process(&config.storage.s3)?;
+            let s3 = crate::adapters::s3::S3Storage::build(&settings, identity.clone(), ledger, clock)?;
+            Ok(BuiltStorage {
+                backend: Arc::new(s3),
+                identity,
+                location: ResolvedLocation {
+                    backend: "s3",
+                    root: std::path::PathBuf::from(&settings.prefix),
+                    service: Some((
+                        settings.endpoint.clone().unwrap_or_default(),
+                        settings.region.clone(),
+                        settings.bucket.clone(),
+                    )),
+                },
+            })
+        }
     }
 }
 
@@ -272,7 +318,14 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let repos = stores.repositories();
     seed_repositories(repos.as_ref(), &config.repositories, Utc::now()).await?;
 
-    let storage = build_storage(&config.server.storage_path, Role::Artifacts).backend;
+    config.validate()?;
+    let storage = build_configured_storage(
+        config,
+        Role::Artifacts,
+        stores.multipart(),
+        Arc::new(crate::adapters::system::SystemClock),
+    )?
+    .backend;
 
     let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 
@@ -1143,6 +1196,64 @@ pub fn decode_percent_encoded_slashes<B>(
         }
     }
     req
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::ResolvedLocation;
+
+    fn location(backend: &'static str, root: &str, bucket: Option<&str>) -> ResolvedLocation {
+        ResolvedLocation {
+            backend,
+            root: std::path::PathBuf::from(root),
+            service: bucket.map(|b| ("http://s3".to_string(), "eu".to_string(), b.to_string())),
+        }
+    }
+
+    trait Fallback {
+        fn displays(&self) -> bool {
+            false
+        }
+        fn serializes(&self) -> bool {
+            false
+        }
+    }
+    impl<T> Fallback for T {}
+    struct Probe<T>(T);
+    impl<T: std::fmt::Display> Probe<T> {
+        #[allow(dead_code)]
+        fn displays(&self) -> bool {
+            true
+        }
+    }
+    impl<T: serde::Serialize> Probe<T> {
+        #[allow(dead_code)]
+        fn serializes(&self) -> bool {
+            true
+        }
+    }
+
+    /// The location may be compared, never rendered: no `Display`, no
+    /// `Serialize`, and a `Debug` that names nothing.
+    #[test]
+    fn resolved_location_has_no_display_or_serialize() {
+        let loc = location("s3", "inst", Some("secret-bucket"));
+        assert!(!Probe(&loc).displays());
+        assert!(!Probe(&loc).serializes());
+        assert!(Probe(&"a string").displays(), "the probe tells the two apart");
+        assert_eq!(format!("{loc:?}"), "ResolvedLocation(..)");
+    }
+
+    /// Tuple first, then prefix on segment boundaries.
+    #[test]
+    fn locations_are_disjoint_by_service_then_prefix() {
+        let a = location("s3", "inst/a", Some("b1"));
+        assert!(!a.disjoint(&location("s3", "inst", Some("b1"))), "a prefix inside another");
+        assert!(a.disjoint(&location("s3", "inst/ab", Some("b1"))), "a string-prefix sibling");
+        assert!(a.disjoint(&location("s3", "inst", Some("b2"))), "another bucket");
+        assert!(a.disjoint(&location("fs", "inst/a", None)), "another backend");
+        assert!(!location("fs", "/d", None).disjoint(&location("fs", "/d/sub", None)));
+    }
 }
 
 #[cfg(test)]

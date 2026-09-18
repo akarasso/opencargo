@@ -80,6 +80,10 @@ dirs = "6"
 # HTTP client (proxy upstream)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 
+# Object storage: named only under src/adapters/s3/ (boundary row object-store).
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+webpki-root-certs = "1"
+
 # URLs: the upstream vocabulary of the strategy port, which must not name the
 # HTTP client it happens to be re-exported from.
 url = "2"
@@ -110,6 +114,7 @@ cvss = "2.2"
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 tempfile = "3"
+percent-encoding = "2"
 tokio-test = "0.4"
 rcgen = "0.13"
 # WebSocket client for tests/ws_test.rs. Already a transitive dependency of

@@ -134,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
             }
         }
         Commands::ValidateConfig { path } => {
-            let _cfg = config::load_config(Some(&path))?;
+            config::load_config(Some(&path))?.validate()?;
             println!("Config is valid.");
         }
         Commands::Migrate => {

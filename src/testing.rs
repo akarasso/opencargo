@@ -28,3 +28,11 @@ pub mod resolver;
 /// An in-memory storage backend with a delete log and injected faults.
 #[cfg(test)]
 pub mod storage;
+
+/// An in-process S3 endpoint with injectable faults, for the S3 adapter.
+#[cfg(test)]
+pub mod fake_s3;
+
+/// The multipart ledger in memory.
+#[cfg(test)]
+pub mod ledger;

@@ -15,6 +15,7 @@ use crate::proxy::UpstreamAuth;
 #[serde(default)]
 pub struct Config {
     pub server: ServerConfig,
+    pub storage: StorageConfig,
     pub database: DatabaseConfig,
     pub auth: AuthConfig,
     pub proxy: ProxyConfig,
@@ -99,6 +100,144 @@ pub struct TlsConfig {
     pub enabled: bool,
     pub cert_path: String,
     pub key_path: String,
+}
+
+// ---------------------------------------------------------------------------
+// Storage
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum StorageKind {
+    #[default]
+    Fs,
+    S3,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct StorageConfig {
+    pub backend: StorageKind,
+    /// The store's declared identity; its role's name when absent. Never an
+    /// endpoint, a bucket or a path.
+    pub id: Option<String>,
+    pub s3: S3Config,
+}
+
+/// Credentials are never read from here: only from the environment, through
+/// the S3 adapter's allowlist.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct S3Config {
+    pub bucket: String,
+    pub region: String,
+    pub endpoint: Option<String>,
+    /// Isolates this instance inside a shared bucket.
+    pub prefix: String,
+    pub allow_http: bool,
+    pub virtual_hosted_style: bool,
+    /// How long one request may stay idle.
+    pub request_timeout: String,
+    /// The outer bound of a multipart completion or a server-side copy.
+    pub completion_timeout: String,
+    pub part_size_mib: u64,
+    /// Server-side multipart uploads open at once, process-wide.
+    pub max_multipart_uploads: usize,
+    /// Positive existence answers kept for `head`; 0 disables the cache.
+    pub exists_cache_entries: usize,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        Self {
+            bucket: String::new(),
+            region: "us-east-1".to_string(),
+            endpoint: None,
+            prefix: String::new(),
+            allow_http: false,
+            virtual_hosted_style: false,
+            request_timeout: "30s".to_string(),
+            completion_timeout: "15m".to_string(),
+            part_size_mib: 16,
+            max_multipart_uploads: 8,
+            exists_cache_entries: 10_000,
+        }
+    }
+}
+
+/// `30s`, `15m`, `2h`, or a bare number of seconds.
+pub fn parse_duration(value: &str) -> Result<std::time::Duration> {
+    let value = value.trim();
+    let (digits, unit) = value.split_at(value.find(|c: char| !c.is_ascii_digit()).unwrap_or(value.len()));
+    let n: u64 = digits
+        .parse()
+        .with_context(|| format!("invalid duration: '{value}'"))?;
+    let secs = match unit {
+        "" | "s" => n,
+        "m" => n * 60,
+        "h" => n * 3600,
+        _ => anyhow::bail!("invalid duration unit in '{value}'"),
+    };
+    Ok(std::time::Duration::from_secs(secs))
+}
+
+/// A prefix as the S3 adapter uses it: segments joined by `/`, none empty,
+/// none `.` or `..`, so two spellings of one prefix cannot alias.
+pub fn normalize_prefix(prefix: &str) -> Result<String> {
+    let trimmed = prefix.trim_matches('/');
+    if trimmed.is_empty() {
+        return Ok(String::new());
+    }
+    for segment in trimmed.split('/') {
+        if segment.is_empty() || segment == "." || segment == ".." || segment.starts_with('_') {
+            anyhow::bail!("invalid storage prefix: '{prefix}'");
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+/// Two stores one process builds may not share an identity: the ledger
+/// scopes its rows by it.
+pub fn refuse_duplicate_identities<'a>(identities: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut seen = std::collections::HashSet::new();
+    for id in identities {
+        if !seen.insert(id) {
+            anyhow::bail!("two stores are declared with the identity '{id}'");
+        }
+    }
+    Ok(())
+}
+
+impl Config {
+    /// The identity of every store this process builds.
+    pub fn store_identities(&self) -> Vec<String> {
+        vec![self.storage.id.clone().unwrap_or_else(|| "artifacts".to_string())]
+    }
+
+    /// What a config must satisfy before any store is built.
+    pub fn validate(&self) -> Result<()> {
+        let ids = self.store_identities();
+        if ids.iter().any(|id| id.trim().is_empty()) {
+            anyhow::bail!("a storage id may not be empty");
+        }
+        refuse_duplicate_identities(ids.iter().map(String::as_str))?;
+        if self.storage.backend == StorageKind::S3 {
+            let s3 = &self.storage.s3;
+            if s3.bucket.trim().is_empty() && std::env::var("OPENCARGO_S3_BUCKET").is_err() {
+                anyhow::bail!("[storage.s3] bucket is required");
+            }
+            normalize_prefix(&s3.prefix)?;
+            parse_duration(&s3.request_timeout)?;
+            parse_duration(&s3.completion_timeout)?;
+            if s3.part_size_mib < 5 {
+                anyhow::bail!("[storage.s3] part_size_mib must be at least 5");
+            }
+            if s3.max_multipart_uploads == 0 {
+                anyhow::bail!("[storage.s3] max_multipart_uploads must be at least 1");
+            }
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -283,4 +422,50 @@ pub fn load_config(path: Option<&Path>) -> Result<Config> {
 
     // Nothing found -- return defaults.
     Ok(Config::default())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_storage_section_takes_documented_defaults() {
+        let config: Config = toml::from_str("").unwrap();
+        assert_eq!(config.storage.backend, StorageKind::Fs);
+        assert_eq!(config.storage.id, None);
+        let s3 = &config.storage.s3;
+        assert_eq!((s3.request_timeout.as_str(), s3.completion_timeout.as_str()), ("30s", "15m"));
+        assert_eq!((s3.part_size_mib, s3.max_multipart_uploads, s3.exists_cache_entries), (16, 8, 10_000));
+        assert_eq!(s3.region, "us-east-1");
+        config.validate().unwrap();
+
+        let partial: Config = toml::from_str("[storage]\nbackend = \"s3\"\n[storage.s3]\nbucket = \"b\"\n").unwrap();
+        assert_eq!(partial.storage.s3.request_timeout, "30s", "a partial section keeps the defaults");
+        partial.validate().unwrap();
+    }
+
+    #[test]
+    fn validate_refuses_duplicate_store_identities() {
+        assert!(refuse_duplicate_identities(["artifacts", "backup"]).is_ok());
+        assert!(refuse_duplicate_identities(["artifacts", "artifacts"]).is_err());
+        let blank: Config = toml::from_str("[storage]\nid = \" \"\n").unwrap();
+        assert!(blank.validate().is_err());
+    }
+
+    #[test]
+    fn default_identity_is_the_role() {
+        assert_eq!(Config::default().store_identities(), vec!["artifacts".to_string()]);
+    }
+
+    #[test]
+    fn prefixes_are_normalized_so_two_spellings_never_alias() {
+        assert_eq!(normalize_prefix("/team/a/").unwrap(), "team/a");
+        assert_eq!(normalize_prefix("").unwrap(), "");
+        for bad in ["a//b", "a/../b", "./a", "_scratch", "a/_backend"] {
+            assert!(normalize_prefix(bad).is_err(), "{bad}");
+        }
+        assert_eq!(parse_duration("15m").unwrap().as_secs(), 900);
+        assert_eq!(parse_duration("45").unwrap().as_secs(), 45);
+        assert!(parse_duration("3d").is_err());
+    }
 }

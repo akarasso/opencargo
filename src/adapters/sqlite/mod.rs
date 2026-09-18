@@ -21,6 +21,7 @@ use crate::error::StoreError;
 use crate::ports::audit::AuditStore;
 use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
+use crate::ports::multipart::MultipartLedger;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
@@ -300,6 +301,10 @@ impl SqliteStores {
 
     pub fn policy(&self) -> Arc<dyn PolicyStore> {
         Arc::new(policy::SqlitePolicyStore::new(self.pool.clone()))
+    }
+
+    pub fn multipart(&self) -> Arc<dyn MultipartLedger> {
+        Arc::new(multipart::SqliteMultipartLedger::new(self.pool.clone()))
     }
 
     pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {
