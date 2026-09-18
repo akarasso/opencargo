@@ -85,6 +85,11 @@ async fn main() -> anyhow::Result<()> {
                 app_state.reclaim.clone(),
                 app_state.clock.clone(),
                 cfg.cleanup.clone(),
+                app_state.reconcilers(),
+            ));
+            tokio::spawn(opencargo::telemetry::cleanup::start_reconcile_task(
+                app_state.reconcilers(),
+                app_state.clock.clone(),
             ));
 
             tokio::spawn(opencargo::app::sweep_storage::start_storage_sweep(

@@ -176,6 +176,24 @@ impl AppState {
         )
     }
 
+    /// Every format's reconciler, for `RunCleanup` to iterate.
+    pub fn reconcilers(&self) -> Vec<Arc<dyn crate::app::reconcile::Reconciler>> {
+        vec![Arc::new(crate::app::maven::reconcile::MavenReconcile::new(
+            self.maven_versions(),
+            MAVEN_PROMOTION_WINDOW,
+            1000,
+            crate::registry::maven::hosted::scopes_of_unit,
+        ))]
+    }
+
+    pub fn decide_maven_unit(&self) -> crate::app::maven::admin::DecideUnit {
+        crate::app::maven::admin::DecideUnit::new(
+            self.maven_versions(),
+            self.audit.clone(),
+            self.events.clone(),
+        )
+    }
+
     /// The only deleter of shared keys, over this state's stores.
     pub fn reclaim_orphans(&self) -> ReclaimOrphans {
         ReclaimOrphans::new(
@@ -192,6 +210,10 @@ impl AppState {
         Announce::new(self.events.clone(), self.repos.clone())
     }
 }
+
+/// How long a Maven unit deposited without its POM waits before
+/// `RunCleanup` may make it visible.
+const MAVEN_PROMOTION_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
 
 /// The path prefixes the protocol adapters mount under the root, which no
 /// new repository may be named after.
@@ -698,6 +720,7 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::api::webhooks::test_webhook),
         )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
+        .route("/api/v1/maven/{repo}/decide", post(crate::api::maven::decide))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),

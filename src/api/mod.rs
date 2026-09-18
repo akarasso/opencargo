@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod dashboard;
 pub mod deps;
+pub mod maven;
 pub mod me;
 pub mod permissions;
 pub mod policy;

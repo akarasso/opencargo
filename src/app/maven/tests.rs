@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
@@ -164,22 +164,38 @@ impl Fx {
         (self, hooked)
     }
 
-    fn deposits(&self) -> MavenDeposits {
-        let storage: Arc<dyn StorageBackend> = Arc::new(self.storage.clone());
-        let versions = MavenVersions::new(
+    fn versions(&self) -> Arc<MavenVersions> {
+        Arc::new(MavenVersions::new(
             self.maven.clone(),
             self.store.packages(),
             self.store.repositories(),
-            storage.clone(),
+            Arc::new(self.storage.clone()),
             self.announced.clone(),
             crate::registry::maven::pom::metadata_json,
-        );
+        ))
+    }
+
+    fn deposits(&self) -> MavenDeposits {
+        let storage: Arc<dyn StorageBackend> = Arc::new(self.storage.clone());
         MavenDeposits::new(
             self.store.repositories(),
             storage.clone(),
             Arc::new(Placer::new(self.store.reclaim(), storage)),
-            Arc::new(versions),
+            self.versions(),
         )
+    }
+
+    fn reconciler(&self) -> super::reconcile::MavenReconcile {
+        super::reconcile::MavenReconcile::new(
+            self.versions(),
+            TimeDelta::minutes(10),
+            100,
+            hosted::scopes_of_unit,
+        )
+    }
+
+    fn announcements(&self) -> usize {
+        self.announced.0.lock().unwrap().len()
     }
 
     async fn put(&self, version: &str, filename: &str, who: &str, body: &'static [u8]) -> Result<Deposited, DepositError> {
@@ -238,7 +254,7 @@ impl Fx {
             .unwrap()
     }
 
-    async fn versions(&self) -> usize {
+    async fn version_rows(&self) -> usize {
         let packages = self.store.packages();
         match packages.package(self.repo, GA, NameMatch::Exact).await.unwrap() {
             Some(p) => packages.versions(p.id).await.unwrap().len(),
@@ -432,16 +448,16 @@ async fn a_new_build_moves_the_counter_and_not_the_version_stamp() {
     let v = "1.0-SNAPSHOT";
     let scope = hosted::scope_snapshot(GA, v);
     let counter = || async { fx.store.maven().counter(fx.repo, &scope).await.unwrap().value };
-    assert_eq!(fx.versions().await, 0);
+    assert_eq!(fx.version_rows().await, 0);
     fx.put(v, "lib-1.0-20260918.120000-1.pom", "ci", b"<project/>").await.unwrap();
     let first = fx.snapshot(v).await.unwrap();
-    assert_eq!(fx.versions().await, 1, "the first visible build publishes the base version");
+    assert_eq!(fx.version_rows().await, 1, "the first visible build publishes the base version");
     assert_eq!(counter().await, 1);
     assert_eq!(fx.announced.0.lock().unwrap().len(), 1);
 
     fx.put(v, "lib-1.0-20260918.130000-2.pom", "ci", b"<project/>").await.unwrap();
     let second = fx.snapshot(v).await.unwrap();
-    assert_eq!(fx.versions().await, 1, "the version stamp does not move for a build");
+    assert_eq!(fx.version_rows().await, 1, "the version stamp does not move for a build");
     assert_eq!(counter().await, 2);
     assert_ne!(first.etag, second.etag);
     let stamp = |e: &str| e.trim_matches('"').rsplit_once('.').unwrap().0.to_string();
@@ -465,8 +481,129 @@ async fn a_failed_version_row_leaves_the_file_served_and_unversioned() {
     fx.store.fail_next(crate::testing::fakes::PortId::Packages, StoreError::Unavailable);
     let done = fx.put("1.0", "lib-1.0.pom", "alice", b"<project/>").await.unwrap();
     assert_eq!(done, Deposited::Stored { revealed: true });
-    assert_eq!(fx.versions().await, 0);
+    assert_eq!(fx.version_rows().await, 0);
     assert_eq!(fx.store.maven().unversioned(10).await.unwrap().len(), 1);
-    let count = AtomicUsize::new(fx.announced.0.lock().unwrap().len());
-    assert_eq!(count.load(Ordering::SeqCst), 0);
+    assert_eq!(fx.announcements(), 0);
+}
+
+fn outcomes(items: &[crate::app::reconcile::Item]) -> Vec<(String, crate::app::reconcile::Reconciled)> {
+    items.iter().map(|i| (i.name.clone(), i.outcome.clone())).collect()
+}
+
+#[tokio::test]
+async fn a_crash_before_the_version_row_is_repaired_and_announced_once() {
+    use crate::app::reconcile::{Reconciled, Reconciler};
+    let fx = Fx::new().await;
+    fx.store.fail_next(crate::testing::fakes::PortId::Packages, StoreError::Unavailable);
+    fx.put("1.0", "lib-1.0.pom", "alice", b"<project/>").await.unwrap();
+    assert_eq!((fx.version_rows().await, fx.announcements()), (0, 0), "the crash left a visible unit alone");
+
+    let first = fx.reconciler().pass(Utc::now()).await;
+    assert_eq!(outcomes(&first), vec![(format!("version {GA}:1.0"), Reconciled::Repaired)]);
+    assert_eq!((fx.version_rows().await, fx.announcements()), (1, 1));
+    let second = fx.reconciler().pass(Utc::now()).await;
+    assert!(second.is_empty(), "{second:?}");
+    assert_eq!(fx.announcements(), 1, "one package.published");
+}
+
+#[tokio::test]
+async fn a_conflict_on_one_item_does_not_stop_the_pass() {
+    use crate::app::reconcile::{Reconciled, Reconciler};
+    let fx = Fx::new().await;
+    for v in ["1.0", "2.0"] {
+        fx.store.fail_next(crate::testing::fakes::PortId::Packages, StoreError::Unavailable);
+        fx.put(v, &format!("lib-{v}.pom"), "alice", b"<project/>").await.unwrap();
+    }
+    fx.store.fail_next(crate::testing::fakes::PortId::Packages, StoreError::Conflict);
+    let pass = fx.reconciler().pass(Utc::now()).await;
+    let outcomes = outcomes(&pass);
+    assert_eq!(outcomes.len(), 2);
+    assert!(matches!(outcomes[0].1, Reconciled::Failed(_)), "{outcomes:?}");
+    assert_eq!(outcomes[1].1, Reconciled::Repaired, "the pass went on");
+    fx.reconciler().pass(Utc::now()).await;
+    assert_eq!(fx.store.maven().unversioned(10).await.unwrap().len(), 0);
+    assert_eq!(fx.announcements(), 2);
+}
+
+#[tokio::test]
+async fn publishing_over_an_existing_base_version_does_not_abandon_the_deposit() {
+    let fx = Fx::new().await;
+    fx.store
+        .packages()
+        .publish_version(&crate::ports::packages::NewRelease {
+            repository: fx.repo,
+            package: GA,
+            match_name: NameMatch::Exact,
+            description: None,
+            readme: None,
+            version: "1.0",
+            metadata_json: "{}",
+            checksum_sha1: None,
+            checksum_sha256: None,
+            integrity: None,
+            size: 1,
+            tarball_path: "elsewhere",
+            dist_tags: &[],
+            pins: &[],
+            now: Utc::now(),
+        })
+        .await
+        .unwrap();
+    let done = fx.put("1.0", "lib-1.0.pom", "alice", b"<project/>").await.unwrap();
+    assert_eq!(done, Deposited::Stored { revealed: true });
+    assert_eq!(fx.version_rows().await, 1);
+    assert!(fx.store.maven().unversioned(10).await.unwrap().is_empty());
+    assert_eq!(fx.announcements(), 0);
+}
+
+#[tokio::test]
+async fn a_quiet_jar_without_pom_is_promoted_once_the_window_has_passed() {
+    use crate::app::reconcile::{Reconciled, Reconciler};
+    let fx = Fx::new().await;
+    fx.put("1.0", "lib-1.0.jar", "alice", b"jar").await.unwrap();
+    let early = fx.reconciler().pass(Utc::now() + TimeDelta::minutes(5)).await;
+    assert!(early.is_empty(), "{early:?}");
+    let late = fx.reconciler().pass(Utc::now() + TimeDelta::minutes(11)).await;
+    assert_eq!(outcomes(&late)[0].1, Reconciled::Repaired);
+    assert!(fx.unit("1.0", "").await.unwrap().visible());
+    assert_eq!((fx.version_rows().await, fx.announcements()), (1, 1));
+}
+
+#[tokio::test]
+async fn a_contested_unit_is_never_promoted_and_an_administrator_decides() {
+    use crate::app::maven::admin::{Decision, DecideUnit};
+    use crate::app::reconcile::{Reconciled, Reconciler};
+    let fx = Fx::new().await;
+    fx.put("1.0", "lib-1.0.jar", "alice", b"jar").await.unwrap();
+    fx.put("1.0", "lib-1.0.jar", "bob", b"evil").await.unwrap_err();
+    let later = fx.reconciler().pass(Utc::now() + TimeDelta::days(3)).await;
+    assert!(matches!(outcomes(&later)[0].1, Reconciled::Skipped(_)), "{later:?}");
+    assert!(!fx.unit("1.0", "").await.unwrap().visible());
+
+    let decide = DecideUnit::new(fx.versions(), fx.store.audit(), crate::server::event_bus());
+    let admin = crate::app::audit::Actor {
+        user_id: Some(1),
+        username: "root",
+        admin: true,
+    };
+    let key = UnitKey {
+        repository: fx.repo,
+        ga: GA,
+        version: "1.0",
+        build: "",
+    };
+    decide.run(&key, Decision::Promote, &scopes("1.0"), &admin, Utc::now()).await.unwrap();
+    assert!(fx.unit("1.0", "").await.unwrap().visible());
+    assert_eq!(fx.version_rows().await, 1);
+    let refused = decide.run(&key, Decision::Refuse, &scopes("1.0"), &admin, Utc::now()).await;
+    assert!(matches!(refused, Err(AppError::Conflict(_))), "a published unit is not refused: {refused:?}");
+
+    fx.put("2.0", "lib-2.0.jar", "alice", b"jar2").await.unwrap();
+    let pending_key = UnitKey { version: "2.0", ..key };
+    let old = fx.unit("2.0", "").await.unwrap().file("lib-2.0.jar").unwrap().physical_key.clone();
+    decide.run(&pending_key, Decision::Refuse, &scopes("2.0"), &admin, Utc::now()).await.unwrap();
+    assert!(fx.unit("2.0", "").await.unwrap().refused);
+    assert!(fx.store.candidates().contains(&old), "released for the reclaimer, not deleted");
+    let trail: Vec<String> = fx.store.audit_rows().into_iter().map(|(_, a, t)| format!("{a} {t}")).collect();
+    assert_eq!(trail, [format!("maven.promote {GA}:1.0:"), format!("maven.refuse {GA}:2.0:")]);
 }

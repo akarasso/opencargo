@@ -166,6 +166,37 @@ async fn a_private_repository_challenges_with_basic_and_a_miss_is_a_plain_404() 
 }
 
 #[tokio::test]
+async fn an_administrator_promotes_a_pending_unit_and_the_trail_says_so() {
+    let s = server(Visibility::Public).await;
+    let jar = format!("{DIR}/1.0/lib-1.0.jar");
+    assert_eq!(put(&s, &jar, "jar").await.status(), StatusCode::CREATED);
+    assert_eq!(get(&s, &jar).await.status(), StatusCode::NOT_FOUND);
+    let decide = |token: String| {
+        reqwest::Client::new()
+            .post(format!("{}/api/v1/maven/releases/decide", s.base_url))
+            .bearer_auth(token)
+            .json(&json!({"groupId": "org.example", "artifactId": "lib", "version": "1.0", "decision": "promote"}))
+            .send()
+    };
+    let client = reqwest::Client::new();
+    let reader = common::named_token(&client, &s.base_url, "reader", "t").await;
+    assert_eq!(decide(reader).await.unwrap().status(), StatusCode::FORBIDDEN);
+    assert_eq!(decide(STATIC_TOKEN.to_string()).await.unwrap().status(), StatusCode::OK);
+    assert_eq!(text(&s, &jar).await, "jar");
+    assert_eq!(decide(STATIC_TOKEN.to_string()).await.unwrap().status(), StatusCode::CONFLICT);
+    let trail = client
+        .get(format!("{}/api/v1/system/audit", s.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .text()
+        .await
+        .unwrap();
+    assert!(trail.contains("maven.promote") && trail.contains("org.example:lib:1.0"), "{trail}");
+}
+
+#[tokio::test]
 async fn a_snapshot_build_is_announced_with_its_pom_and_never_mixed() {
     let s = server(Visibility::Public).await;
     let v = "1.0-SNAPSHOT";

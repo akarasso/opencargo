@@ -44,6 +44,16 @@ pub fn scopes_of(gav: &Gav) -> Vec<String> {
     scopes
 }
 
+/// The same, from a `groupId:artifactId` and a version.
+pub fn scopes_of_unit(ga: &str, version: &str) -> Vec<String> {
+    let (group, artifact) = ga.split_once(':').unwrap_or((ga, ""));
+    scopes_of(&Gav {
+        group: group.to_string(),
+        artifact: artifact.to_string(),
+        version: version.to_string(),
+    })
+}
+
 /// What the generic readers see of `ga`: moved only by publish, yank and
 /// delete (A1 C5), read off the `versions` rows.
 async fn version_stamp(
