@@ -156,6 +156,7 @@ pub fn rules(format: Format) -> Option<&'static dyn FormatRules> {
         Format::Oci => Some(&OciRules),
         Format::Pypi => Some(&super::pypi::names::PypiRules),
         Format::Maven => Some(&MavenRules),
+        Format::Nuget => Some(&super::nuget::rules::NugetRules),
     }
 }
 
@@ -210,6 +211,18 @@ mod tests {
         assert!(!same_version(r, "Latest", "latest"));
         assert!(r.validate_version("v1_rc").is_ok(), "a tag, not a semver");
         assert!(r.validate("Upper/Case").is_err());
+    }
+
+    #[test]
+    fn nuget_spellings_of_one_version_are_one_key() {
+        let r = rules_of(Format::Nuget).unwrap();
+        assert!(same(r, "Newtonsoft.Json", "newtonsoft.json"));
+        for spelling in ["1.0", "1.0.0.0", "1.0.0+abc", "01.0.0"] {
+            assert!(same_version(r, spelling, "1.0.0"), "{spelling}");
+        }
+        assert!(!same_version(r, "1.0.0-beta", "1.0.0"));
+        assert!(r.validate_version("1.0.0/..").is_err());
+        assert!(r.admit("../x").is_err());
     }
 
     #[test]

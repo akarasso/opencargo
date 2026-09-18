@@ -141,6 +141,11 @@ pub const MIGRATIONS: &[Migration] = &[
     ),
     sql_migration!("019", "019_pypi.sql", Sentinel::Object("idx_pypi_files_package")),
     Migration {
+        id: "020",
+        sentinel: Sentinel::Unprovable,
+        step: Step::Rust(nuget_format),
+    },
+    Migration {
         id: "024",
         sentinel: Sentinel::Object("idx_maven_units_pending"),
         step: Step::Rust(maven),
@@ -151,6 +156,11 @@ pub const MIGRATIONS: &[Migration] = &[
         Sentinel::Object("idx_reclaim_candidates_enqueued")
     ),
 ];
+
+/// 020: the `nuget` format, through the shared rebuild; no table of its own.
+fn nuget_format(conn: &mut SqliteConnection) -> StepFuture<'_> {
+    Box::pin(super::rebuild::widen_formats(conn, "nuget"))
+}
 
 const MAVEN_TABLES: &str = include_str!("migrations/024_maven.sql");
 

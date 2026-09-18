@@ -46,16 +46,18 @@ pub enum Format {
     Go,
     Pypi,
     Maven,
+    Nuget,
 }
 
 impl Format {
-    pub const ALL: [Format; 6] = [
+    pub const ALL: [Format; 7] = [
         Format::Npm,
         Format::Cargo,
         Format::Oci,
         Format::Go,
         Format::Pypi,
         Format::Maven,
+        Format::Nuget,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -66,6 +68,7 @@ impl Format {
             Format::Go => "go",
             Format::Pypi => "pypi",
             Format::Maven => "maven",
+            Format::Nuget => "nuget",
         }
     }
 
@@ -76,6 +79,7 @@ impl Format {
             Format::Go => Some("Go"),
             Format::Pypi => Some("PyPI"),
             Format::Maven => Some("Maven"),
+            Format::Nuget => Some("NuGet"),
             Format::Oci => None,
         }
     }
@@ -153,6 +157,7 @@ mod tests {
         assert_eq!(Format::Oci.osv_ecosystem(), None);
         assert_eq!(Format::Pypi.osv_ecosystem(), Some("PyPI"));
         assert_eq!(Format::Maven.osv_ecosystem(), Some("Maven"));
+        assert_eq!(Format::Nuget.osv_ecosystem(), Some("NuGet"));
 
         for visibility in Visibility::ALL {
             assert_eq!(

@@ -130,6 +130,10 @@ pub enum Source {
         digest: Option<String>,
         uploaded: Option<String>,
     },
+    Nuget {
+        body: Cached,
+        published: Option<DateTime<Utc>>,
+    },
     Oci {
         body: Cached,
         served: Option<Cached>,

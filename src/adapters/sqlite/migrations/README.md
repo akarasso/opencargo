@@ -38,12 +38,16 @@ checksum in the same commit.
 | 017 | 017_storage_multipart.sql | s3.md (storage_multipart) | d33bf7772baee4f379535f7983837a5c56e0f707211e3e4cbf00b359efe0f6d2 |
 | 018 | 018_oci_upload_progress.sql | s3.md S4 (oci_upload_progress, physical keys on OCI rows) | de0ec789fca377873106f27a2b88af5517e797d28dd38aaf7840277371bba44a |
 | 019 | 019_pypi.sql | pypi.md (pypi_files) | d301499e72c72ddbb460fee30d6c39dbf0b4cbdf2e7a609ba2ee0b0d91f5108e |
-| 020 | - | nuget.md (nuget_format + its Step::Rust rebuild) | - |
+| 020 | - | nuget.md (nuget_format: a `Step::Rust` through the shared `widen_format_check`, no file) | - |
 | 021 | - | sso.md (sso) | - |
 | 022 | - | ha-options.md (server_leases) | - |
 | 023 | - | mcp-governance.md (mcp, reusing 020's rebuild) | - |
 | 024 | 024_maven.sql | maven.md (maven format through the shared rebuild helper `rebuild::widen_formats`, port 18 tables) | 58ca2fdd771fe0dc453d1c21499855df9f303d520f85451b7b508c907170b95d |
 | 025 | 025_reclaim.sql | s3.md S2r (reclamation, incarnations, retired prefixes) | aec372d3addae7af66c944632d4296f5041b659c5971a5f97569eef8aa8f2654 |
+
+A `Step::Rust` migration has no file and so no checksum: `020` is the
+`repositories` CHECK widened by `migrate::widen_format_check`, the one helper
+`023` and `024` reuse (existing formats plus one, never a literal list).
 
 Ids from 018 on are order-independent: none reads or alters a table another
 of them creates, and `025` ships before `018`-`024`. The Postgres side of

@@ -44,6 +44,7 @@ pub mod deps;
 pub mod maven;
 pub mod migrate;
 pub mod multipart;
+pub mod nuget;
 pub mod oci;
 pub mod packages;
 pub mod permissions;
@@ -282,6 +283,10 @@ impl SqliteStores {
 
     pub fn packages(&self) -> Arc<dyn PackageStore> {
         Arc::new(packages::SqlitePackageStore::new(self.pool.clone()))
+    }
+
+    pub fn nuget_feed(&self) -> Arc<dyn crate::ports::nuget::NugetFeedRead> {
+        Arc::new(nuget::SqliteNugetFeed::new(self.pool.clone()))
     }
 
     pub fn search(&self) -> Arc<dyn SearchIndex> {

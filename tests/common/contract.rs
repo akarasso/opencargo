@@ -33,6 +33,7 @@ pub struct Handles {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub deps: Arc<dyn DependencyStore>,
     _keep: Box<dyn Any + Send>,
 }
 
@@ -43,6 +44,7 @@ pub struct Ports {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub deps: Arc<dyn DependencyStore>,
 }
 
 impl Handles {
@@ -52,6 +54,7 @@ impl Handles {
             repos: ports.repos,
             packages: ports.packages,
             search: ports.search,
+            deps: ports.deps,
             _keep: keep,
         }
     }
@@ -407,6 +410,7 @@ macro_rules! package_contract {
                     size: 4,
                     tarball_path: "npm/r/p/p.tgz",
                     dist_tags: tags,
+                    dependencies: &[],
                     pins: &[],
                     now: at(9),
                 }
@@ -453,6 +457,83 @@ macro_rules! package_contract {
                     .unwrap();
                 assert_eq!(landed.package.created_at, at(9).trunc_subsecs(0));
                 assert_eq!(landed.version.published_at, at(9).trunc_subsecs(0));
+            }
+
+            /// The edges of a release are written with its version row, so
+            /// a visible version never lacks them; a refused one writes none.
+            #[tokio::test]
+            async fn a_release_lands_with_its_dependencies_or_not_at_all() {
+                use ::opencargo::ports::packages::ReleaseDependency;
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let edges = [
+                    ReleaseDependency { name: "a", requirement: "^1", kind: "net8.0" },
+                    ReleaseDependency { name: "b", requirement: "", kind: "any" },
+                ];
+                let mut with = release(repo.id, "left-pad", "1.0.0", &[]);
+                with.dependencies = &edges;
+                let landed = handles.packages.publish_version(&with).await.unwrap();
+                let recorded = handles.deps.of_version(landed.version.id).await.unwrap();
+                assert_eq!(
+                    recorded
+                        .iter()
+                        .map(|d| (d.name.as_str(), d.requirement.as_str(), d.kind.as_str()))
+                        .collect::<Vec<_>>(),
+                    [("a", "^1", "net8.0"), ("b", "", "any")]
+                );
+
+                let refused = handles.packages.publish_version(&with).await.unwrap_err();
+                assert!(matches!(refused, StoreError::Conflict), "{refused:?}");
+                assert_eq!(handles.deps.of_version(landed.version.id).await.unwrap().len(), 2);
+                assert!(
+                    handles.deps.dependents("a", false).await.unwrap().len() == 1,
+                    "the refused publish recorded no second edge"
+                );
+            }
+
+            /// A1 C5: each publish, yank, unyank and delete moves the stamp,
+            /// nothing else does, and a stamp is a function of the versions'
+            /// state, so a validated reader never sees a stale state as current.
+            #[tokio::test]
+            async fn the_version_stamp_moves_with_the_four_operations_only() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let first = handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "1.0.0", &[]))
+                    .await
+                    .unwrap();
+                let package = first.package.id;
+                let stamp = || handles.packages.stamp(package);
+                let one = stamp().await.unwrap();
+                let second = handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "2.0.0", &[]))
+                    .await
+                    .unwrap();
+                let two = stamp().await.unwrap();
+                assert_ne!(two, one, "publish");
+                handles.packages.set_yanked(first.version.id, true).await.unwrap();
+                let yanked = stamp().await.unwrap();
+                assert_ne!(yanked, two, "yank");
+                handles.packages.set_yanked(first.version.id, false).await.unwrap();
+                let unyanked = stamp().await.unwrap();
+                assert_ne!(unyanked, yanked, "unyank");
+                assert_eq!(unyanked, two, "the same state, the same stamp");
+                handles.packages.set_metadata(second.version.id, "{\"x\":1}").await.unwrap();
+                handles.packages.record_download(second.version.id).await.unwrap();
+                assert_eq!(stamp().await.unwrap(), two, "nothing else moves it");
+                handles.packages.delete_version(second.version.id, at(10)).await.unwrap();
+                let deleted = stamp().await.unwrap();
+                assert_ne!(deleted, two, "delete");
+                handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "2.0.0", &[]))
+                    .await
+                    .unwrap();
+                let republished = stamp().await.unwrap();
+                assert_ne!(republished, deleted, "republish");
+                assert_ne!(republished, two, "a republished version is a new row");
             }
 
             #[tokio::test]
@@ -1871,6 +1952,7 @@ macro_rules! reclaim_contract {
                         size: 1,
                         tarball_path: key,
                         dist_tags: &[],
+                        dependencies: &[],
                         pins: &[],
                         now: at(2),
                     })
@@ -2081,6 +2163,20 @@ macro_rules! reclaim_contract {
                 assert!(h.reclaim.due(GRACE, at(5), 10).await.unwrap().is_empty(), "Referenced drops the candidate");
             }
 
+            /// NuGet 2.5: the `.nupkg` of an unlisted version stays referenced,
+            /// because an unlist keeps it restorable by exact version.
+            #[tokio::test]
+            async fn an_unlisted_nupkg_is_referenced_and_listed() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "nuget").await;
+                let key = format!("{prefix}/my.lib/ab/my.lib.1.0.0.nupkg~g1");
+                let id = publish(&h, r.id, "1.0.0", &key).await;
+                h.packages.set_yanked(id, true).await.unwrap();
+                h.reclaim.enqueue(std::slice::from_ref(&key), at(1)).await.unwrap();
+                assert!(listed(&h, 5).await.contains(&key));
+                assert_eq!(claim(&h, &key, 5).await, Claim::Referenced);
+            }
+
             #[tokio::test]
             async fn segments_of_a_slow_session_are_never_claimable() {
                 let h = $open().await;
@@ -2142,6 +2238,7 @@ macro_rules! reclaim_contract {
                     size: 1,
                     tarball_path: &pins[0].physical_key,
                     dist_tags: &[],
+                    dependencies: &[],
                     pins,
                     now: at(2),
                 }
@@ -3037,3 +3134,211 @@ macro_rules! maven_contract {
 
 #[allow(unused_imports)]
 pub(crate) use maven_contract;
+
+/// What `NugetFeedRead` (port 17) owes, beside the `PackageStore` it reads.
+pub struct FeedHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub packages: Arc<dyn PackageStore>,
+    pub feed: Arc<dyn opencargo::ports::nuget::NugetFeedRead>,
+    _keep: Box<dyn Any + Send>,
+}
+
+impl FeedHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        packages: Arc<dyn PackageStore>,
+        feed: Arc<dyn opencargo::ports::nuget::NugetFeedRead>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            packages,
+            feed,
+            _keep: keep,
+        }
+    }
+}
+
+/// `nuget_feed_contract!(name, opener)`: port 17 filters before it cuts the
+/// window, counts exactly, never returns an unlisted version, and holds a
+/// consistent window while publishes land; `PackageStore` gives two
+/// concurrent publishes of one normalized version one row and one
+/// `Conflict`.
+#[allow(unused_macros)]
+macro_rules! nuget_feed_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::Utc;
+            use ::opencargo::domain::{Format, RepoKind, RepoSpec, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::nuget::FeedQuery;
+            use ::opencargo::ports::packages::{NameMatch, NewRelease};
+
+            async fn repo(h: &FeedHandles) -> i64 {
+                h.repos
+                    .create(
+                        &RepoSpec {
+                            name: "nuget-hosted",
+                            kind: RepoKind::Hosted,
+                            format: Format::Nuget,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap()
+                    .id
+            }
+
+            async fn publish(
+                h: &FeedHandles,
+                repository: i64,
+                package: &str,
+                version: &str,
+                facts: &str,
+            ) -> Result<i64, StoreError> {
+                h.packages
+                    .publish_version(&NewRelease {
+                        repository,
+                        package,
+                        match_name: NameMatch::Exact,
+                        description: Some("a nuget package"),
+                        readme: None,
+                        version,
+                        metadata_json: facts,
+                        checksum_sha1: None,
+                        checksum_sha256: None,
+                        integrity: None,
+                        size: 1,
+                        tarball_path: "k",
+                        dist_tags: &[],
+                        dependencies: &[],
+                        pins: &[],
+                        now: Utc::now(),
+                    })
+                    .await
+                    .map(|r| r.version.id)
+            }
+
+            fn query(repository: i64) -> FeedQuery<'static> {
+                FeedQuery {
+                    repository,
+                    take: 20,
+                    ..FeedQuery::default()
+                }
+            }
+
+            #[tokio::test]
+            async fn filters_apply_before_the_window_and_the_total_is_exact() {
+                let h = $open().await;
+                let r = repo(&h).await;
+                publish(&h, r, "a.pre", "1.0.0-beta", r#"{"prerelease":true}"#).await.unwrap();
+                publish(&h, r, "b.stable", "1.0.0", "{}").await.unwrap();
+                publish(&h, r, "c.pre", "2.0.0-rc", r#"{"prerelease":true}"#).await.unwrap();
+                publish(&h, r, "d.stable", "1.0.0", r#"{"packageTypes":["dotnettool"]}"#)
+                    .await
+                    .unwrap();
+                publish(&h, r, "e.semver2", "1.0.0-rc.1", r#"{"prerelease":true,"semver2":true}"#)
+                    .await
+                    .unwrap();
+
+                let stable = h.feed.search(&FeedQuery { take: 1, ..query(r) }).await.unwrap();
+                assert_eq!(stable.total, 2);
+                assert_eq!(stable.hits.len(), 1);
+                assert_eq!(stable.hits[0].package.name, "b.stable");
+                let second = h.feed.search(&FeedQuery { skip: 1, take: 1, ..query(r) }).await.unwrap();
+                assert_eq!(second.hits[0].package.name, "d.stable");
+
+                let pre = h.feed.search(&FeedQuery { prerelease: true, ..query(r) }).await.unwrap();
+                assert_eq!(pre.total, 4, "semver2 still filtered");
+                let all = h
+                    .feed
+                    .search(&FeedQuery { prerelease: true, semver2: true, ..query(r) })
+                    .await
+                    .unwrap();
+                assert_eq!(all.total, 5);
+                let tools = h
+                    .feed
+                    .search(&FeedQuery { package_type: Some("DotnetTool"), ..query(r) })
+                    .await
+                    .unwrap();
+                assert_eq!(tools.total, 1);
+                let text = h
+                    .feed
+                    .search(&FeedQuery { text: Some("STABLE"), ..query(r) })
+                    .await
+                    .unwrap();
+                assert_eq!(text.total, 2);
+            }
+
+            #[tokio::test]
+            async fn an_unlisted_version_is_never_returned() {
+                let h = $open().await;
+                let r = repo(&h).await;
+                let old = publish(&h, r, "lib", "1.0.0", "{}").await.unwrap();
+                publish(&h, r, "lib", "2.0.0", "{}").await.unwrap();
+                let only = publish(&h, r, "solo", "1.0.0", "{}").await.unwrap();
+                h.packages.set_yanked(old, true).await.unwrap();
+                h.packages.set_yanked(only, true).await.unwrap();
+
+                let page = h.feed.search(&query(r)).await.unwrap();
+                assert_eq!(page.total, 1, "a package with nothing listed is not a hit");
+                let versions: Vec<&str> =
+                    page.hits[0].versions.iter().map(|v| v.version.as_str()).collect();
+                assert_eq!(versions, ["2.0.0"]);
+            }
+
+            #[tokio::test]
+            async fn two_spellings_of_one_version_race_to_one_row() {
+                let h = $open().await;
+                let r = repo(&h).await;
+                let (a, b) = tokio::join!(
+                    publish(&h, r, "race", "1.0.0", "{}"),
+                    publish(&h, r, "race", "1.0.0", "{}")
+                );
+                let conflicts = [&a, &b]
+                    .iter()
+                    .filter(|x| matches!(x, Err(StoreError::Conflict)))
+                    .count();
+                assert_eq!(conflicts, 1, "{a:?} {b:?}");
+                assert!([&a, &b].iter().any(|x| x.is_ok()));
+                let page = h.feed.search(&query(r)).await.unwrap();
+                assert_eq!(page.hits[0].versions.len(), 1);
+            }
+
+            #[tokio::test]
+            async fn the_window_holds_while_publishes_land() {
+                let h = $open().await;
+                let r = repo(&h).await;
+                let writer = async {
+                    for i in 0..20 {
+                        publish(&h, r, &format!("p{i:02}"), "1.0.0", "{}").await.unwrap();
+                    }
+                };
+                let reader = async {
+                    let mut last = 0;
+                    for _ in 0..20 {
+                        let page = h.feed.search(&FeedQuery { take: 5, ..query(r) }).await.unwrap();
+                        assert!(page.total >= last, "the total never goes back");
+                        assert_eq!(page.hits.len() as u64, page.total.min(5));
+                        let names: Vec<&str> =
+                            page.hits.iter().map(|h| h.package.name.as_str()).collect();
+                        let mut sorted = names.clone();
+                        sorted.sort();
+                        assert_eq!(names, sorted);
+                        last = page.total;
+                        tokio::task::yield_now().await;
+                    }
+                };
+                tokio::join!(writer, reader);
+                assert_eq!(h.feed.search(&query(r)).await.unwrap().total, 20);
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use nuget_feed_contract;

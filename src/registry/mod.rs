@@ -3,6 +3,7 @@ pub mod go;
 pub mod maven;
 pub mod npm;
 pub mod archive;
+pub mod nuget;
 pub mod oci;
 pub mod pypi;
 pub mod resolve;
@@ -42,6 +43,7 @@ pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Reposit
         oci: state.oci.as_ref(),
         maven: state.maven.as_ref(),
         search: state.search.as_ref(),
+        nuget: state.nuget_feed.as_ref(),
         proxy: &state.proxy,
         policy: &state.policy,
         creds: state.upstream_auth.as_ref(),

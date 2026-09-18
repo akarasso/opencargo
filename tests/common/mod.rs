@@ -9,6 +9,8 @@ pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;
 pub mod pypi;
+pub mod faults;
+pub mod nuget;
 pub mod upstream_tap;
 
 use std::collections::HashMap;
@@ -45,6 +47,10 @@ pub struct SpawnOpts {
     pub policy: HashMap<String, PolicyConfig>,
     /// Replaces the policy engine's timing knobs after `build_state`.
     pub policy_tuning: Option<Tuning>,
+    /// Puts the storage and the permission store behind switches.
+    pub outage: Option<faults::Outage>,
+    /// The URL clients reach the server by, when a reverse proxy fronts it.
+    pub public_url: Option<String>,
 }
 
 impl Default for SpawnOpts {
@@ -56,6 +62,8 @@ impl Default for SpawnOpts {
             vuln: VulnScanConfig::default(),
             policy: HashMap::new(),
             policy_tuning: None,
+            outage: None,
+            public_url: None,
         }
     }
 }
@@ -71,12 +79,13 @@ pub struct TestServer {
 
 /// The config every spawned server runs with: storage and database under `tmp`.
 fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
+    let public_url = opts.public_url.clone().unwrap_or_else(|| base_url.to_string());
     let storage_path = tmp.path().join("storage");
     let db_path = tmp.path().join("opencargo.db");
     Config {
         server: ServerConfig {
             bind: base_url.trim_start_matches("http://").to_string(),
-            base_url: base_url.to_string(),
+            base_url: public_url,
             storage_path: storage_path
                 .to_str()
                 .expect("non-utf8 temp path")
@@ -189,6 +198,7 @@ async fn spawn_in(
     let base_url = format!("http://{addr}");
 
     let tuning = opts.policy_tuning;
+    let outage = opts.outage.clone();
     let mut config = test_config(&tmp, &base_url, opts);
     if let Some(storage) = storage {
         config.storage = storage;
@@ -205,6 +215,9 @@ async fn spawn_in(
             state.proxy.clone(),
             tuning,
         );
+    }
+    if let Some(outage) = outage {
+        outage.install(&mut state);
     }
     let app = server::build_router(state)
         .map_request(server::decode_percent_encoded_slashes)

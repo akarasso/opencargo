@@ -50,6 +50,7 @@ use opencargo::ports::reclaim::{
 };
 use opencargo::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
+use opencargo::ports::nuget::{FeedPage, FeedQuery, NugetFeedRead};
 use opencargo::ports::search::{SearchIndex, SearchQuery, SearchScope};
 use opencargo::ports::tokens::{NewToken, TokenStore};
 use opencargo::ports::users::{NewUser, UserPatch, UserStore};
@@ -229,6 +230,10 @@ impl FakeDb {
 
     pub fn search(&self) -> Arc<dyn SearchIndex> {
         Arc::new(Search(self.0.clone()))
+    }
+
+    pub fn nuget_feed(&self) -> Arc<dyn NugetFeedRead> {
+        Arc::new(NugetFeed(self.0.clone()))
     }
 
     pub fn proxy_cache(&self) -> Arc<dyn ProxyCacheStore> {
@@ -896,6 +901,18 @@ impl PackageStore for Packages {
         })
     }
 
+    async fn stamp(&self, package: i64) -> Result<String, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .versions
+                .iter()
+                .filter(|v| v.package_id == package)
+                .map(|v| format!("{}:{}", v.id, u8::from(v.yanked)))
+                .collect::<Vec<_>>()
+                .join(","))
+        })
+    }
+
     async fn version(
         &self,
         package: i64,
@@ -941,6 +958,14 @@ impl PackageStore for Packages {
         self.with(|state| {
             state.reclaim.live_pins(release.pins)?;
             let (package, version) = Self::write_release(state, &spec)?;
+            for dep in release.dependencies {
+                state.dependencies.push(DependencyRow {
+                    version_id: version.id,
+                    name: dep.name.to_string(),
+                    requirement: dep.requirement.to_string(),
+                    kind: dep.kind.to_string(),
+                });
+            }
             state.reclaim.spend(release.pins);
             Ok(Release { package, version })
         })
@@ -1087,6 +1112,31 @@ impl PackageStore for Packages {
     /// that stored it could never be asserted against.
     async fn record_download(&self, _version: i64) -> Result<(), StoreError> {
         self.with(|_| Ok(()))
+    }
+}
+
+struct NugetFeed(Arc<Mutex<State>>);
+
+#[async_trait]
+impl NugetFeedRead for NugetFeed {
+    async fn search(&self, query: &FeedQuery<'_>) -> Result<FeedPage, StoreError> {
+        with(&self.0, PortId::Search, |state| {
+            let candidates = state
+                .packages
+                .iter()
+                .filter(|p| p.repository_id == query.repository)
+                .map(|p| {
+                    let versions = state
+                        .versions
+                        .iter()
+                        .filter(|v| v.package_id == p.id)
+                        .cloned()
+                        .collect();
+                    (p.clone(), versions, 0)
+                })
+                .collect();
+            Ok(query.page(candidates))
+        })
     }
 }
 

@@ -34,7 +34,7 @@ export interface RecentVersion {
 }
 
 export type RepoType = 'hosted' | 'proxy' | 'group';
-export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go' | 'maven';
+export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go' | 'maven' | 'nuget';
 export type RepoVisibility = 'public' | 'private';
 
 export interface Repository {

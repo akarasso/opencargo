@@ -70,6 +70,7 @@ pub struct Resolver {
     oci: Arc<dyn crate::ports::oci::OciStore>,
     maven: Arc<dyn crate::ports::maven::MavenFileStore>,
     search: Arc<dyn crate::ports::search::SearchIndex>,
+    nuget: Arc<dyn crate::ports::nuget::NugetFeedRead>,
     proxy: ProxyEngine,
 }
 
@@ -103,6 +104,7 @@ impl Resolver {
             oci: db.oci(),
             maven: db.maven(),
             search: db.search(),
+            nuget: db.nuget_feed(),
             proxy,
             fakes: db,
         }
@@ -116,6 +118,7 @@ impl Resolver {
             oci: self.oci.as_ref(),
             maven: self.maven.as_ref(),
             search: self.search.as_ref(),
+            nuget: self.nuget.as_ref(),
             proxy: &self.proxy,
             policy: &self.policy,
             creds: &self.creds,

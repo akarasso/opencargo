@@ -11,6 +11,7 @@ pub mod events;
 pub mod ids;
 pub mod maven;
 pub mod multipart;
+pub mod nuget;
 pub mod oci;
 pub mod packages;
 pub mod permissions;

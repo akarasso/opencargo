@@ -119,6 +119,7 @@ fn release<'a>(repo: i64, version: &'a str, pins: &'a [PinToken]) -> NewRelease<
         size: 4,
         tarball_path: &pins[0].physical_key,
         dist_tags: &[],
+        dependencies: &[],
         pins,
         now: Utc::now(),
     }

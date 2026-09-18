@@ -5,7 +5,7 @@ use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
 use crate::domain::{
-    CacheRepo, DomainError, Miss, Outcome, RepoKind, Repository, UrlRepo, Visit, Walk,
+    Action, CacheRepo, DomainError, Miss, Resource, Outcome, RepoKind, Repository, UrlRepo, Visit, Walk,
     MAX_GROUP_DEPTH,
 };
 use crate::error::{AppError, StoreError};
@@ -93,6 +93,7 @@ pub struct Cx<'a> {
     pub oci: &'a dyn OciStore,
     pub maven: &'a dyn MavenFileStore,
     pub search: &'a dyn SearchIndex,
+    pub nuget: &'a dyn crate::ports::nuget::NugetFeedRead,
     pub proxy: &'a ProxyEngine,
     pub policy: &'a dyn ResolutionRecorder,
     pub creds: &'a dyn UpstreamCredsSource,
@@ -294,6 +295,88 @@ async fn walk_members<'a, L: Leaf + 'a>(
         walk(cx, &member, leaf, depth + 1, w).await?;
     }
     Ok(())
+}
+
+/// For an anonymous caller only: `Forbidden(read)` when any member the
+/// group would walk is unreadable to them, whatever the member order and
+/// whether or not the package exists. Reads the configuration only, never
+/// an upstream or a package store. An authenticated caller is not probed:
+/// the walk skips an unreadable member silently.
+pub async fn probe_access(cx: &Cx<'_>, repo: &Repository) -> Result<(), ResolveError> {
+    if cx.auth.is_some() {
+        return Ok(());
+    }
+    let mut seen = vec![repo.id];
+    let mut level = vec![repo.clone()];
+    for _ in 0..=MAX_GROUP_DEPTH {
+        let mut next = Vec::new();
+        for group in level.iter().filter(|r| r.kind().ok() == Some(RepoKind::Group)) {
+            for name in group.members() {
+                let Some(member) = cx.repos.by_name(&name).await? else {
+                    continue;
+                };
+                if seen.contains(&member.id) {
+                    continue;
+                }
+                seen.push(member.id);
+                if !readable(cx, &member).await? {
+                    return Err(ResolveError::Domain(DomainError::Forbidden(Action {
+                        verb: "read",
+                        on: Resource {
+                            kind: "repository",
+                            id: cx.url.0.to_string(),
+                        },
+                    })));
+                }
+                next.push(member);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
+    }
+    Ok(())
+}
+
+/// The hosted and proxy repositories a `collect` over `repo` asks for this
+/// caller, in walk order: the caller's permission view of `repo`, which a
+/// memo of merged answers keys by. Reads the configuration and the grants,
+/// never an upstream or a package store.
+pub async fn view(cx: &Cx<'_>, repo: &Repository) -> Result<Vec<Repository>, ResolveError> {
+    let mut seen = std::collections::HashSet::from([repo.id]);
+    let mut out = Vec::new();
+    view_of(cx, repo, 0, &mut seen, &mut out).await?;
+    Ok(out)
+}
+
+fn view_of<'a>(
+    cx: &'a Cx<'a>,
+    repo: &'a Repository,
+    depth: u32,
+    seen: &'a mut std::collections::HashSet<i64>,
+    out: &'a mut Vec<Repository>,
+) -> Pin<Box<dyn Future<Output = Result<(), ResolveError>> + Send + 'a>> {
+    Box::pin(async move {
+        if repo.kind()? != RepoKind::Group {
+            out.push(repo.clone());
+            return Ok(());
+        }
+        if depth >= MAX_GROUP_DEPTH {
+            return Err(ResolveError::Internal("group nesting depth exceeded".to_string()));
+        }
+        let format = repo.fmt()?;
+        for name in repo.members() {
+            let Some(member) = cx.repos.by_name(&name).await? else {
+                continue;
+            };
+            if !readable(cx, &member).await? || member.fmt()? != format || !seen.insert(member.id) {
+                continue;
+            }
+            view_of(cx, &member, depth + 1, seen, out).await?;
+        }
+        Ok(())
+    })
 }
 
 /// Whether the caller may read this member, and the one refusal that is not a

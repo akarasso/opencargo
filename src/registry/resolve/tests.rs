@@ -328,3 +328,28 @@ async fn misconfigured_member_status_is_unchanged() {
     let alone = first(&fx, "p-misconfigured").await.unwrap_err();
     assert_eq!(status(alone), axum::http::StatusCode::BAD_GATEWAY);
 }
+
+/// NuGet 2.3: an anonymous caller on a group with an unreadable member is
+/// refused in either member order; an authenticated one is not probed.
+#[tokio::test]
+async fn anonymous_probe_refuses_a_group_with_an_unreadable_member_in_any_order() {
+    let fx = fixture().await;
+    add(&fx.fakes, "g-private-first", RepoKind::Group, &["h-private", "h-found"]).await;
+    add(&fx.fakes, "g-private-last", RepoKind::Group, &["h-found", "h-private"]).await;
+    add(&fx.fakes, "g-private-nested", RepoKind::Group, &["g-order", "g-private-last"]).await;
+    for name in ["g-private-first", "g-private-last", "g-private-nested"] {
+        let group = repo(&fx, name).await;
+        let err = probe_access(&fx.cx(None, "requested"), &group).await.unwrap_err();
+        assert!(
+            matches!(err, ResolveError::Domain(DomainError::Forbidden(_))),
+            "{name}: {err}"
+        );
+        let alice = user(1, "admin");
+        probe_access(&fx.cx(Some(&alice), "requested"), &group).await.unwrap();
+    }
+    for name in ["g-order", "g-cycle-a", "h-found", "g-empty"] {
+        probe_access(&fx.cx(None, "requested"), &repo(&fx, name).await)
+            .await
+            .unwrap();
+    }
+}

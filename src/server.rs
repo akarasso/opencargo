@@ -102,6 +102,9 @@ pub struct AppState {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub nuget_feed: Arc<dyn crate::ports::nuget::NugetFeedRead>,
+    /// NuGet's registration memo, per server: its keys are repository ids.
+    pub nuget_documents: Arc<crate::registry::nuget::merged::Documents>,
     pub oci: Arc<dyn OciStore>,
     pub pypi: Arc<dyn PypiFileStore>,
     /// Bounds the archives inspected at once; inspection is CPU on a blocking thread.
@@ -564,6 +567,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         repos,
         packages: stores.packages(),
         search: stores.search(),
+        nuget_feed: stores.nuget_feed(),
+        nuget_documents: Arc::new(crate::registry::nuget::merged::documents()),
         oci: stores.oci(),
         pypi: stores.pypi(),
         archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
@@ -615,6 +620,7 @@ fn auth_state(
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
             Arc::new(crate::registry::pypi::auth_rules::PypiRouteRules),
             Arc::new(crate::registry::maven::auth_rules::MavenRouteRules),
+            Arc::new(crate::registry::nuget::auth_rules::NugetRouteRules),
         ],
         trusted_proxies: config.auth.trusted_proxies.clone(),
     })
@@ -1013,6 +1019,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::pypi::routes::routes())
         .merge(crate::registry::oci::routes::routes())
         .merge(crate::registry::maven::routes::routes())
+        .merge(crate::registry::nuget::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
         .merge(dashboard_routes)

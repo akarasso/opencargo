@@ -46,10 +46,20 @@ pub struct NewRelease<'a> {
     pub tarball_path: &'a str,
     /// The tags that point at this version once it exists.
     pub dist_tags: &'a [String],
+    /// Edges out of this version, written in the same transaction so a
+    /// visible version never lacks them.
+    pub dependencies: &'a [ReleaseDependency<'a>],
     /// The pins of the keys the row references, spent by compare-and-set in
     /// the transaction; a revoked one makes the publish write nothing.
     pub pins: &'a [PinToken],
     pub now: DateTime<Utc>,
+}
+
+/// One dependency edge of a release, recorded with its version row.
+pub struct ReleaseDependency<'a> {
+    pub name: &'a str,
+    pub requirement: &'a str,
+    pub kind: &'a str,
 }
 
 /// What a publish landed: both rows, as stored.
@@ -124,6 +134,13 @@ pub trait PackageStore: Send + Sync {
 
     async fn version(&self, package: i64, version: &str)
         -> Result<Option<Version>, StoreError>;
+
+    /// The package's version stamp (A1 C5), opaque: every publish, yank,
+    /// unyank and delete of one of its versions moves it, nothing else does,
+    /// and equal stamps mean the same version rows in the same listing
+    /// state, so a reader validates what it derived from them without
+    /// reading them again.
+    async fn stamp(&self, package: i64) -> Result<String, StoreError>;
 
     async fn dist_tags(&self, package: i64) -> Result<Vec<DistTag>, StoreError>;
 

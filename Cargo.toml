@@ -23,7 +23,7 @@ path = "src/main.rs"
 opencargo-domain = { path = "crates/domain" }
 
 # HTTP server
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
@@ -112,9 +112,10 @@ zip = "8.3.1"
 cvss = "2.2"
 roxmltree = "0.20"
 md-5 = "0.10"
+quick-xml = "0.37"
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-webpki-roots-no-provider"] }
 tempfile = "3"
 percent-encoding = "2"
 tokio-test = "0.4"

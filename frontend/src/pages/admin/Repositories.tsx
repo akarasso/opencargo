@@ -321,6 +321,7 @@ function RepositoriesInner() {
                 <option value="oci">oci</option>
                 <option value="go">go</option>
                 <option value="maven">maven</option>
+                <option value="nuget">nuget</option>
               </select>
             </div>
           </div>

@@ -33,6 +33,7 @@ fn release(repository: i64) -> NewRelease<'static> {
         size: 1,
         tarball_path: "npm/p/widget/widget-1.0.0.tgz",
         dist_tags: &[],
+        dependencies: &[],
         pins: &[],
         now: Utc::now(),
     }

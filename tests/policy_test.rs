@@ -1808,3 +1808,58 @@ async fn pypi_row_dates_from_the_page_and_squats_on_the_normalized_name() {
     assert!(reason.contains("requests"), "{reason}");
     assert_eq!(policy_rows(&a).await.len(), 1, "a .metadata records nothing");
 }
+
+/// NuGet 3.4: a served `.nupkg` is recorded under its normalized id and
+/// version, dated by its registration, and judged by what it would run.
+#[tokio::test]
+async fn nuget_proxy_records_facts_dates_and_install_assets() {
+    let up = common::fake_upstream::nuget::start().await;
+    up.add(
+        "Scripted.Lib",
+        "1.0.0",
+        common::nuget::nupkg("Scripted.Lib", "1.0.0", &["tools/install.ps1"]),
+    );
+    up.add("Plain.Lib", "1.0.0", common::nuget::nupkg("Plain.Lib", "1.0.0", &[]));
+    let server = spawn_server(SpawnOpts {
+        repositories: vec![proxy_with(
+            "nuget-proxy",
+            RepositoryFormat::Nuget,
+            &up.service_index(),
+            ProxyOpts {
+                dl_allow_private: true,
+                ..Default::default()
+            },
+        )],
+        policy: policy(
+            "nuget-proxy",
+            PolicyConfig {
+                install_scripts: true,
+                typosquat: true,
+                ..aged("48h")
+            },
+        ),
+        ..Default::default()
+    })
+    .await;
+    for id in ["scripted.lib", "plain.lib"] {
+        get_ok(
+            &format!("{}/nuget-proxy/v3/flatcontainer/{id}/1.0.0/{id}.1.0.0.nupkg", server.base_url),
+            None,
+        )
+        .await;
+    }
+    let rows = wait_for_policy_rows(&server, 2).await;
+    let verdicts = policy_verdicts(&server).await;
+    for (row, (name, scripts)) in rows.iter().zip([
+        ("scripted.lib", ("would_block", "ships install scripts or MSBuild imports")),
+        ("plain.lib", ("pass", "no install script")),
+    ]) {
+        assert_eq!((row.format.as_str(), row.name.as_str()), ("nuget", name));
+        assert_eq!(row.version.as_deref(), Some("1.0.0"));
+        assert_eq!(row.date_source, "registration");
+        assert!(row.published().is_some());
+        assert_eq!(verdict_of(&verdicts, row.id, "install_scripts"), scripts);
+        assert_eq!(verdict_of(&verdicts, row.id, "min_release_age").0, "pass", "published in 2024");
+        assert_eq!(verdict_of(&verdicts, row.id, "typosquat").0, "not_applicable", "no NuGet list ships");
+    }
+}

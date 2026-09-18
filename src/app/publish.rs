@@ -144,6 +144,7 @@ impl PublishVersion {
                                 size,
                                 tarball_path: &pins[0].physical_key,
                                 dist_tags: artifact.dist_tags,
+                                dependencies: &[],
                                 pins: &pins,
                                 now,
                             })
