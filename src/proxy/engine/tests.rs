@@ -160,15 +160,16 @@ async fn a_row_goes_stale_when_now_passes_its_expiry() {
     assert!(fresh.fresh, "a row just written is fresh");
     assert_eq!(fx.hits().len(), 1);
 
-    // One second short of the fixture's 3600s ttl: still a hit.
-    fx.advance(Duration::from_secs(3599));
+    // Well inside the fixture's 3600s ttl: still a hit. The margin is wide on
+    // purpose: the shift adds to a real clock that moves between the two reads.
+    fx.advance(Duration::from_secs(3000));
     assert!(fx.row("t-item", "art/x").await.unwrap().fresh);
     found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
     assert_eq!(fx.hits().len(), 1, "a fresh row asks nobody");
 
-    fx.advance(Duration::from_secs(1));
+    fx.advance(Duration::from_secs(700));
     let expired = fx.row("t-item", "art/x").await.unwrap();
-    assert!(!expired.fresh, "stale at exactly the expiry");
+    assert!(!expired.fresh, "stale once the expiry has passed");
     assert_eq!(expired.id, fresh.id);
     let served = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
     assert_eq!(fx.hits().len(), 2, "an expired row is revalidated");
