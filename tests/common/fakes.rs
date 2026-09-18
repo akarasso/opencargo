@@ -49,7 +49,7 @@ use opencargo::ports::policy::{
 use opencargo::ports::proxy_cache::ProxyCacheStore;
 use opencargo::ports::pypi::{NewPypiFile, Published, PypiFile, PypiFileStore};
 use opencargo::ports::reclaim::{
-    Backlog, Candidate, Claim, ClaimToken, PinToken, Pinned, ReclaimStore, Renewal,
+    Backlog, Candidate, Claim, ClaimToken, Epoch, PinToken, Pinned, ReclaimStore, Renewal,
 };
 use opencargo::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
@@ -2728,6 +2728,7 @@ struct CandidateRow {
 /// incarnations with their prefixes and retired marks.
 #[derive(Default)]
 struct ReclaimState {
+    epoch: Option<Epoch>,
     incarnations: Vec<(i64, String)>,
     prefixes: Vec<(String, String)>,
     retired: Vec<String>,
@@ -2738,6 +2739,15 @@ struct ReclaimState {
 }
 
 impl ReclaimState {
+    fn state(&mut self) -> &mut Epoch {
+        self.epoch.get_or_insert_with(|| Epoch {
+            installation: uuid::Uuid::new_v4().simple().to_string(),
+            epoch: uuid::Uuid::new_v4().simple().to_string(),
+            counter: 0,
+            verify_pending: false,
+        })
+    }
+
     fn enqueue(&mut self, key: &str, prefix: bool, now: DateTime<Utc>) {
         match self.candidates.iter_mut().find(|c| c.key == key) {
             Some(existing) => existing.prefix |= prefix,
@@ -2843,6 +2853,62 @@ impl Reclaim {
 
 #[async_trait]
 impl ReclaimStore for Reclaim {
+    async fn epoch(&self) -> Result<Epoch, StoreError> {
+        self.with(|state| Ok(state.reclaim.state().clone()))
+    }
+
+    async fn new_epoch(&self) -> Result<Epoch, StoreError> {
+        self.with(|state| {
+            let current = state.reclaim.state();
+            current.epoch = uuid::Uuid::new_v4().simple().to_string();
+            current.verify_pending = true;
+            Ok(current.clone())
+        })
+    }
+
+    async fn require_verify(&self) -> Result<(), StoreError> {
+        self.with(|state| {
+            state.reclaim.state().verify_pending = true;
+            Ok(())
+        })
+    }
+
+    async fn verified(&self, epoch: &str) -> Result<(), StoreError> {
+        self.with(|state| {
+            let current = state.reclaim.state();
+            if current.epoch == epoch {
+                current.verify_pending = false;
+            }
+            Ok(())
+        })
+    }
+
+    async fn advance(&self, epoch: &str, counter: u64) -> Result<bool, StoreError> {
+        self.with(|state| {
+            let current = state.reclaim.state();
+            let moved =
+                current.epoch == epoch && current.counter < counter && !current.verify_pending;
+            if moved {
+                current.counter = counter;
+            }
+            Ok(moved)
+        })
+    }
+
+    async fn live_prefixes(&self) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let r = &state.reclaim;
+            let mut live: Vec<String> = r
+                .prefixes
+                .iter()
+                .filter(|(_, i)| !r.retired.contains(i))
+                .map(|(p, _)| p.clone())
+                .collect();
+            live.sort();
+            Ok(live)
+        })
+    }
+
     async fn pin(
         &self,
         repo_prefix: &str,
@@ -2853,18 +2919,22 @@ impl ReclaimStore for Reclaim {
             if !state.reclaim.live_prefix(repo_prefix) {
                 return Ok(Pinned::Retired);
             }
+            let epoch = state.reclaim.state().epoch.clone();
             let mut tokens = Vec::new();
             for logical in logical_keys {
                 let stem = layout::physical_key(logical, "");
                 let reusable = row_references(state).into_iter().find(|(k, covers)| {
                     !covers
                         && k.strip_prefix(&stem).is_some_and(|g| !g.contains('/'))
+                        && layout::generation_epoch(k) == Some(epoch.as_str())
                         && !state.reclaim.claimed.contains(k)
                 });
                 let physical = match reusable {
                     Some((k, _)) => k,
                     None => {
-                        layout::physical_key(logical, &uuid::Uuid::new_v4().simple().to_string())
+                        let generation =
+                            layout::generation(&epoch, &uuid::Uuid::new_v4().simple().to_string());
+                        layout::physical_key(logical, &generation)
                     }
                 };
                 let token = uuid::Uuid::new_v4().to_string();

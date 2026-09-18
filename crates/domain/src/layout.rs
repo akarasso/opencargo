@@ -58,6 +58,23 @@ pub fn physical_key(logical: &str, generation: &str) -> String {
     format!("{logical}~{generation}")
 }
 
+/// A generation minted under a restore epoch. The epoch is readable from
+/// the key, so a generation of another epoch is never reused.
+pub fn generation(epoch: &str, nonce: &str) -> String {
+    format!("{epoch}-{nonce}")
+}
+
+/// The epoch a physical key was minted under; `None` for a key with no
+/// generation, or one minted before epochs.
+pub fn generation_epoch(physical: &str) -> Option<&str> {
+    let (_, generation) = physical.rsplit_once('~')?;
+    if generation.contains('/') {
+        return None;
+    }
+    let (epoch, nonce) = generation.split_once('-')?;
+    (!epoch.is_empty() && !nonce.is_empty()).then_some(epoch)
+}
+
 /// The logical key of a physical one; a legacy key is its own.
 pub fn logical_key(physical: &str) -> &str {
     match physical.rsplit_once('~') {
@@ -104,6 +121,15 @@ mod tests {
     }
 
     #[test]
+    fn a_generation_names_the_epoch_it_was_minted_under() {
+        let key = physical_key("r/i/p/f", &generation("e1", "n"));
+        assert_eq!(generation_epoch(&key), Some("e1"));
+        assert_eq!(generation_epoch("r/i/p/f~deadbeef"), None, "minted before epochs");
+        assert_eq!(generation_epoch("npm/r/p/f.tgz"), None);
+        assert_eq!(generation_epoch("r/i/p/f~e1-"), None);
+    }
+
+    #[test]
     fn prefixes_compare_as_segments() {
         assert!(under("r/ab/x", "r/ab"));
         assert!(under("r/ab", "r/ab"));
@@ -118,6 +144,7 @@ mod tests {
         assert_eq!(file_name("npm/r/p/p-1.0.0.tgz"), "p-1.0.0.tgz");
         assert_eq!(logical_key("r/i/p/f.tgz~g1"), "r/i/p/f.tgz");
         assert_eq!(logical_key("npm/r/p/f.tgz"), "npm/r/p/f.tgz");
+        assert_eq!(logical_key(&physical_key("r/i/p/f", &generation("e1", "n"))), "r/i/p/f");
         assert_eq!(incarnation_prefix("i"), "r/i");
         assert_eq!(oci_blob_key("r/i", "ab"), "r/i/_blobs/ab/blob");
         assert_eq!(oci_manifest_key("r/i", "team/app", "ab"), "r/i/team/app/ab/manifest");

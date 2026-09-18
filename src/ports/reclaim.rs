@@ -62,8 +62,39 @@ pub struct Backlog {
     pub prefixes: u64,
 }
 
+/// Who this installation is, which restore epoch its generations are minted
+/// under, and how far the high-water mark it wrote has gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Epoch {
+    pub installation: String,
+    pub epoch: String,
+    pub counter: u64,
+    /// Reclamation is refused until a `storage verify` clears it.
+    pub verify_pending: bool,
+}
+
 #[async_trait]
 pub trait ReclaimStore: Send + Sync {
+    /// The installation, its epoch and its counter.
+    async fn epoch(&self) -> Result<Epoch, StoreError>;
+
+    /// Draws a fresh opaque epoch — never a counter, so two branches of one
+    /// backup never draw the same — and refuses reclamation until verified.
+    async fn new_epoch(&self) -> Result<Epoch, StoreError>;
+
+    /// Refuses reclamation until verified, under the same epoch.
+    async fn require_verify(&self) -> Result<(), StoreError>;
+
+    /// Lifts the refusal, when `epoch` is still the current one.
+    async fn verified(&self, epoch: &str) -> Result<(), StoreError>;
+
+    /// Records the counter the mark already carries: a compare-and-set on
+    /// the epoch and the counter it advances from.
+    async fn advance(&self, epoch: &str, counter: u64) -> Result<bool, StoreError>;
+
+    /// The prefixes of live incarnations: what a verify may enqueue under.
+    async fn live_prefixes(&self) -> Result<Vec<String>, StoreError>;
+
     /// One transaction for every key of one placement. A generation is
     /// reused only when a committed row references it and it was never
     /// claimed; otherwise a fresh opaque one is allocated. Never waits.
