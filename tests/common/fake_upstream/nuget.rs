@@ -21,6 +21,7 @@ pub struct Switches {
     pub redirect_index: bool,
     pub gzip_registration: bool,
     pub hash_in_registration: bool,
+    pub down: bool,
 }
 
 #[derive(Default)]
@@ -132,6 +133,9 @@ async fn serve(State(s): State<Shared>, req: Request) -> Response<Body> {
     inner.hits.push((path.clone(), authorized));
     let segments: Vec<&str> = path.trim_start_matches('/').split('/').collect();
     let (base, other) = (&s.base, &s.other);
+    if inner.switches.down {
+        return reply(StatusCode::SERVICE_UNAVAILABLE, "{}");
+    }
     match segments.as_slice() {
         ["v3", "index.json"] if inner.switches.redirect_index => Response::builder()
             .status(StatusCode::FOUND)
