@@ -431,6 +431,23 @@ mod tests {
         ));
     }
 
+    /// `corrupt_column` and `DomainError::CorruptColumn` build the same
+    /// sentence, so moving these two methods into the domain cannot change an
+    /// HTTP body.
+    #[test]
+    fn corrupt_column_message_matches_the_domain_error() {
+        let repo = repository("mirror", "npm");
+        assert_eq!(
+            repo.kind().unwrap_err().to_string(),
+            crate::domain::DomainError::CorruptColumn {
+                repo: repo.name.clone(),
+                column: "repo_type",
+                value: repo.repo_type.clone(),
+            }
+            .to_string()
+        );
+    }
+
     #[tokio::test]
     async fn check_repository_names_refuses_pre_upgrade_slash() {
         for ok in [
