@@ -13,6 +13,7 @@ pub mod identities;
 pub mod identity_provider;
 pub mod ids;
 pub mod maven;
+pub mod mcp;
 pub mod multipart;
 pub mod nuget;
 pub mod oci;

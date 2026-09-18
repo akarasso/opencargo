@@ -45,6 +45,7 @@ pub mod audit;
 pub mod dashboard;
 pub mod deps;
 pub mod maven;
+pub mod mcp;
 pub mod identities;
 pub mod migrate;
 pub mod multipart;
@@ -347,6 +348,10 @@ impl SqliteStores {
 
     pub fn secrets(&self) -> Arc<dyn ServerSecretStore> {
         Arc::new(identities::SqliteSecretStore::new(self.pool.clone()))
+    }
+
+    pub fn mcp(&self) -> Arc<dyn crate::ports::mcp::McpStore> {
+        Arc::new(mcp::SqliteMcpStore::new(self.pool.clone()))
     }
 
     pub fn dashboard(&self) -> Arc<dyn DashboardRead> {
