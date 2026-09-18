@@ -1,3 +1,5 @@
+mod common;
+
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -128,7 +130,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
 
     config.server.base_url = base_url.clone();
 
-    let state = server::build_state(&config)
+    let state = common::build_state(&mut config)
         .await
         .expect("failed to build app state");
     let router = server::build_router(state);

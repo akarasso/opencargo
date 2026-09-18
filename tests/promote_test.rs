@@ -1,3 +1,5 @@
+mod common;
+
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -138,7 +140,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
 
     config.server.base_url = base_url.clone();
 
-    let state = server::build_state(&config)
+    let state = common::build_state(&mut config)
         .await
         .expect("failed to build app state");
     let router = server::build_router(state);
@@ -328,6 +330,10 @@ async fn test_promote_package() {
 /// shared-path behavior this download would 404.
 #[tokio::test]
 async fn test_promote_isolates_tarball_from_source() {
+    if common::storage_is_s3() {
+        eprintln!("skipped under S3: the test deletes the source's files on disk");
+        return;
+    }
     let (base_url, _handle, tmp) = setup().await;
     let client = reqwest::Client::new();
 

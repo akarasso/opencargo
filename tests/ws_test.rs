@@ -116,7 +116,7 @@ async fn setup(anonymous_read: bool) -> (String, tokio::task::JoinHandle<()>, Te
 
     config.server.base_url = base_url.clone();
 
-    let state = server::build_state(&config)
+    let state = common::build_state(&mut config)
         .await
         .expect("failed to build app state");
     let router = server::build_router(state);

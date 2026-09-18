@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -189,7 +191,7 @@ async fn setup_with_webhooks(
 
     config.server.base_url = base_url.clone();
 
-    let state = server::build_state(&config)
+    let state = common::build_state(&mut config)
         .await
         .expect("failed to build app state");
     let router = server::build_router(state);

@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test test-quick test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker clean frontend release docker deploy undeploy logs publish lint fmt
 
 # Load .env if it exists
 -include .env
@@ -54,6 +54,9 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 		--test go_test --test go_proxy_test --test oci_test --test oci_nested_test --test oci_proxy_test \
 		--test vuln_test --test group_resolver_test --test auth_test --test features_test \
 		--test promote_test --test permissions_test --test policy_test
+
+test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
+	scripts/test-s3.sh
 
 test-load: ## Test de charge du writer policy (5 000 evenements a 500/s, ~16 s)
 	cargo test --lib burst_over_cold_rate_drops_nothing -- --ignored

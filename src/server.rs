@@ -72,6 +72,8 @@ const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<dyn StorageBackend>,
+    /// `fs` or `s3`: which adapter the store is, never where it points.
+    pub storage_backend: &'static str,
     pub storage_ready: Arc<StorageReadiness>,
     /// What the proxy remembers; the engine holds it too, and the background
     /// sweep needs it without going through the engine.
@@ -261,6 +263,21 @@ fn filesystem_store(root: impl Into<std::path::PathBuf>, identity: StoreIdentity
     }
 }
 
+/// The artifacts store `config` declares, on the system clock: what the test
+/// harness rebuilds to look at a server's bytes.
+pub fn storage_for(
+    config: &Config,
+    ledger: Arc<dyn MultipartLedger>,
+) -> anyhow::Result<Arc<dyn StorageBackend>> {
+    Ok(build_configured_storage(
+        config,
+        Role::Artifacts,
+        ledger,
+        Arc::new(crate::adapters::system::SystemClock),
+    )?
+    .backend)
+}
+
 /// The store `config` declares for `role`: the filesystem under the storage
 /// path, or S3 with its multipart uploads recorded in `ledger`.
 pub fn build_configured_storage(
@@ -319,13 +336,14 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     seed_repositories(repos.as_ref(), &config.repositories, Utc::now()).await?;
 
     config.validate()?;
-    let storage = build_configured_storage(
+    let built = build_configured_storage(
         config,
         Role::Artifacts,
         stores.multipart(),
         Arc::new(crate::adapters::system::SystemClock),
-    )?
-    .backend;
+    )?;
+    let storage_backend = built.location.backend;
+    let storage = built.backend;
 
     let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 
@@ -363,6 +381,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     report_ready(config, &policy_notes);
 
     Ok(AppState {
+        storage_backend,
         storage_ready: Arc::new(StorageReadiness::new(storage.clone())),
         storage,
         cache,

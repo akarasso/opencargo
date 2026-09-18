@@ -64,6 +64,8 @@ pub struct TestServer {
     pub port: u16,
     pub handle: tokio::task::JoinHandle<()>,
     pub tmp: TempDir,
+    /// The store the server ran on, kept so a restart finds its bytes.
+    pub storage: opencargo::config::StorageConfig,
 }
 
 /// The config every spawned server runs with: storage and database under `tmp`.
@@ -99,19 +101,79 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
     }
 }
 
+/// Whether this run puts every test server on S3 (`OPENCARGO_TEST_STORAGE=s3`,
+/// the endpoint and credentials in the adapter's own variables).
+pub fn storage_is_s3() -> bool {
+    std::env::var("OPENCARGO_TEST_STORAGE").as_deref() == Ok("s3")
+}
+
+/// The storage switch every test config goes through: under S3, one bucket
+/// and a prefix of its own per server.
+pub fn switch_storage(config: &mut Config) {
+    if !storage_is_s3() {
+        return;
+    }
+    config.storage.backend = opencargo::config::StorageKind::S3;
+    config.storage.s3.bucket =
+        std::env::var("OPENCARGO_TEST_S3_BUCKET").unwrap_or_else(|_| "opencargo-test".to_string());
+    config.storage.s3.allow_http = true;
+    config.storage.s3.part_size_mib = 5;
+    if config.storage.s3.prefix.is_empty() {
+        config.storage.s3.prefix = format!("t/{}", uuid::Uuid::new_v4().simple());
+    }
+}
+
+/// `server::build_state` behind the switch, refusing a vacuous S3 run: a
+/// switched server that did not build an S3 store fails the test.
+pub async fn build_state(config: &mut Config) -> anyhow::Result<opencargo::server::AppState> {
+    switch_storage(config);
+    let state = server::build_state(config).await?;
+    let want = if storage_is_s3() { "s3" } else { "fs" };
+    assert_eq!(state.storage_backend, want, "the storage switch was not applied");
+    Ok(state)
+}
+
 /// Start an opencargo on a random loopback port, ready to serve.
 pub async fn spawn_server(opts: SpawnOpts) -> TestServer {
     let tmp = TempDir::new().expect("failed to create temp dir");
-    spawn_in(tmp, opts).await
+    spawn_in(tmp, opts, None).await
 }
 
 /// Stop `server` and start another on its database and storage: a restart.
 pub async fn respawn(server: TestServer, opts: SpawnOpts) -> TestServer {
     server.handle.abort();
-    spawn_in(server.tmp, opts).await
+    spawn_in(server.tmp, opts, Some(server.storage)).await
 }
 
-async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
+/// The store `server` runs on, built again through the composition root.
+pub async fn storage_of(server: &TestServer) -> std::sync::Arc<dyn opencargo::storage::StorageBackend> {
+    let mut config = test_config(&server.tmp, "http://127.0.0.1:0", SpawnOpts::default());
+    config.storage = server.storage.clone();
+    let stores = server::open_stores(&server.tmp.path().join("opencargo.db"))
+        .await
+        .expect("failed to open the server database");
+    server::storage_for(&config, stores.multipart()).expect("failed to build the server's store")
+}
+
+/// Every key the server's store holds, sorted.
+pub async fn stored_keys(server: &TestServer) -> Vec<String> {
+    use futures_util::TryStreamExt;
+    let mut keys: Vec<String> = storage_of(server)
+        .await
+        .list("")
+        .map_ok(|meta| meta.key)
+        .try_collect()
+        .await
+        .expect("failed to list the server's store");
+    keys.sort();
+    keys
+}
+
+async fn spawn_in(
+    tmp: TempDir,
+    opts: SpawnOpts,
+    storage: Option<opencargo::config::StorageConfig>,
+) -> TestServer {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("failed to bind to random port");
@@ -119,8 +181,11 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
     let base_url = format!("http://{addr}");
 
     let tuning = opts.policy_tuning;
-    let config = test_config(&tmp, &base_url, opts);
-    let mut state = server::build_state(&config)
+    let mut config = test_config(&tmp, &base_url, opts);
+    if let Some(storage) = storage {
+        config.storage = storage;
+    }
+    let mut state = build_state(&mut config)
         .await
         .expect("failed to build app state");
     if let Some(tuning) = tuning {
@@ -154,6 +219,7 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
         port: addr.port(),
         handle,
         tmp,
+        storage: config.storage.clone(),
     }
 }
 
@@ -169,8 +235,8 @@ pub async fn seed_error(repositories: Vec<RepositoryConfig>) -> String {
 /// The error a server refuses to start with under these options.
 pub async fn seed_error_opts(opts: SpawnOpts) -> String {
     let tmp = TempDir::new().expect("failed to create temp dir");
-    let config = test_config(&tmp, "http://127.0.0.1:0", opts);
-    server::build_state(&config)
+    let mut config = test_config(&tmp, "http://127.0.0.1:0", opts);
+    build_state(&mut config)
         .await
         .err()
         .expect("the seed should be refused")

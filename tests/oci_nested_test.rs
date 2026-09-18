@@ -160,24 +160,12 @@ async fn push_pull_team_app_and_org_team_app_on_every_route() {
     every_route_roundtrip(&client, &server.base_url, "org/team/app").await;
 }
 
-fn files_under(dir: &std::path::Path, out: &mut Vec<String>, root: &std::path::Path) {
-    for entry in std::fs::read_dir(dir).unwrap().flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            files_under(&path, out, root);
-        } else {
-            out.push(path.strip_prefix(root).unwrap().to_string_lossy().into_owned());
-        }
-    }
-}
-
 /// Manifest keys carry the image, blob keys only the digest, and both lie
 /// under the repository's incarnation rather than its name.
 #[tokio::test]
 async fn manifest_keys_carry_the_image_and_blob_keys_do_not() {
     let server = setup().await;
     let client = reqwest::Client::new();
-    let storage = server.tmp.path().join("storage");
 
     for name in ["myapp", "team/app"] {
         let image = format!("{REPO}/{name}");
@@ -188,14 +176,14 @@ async fn manifest_keys_carry_the_image_and_blob_keys_do_not() {
             .trim_start_matches("sha256:")
             .to_string();
 
-        let mut files = Vec::new();
-        files_under(&storage, &mut files, &storage);
+        let files = common::stored_keys(&server).await;
         let manifest_file = files
             .iter()
             .find(|f| f.contains(&format!("/{name}/{hex}/manifest~")))
             .unwrap_or_else(|| panic!("{name}: no manifest key in {files:?}"));
         assert!(manifest_file.starts_with("r/"), "{manifest_file}");
-        assert_eq!(std::fs::read(storage.join(manifest_file)).unwrap(), manifest);
+        let stored = common::storage_of(&server).await.get(manifest_file).await.unwrap();
+        assert_eq!(stored.as_ref(), manifest.as_slice());
         let blob_file = files
             .iter()
             .find(|f| f.contains(&format!("/_blobs/{layer_hex}/blob~")))

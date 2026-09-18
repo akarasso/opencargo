@@ -159,22 +159,14 @@ async fn seed_upstream() -> Upstream {
     }
 }
 
-/// How many cached bodies the proxies hold: every file under an
+/// How many cached bodies the proxies hold: every key under an
 /// incarnation's `_proxy` segment.
-fn cached_files(server: &TestServer) -> usize {
-    let mut n = 0;
-    let mut pending = vec![server.tmp.path().join("storage/r")];
-    while let Some(dir) = pending.pop() {
-        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                pending.push(path);
-            } else if path.to_string_lossy().contains("/_proxy/") {
-                n += 1;
-            }
-        }
-    }
-    n
+async fn cached_files(server: &TestServer) -> usize {
+    common::stored_keys(server)
+        .await
+        .iter()
+        .filter(|k| k.starts_with("r/") && k.contains("/_proxy/"))
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -526,11 +518,11 @@ async fn delete_then_recreate_never_serves_old_cache() {
 
     assert_eq!(get_status(&url).await, StatusCode::OK);
     assert_eq!(up.packument_hits(), 1);
-    assert!(cached_files(&server) > 0, "the proxy wrote its cache");
+    assert!(cached_files(&server).await > 0, "the proxy wrote its cache");
 
     let (status, text) = admin.delete("p").await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert_eq!(cached_files(&server), 0, "delete reclaims the cache files");
+    assert_eq!(cached_files(&server).await, 0, "delete reclaims the cache files");
     let pool = db(&server).await;
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await,
@@ -573,12 +565,12 @@ async fn changing_the_upstream_purges_the_cache() {
 
     assert_eq!(get_status(&url).await, StatusCode::OK);
     assert_eq!(old.packument_hits(), 1);
-    let before = cached_files(&server);
+    let before = cached_files(&server).await;
     assert!(before > 0);
 
     let (status, text) = admin.update("p", json!({ "visibility": "public" })).await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert_eq!(cached_files(&server), before, "a patch that keeps the upstream keeps the cache");
+    assert_eq!(cached_files(&server).await, before, "a patch that keeps the upstream keeps the cache");
 
     let (status, text) = admin.update("p", json!({ "upstream": new.url() })).await;
     assert_eq!(status, StatusCode::OK, "{text}");
@@ -613,12 +605,12 @@ async fn delete_group_keeps_member_caches() {
     })
     .await;
     assert_eq!(get_status(&format!("{}/g/{PKG}", server.base_url)).await, StatusCode::OK);
-    let before = cached_files(&server);
+    let before = cached_files(&server).await;
     assert!(before > 0);
 
     let (status, text) = Admin::of(&server).delete("g").await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert_eq!(cached_files(&server), before, "the member's files survive");
+    assert_eq!(cached_files(&server).await, before, "the member's files survive");
     assert_eq!(get_status(&format!("{}/p/{PKG}", server.base_url)).await, StatusCode::OK);
     assert_eq!(up.packument_hits(), 1, "served from the surviving cache");
 }
