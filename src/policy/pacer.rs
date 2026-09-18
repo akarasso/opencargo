@@ -124,7 +124,7 @@ mod tests {
     use super::*;
     use crate::policy::testing::{engine_over, fast};
     use crate::policy::Tuning;
-    use crate::proxy::engine::fixture::Fx;
+    use crate::testing::fixture::Fx;
     use axum::http::StatusCode;
 
     fn meta(fx: &Fx, version: &str) -> CargoArtifact {

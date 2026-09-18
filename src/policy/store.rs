@@ -149,10 +149,6 @@ struct RuleCountRow {
     count: i64,
 }
 
-fn sqlite_time(t: DateTime<Utc>) -> String {
-    t.format("%Y-%m-%d %H:%M:%S").to_string()
-}
-
 /// Which rows of the window the totals cover: `after < id <= upto`, so
 /// a snapshot and the delta on top of it never count a row twice.
 #[derive(Debug, Clone, Copy)]
@@ -173,7 +169,7 @@ fn from<'a>(q: &mut QueryBuilder<'a, Sqlite>, f: &ReportFilter<'a>) {
 
 fn filters<'a>(q: &mut QueryBuilder<'a, Sqlite>, f: &ReportFilter<'a>, range: Option<IdRange>) {
     q.push(" WHERE r.created_at >= ");
-    q.push_bind(sqlite_time(f.since));
+    q.push_bind(crate::db::bind_ts(f.since));
     if let Some(range) = range {
         q.push(" AND r.id > ");
         q.push_bind(range.after);

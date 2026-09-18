@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             // cache sweep runs whenever proxy_cache_older_than_days is set.
             tokio::spawn(opencargo::telemetry::cleanup::start_cleanup_task(
                 app_state.db.clone(),
+                app_state.cache.clone(),
                 app_state.storage.clone(),
                 cfg.cleanup.clone(),
             ));

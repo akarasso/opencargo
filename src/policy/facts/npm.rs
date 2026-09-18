@@ -107,7 +107,7 @@ pub fn npm_version(name: &str, filename: &str, packument: Option<&Value>) -> Opt
 /// One memo entry per packument row: concurrent misses await one parse,
 /// one conditional refresh.
 pub struct NpmSlot {
-    pub stamp: (i64, String, Option<String>),
+    pub stamp: (i64, DateTime<Utc>, Option<String>),
     pub cell: Arc<OnceCell<Arc<PackageFacts>>>,
     pub refresh: Option<(Instant, Arc<OnceCell<()>>)>,
 }
@@ -206,10 +206,10 @@ pub(crate) async fn package_facts(
     }
 }
 
-fn stamp(cached: &Cached) -> (i64, String, Option<String>) {
+fn stamp(cached: &Cached) -> (i64, DateTime<Utc>, Option<String>) {
     (
         cached.entry.id,
-        cached.entry.fetched_at.clone(),
+        cached.entry.fetched_at,
         cached.entry.digest.clone(),
     )
 }

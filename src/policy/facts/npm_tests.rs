@@ -7,7 +7,7 @@ use serde_json::json;
 use super::*;
 use crate::policy::testing::{engine_over, fast};
 use crate::policy::Tuning;
-use crate::proxy::engine::fixture::Fx;
+use crate::testing::fixture::Fx;
 
 fn packument(versions: &[(&str, &str)]) -> Value {
     let mut v = json!({ "name": "widget", "versions": {}, "time": {} });

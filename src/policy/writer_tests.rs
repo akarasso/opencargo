@@ -3,14 +3,15 @@ use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 
+use chrono::DateTime;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::db::proxy_cache::CacheEntry;
+use crate::domain::CacheEntry;
 use crate::policy::rules::PolicyConfig;
 use crate::policy::testing::{engine_over, engine_with, fast, pending, repo, scanner, FakeOsv};
 use crate::policy::{PolicyEngine, Source, Tuning, QUEUE};
-use crate::proxy::engine::fixture::Fx;
+use crate::testing::fixture::Fx;
 use crate::proxy::engine::Cached;
 use crate::proxy::UpstreamStrategy;
 use crate::registry::oci::upstream::{OciArtifact, OciUpstream};
@@ -584,9 +585,10 @@ fn cache_entry_shape_pins_the_served_digest_column() {
         etag: None,
         digest: Some("aa".into()),
         size: 0,
-        fetched_at: String::new(),
+        fetched_at: DateTime::UNIX_EPOCH,
         expires_at: None,
-        last_used_at: String::new(),
+        last_used_at: DateTime::UNIX_EPOCH,
+        fresh: true,
     };
     let key = OciUpstream.cache_key(&OciArtifact::Manifest {
         name: "app".into(),

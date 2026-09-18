@@ -234,9 +234,9 @@ pub(crate) async fn go_published_at(
 mod tests {
     use super::*;
     use crate::domain::Format;
-    use crate::db::proxy_cache::CacheEntry;
+    use crate::domain::CacheEntry;
     use crate::policy::testing::{engine_over, fast, pending, repo};
-    use crate::proxy::engine::fixture::Fx;
+    use crate::testing::fixture::Fx;
 
     #[test]
     fn parse_time_rfc3339_with_millis() {
@@ -278,9 +278,10 @@ mod tests {
                 etag: None,
                 digest: Some(hex.into()),
                 size: 0,
-                fetched_at: String::new(),
+                fetched_at: DateTime::UNIX_EPOCH,
                 expires_at: None,
-                last_used_at: String::new(),
+                last_used_at: DateTime::UNIX_EPOCH,
+                fresh: true,
             },
             stale: false,
         }

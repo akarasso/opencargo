@@ -12,12 +12,12 @@ declare_row() { local IFS=$'\x1f'; rows+=("$*"); }
 # Bounds are measured occurrences at 6c9747a, never lines: `\bdb::` is 232 occurrences over 231
 # lines, so a max fed by a line count licenses one free violation. A raise is an edit to this
 # block, in the commit that needs it, with the reason on the line -- never a silent bump.
-declare_row db-calls       max 159 '\bdb::'                  plain src '*.rs' src/db src/adapters # 171 -> 159: the webhook CRUD is a port
-declare_row pool-field     max 209 '\.db\b'                  strip src '*.rs' src/db src/adapters # 219 -> 209: the webhook handlers hold a store, not the pool. strip: `"...opencargo.db"` is a filename, not a pool
-declare_row stray-sql      max  96 'sqlx::query'             plain src '*.rs' src/db src/adapters # covers _as and _scalar
-declare_row pool-leak      max  70 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 73 -> 70: the webhook dispatcher holds a WebhookStore
+declare_row db-calls       max 153 '\bdb::'                  plain src '*.rs' src/db src/adapters # 159 -> 153: the proxy cache is a port
+declare_row pool-field     max 195 '\.db\b'                  strip src '*.rs' src/db src/adapters # 209 -> 195: the proxy engine holds a store, not the pool. strip: `"...opencargo.db"` is a filename, not a pool
+declare_row stray-sql      max  91 'sqlx::query'             plain src '*.rs' src/db src/adapters # 96 -> 91: 0 in src/proxy/, and the cache sweep goes through the store. covers _as and _scalar
+declare_row pool-leak      max  67 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 70 -> 67: 0 in src/proxy/, the precondition 7a's Cx.proxy depends on
 declare_row context-bypass max  25 'cx\.state\b'             plain src '*.rs'                     # word boundary: `cx.state` is also passed whole
-declare_row dialect-rs     max  21 'datetime\(|julianday\(|strftime\(|AUTOINCREMENT|INSERT OR ' plain src '*.rs' src/db src/adapters/sqlite # 22 -> 21: go/mod.rs's rfc3339 comment went with its subject
+declare_row dialect-rs     max  14 'datetime\(|julianday\(|strftime\(|AUTOINCREMENT|INSERT OR ' plain src '*.rs' src/db src/adapters/sqlite # 21 -> 14: the cache predicates bind the caller's clock instead of reading the database's
 declare_row dialect-sql    max  49 "AUTOINCREMENT|CHECK\(|fts5|CREATE TRIGGER|datetime\('now'\)" plain 'src/db/migrations src/adapters/sqlite/migrations' '*.sql' # scoped, not eliminated: SQLite DDL belongs in a SQLite directory
 declare_row concrete-fs    eq    0 'FilesystemStorage'       plain src '*.rs' src/storage src/adapters/fs # eq, not max: clippy cannot see `FilesystemStorage::new(..)` in expression position, so this row is the real check (4.1)
 declare_row storage-error  eq    0 '(crate|opencargo)::error' plain 'src/storage src/adapters/fs' '*.rs' # the storage port answers with StorageError; AppError is the layer above's word (2.1)
@@ -25,8 +25,8 @@ declare_row adapter-import max   0 '(crate|opencargo)::adapters::' plain src '*.
 declare_row domain-paths   max   0 '(crate|opencargo)::(error|server|db|api|registry|proxy|storage|telemetry|auth|app|adapters)\b' plain src/domain '*.rs'
 declare_row domain-names   max   0 'AppError|AppResult|sqlx|axum|reqwest' plain src/domain '*.rs'
 declare_row tests-raw-sql  max  41 'sqlx::query|SqlitePool'  plain tests '*.rs' tests/common/contract.rs # ratchet-only (7.4); the contract suite is the one exclusion
-declare_row unit-tests     min 241 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 234 -> 241: the pilot's use case and its domain rule. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
-declare_row integ-tests    min 278 '#\[(tokio::)?test\]'     plain tests '*.rs' # 271 -> 278: store_contract!, seven clauses run against two adapters
+declare_row unit-tests     min 244 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 241 -> 244: the freshness rule and the engine's expiry case. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
+declare_row integ-tests    min 284 '#\[(tokio::)?test\]'     plain tests '*.rs' # 278 -> 284: proxy_cache_contract!, six clauses run against two adapters
 
 # files <roots> <glob> [excluded paths...] -- the scope, one path per line
 files() {

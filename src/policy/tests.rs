@@ -1,5 +1,5 @@
 use super::*;
-use crate::proxy::engine::fixture::Fx;
+use crate::testing::fixture::Fx;
 
 fn user(user_id: Option<i64>, username: &str, token_name: Option<&str>) -> AuthUser {
     AuthUser {

@@ -3,14 +3,15 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
 use crate::error::StoreError;
+use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::webhooks::WebhookStore;
 
 pub mod migrate;
 pub mod multipart;
+pub mod proxy_cache;
 pub mod webhooks;
 
 /// This adapter's stored timestamp: UTC, second precision.
@@ -20,9 +21,10 @@ pub mod webhooks;
 /// adapter that wrote RFC 3339 instead would sort `'T'` above `' '` and
 /// mis-evaluate every legacy row. Every statement here binds it, so no column
 /// default ever fires and the row carries the caller's clock.
-pub(crate) fn bind_ts(at: DateTime<Utc>) -> String {
-    at.format("%Y-%m-%d %H:%M:%S").to_string()
-}
+///
+/// It is defined next to its inverse `parse_ts`, one module below, which the
+/// statements not yet behind a store still reach; both move here when they do.
+pub(crate) use crate::db::{bind_ts, parse_ts};
 
 /// The driver's failures in the store's vocabulary, for every store here.
 /// `Unavailable` is the one that must not collapse into `Other`: SQLite has a
@@ -68,5 +70,9 @@ impl SqliteStores {
 
     pub fn webhooks(&self) -> Arc<dyn WebhookStore> {
         Arc::new(webhooks::SqliteWebhookStore::new(self.pool.clone()))
+    }
+
+    pub fn proxy_cache(&self) -> Arc<dyn ProxyCacheStore> {
+        Arc::new(proxy_cache::SqliteProxyCacheStore::new(self.pool.clone()))
     }
 }

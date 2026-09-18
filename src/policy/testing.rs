@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 
 use super::*;
 use crate::domain::Visibility;
-use crate::proxy::engine::fixture::{timeouts, Fx};
+use crate::testing::fixture::{timeouts, Fx};
 
 pub fn repo(id: i64, name: &str, format: Format) -> Repository {
     Repository {
