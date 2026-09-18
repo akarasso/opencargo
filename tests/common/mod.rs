@@ -8,6 +8,7 @@ pub mod contract;
 pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;
+pub mod faults;
 pub mod nuget;
 pub mod upstream_tap;
 
@@ -45,6 +46,8 @@ pub struct SpawnOpts {
     pub policy: HashMap<String, PolicyConfig>,
     /// Replaces the policy engine's timing knobs after `build_state`.
     pub policy_tuning: Option<Tuning>,
+    /// Puts the storage and the permission store behind switches.
+    pub outage: Option<faults::Outage>,
 }
 
 impl Default for SpawnOpts {
@@ -56,6 +59,7 @@ impl Default for SpawnOpts {
             vuln: VulnScanConfig::default(),
             policy: HashMap::new(),
             policy_tuning: None,
+            outage: None,
         }
     }
 }
@@ -120,6 +124,7 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
     let base_url = format!("http://{addr}");
 
     let tuning = opts.policy_tuning;
+    let outage = opts.outage.clone();
     let config = test_config(&tmp, &base_url, opts);
     let mut state = server::build_state(&config)
         .await
@@ -133,6 +138,9 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
             state.proxy.clone(),
             tuning,
         );
+    }
+    if let Some(outage) = outage {
+        outage.install(&mut state);
     }
     let app = server::build_router(state)
         .map_request(server::decode_percent_encoded_slashes)

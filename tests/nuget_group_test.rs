@@ -9,6 +9,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 use common::fake_upstream::nuget::{self as fake, FakeNuget};
+use common::faults::Outage;
 use common::nuget::{nupkg, push};
 use common::{
     add_token, create_user, group, hosted, proxy_with, spawn_server, ProxyOpts, SpawnOpts,
@@ -19,6 +20,10 @@ use opencargo::config::{RepositoryFormat, Visibility};
 const N: RepositoryFormat = RepositoryFormat::Nuget;
 
 async fn setup(up: &FakeNuget) -> TestServer {
+    setup_with(up, None).await
+}
+
+async fn setup_with(up: &FakeNuget, outage: Option<Outage>) -> TestServer {
     spawn_server(SpawnOpts {
         repositories: vec![
             hosted("local", N, Visibility::Public),
@@ -37,6 +42,7 @@ async fn setup(up: &FakeNuget) -> TestServer {
             group("private-last", N, &["local", "secret"]),
             group("without-secret", N, &["local"]),
         ],
+        outage,
         ..Default::default()
     })
     .await
@@ -155,4 +161,62 @@ async fn a_member_down_is_never_a_not_found() {
     assert_eq!(cold.status(), StatusCode::BAD_GATEWAY, "a member down is not an absent package");
     let cold = get(format!("{base}/all/v3/registration/cold.lib/index.json"), None).await;
     assert_eq!(cold.status(), StatusCode::BAD_GATEWAY);
+}
+
+/// NuGet 2.6 and invariant 14: a store or storage outage is ours, a 503,
+/// never the 404 `dotnet` would cache as NU1101 nor a member's 502.
+#[tokio::test]
+async fn an_unavailable_store_or_storage_is_503_never_404_nor_502() {
+    let up = fake::start().await;
+    let outage = Outage::default();
+    let server = setup_with(&up, Some(outage.clone())).await;
+    let c = reqwest::Client::new();
+    let base = &server.base_url;
+    push(&c, base, "local", nupkg("Local.Lib", "1.0.0", &[])).await;
+    push(&c, base, "secret", nupkg("Local.Lib", "2.0.0", &[])).await;
+    up.add("Remote.Lib", "1.0.0", nupkg("Remote.Lib", "1.0.0", &[]));
+    create_user(&c, base, STATIC_TOKEN, "reader", "reader").await;
+    let token = add_token(&c, base, "reader", "t").await;
+
+    let paths = |id: &str| {
+        [
+            format!("flatcontainer/{id}/index.json"),
+            format!("registration/{id}/index.json"),
+            format!("flatcontainer/{id}/1.0.0/{id}.1.0.0.nupkg"),
+        ]
+    };
+    for id in ["local.lib", "remote.lib"] {
+        for path in paths(id) {
+            let resp = get(format!("{base}/all/v3/{path}"), None).await;
+            assert_eq!(resp.status(), StatusCode::OK, "warm {path}");
+        }
+    }
+
+    outage.set(true, false);
+    for id in ["local.lib", "remote.lib"] {
+        for path in paths(id) {
+            for (who, t) in [("anonymous", None), ("reader", Some(token.as_str()))] {
+                let resp = get(format!("{base}/all/v3/{path}"), t).await;
+                assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "storage down, {who}: {path}");
+            }
+        }
+    }
+
+    outage.set(false, true);
+    for path in paths("local.lib") {
+        let resp = get(format!("{base}/private-first/v3/{path}"), Some(&token)).await;
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE, "permissions down, reader: {path}");
+        let resp = get(format!("{base}/private-first/v3/{path}"), None).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "an anonymous caller is asked for credentials, which reads no grant: {path}"
+        );
+    }
+
+    outage.set(false, false);
+    for path in paths("local.lib") {
+        let resp = get(format!("{base}/private-first/v3/{path}"), Some(&token)).await;
+        assert_eq!(resp.status(), StatusCode::OK, "back up: {path}");
+    }
 }
