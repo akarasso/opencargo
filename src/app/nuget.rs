@@ -1,8 +1,8 @@
 //! Pushing a NuGet package: the id and version admitted and normalized by
 //! the format's rules, the `.nupkg` placed under a `HostedKey` by
 //! `place_shared` only, the version row committed by compare-and-set on the
-//! placement's pin. A `Superseded` commit is replayed from the request's
-//! spool by the helper; a `Conflict` loser's generation is enqueued; nothing
+//! placement's pin, its dependency edges in the same transaction. A
+//! `Superseded` commit is replayed from the request's spool by the helper; a `Conflict` loser's generation is enqueued; nothing
 //! here deletes or pins.
 
 use std::sync::Arc;
@@ -11,14 +11,12 @@ use base64::Engine;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256, Sha512};
-use tracing::warn;
 
 use crate::app::place::{Entry, Placer, Source};
 use crate::app::publish::{repo_prefix, PublishError};
 use crate::domain::{layout, DomainError, FormatRules};
 use crate::error::AppError;
-use crate::ports::deps::{DependencyStore, NewDependency};
-use crate::ports::packages::{NameMatch, NewRelease, PackageStore, Release};
+use crate::ports::packages::{NameMatch, NewRelease, PackageStore, Release, ReleaseDependency};
 use crate::ports::repositories::RepositoryStore;
 
 /// One edge of the nuspec: the dependency id, its range, and its target
@@ -61,7 +59,6 @@ impl From<PushError> for AppError {
 pub struct PublishNugetPackage {
     packages: Arc<dyn PackageStore>,
     repos: Arc<dyn RepositoryStore>,
-    deps: Arc<dyn DependencyStore>,
     placer: Arc<Placer>,
     rules: &'static dyn FormatRules,
 }
@@ -70,14 +67,12 @@ impl PublishNugetPackage {
     pub fn new(
         packages: Arc<dyn PackageStore>,
         repos: Arc<dyn RepositoryStore>,
-        deps: Arc<dyn DependencyStore>,
         placer: Arc<Placer>,
         rules: &'static dyn FormatRules,
     ) -> Self {
         Self {
             packages,
             repos,
-            deps,
             placer,
             rules,
         }
@@ -96,6 +91,16 @@ impl PublishNugetPackage {
             logical_key: layout::hosted_key(&prefix, &name, &sha256, &filename),
             source: Source::Bytes(push.spool.clone()),
         }];
+        let dependencies: Vec<ReleaseDependency<'_>> = push
+            .dependencies
+            .iter()
+            .map(|d| ReleaseDependency {
+                name: d.id,
+                requirement: d.range,
+                kind: d.framework,
+            })
+            .collect();
+        let deps_ref = &dependencies;
         let (name_ref, version_ref, sha256_ref, sha512_ref) = (&name, &version, &sha256, &sha512);
         let push_ref = &push;
         let landed = self
@@ -121,6 +126,7 @@ impl PublishNugetPackage {
                                 size,
                                 tarball_path: &pins[0].physical_key,
                                 dist_tags: &[],
+                                dependencies: deps_ref,
                                 pins: &pins,
                                 now,
                             })
@@ -131,18 +137,6 @@ impl PublishNugetPackage {
             )
             .await
             .map_err(PublishError::from)?;
-        for dep in push.dependencies {
-            let edge = NewDependency {
-                package: landed.package.id,
-                version: landed.version.id,
-                name: dep.id,
-                requirement: dep.range,
-                kind: dep.framework,
-            };
-            if let Err(e) = self.deps.record(&edge, now).await {
-                warn!(error = %e, dependency = dep.id, "nuget dependency not recorded");
-            }
-        }
         Ok(landed)
     }
 }

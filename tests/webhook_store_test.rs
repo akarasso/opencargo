@@ -15,6 +15,7 @@ async fn fake() -> Handles {
         repos: db.repositories(),
         packages: db.packages(),
         search: db.search(),
+        deps: db.dependencies(),
     };
     Handles::new(ports, Box::new(db))
 }
@@ -29,6 +30,7 @@ async fn sqlite() -> Handles {
         repos: stores.repositories(),
         packages: stores.packages(),
         search: stores.search(),
+        deps: stores.dependencies(),
     };
     Handles::new(ports, Box::new((tmp, stores)))
 }

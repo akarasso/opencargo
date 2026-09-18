@@ -328,6 +328,7 @@ mod tests {
                     size: 6,
                     tarball_path: &tarball_path,
                     dist_tags: &["latest".to_string()],
+                    dependencies: &[],
                     pins: &[],
                     now: at,
                 })

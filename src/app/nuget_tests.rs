@@ -121,7 +121,6 @@ impl Fx {
         PublishNugetPackage::new(
             packages,
             self.fakes.repositories(),
-            self.fakes.dependencies(),
             Arc::new(Placer::new(self.fakes.reclaim(), Arc::new(self.storage.clone()))),
             crate::registry::rules::rules_of(crate::domain::Format::Nuget).unwrap(),
         )
@@ -226,4 +225,29 @@ async fn push_leaves_no_part_file() {
     let fx = Fx::new().await;
     let landed = fx.publisher().run(fx.push("a", "1.0.0", b"pkg"), Utc::now()).await.unwrap();
     assert_eq!(fx.storage.keys(), vec![landed.version.tarball_path]);
+}
+
+#[tokio::test]
+async fn dependencies_commit_with_the_version_row() {
+    let fx = Fx::new().await;
+    let edges = [NugetDependency {
+        id: "Newtonsoft.Json",
+        range: "[13.0.1, )",
+        framework: "net8.0",
+    }];
+    let mut push = fx.push("a", "1.0.0", b"pkg");
+    push.dependencies = &edges;
+    let landed = fx.publisher().run(push, Utc::now()).await.unwrap();
+    let recorded = fx.fakes.dependencies().of_version(landed.version.id).await.unwrap();
+    assert_eq!(recorded.len(), 1);
+    assert_eq!(
+        (recorded[0].name.as_str(), recorded[0].requirement.as_str(), recorded[0].kind.as_str()),
+        ("Newtonsoft.Json", "[13.0.1, )", "net8.0")
+    );
+
+    let mut again = fx.push("a", "1.0.0", b"other");
+    again.dependencies = &edges;
+    fx.publisher().run(again, Utc::now()).await.unwrap_err();
+    let dependents = fx.fakes.dependencies().dependents("Newtonsoft.Json", false).await.unwrap();
+    assert_eq!(dependents.len(), 1, "the refused push recorded no edge");
 }

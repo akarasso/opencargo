@@ -46,10 +46,20 @@ pub struct NewRelease<'a> {
     pub tarball_path: &'a str,
     /// The tags that point at this version once it exists.
     pub dist_tags: &'a [String],
+    /// Edges out of this version, written in the same transaction so a
+    /// visible version never lacks them.
+    pub dependencies: &'a [ReleaseDependency<'a>],
     /// The pins of the keys the row references, spent by compare-and-set in
     /// the transaction; a revoked one makes the publish write nothing.
     pub pins: &'a [PinToken],
     pub now: DateTime<Utc>,
+}
+
+/// One dependency edge of a release, recorded with its version row.
+pub struct ReleaseDependency<'a> {
+    pub name: &'a str,
+    pub requirement: &'a str,
+    pub kind: &'a str,
 }
 
 /// What a publish landed: both rows, as stored.

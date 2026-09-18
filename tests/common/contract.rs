@@ -33,6 +33,7 @@ pub struct Handles {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub deps: Arc<dyn DependencyStore>,
     _keep: Box<dyn Any + Send>,
 }
 
@@ -43,6 +44,7 @@ pub struct Ports {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub deps: Arc<dyn DependencyStore>,
 }
 
 impl Handles {
@@ -52,6 +54,7 @@ impl Handles {
             repos: ports.repos,
             packages: ports.packages,
             search: ports.search,
+            deps: ports.deps,
             _keep: keep,
         }
     }
@@ -407,6 +410,7 @@ macro_rules! package_contract {
                     size: 4,
                     tarball_path: "npm/r/p/p.tgz",
                     dist_tags: tags,
+                    dependencies: &[],
                     pins: &[],
                     now: at(9),
                 }
@@ -453,6 +457,38 @@ macro_rules! package_contract {
                     .unwrap();
                 assert_eq!(landed.package.created_at, at(9).trunc_subsecs(0));
                 assert_eq!(landed.version.published_at, at(9).trunc_subsecs(0));
+            }
+
+            /// The edges of a release are written with its version row, so
+            /// a visible version never lacks them; a refused one writes none.
+            #[tokio::test]
+            async fn a_release_lands_with_its_dependencies_or_not_at_all() {
+                use ::opencargo::ports::packages::ReleaseDependency;
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let edges = [
+                    ReleaseDependency { name: "a", requirement: "^1", kind: "net8.0" },
+                    ReleaseDependency { name: "b", requirement: "", kind: "any" },
+                ];
+                let mut with = release(repo.id, "left-pad", "1.0.0", &[]);
+                with.dependencies = &edges;
+                let landed = handles.packages.publish_version(&with).await.unwrap();
+                let recorded = handles.deps.of_version(landed.version.id).await.unwrap();
+                assert_eq!(
+                    recorded
+                        .iter()
+                        .map(|d| (d.name.as_str(), d.requirement.as_str(), d.kind.as_str()))
+                        .collect::<Vec<_>>(),
+                    [("a", "^1", "net8.0"), ("b", "", "any")]
+                );
+
+                let refused = handles.packages.publish_version(&with).await.unwrap_err();
+                assert!(matches!(refused, StoreError::Conflict), "{refused:?}");
+                assert_eq!(handles.deps.of_version(landed.version.id).await.unwrap().len(), 2);
+                assert!(
+                    handles.deps.dependents("a", false).await.unwrap().len() == 1,
+                    "the refused publish recorded no second edge"
+                );
             }
 
             #[tokio::test]
@@ -1670,6 +1706,7 @@ macro_rules! reclaim_contract {
                         size: 1,
                         tarball_path: key,
                         dist_tags: &[],
+                        dependencies: &[],
                         pins: &[],
                         now: at(2),
                     })
@@ -1954,6 +1991,7 @@ macro_rules! reclaim_contract {
                     size: 1,
                     tarball_path: &pins[0].physical_key,
                     dist_tags: &[],
+                    dependencies: &[],
                     pins,
                     now: at(2),
                 }
@@ -2158,6 +2196,7 @@ macro_rules! nuget_feed_contract {
                         size: 1,
                         tarball_path: "k",
                         dist_tags: &[],
+                        dependencies: &[],
                         pins: &[],
                         now: Utc::now(),
                     })

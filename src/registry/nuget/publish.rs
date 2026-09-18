@@ -114,7 +114,6 @@ pub async fn push(
     let landed = PublishNugetPackage::new(
         state.packages.clone(),
         state.repos.clone(),
-        state.deps.clone(),
         state.placer(),
         super::read::rules(),
     )

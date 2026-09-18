@@ -16,6 +16,7 @@ use crate::adapters::sqlite::rows::{DistTagRow, PackageRow, VersionRow};
 use crate::domain::{DistTag, Package, Version};
 use crate::error::StoreError;
 use crate::ports::packages::{
+    ReleaseDependency,
     NameMatch, NewRelease, PackageStore, Promotion, PromotionAudit, Release, StalePrerelease,
 };
 
@@ -45,6 +46,7 @@ struct ReleaseSpec<'a> {
     readme: Option<&'a str>,
     values: VersionValues<'a>,
     dist_tags: &'a [String],
+    dependencies: &'a [ReleaseDependency<'a>],
     now: DateTime<Utc>,
 }
 
@@ -66,6 +68,7 @@ impl<'a> From<&'a NewRelease<'a>> for ReleaseSpec<'a> {
                 tarball_path: release.tarball_path,
             },
             dist_tags: release.dist_tags,
+            dependencies: release.dependencies,
             now: release.now,
         }
     }
@@ -89,6 +92,7 @@ impl<'a> From<&'a Promotion<'a>> for ReleaseSpec<'a> {
                 tarball_path: promotion.tarball_path,
             },
             dist_tags: promotion.dist_tags,
+            dependencies: &[],
             now: promotion.now,
         }
     }
@@ -200,6 +204,22 @@ async fn write_release(
 
     for tag in spec.dist_tags {
         tag_version(tx, package.id, tag, version.id).await?;
+    }
+    for dep in spec.dependencies {
+        sqlx::query(
+            "INSERT INTO package_dependencies
+                 (package_id, version_id, dependency_name, dependency_version_req,
+                  dependency_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(package.id)
+        .bind(version.id)
+        .bind(dep.name)
+        .bind(dep.requirement)
+        .bind(dep.kind)
+        .bind(bind_ts(spec.now))
+        .execute(&mut **tx)
+        .await?;
     }
     Ok((package, version))
 }

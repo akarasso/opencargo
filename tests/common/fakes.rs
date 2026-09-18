@@ -898,6 +898,14 @@ impl PackageStore for Packages {
         self.with(|state| {
             state.reclaim.live_pins(release.pins)?;
             let (package, version) = Self::write_release(state, &spec)?;
+            for dep in release.dependencies {
+                state.dependencies.push(DependencyRow {
+                    version_id: version.id,
+                    name: dep.name.to_string(),
+                    requirement: dep.requirement.to_string(),
+                    kind: dep.kind.to_string(),
+                });
+            }
             state.reclaim.spend(release.pins);
             Ok(Release { package, version })
         })
