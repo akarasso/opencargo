@@ -48,12 +48,14 @@ const CLOSE_FORBIDDEN: u16 = 4403;
 // Standard "Try Again Later" close code — used for transient DB failures
 // during auth, which must not look like a token rejection to the client.
 const CLOSE_TRY_AGAIN: u16 = 1013;
+const CLOSE_GOING_AWAY: u16 = 1001;
 
 pub async fn ws_handler(
     ws: WebSocketUpgrade,
     State(state): State<AppState>,
 ) -> impl IntoResponse {
-    ws.on_upgrade(move |socket| client_loop(socket, state))
+    let shutdown = state.shutdown.clone();
+    ws.on_upgrade(move |socket| shutdown.track_ws(client_loop(socket, state)))
 }
 
 /// Identity attached to one WebSocket connection.
@@ -89,6 +91,10 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
 
     loop {
         tokio::select! {
+            _ = state.shutdown.cancelled() => {
+                close(&mut socket, CLOSE_GOING_AWAY, "server shutting down").await;
+                break;
+            }
             event = rx.recv() => match event {
                 Received::Event(ev) => {
                     if ev.audience <= identity.level {
@@ -182,7 +188,13 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
 /// Wait for the auth frame and resolve the connection's identity.
 /// Returns `None` after sending an appropriate close frame on failure.
 async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<WsIdentity> {
-    let frame = tokio::time::timeout(AUTH_TIMEOUT, socket.recv()).await;
+    let frame = tokio::select! {
+        frame = tokio::time::timeout(AUTH_TIMEOUT, socket.recv()) => frame,
+        _ = state.shutdown.cancelled() => {
+            close(socket, CLOSE_GOING_AWAY, "server shutting down").await;
+            return None;
+        }
+    };
 
     let text = match frame {
         Ok(Some(Ok(Message::Text(t)))) => t,

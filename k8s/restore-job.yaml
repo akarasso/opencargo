@@ -1,0 +1,54 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: opencargo-restore
+  labels:
+    app: opencargo-restore
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: opencargo-restore
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: restore
+          image: ghcr.io/akarasso/opencargo:latest
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+          command:
+            - opencargo
+            - --config
+            - /etc/opencargo/config.toml
+            - restore
+            - --from
+            - /data/backups/SNAPSHOT
+          volumeMounts:
+            - name: data
+              mountPath: /data
+            - name: config
+              mountPath: /etc/opencargo
+              readOnly: true
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: opencargo-data
+        - name: config
+          configMap:
+            name: opencargo-config
+        - name: tmp
+          emptyDir: {}

@@ -414,9 +414,17 @@ delivery carries `X-Webhook-Signature` = HMAC-SHA256 of the body.
 
 ```
 GET    /health/live
-GET    /health/ready
+GET    /health/ready             503 {"status":"draining"} during a shutdown
 GET    /metrics
+GET    /api/v1/system/instance   admin
 ```
+
+`/api/v1/system/instance` answers `owner` (8 characters), `version`,
+`acquired_at`, `renewed_at`, `lease` (`held`, `lost` or `disabled`),
+`last_backup_at`, `last_sweep_at`, `last_backup_wal` (`truncated`, `busy` or
+null), `incomplete_snapshots`, `shutdown_grace_secs`, `endpoint_drain_secs`
+and `open_http_connections`, which excludes WebSocket clients. A lost lease is
+never a readiness failure.
 
 Prometheus metrics: `opencargo_http_requests_total{method,path,status}`,
 `opencargo_http_request_duration_seconds{method,path}`,

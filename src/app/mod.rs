@@ -47,6 +47,7 @@ pub mod import;
 pub mod maven;
 pub mod mcp;
 pub mod nuget;
+pub mod lease;
 pub mod login_gate;
 pub mod oci;
 pub mod permissions;

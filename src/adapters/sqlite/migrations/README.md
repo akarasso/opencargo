@@ -40,7 +40,7 @@ checksum in the same commit.
 | 019 | 019_pypi.sql | pypi.md (pypi_files) | d301499e72c72ddbb460fee30d6c39dbf0b4cbdf2e7a609ba2ee0b0d91f5108e |
 | 020 | - | nuget.md (nuget_format: a `Step::Rust` through the shared `rebuild::widen_formats`, no file) | - |
 | 021 | 021_sso.sql | sso.md (sso, server_secrets) | 56921514f38896bf6ac419d884a164839bc5521afa1bca372fdcf8376185d62c |
-| 022 | - | ha-options.md (server_leases) | - |
+| 022 | 022_server_leases.sql | ha-options.md (server_leases, server_state; server_secrets when 021 has not run) | 5a9163cb82081825640cf537a25dcf872b17edfdd140728cbd18029ff1ee0a67 |
 | 023 | 023_mcp.sql | mcp-governance.md (mcp format through the shared rebuild helper `rebuild::widen_formats`, governance tables) | af1ab372ba05dcfb2207e210759a835c4a66870e90ec683a454c19d3e6482eb3 |
 | 024 | 024_maven.sql | maven.md (maven format through the shared rebuild helper `rebuild::widen_formats`, port 18 tables) | 58ca2fdd771fe0dc453d1c21499855df9f303d520f85451b7b508c907170b95d |
 | 025 | 025_reclaim.sql | s3.md S2r (reclamation, incarnations, retired prefixes) | aec372d3addae7af66c944632d4296f5041b659c5971a5f97569eef8aa8f2654 |

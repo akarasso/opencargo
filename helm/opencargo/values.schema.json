@@ -1,0 +1,81 @@
+{
+  "$schema": "https://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "replicaCount": {
+      "type": "integer",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "One instance per database: a second pod refuses to start on the writer lease."
+    },
+    "lease": {
+      "type": "object",
+      "properties": {
+        "waitSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "startup": {
+      "type": "object",
+      "properties": {
+        "periodSeconds": {
+          "type": "integer",
+          "minimum": 1
+        }
+      }
+    },
+    "shutdown": {
+      "type": "object",
+      "properties": {
+        "endpointDrainSeconds": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "graceSeconds": {
+          "type": "integer",
+          "minimum": 1
+        },
+        "wsCloseGraceSeconds": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 5,
+          "description": "Mirrors WS_CLOSE_GRACE in src/server/shutdown.rs; not a knob."
+        }
+      }
+    },
+    "preStop": {
+      "type": "object",
+      "properties": {
+        "sleepSeconds": {
+          "type": "integer",
+          "minimum": 0
+        }
+      }
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "accessMode": {
+          "type": "string",
+          "enum": [
+            "ReadWriteOnce",
+            "ReadWriteOncePod"
+          ]
+        }
+      }
+    },
+    "restore": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "from": {
+          "type": "string"
+        }
+      }
+    }
+  }
+}

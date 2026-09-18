@@ -84,6 +84,13 @@ jobs:
           echo "NUGET_EXE=$RUNNER_TEMP/nuget.exe" >> "$GITHUB_ENV"
           echo "NUGET_BIN=$GITHUB_WORKSPACE/scripts/nuget-in-docker" >> "$GITHUB_ENV"
 
+      - name: Install helm
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/helm.tar.gz" https://get.helm.sh/helm-v3.19.0-linux-amd64.tar.gz
+          echo "a7f81ce08007091b86d8bd696eb4d86b8d0f2e1b9f6c714be62f82f96a594496  $RUNNER_TEMP/helm.tar.gz" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/helm.tar.gz" -C "$RUNNER_TEMP" linux-amd64/helm
+          echo "HELM_BIN=$RUNNER_TEMP/linux-amd64/helm" >> "$GITHUB_ENV"
+
       # The real-client e2e suites shell out to `pnpm`, `cargo`, `go`,
       # `docker` and the PyPI clients, resolved from PATH or `*_BIN`. Locally
       # an absent client prints `skipped:`; OPENCARGO_E2E_REQUIRE=1 turns that

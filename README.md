@@ -192,16 +192,18 @@ Read this before the comparison table sells you anything.
 - A cold blob is written to disk in full before the first byte reaches the
   client (bounded by the read timeout, not by size). Pushes are capped at
   1 GiB per request, so a proxied 3 GiB layer pulls but cannot be re-pushed.
-- Deduplication of concurrent downloads, upstream tokens and OSV advisories
-  is per process: several replicas behind one load balancer each fetch their
-  own copy.
+- One instance per database: a second process on the same database refuses
+  to start, and every upgrade has a downtime window (`Recreate`). Read scale
+  is other opencargo instances proxying this one, each with its own cache
+  and upstream traffic. See [docs/operations.md](docs/operations.md).
 - Vulnerability severity is read per advisory from the full OSV record: a
   `database_specific.severity` label wins, else the highest CVSS 3.x/4.0
   vector is scored, and `MAL-` ids are critical. `vuln_scan.block_on_critical`
   refuses such a publish before anything is written; `vuln_scan.fail_closed`
   turns an OSV outage into a 503 instead of an unscanned publish. Advisories
   with only CVSS 2 data (or none) are reported as `unknown` and never block.
-- One maintainer, pre-1.0. Pin the image by digest and keep backups of `/data`.
+- One maintainer, pre-1.0. Pin the image by digest and back up with
+  `opencargo backup` ([docs/operations.md](docs/operations.md)).
 
 ---
 
@@ -336,6 +338,10 @@ bind = "0.0.0.0:6789"                # default: 127.0.0.1:6789
 base_url = "https://registry.example.com"
 storage_path = "/data/storage"
 
+lease_wait = "60s"                 # writer lease, shutdown: docs/operations.md
+shutdown_grace = "30s"
+endpoint_drain = "0s"
+
 [server.tls]                       # optional native TLS (rustls)
 cert_path = "/certs/cert.pem"
 key_path = "/certs/key.pem"
@@ -361,6 +367,14 @@ enabled = true                     # default: false
 prerelease_older_than_days = 90
 proxy_cache_older_than_days = 30   # idle proxy cache entries; swept even with enabled = false
 policy_report_older_than_days = 90 # policy report rows; swept even with enabled = false, 0 disables
+
+[backup]                           # docs/operations.md
+enabled = true                     # default: false
+every = "24h"                      # at t = at (mod every), UTC
+at = "03:00"
+keep = 7
+to = "/backups"
+storage = false                    # the schedule copies the database only
 
 [vuln_scan]
 enabled = true                     # default: false
@@ -421,6 +435,7 @@ erases one user's rows, audited with the count and never the name.
 | `OPENCARGO_UPSTREAM_AUTH_<REPO>` | Upstream credentials for a proxy, `basic:user:pass` or `bearer:token`; overrides `upstream_auth`. `<REPO>` is the name uppercased, non-alphanumerics as `_`. Read at startup for every repository, declared in the file or created through the API (restart after creating one) |
 | `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>` | `1` to allow that proxy's `dl`/token realm on a private IP (same as `dl_allow_private = true`) |
 | `OPENCARGO_OSV_BASE_URL` | OSV API base URL (also `--osv-base-url`) |
+| `OPENCARGO_LEASE_WAIT`, `OPENCARGO_SHUTDOWN_GRACE`, `OPENCARGO_ENDPOINT_DRAIN` | Override `[server]`; the Helm chart sets them from its values |
 | `RUST_LOG` | Log filter, default `opencargo=info,tower_http=info` |
 
 ---
@@ -449,7 +464,9 @@ helm install opencargo helm/opencargo/ \
 **CI sidecar**: run opencargo next to your runners as a pull-through cache.
 Examples for GitHub Actions and GitLab CI in [`k8s/sidecar/`](k8s/sidecar/).
 
-Health: `GET /health/live`, `GET /health/ready`. Metrics: `GET /metrics`.
+Health: `GET /health/live`, `GET /health/ready` (`503 draining` during a
+shutdown). Metrics: `GET /metrics`. Backups, restore and the upgrade window:
+[docs/operations.md](docs/operations.md).
 
 ---
 
@@ -554,6 +571,8 @@ group whose proxy member fronts another instance; locally they print
 - [docs/import.md](docs/import.md): `opencargo import`, copying Nexus,
   Artifactory, Verdaccio, GitHub Packages or any OCI registry into opencargo,
   and the gap report.
+- [docs/operations.md](docs/operations.md): one instance, the writer lease,
+  shutdown and upgrades, backups and the restore drill.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).

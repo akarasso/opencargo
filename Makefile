@@ -59,7 +59,8 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 		--test nuget_test --test nuget_feed_store_test --test nuget_proxy_test --test nuget_group_test \
 		--test sso_test --test sso_store_test \
 		--test mcp_test --test mcp_sync_test --test mcp_probe_test --test mcp_policy_test --test mcp_client_test --test mcp_admin_test \
-		--test import_test --test import_managers_test --test import_oci_test
+		--test import_test --test import_managers_test --test import_oci_test \
+		--test instance_lease_test --test storage_cli_test --test shutdown_test --test backup_test
 
 test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
 	scripts/test-s3.sh
@@ -77,7 +78,7 @@ test-docker: ## Tests Docker/OCI (HTTP, sans client docker)
 test-e2e: ## Tests E2E avec les vrais clients (pnpm, cargo, go, docker, mvn, gradle requis)
 	OPENCARGO_E2E_REQUIRE=1 cargo test --test pnpm_e2e_test --test e2e_scoped_test \
 		--test cargo_e2e_test --test go_e2e_test --test docker_cli_e2e_test --test maven_e2e_test \
-		--test mcp_e2e_test
+		--test mcp_e2e_test --test e2e_shutdown_test
 
 test-e2e-cargo: ## E2E cargo (client cargo requis, ou CARGO_BIN)
 	OPENCARGO_E2E_REQUIRE=1 cargo test --test cargo_e2e_test

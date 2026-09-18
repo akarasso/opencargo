@@ -2,25 +2,27 @@ use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
 
+use axum::ServiceExt as _;
 use opencargo::{config, server};
+use tower::ServiceExt as _;
 
 #[derive(Parser)]
 #[command(name = "opencargo", version, about = "Lightweight universal package registry")]
 struct Cli {
     /// Path to config file
-    #[arg(short, long, env = "OPENCARGO_CONFIG")]
+    #[arg(short, long, env = "OPENCARGO_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     /// Bind address (overrides config)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     bind: Option<String>,
 
     /// Public URL clients use to reach this server (overrides config)
-    #[arg(long, env = "OPENCARGO_BASE_URL")]
+    #[arg(long, env = "OPENCARGO_BASE_URL", global = true)]
     base_url: Option<String>,
 
     /// OSV API base URL for vulnerability scanning (overrides config)
-    #[arg(long, env = "OPENCARGO_OSV_BASE_URL")]
+    #[arg(long, env = "OPENCARGO_OSV_BASE_URL", global = true)]
     osv_base_url: Option<String>,
 
     #[command(subcommand)]
@@ -36,8 +38,36 @@ enum Commands {
         /// Path to config file to validate
         path: PathBuf,
     },
-    /// Run database migrations
-    Migrate,
+    /// Run database migrations, under the writer lease
+    Migrate {
+        /// Skip the writer lease, for a holder known to be dead
+        #[arg(long)]
+        force: bool,
+    },
+    /// Snapshot the database, and with --storage every object, into a
+    /// local directory; or verify a snapshot with --check
+    Backup {
+        #[arg(long, required_unless_present = "check")]
+        to: Option<PathBuf>,
+        #[arg(long)]
+        storage: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value_t = 7)]
+        keep: usize,
+        /// Verify a snapshot without restoring it
+        #[arg(long, conflicts_with = "to")]
+        check: Option<PathBuf>,
+    },
+    /// Restore a snapshot, storage first; run with the server stopped. An
+    /// interrupted restore is finished by running the same command again
+    Restore {
+        #[arg(long)]
+        from: PathBuf,
+        /// Replace an existing database, or restore a database-only snapshot
+        #[arg(long)]
+        force: bool,
+    },
     /// Operate on the artifact store; the server must be stopped for
     /// `migrate` and `reclaim`
     Storage {
@@ -126,7 +156,7 @@ async fn storage(cfg: &config::Config, command: StorageCommand) -> anyhow::Resul
             }
         }
         StorageCommand::Migrate { to, dry_run } => {
-            let target = config::load_config(Some(&to))?;
+            let target = config::load_config(Some(&to))?.config;
             let report = server::storage_migrate(cfg, &target, dry_run).await?;
             println!(
                 "{} {} objects ({} bytes), {} already there",
@@ -165,7 +195,7 @@ async fn main() -> anyhow::Result<()> {
         std::process::exit(i32::from(ran.code));
     }
 
-    let mut cfg = config::load_config(cli.config.as_deref())?;
+    let config::Loaded { config: mut cfg, problems } = config::load_config(cli.config.as_deref())?;
     if let Some(base_url) = cli.base_url {
         cfg.server.base_url = base_url.trim_end_matches('/').to_string();
     }
@@ -176,7 +206,17 @@ async fn main() -> anyhow::Result<()> {
         cfg.vuln_scan.osv_base_url = osv_base_url.trim_end_matches('/').to_string();
     }
 
-    match cli.command.unwrap_or(Commands::Serve) {
+    let command = cli.command.unwrap_or(Commands::Serve);
+    if !problems.is_empty() {
+        for problem in &problems {
+            eprintln!("config: {problem}");
+        }
+        if matches!(command, Commands::Serve | Commands::Migrate { .. }) {
+            anyhow::bail!("invalid configuration ({} problems)", problems.len());
+        }
+    }
+
+    match command {
         Commands::Serve => {
             let bind = cli.bind.as_deref().unwrap_or(&cfg.server.bind);
             info!("Starting opencargo on {}", bind);
@@ -188,7 +228,18 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let app_state = server::build_state(&cfg).await?;
+            let srv = server::shutdown::ServerHandle::new();
+            let shutdown = server::shutdown::Shutdown::new();
+            let endpoint_drain = cfg.server.endpoint_drain()?;
+            let grace = cfg.server.shutdown_grace()?;
+            let server::Started { state: app_state, lease, lock } =
+                server::build_state(&cfg, srv.clone(), shutdown.clone()).await?;
+            if let Some(schedule) = server::backup_schedule(&cfg, &app_state)? {
+                tokio::spawn(schedule);
+            }
+            let runner = lease
+                .as_ref()
+                .map_or_else(opencargo::app::lease::LeaseHandle::disabled, |l| l.handle());
             let probe_every = config::parse_chrono_duration(&cfg.auth.sso.probe_interval)?
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(60));
@@ -205,11 +256,14 @@ async fn main() -> anyhow::Result<()> {
                 app_state.clock.clone(),
                 cfg.cleanup.clone(),
                 app_state.reconcilers(),
+                runner.clone(),
+                app_state.server_state.clone(),
             ));
             tokio::spawn(app_state.sync_supervisor()?.run());
             tokio::spawn(opencargo::telemetry::cleanup::start_reconcile_task(
                 app_state.reconcilers(),
                 app_state.clock.clone(),
+                runner.clone(),
             ));
 
             tokio::spawn(opencargo::app::sweep_storage::start_storage_sweep(
@@ -217,35 +271,100 @@ async fn main() -> anyhow::Result<()> {
                     .reclaiming(app_state.reclaim_orphans())
                     .reaping_uploads(app_state.oci.clone()),
                 app_state.clock.clone(),
+                runner,
             ));
 
-            let router = server::build_router(app_state);
-
-            if !cfg.server.tls.cert_path.is_empty() && !cfg.server.tls.key_path.is_empty() {
+            // Decode %2f in scoped package names before routing: this must
+            // wrap the Router, since Router::layer runs after route matching.
+            let app = server::build_router(app_state)
+                .map_request(server::decode_percent_encoded_slashes)
+                .into_make_service_with_connect_info::<std::net::SocketAddr>();
+            let listener = std::net::TcpListener::bind(bind)?;
+            listener.set_nonblocking(true)?;
+            let mut serving = if !cfg.server.tls.cert_path.is_empty() && !cfg.server.tls.key_path.is_empty() {
                 let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
                     &cfg.server.tls.cert_path,
                     &cfg.server.tls.key_path,
                 )
                 .await?;
-                let bind_addr: std::net::SocketAddr = bind.parse()?;
-                info!("Listening with TLS on {}", bind_addr);
-                axum_server::bind_rustls(bind_addr, tls_config)
-                    .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
-                    .await?;
+                info!("Listening with TLS on {}", listener.local_addr()?);
+                tokio::spawn(
+                    axum_server::from_tcp_rustls(listener, tls_config)?
+                        .handle(srv.clone())
+                        .serve(app),
+                )
             } else {
-                let app = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
-                let listener = tokio::net::TcpListener::bind(bind).await?;
                 info!("Listening on {}", listener.local_addr()?);
-                axum::serve(listener, app).await?;
+                tokio::spawn(axum_server::from_tcp(listener)?.handle(srv.clone()).serve(app))
+            };
+
+            tokio::select! {
+                served = &mut serving => {
+                    served??;
+                }
+                () = server::shutdown::signal() => {
+                    shutdown.drain(&srv, endpoint_drain, grace).await;
+                    serving.await??;
+                }
             }
+            if let Some(lease) = lease {
+                lease.release().await;
+            }
+            drop(lock);
+            info!("stopped");
         }
         Commands::ValidateConfig { path } => {
-            config::load_config(Some(&path))?.validate()?;
+            let checked = config::load_config(Some(&path))?;
+            if !checked.problems.is_empty() {
+                for problem in &checked.problems {
+                    println!("{}: {problem}", path.display());
+                }
+                anyhow::bail!("{} problems in {}", checked.problems.len(), path.display());
+            }
             println!("Config is valid.");
         }
-        Commands::Migrate => {
-            server::run_migrations(&cfg).await?;
+        Commands::Migrate { force } => {
+            server::run_migrations(&cfg, force).await?;
             println!("Migrations applied successfully.");
+        }
+        Commands::Backup { check: Some(dir), .. } => {
+            let manifest = server::check_backup(&dir).await?;
+            println!(
+                "{}: ok, taken {}, {} objects{}",
+                dir.display(),
+                manifest.taken_at.to_rfc3339(),
+                manifest.storage_keys,
+                if manifest.storage { "" } else { " (storage: false: database only, not restorable onto an empty tree)" }
+            );
+        }
+        Commands::Backup { to, storage, force, keep, check: None } => {
+            let snapshot = server::run_backup(
+                &cfg,
+                server::BackupArgs {
+                    to: to.expect("clap requires --to without --check"),
+                    storage,
+                    force,
+                    keep,
+                    space: std::sync::Arc::new(opencargo::backup::StatvfsProbe),
+                },
+            )
+            .await?;
+            println!("{}", snapshot.dir.display());
+        }
+        Commands::Restore { from, force } => {
+            let db_path = server::database_path(&cfg)
+                .ok_or_else(|| anyhow::anyhow!("a restore needs a database file"))?;
+            let lock = opencargo::backup::lock::restore_lock_guard(
+                &db_path,
+                opencargo::backup::lock::Lock::Exclusive(&from),
+            )?;
+            let report = server::run_restore(&cfg, &from, force, lock).await?;
+            println!(
+                "restored {} objects and the database of {}; now run `{}`",
+                report.objects,
+                report.manifest.taken_at.to_rfc3339(),
+                report.gate
+            );
         }
         Commands::Storage { command } => storage(&cfg, command).await?,
         Commands::Mcp {

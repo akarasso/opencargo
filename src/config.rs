@@ -20,6 +20,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub proxy: ProxyConfig,
     pub cleanup: CleanupConfig,
+    pub backup: BackupConfig,
     #[serde(default)]
     pub repositories: Vec<RepositoryConfig>,
     #[serde(default)]
@@ -157,6 +158,17 @@ pub struct ServerConfig {
     pub base_url: String,
     pub storage_path: String,
     pub tls: TlsConfig,
+    /// Take the writer lease before writing anything. Off is for tests: two
+    /// instances on one database are not supported.
+    pub lease: bool,
+    pub lease_wait: String,
+    pub lease_stale_after: String,
+    pub lease_renew: String,
+    /// How long in-flight requests may run once the drain starts.
+    pub shutdown_grace: String,
+    /// How long `/health/ready` answers 503 while still serving, before the
+    /// drain starts: one poll period of an ingress or mesh that polls.
+    pub endpoint_drain: String,
 }
 
 impl Default for ServerConfig {
@@ -166,6 +178,67 @@ impl Default for ServerConfig {
             base_url: "http://localhost:6789".to_string(),
             storage_path: "./data/storage".to_string(),
             tls: TlsConfig::default(),
+            lease: true,
+            lease_wait: "60s".to_string(),
+            lease_stale_after: "30s".to_string(),
+            lease_renew: "10s".to_string(),
+            shutdown_grace: "30s".to_string(),
+            endpoint_drain: "0s".to_string(),
+        }
+    }
+}
+
+impl ServerConfig {
+    /// The lease this server takes, `None` when it takes none.
+    pub fn lease_terms(&self) -> Result<Option<crate::app::lease::LeaseTerms>> {
+        if !self.lease {
+            return Ok(None);
+        }
+        Ok(Some(crate::app::lease::LeaseTerms {
+            wait: parse_duration(&self.lease_wait)?,
+            stale_after: parse_duration(&self.lease_stale_after)?,
+            renew: parse_duration(&self.lease_renew)?,
+        }))
+    }
+
+    pub fn shutdown_grace(&self) -> Result<std::time::Duration> {
+        parse_duration(&self.shutdown_grace)
+    }
+
+    pub fn endpoint_drain(&self) -> Result<std::time::Duration> {
+        parse_duration(&self.endpoint_drain)
+    }
+
+    fn problems(&self, problems: &mut Vec<String>) {
+        let mut parsed = |key: &str, value: &str| match parse_duration(value) {
+            Ok(d) => Some(d),
+            Err(_) => {
+                problems.push(format!("[server] {key} = {value:?} is not a duration (30s, 15m, 2h or seconds)"));
+                None
+            }
+        };
+        let wait = parsed("lease_wait", &self.lease_wait);
+        let stale = parsed("lease_stale_after", &self.lease_stale_after);
+        let renew = parsed("lease_renew", &self.lease_renew);
+        let grace = parsed("shutdown_grace", &self.shutdown_grace);
+        parsed("endpoint_drain", &self.endpoint_drain);
+        if let (Some(renew), Some(stale)) = (renew, stale) {
+            if renew.is_zero() || renew * 3 > stale {
+                problems.push(
+                    "[server] lease_renew must be non-zero and three renewals must fit in lease_stale_after".to_string(),
+                );
+            }
+        }
+        if let (Some(wait), Some(stale)) = (wait, stale) {
+            if wait <= stale {
+                problems.push(
+                    "[server] lease_wait must be longer than lease_stale_after, or a restart dies waiting on its own lease"
+                        .to_string(),
+                );
+            }
+        }
+        if grace.is_some_and(|g| g < std::time::Duration::from_secs(1)) {
+            problems.push("[server] shutdown_grace must be at least 1s".to_string());
         }
     }
 }
@@ -176,6 +249,103 @@ pub struct TlsConfig {
     pub enabled: bool,
     pub cert_path: String,
     pub key_path: String,
+}
+
+// ---------------------------------------------------------------------------
+// Backup
+// ---------------------------------------------------------------------------
+
+/// The in-process backup schedule. `storage` is off for the scheduler: seven
+/// full artifact copies on the data volume would fill it.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    pub every: String,
+    /// `HH:MM`, UTC: the phase of `every`.
+    pub at: String,
+    pub keep: usize,
+    /// A local directory.
+    pub to: String,
+    pub storage: bool,
+    /// An off-box copy of every finished snapshot, in a keyspace disjoint
+    /// from `[storage]`; built by the run, never at boot.
+    pub sink: Option<BackupSinkConfig>,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every: "24h".to_string(),
+            at: "03:00".to_string(),
+            keep: 7,
+            to: String::new(),
+            storage: false,
+            sink: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct BackupSinkConfig {
+    #[serde(flatten)]
+    pub storage: StorageConfig,
+    /// The root of a filesystem sink.
+    pub path: String,
+}
+
+impl BackupConfig {
+    fn problems(&self, config: &Config, problems: &mut Vec<String>) {
+        if self.enabled && self.to.trim().is_empty() {
+            problems.push("[backup] enabled needs `to`: a schedule with nowhere to write never backs up".to_string());
+        }
+        match parse_duration(&self.every) {
+            Ok(every) if every.as_secs() < 3600 => problems.push("[backup] every must be at least 1h".to_string()),
+            Ok(every) if 86_400 % every.as_secs() != 0 => problems.push(format!(
+                "[backup] every = {:?} does not divide the day, so `at` has no single phase",
+                self.every
+            )),
+            Ok(_) => {}
+            Err(_) => problems.push(format!("[backup] every = {:?} is not a duration", self.every)),
+        }
+        if crate::backup::schedule::parse_at(&self.at).is_none() {
+            problems.push(format!("[backup] at = {:?} is not HH:MM (UTC)", self.at));
+        }
+        if self.keep == 0 {
+            problems.push("[backup] keep must be at least 1".to_string());
+        }
+        if let Some(sink) = &self.sink {
+            if !sink_disjoint(sink, config) {
+                problems.push(
+                    "[backup.sink] overlaps [storage]: a snapshot would land among the artifacts".to_string(),
+                );
+            }
+        }
+    }
+}
+
+/// The declared-TOML check only: the resolved one runs with each backup.
+fn sink_disjoint(sink: &BackupSinkConfig, config: &Config) -> bool {
+    match (sink.storage.backend, config.storage.backend) {
+        (StorageKind::S3, StorageKind::S3) => {
+            let (a, b) = (&sink.storage.s3, &config.storage.s3);
+            (a.endpoint.as_deref(), a.region.as_str(), a.bucket.as_str()) != (b.endpoint.as_deref(), b.region.as_str(), b.bucket.as_str())
+                || !segments_overlap(&a.prefix, &b.prefix, '/')
+        }
+        (StorageKind::Fs, StorageKind::Fs) => {
+            !segments_overlap(&sink.path, &config.server.storage_path, std::path::MAIN_SEPARATOR)
+        }
+        _ => true,
+    }
+}
+
+/// One of the two is the other or lies under it, on segment boundaries.
+pub fn segments_overlap(a: &str, b: &str, sep: char) -> bool {
+    let (a, b) = (a.trim_end_matches(sep), b.trim_end_matches(sep));
+    let under = |x: &str, y: &str| y.is_empty() || x == y || x.starts_with(&format!("{y}{sep}"));
+    under(a, b) || under(b, a)
 }
 
 // ---------------------------------------------------------------------------
@@ -287,35 +457,77 @@ pub fn refuse_duplicate_identities<'a>(identities: impl IntoIterator<Item = &'a 
 impl Config {
     /// The identity of every store this process builds.
     pub fn store_identities(&self) -> Vec<String> {
-        vec![self.storage.id.clone().unwrap_or_else(|| "artifacts".to_string())]
+        let mut ids = vec![self.storage.id.clone().unwrap_or_else(|| "artifacts".to_string())];
+        if let Some(sink) = &self.backup.sink {
+            ids.push(sink.storage.id.clone().unwrap_or_else(|| "backup".to_string()));
+        }
+        ids
     }
 
-    /// What a config must satisfy before any store is built.
+    /// What a config must satisfy before any store is built, every refusal
+    /// at once.
     pub fn validate(&self) -> Result<()> {
+        let problems = self.problems();
+        if problems.is_empty() {
+            return Ok(());
+        }
+        anyhow::bail!("invalid configuration:\n  {}", problems.join("\n  "))
+    }
+
+    /// Every rule this config breaks. The `[proxy]` durations are not read:
+    /// they fall back to 10s as they always have.
+    pub fn problems(&self) -> Vec<String> {
+        let mut problems = Vec::new();
         let ids = self.store_identities();
         if ids.iter().any(|id| id.trim().is_empty()) {
-            anyhow::bail!("a storage id may not be empty");
+            problems.push("a storage id may not be empty".to_string());
         }
-        refuse_duplicate_identities(ids.iter().map(String::as_str))?;
+        if let Err(e) = refuse_duplicate_identities(ids.iter().map(String::as_str)) {
+            problems.push(e.to_string());
+        }
         for (repo, mcp) in &self.mcp {
-            mcp.validate(repo)?;
+            if let Err(e) = mcp.validate(repo) {
+                problems.push(e.to_string());
+            }
         }
         if self.storage.backend == StorageKind::S3 {
             let s3 = &self.storage.s3;
             if s3.bucket.trim().is_empty() && std::env::var("OPENCARGO_S3_BUCKET").is_err() {
-                anyhow::bail!("[storage.s3] bucket is required");
+                problems.push("[storage.s3] bucket is required".to_string());
             }
-            normalize_prefix(&s3.prefix)?;
-            parse_duration(&s3.request_timeout)?;
-            parse_duration(&s3.completion_timeout)?;
+            for outcome in [
+                normalize_prefix(&s3.prefix).map(|_| ()),
+                parse_duration(&s3.request_timeout).map(|_| ()),
+                parse_duration(&s3.completion_timeout).map(|_| ()),
+            ] {
+                if let Err(e) = outcome {
+                    problems.push(format!("[storage.s3] {e}"));
+                }
+            }
             if s3.part_size_mib < 5 {
-                anyhow::bail!("[storage.s3] part_size_mib must be at least 5");
+                problems.push("[storage.s3] part_size_mib must be at least 5".to_string());
             }
             if s3.max_multipart_uploads == 0 {
-                anyhow::bail!("[storage.s3] max_multipart_uploads must be at least 1");
+                problems.push("[storage.s3] max_multipart_uploads must be at least 1".to_string());
             }
         }
-        Ok(())
+        self.server.problems(&mut problems);
+        self.backup.problems(self, &mut problems);
+        problems
+    }
+
+    /// The three keys the deployment manifests derive their grace period
+    /// from, as the manifests render them.
+    fn apply_env(&mut self, var: impl Fn(&str) -> Option<String>) {
+        for (name, field) in [
+            ("OPENCARGO_LEASE_WAIT", &mut self.server.lease_wait),
+            ("OPENCARGO_SHUTDOWN_GRACE", &mut self.server.shutdown_grace),
+            ("OPENCARGO_ENDPOINT_DRAIN", &mut self.server.endpoint_drain),
+        ] {
+            if let Some(value) = var(name) {
+                *field = value;
+            }
+        }
     }
 }
 
@@ -556,14 +768,31 @@ pub use crate::domain::Visibility;
 // Loader
 // ---------------------------------------------------------------------------
 
-/// Load configuration from an explicit path, well-known locations, or defaults.
+/// A config as loaded, and every rule it breaks: whether a problem is fatal
+/// is the caller's decision, so a bad config never disables the commands
+/// that recover from it.
+#[derive(Debug)]
+pub struct Loaded {
+    pub config: Config,
+    pub problems: Vec<String>,
+}
+
+/// Load configuration, apply the environment's overrides, then validate the
+/// effective values.
 ///
 /// Resolution order:
 /// 1. Explicit `path` argument (error if it does not exist).
 /// 2. `./config.toml` in the current directory.
 /// 3. `~/.opencargo/config.toml`.
 /// 4. Built-in defaults.
-pub fn load_config(path: Option<&Path>) -> Result<Config> {
+pub fn load_config(path: Option<&Path>) -> Result<Loaded> {
+    let mut config = read_config(path)?;
+    config.apply_env(|name| std::env::var(name).ok());
+    let problems = config.problems();
+    Ok(Loaded { config, problems })
+}
+
+fn read_config(path: Option<&Path>) -> Result<Config> {
     if let Some(p) = path {
         let content = std::fs::read_to_string(p)
             .with_context(|| format!("failed to read config file: {}", p.display()))?;
@@ -663,5 +892,100 @@ mod tests {
         assert_eq!(parse_duration("15m").unwrap().as_secs(), 900);
         assert_eq!(parse_duration("45").unwrap().as_secs(), 45);
         assert!(parse_duration("3d").is_err());
+    }
+
+    #[test]
+    fn duration_parse_table() {
+        for (input, want) in [("30", Some(30)), ("10s", Some(10)), ("24h", Some(86_400)), ("15m", Some(900))] {
+            assert_eq!(parse_duration(input).ok().map(|d| d.as_secs()), want, "{input}");
+        }
+        for refused in ["1d", "5min", "03:00", "", "s", "-1s"] {
+            assert!(parse_duration(refused).is_err(), "{refused:?}");
+        }
+    }
+
+    fn problems_of(toml: &str) -> Vec<String> {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("c.toml");
+        std::fs::write(&path, toml).unwrap();
+        load_config(Some(&path)).unwrap().problems
+    }
+
+    #[test]
+    fn validate_rules_table() {
+        let rows: &[(&str, &str)] = &[
+            ("[server]\nlease_renew = \"20s\"", "three renewals"),
+            ("[server]\nlease_wait = \"30s\"", "lease_wait must be longer"),
+            ("[server]\nshutdown_grace = \"0s\"", "shutdown_grace must be at least 1s"),
+            ("[server]\nendpoint_drain = \"soon\"", "endpoint_drain"),
+            ("[server]\nlease_stale_after = \"5min\"", "lease_stale_after"),
+        ];
+        for (toml, needle) in rows {
+            let problems = problems_of(toml);
+            assert!(problems.iter().any(|p| p.contains(needle)), "{toml}: {problems:?}");
+        }
+        assert!(problems_of("").is_empty());
+    }
+
+    #[test]
+    fn a_garbage_proxy_duration_still_loads() {
+        for ttl in ["5min", "1d"] {
+            assert!(problems_of(&format!("[proxy]\ndefault_ttl = \"{ttl}\"")).is_empty(), "{ttl}");
+        }
+    }
+
+    #[test]
+    fn env_overrides_the_file_and_is_validated() {
+        let mut config: Config = toml::from_str("[server]\nshutdown_grace = \"45s\"").unwrap();
+        config.apply_env(|name| match name {
+            "OPENCARGO_SHUTDOWN_GRACE" => Some("0".to_string()),
+            "OPENCARGO_LEASE_WAIT" => Some("90".to_string()),
+            _ => None,
+        });
+        assert_eq!(config.server.shutdown_grace, "0");
+        assert_eq!(config.server.lease_terms().unwrap().unwrap().wait.as_secs(), 90);
+        assert!(config.problems().iter().any(|p| p.contains("shutdown_grace")));
+    }
+
+    #[test]
+    fn backup_rules_table() {
+        let rows: &[(&str, &str)] = &[
+            ("[backup]\nenabled = true", "enabled needs `to`"),
+            ("[backup]\nevery = \"7h\"", "does not divide the day"),
+            ("[backup]\nevery = \"30m\"", "at least 1h"),
+            ("[backup]\nevery = \"1d\"", "not a duration"),
+            ("[backup]\nat = \"3am\"", "HH:MM"),
+            ("[backup]\nkeep = 0", "keep"),
+        ];
+        for (toml, needle) in rows {
+            let problems = problems_of(toml);
+            assert!(problems.iter().any(|p| p.contains(needle)), "{toml}: {problems:?}");
+        }
+        assert!(problems_of("[backup]\nenabled = true\nto = \"/b\"\nevery = \"6h\"").is_empty());
+    }
+
+    #[test]
+    fn backup_sink_must_be_disjoint_from_storage() {
+        let s3 = |sink: &str| {
+            format!(
+                "[storage]\nbackend = \"s3\"\n[storage.s3]\nbucket = \"b\"\nprefix = \"oc\"\n\
+                 [backup.sink]\nbackend = \"s3\"\n[backup.sink.s3]\n{sink}"
+            )
+        };
+        let overlap = |toml: String| problems_of(&toml).iter().any(|p| p.contains("[backup.sink]"));
+        assert!(overlap(s3("bucket = \"b\"\nprefix = \"oc\"")), "the same keyspace");
+        assert!(overlap(s3("bucket = \"b\"\nprefix = \"oc/snapshots\"")), "inside it");
+        assert!(overlap(s3("bucket = \"b\"")), "around it");
+        assert!(!overlap(s3("bucket = \"b\"\nprefix = \"oc-backups\"")), "a sibling prefix");
+        assert!(!overlap(s3("bucket = \"b\"\nprefix = \"oc\"\nendpoint = \"https://dr.example\"")), "another endpoint");
+        let fs = |path: &str| format!("[server]\nstorage_path = \"/data/storage\"\n[backup.sink]\npath = \"{path}\"");
+        assert!(overlap(fs("/data/storage/backups")));
+        assert!(!overlap(fs("/data/storage-backups")));
+    }
+
+    #[test]
+    fn every_problem_is_reported_at_once() {
+        let problems = problems_of("[server]\nlease_wait = \"1s\"\nshutdown_grace = \"0s\"\nendpoint_drain = \"x\"");
+        assert_eq!(problems.len(), 3, "{problems:?}");
     }
 }

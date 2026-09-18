@@ -4,9 +4,11 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
 
+use crate::app::lease::LeaseHandle;
 use crate::app::reconcile::{Reconciled, Reconciler};
 use crate::config::CleanupConfig;
 use crate::ports::clock::Clock;
+use crate::ports::leases::ServerStateStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
@@ -40,14 +42,23 @@ pub(crate) struct CleanupStats {
 /// past its promotion window at most.
 const RECONCILE_EVERY: Duration = Duration::from_secs(60);
 
+pub const LAST_SWEEP_AT: &str = "last_sweep_at";
+
 /// The reconcilers the composition root registered, on their own period:
 /// they repair within minutes what the daily sweeps would leave for a day.
-pub async fn start_reconcile_task(reconcilers: Vec<Arc<dyn Reconciler>>, clock: Arc<dyn Clock>) {
+/// Only the lease holder runs them.
+pub async fn start_reconcile_task(
+    reconcilers: Vec<Arc<dyn Reconciler>>,
+    clock: Arc<dyn Clock>,
+    lease: LeaseHandle,
+) {
     if reconcilers.is_empty() {
         return;
     }
     loop {
-        reconcile(&reconcilers, clock.now()).await;
+        if lease.held() {
+            reconcile(&reconcilers, clock.now()).await;
+        }
         tokio::time::sleep(RECONCILE_EVERY).await;
     }
 }
@@ -96,6 +107,7 @@ pub(crate) fn sweeps_configured(config: &CleanupConfig) -> bool {
 /// Start a background cleanup task that runs every 24 hours: the pre-release
 /// sweep when `enabled`, the proxy cache and policy report sweeps whenever
 /// their bound is set.
+#[allow(clippy::too_many_arguments)]
 pub async fn start_cleanup_task(
     packages: Arc<dyn PackageStore>,
     cache: Arc<dyn ProxyCacheStore>,
@@ -104,6 +116,8 @@ pub async fn start_cleanup_task(
     clock: Arc<dyn Clock>,
     config: CleanupConfig,
     reconcilers: Vec<Arc<dyn Reconciler>>,
+    lease: LeaseHandle,
+    state: Arc<dyn ServerStateStore>,
 ) {
     if !sweeps_configured(&config) {
         info!("Cleanup task is disabled");
@@ -120,6 +134,8 @@ pub async fn start_cleanup_task(
             policy: policy.as_ref(),
             reclaim: reclaim.as_ref(),
             reconcilers: &reconcilers,
+            lease: &lease,
+            state: Some(state.as_ref()),
         };
         sweeps.run(&config, clock.now()).await;
         tokio::time::sleep(Duration::from_secs(86400)).await;
@@ -133,10 +149,17 @@ pub(crate) struct RunCleanup<'a> {
     pub policy: &'a dyn PolicyStore,
     pub reclaim: &'a dyn ReclaimStore,
     pub reconcilers: &'a [Arc<dyn Reconciler>],
+    /// The sweeps assume one runner: the lease holder.
+    pub lease: &'a LeaseHandle,
+    pub state: Option<&'a dyn ServerStateStore>,
 }
 
 impl RunCleanup<'_> {
     pub(crate) async fn run(&self, config: &CleanupConfig, now: DateTime<Utc>) -> CleanupStats {
+        if !self.lease.held() {
+            info!("Cleanup skipped: another instance holds the writer lease");
+            return CleanupStats::default();
+        }
         info!("Running scheduled cleanup");
         let mut stats = CleanupStats::default();
 
@@ -165,6 +188,11 @@ impl RunCleanup<'_> {
         }
 
         stats.reconciled = reconcile(self.reconcilers, now).await;
+        if let Some(state) = self.state {
+            if let Err(e) = state.set(LAST_SWEEP_AT, &now.to_rfc3339(), now).await {
+                warn!(error = %e, "last_sweep_at not recorded");
+            }
+        }
         stats
     }
 }
@@ -252,6 +280,7 @@ mod tests {
         storage: Arc<dyn StorageBackend>,
         fakes: FakeDb,
         reclaim: Arc<dyn ReclaimStore>,
+        lease: LeaseHandle,
         /// The seeded repositories: a hosted npm one, a hosted go one, and
         /// the npm proxy whose answers the cache rows belong to.
         npm: i64,
@@ -290,6 +319,7 @@ mod tests {
             cache: db.proxy_cache(),
             policy: db.policy(),
             reclaim: db.reclaim(),
+            lease: LeaseHandle::disabled(),
             fakes: db,
             _tmp: tmp,
             npm: ids[0],
@@ -306,6 +336,8 @@ mod tests {
                 policy: self.policy.as_ref(),
                 reclaim: self.reclaim.as_ref(),
                 reconcilers: &[],
+                lease: &self.lease,
+                state: None,
             }
         }
 
@@ -650,5 +682,55 @@ mod tests {
             .map(|(r, item)| (*r, item.name.clone()))
             .collect();
         assert_eq!(names, [("a", "a-0".to_string()), ("a", "a-1".to_string()), ("b", "b-0".to_string())]);
+    }
+
+    /// The server's state rows, in memory.
+    #[derive(Default)]
+    struct State(std::sync::Mutex<std::collections::HashMap<String, String>>);
+
+    #[async_trait::async_trait]
+    impl ServerStateStore for State {
+        async fn get(&self, name: &str) -> Result<Option<String>, crate::error::StoreError> {
+            Ok(self.0.lock().unwrap().get(name).cloned())
+        }
+
+        async fn set(&self, name: &str, value: &str, _: DateTime<Utc>) -> Result<(), crate::error::StoreError> {
+            self.0.lock().unwrap().insert(name.to_string(), value.to_string());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn sweeps_run_only_for_the_lease_holder() {
+        let fx = fixture().await;
+        fx.policy_row("old", days_ago(400)).await;
+        let lost = LeaseHandle::detached(false);
+        let state = State::default();
+        let sweeps = RunCleanup {
+            lease: &lost,
+            state: Some(&state),
+            ..fx.sweeps()
+        };
+        let stats = sweeps.run(&CleanupConfig::default(), now()).await;
+        assert!(stats.policy.is_none() && stats.proxy.is_none(), "{stats:?}");
+        assert_eq!(state.get(LAST_SWEEP_AT).await.unwrap(), None);
+        let held = LeaseHandle::detached(true);
+        let sweeps = RunCleanup {
+            lease: &held,
+            ..fx.sweeps()
+        };
+        assert_eq!(sweeps.run(&CleanupConfig::default(), now()).await.policy, Some(1));
+    }
+
+    #[tokio::test]
+    async fn run_cleanup_records_last_sweep_at() {
+        let fx = fixture().await;
+        let state = State::default();
+        let sweeps = RunCleanup {
+            state: Some(&state),
+            ..fx.sweeps()
+        };
+        sweeps.run(&CleanupConfig::default(), now()).await;
+        assert_eq!(state.get(LAST_SWEEP_AT).await.unwrap(), Some(now().to_rfc3339()));
     }
 }

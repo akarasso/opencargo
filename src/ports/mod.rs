@@ -4,6 +4,7 @@
 //! behind it is chosen by the composition root and named nowhere else.
 
 pub mod audit;
+pub mod backup;
 pub mod clock;
 pub mod dashboard;
 pub mod deps;
@@ -13,6 +14,7 @@ pub mod identities;
 pub mod identity_provider;
 pub mod import;
 pub mod ids;
+pub mod leases;
 pub mod maven;
 pub mod mcp;
 pub mod mcp_feed;

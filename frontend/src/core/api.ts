@@ -24,6 +24,7 @@ import type {
   RepositoryDetail,
   SearchResponse,
   StorageStatus,
+  InstanceStatus,
   Token,
   User,
   VulnReport,
@@ -232,6 +233,10 @@ export function fetchHealthReady(): Promise<{ status: string }> {
 
 export function fetchStorageStatus(): Promise<StorageStatus> {
   return http.get('/api/v1/system/storage');
+}
+
+export function fetchInstanceStatus(): Promise<InstanceStatus> {
+  return http.get('/api/v1/system/instance');
 }
 
 // --- Webhooks ---------------------------------------------------------------------------------
