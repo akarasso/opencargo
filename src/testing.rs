@@ -36,3 +36,7 @@ pub mod fake_s3;
 /// The multipart ledger in memory.
 #[cfg(test)]
 pub mod ledger;
+
+/// A TCP relay that resets or stalls a matching connection.
+#[cfg(test)]
+pub mod relay;

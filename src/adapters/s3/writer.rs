@@ -93,11 +93,15 @@ impl S3Writer {
     async fn put_part(&mut self, data: Bytes) -> Result<(), StorageError> {
         let inner = self.inner.clone();
         let open = self.open.as_mut().expect("a part needs an open upload");
-        let part = inner
-            .store
-            .put_part(&self.path, &open.id, open.parts.len(), PutPayload::from(data))
-            .await
-            .map_err(|e| fault("part", e))?;
+        let part = tokio::time::timeout(
+            inner.completion_timeout,
+            inner
+                .store
+                .put_part(&self.path, &open.id, open.parts.len(), PutPayload::from(data)),
+        )
+        .await
+        .map_err(|_| timed_out("part"))?
+        .map_err(|e| fault("part", e))?;
         open.parts.push(part);
         if open.touched.elapsed() >= TOUCH_EVERY {
             open.touched = Instant::now();

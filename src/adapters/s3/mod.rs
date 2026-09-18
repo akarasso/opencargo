@@ -165,7 +165,6 @@ impl S3Storage {
             .with_allow_http(settings.allow_http)
             .with_no_system_certificates(true)
             .with_connect_timeout(Duration::from_secs(10))
-            .with_read_timeout(settings.request_timeout)
             .with_timeout_disabled();
         for der in &roots {
             options = options.with_root_certificate(object_store::Certificate::from_der(der)?);
@@ -284,9 +283,8 @@ impl S3Storage {
             })
             .filter_map(|r| async move { r.transpose() })
         };
-        let children = inner
-            .store
-            .list(listing_root.as_ref())
+        let idle = inner.request_timeout;
+        let children = idle_bounded(inner.store.list(listing_root.as_ref()), idle)
             .map(move |entry| {
                 let meta = entry.map_err(|e| fault("list", e))?;
                 let key = inner.logical(&meta.location)?;
@@ -303,8 +301,14 @@ impl S3Storage {
 impl StorageBackend for S3Storage {
     async fn get(&self, key: &str) -> Result<Bytes, StorageError> {
         let path = self.inner.path(key)?;
-        let got = self.inner.store.get(&path).await.map_err(|e| fault("get", e))?;
-        got.bytes().await.map_err(|e| fault("get", e))
+        let bound = self.inner.completion_timeout;
+        let got = tokio::time::timeout(bound, async {
+            let got = self.inner.store.get(&path).await?;
+            got.bytes().await
+        })
+        .await
+        .map_err(|_| timed_out("get"))?;
+        got.map_err(|e| fault("get", e))
     }
 
     async fn writer(&self, key: &str) -> Result<Box<dyn ObjectWriter>, StorageError> {
@@ -314,10 +318,12 @@ impl StorageBackend for S3Storage {
 
     async fn read_stream(&self, key: &str) -> Result<ReadStream, StorageError> {
         let path = self.inner.path(key)?;
-        let got = self.inner.store.get(&path).await.map_err(|e| fault("read", e))?;
+        let got = tokio::time::timeout(self.inner.request_timeout, self.inner.store.get(&path))
+            .await
+            .map_err(|_| timed_out("read"))?
+            .map_err(|e| fault("read", e))?;
         let total = got.meta.size;
-        let body = got
-            .into_stream()
+        let body = idle_bounded(got.into_stream(), self.inner.request_timeout)
             .map_err(|e| std::io::Error::other(fault("read", e)));
         Ok(ReadStream {
             total,
@@ -456,6 +462,29 @@ impl StorageBackend for S3Storage {
     }
 }
 
+/// A body stream that fails once the wire stays silent for `idle` while its
+/// reader waits on it; a reader that is slow to ask is never counted.
+fn idle_bounded<T: Send + 'static>(
+    inner: futures_util::stream::BoxStream<'static, object_store::Result<T>>,
+    idle: Duration,
+) -> futures_util::stream::BoxStream<'static, object_store::Result<T>> {
+    stream::unfold(Some(inner), move |state| async move {
+        let mut inner = state?;
+        match tokio::time::timeout(idle, inner.next()).await {
+            Ok(Some(item)) => Some((item, Some(inner))),
+            Ok(None) => None,
+            Err(_) => Some((
+                Err(object_store::Error::Generic {
+                    store: "S3",
+                    source: "the object stream stayed idle past the request timeout".into(),
+                }),
+                None,
+            )),
+        }
+    })
+    .boxed()
+}
+
 /// Every operation on a private tree, cleaned up after itself.
 async fn self_check(inner: &Arc<Inner>) -> CheckReport {
     let nonce = uuid::Uuid::new_v4().simple().to_string();
@@ -517,3 +546,6 @@ async fn self_check(inner: &Arc<Inner>) -> CheckReport {
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod relay_tests;
