@@ -5,6 +5,7 @@
 #![allow(dead_code)]
 
 pub mod contract;
+pub mod fake_idp;
 pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;
@@ -49,6 +50,7 @@ pub struct SpawnOpts {
     pub policy_tuning: Option<Tuning>,
     /// Puts the storage and the permission store behind switches.
     pub outage: Option<faults::Outage>,
+    pub sso: opencargo::config::SsoConfig,
     /// The URL clients reach the server by, when a reverse proxy fronts it.
     pub public_url: Option<String>,
 }
@@ -63,6 +65,7 @@ impl Default for SpawnOpts {
             policy: HashMap::new(),
             policy_tuning: None,
             outage: None,
+            sso: Default::default(),
             public_url: None,
         }
     }
@@ -101,6 +104,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         auth: AuthConfig {
             anonymous_read: opts.anonymous_read,
             static_tokens: vec![STATIC_TOKEN.to_string()],
+            sso: opts.sso.clone(),
             ..Default::default()
         },
         proxy: opts.proxy,
@@ -242,6 +246,17 @@ async fn spawn_in(
         tmp,
         storage: config.storage.clone(),
     }
+}
+
+/// The error a restart of `server` on its own database refuses to start
+/// with under `opts`; the running server is left alone.
+pub async fn start_error_in(server: &TestServer, opts: SpawnOpts) -> String {
+    let config = test_config(&server.tmp, "http://127.0.0.1:0", opts);
+    server::build_state(&config)
+        .await
+        .err()
+        .expect("the start should be refused")
+        .to_string()
 }
 
 /// The error a server refuses to start with under this repository seed.

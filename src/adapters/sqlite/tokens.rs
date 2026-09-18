@@ -51,6 +51,33 @@ fn decode(row: TokenRow) -> Result<ApiToken, StoreError> {
     ApiToken::try_from(row).map_err(corrupt_row)
 }
 
+fn insert<'q>(
+    token: &'q NewToken<'q>,
+    now: DateTime<Utc>,
+) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, TokenRow, sqlx::sqlite::SqliteArguments<'q>> {
+    sqlx::query_as(
+        "INSERT INTO api_tokens (id, user_id, name, prefix, token_hash, expires_at, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+         RETURNING id, user_id, name, prefix, token_hash, expires_at, last_used_at, created_at",
+    )
+    .bind(token.id)
+    .bind(token.user_id)
+    .bind(token.name)
+    .bind(token.prefix)
+    .bind(token.token_hash)
+    .bind(token.expires_at.map(bind_ts))
+    .bind(bind_ts(now))
+}
+
+pub(super) async fn insert_in(
+    tx: &mut super::Tx,
+    token: &NewToken<'_>,
+    now: DateTime<Utc>,
+) -> Result<Result<ApiToken, StoreError>, sqlx::Error> {
+    let row = insert(token, now).fetch_one(&mut **tx).await?;
+    Ok(decode(row))
+}
+
 pub struct SqliteTokenStore {
     pool: SqlitePool,
 }
@@ -98,20 +125,10 @@ impl TokenStore for SqliteTokenStore {
         token: &NewToken<'_>,
         now: DateTime<Utc>,
     ) -> Result<ApiToken, StoreError> {
-        let row: TokenRow = sqlx::query_as(&format!(
-            "INSERT INTO api_tokens (id, user_id, name, prefix, token_hash, expires_at, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) RETURNING {COLUMNS}"
-        ))
-        .bind(token.id)
-        .bind(token.user_id)
-        .bind(token.name)
-        .bind(token.prefix)
-        .bind(token.token_hash)
-        .bind(token.expires_at.map(bind_ts))
-        .bind(bind_ts(now))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(store_error)?;
+        let row: TokenRow = insert(token, now)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(store_error)?;
         decode(row)
     }
 

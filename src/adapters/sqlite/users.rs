@@ -47,6 +47,41 @@ fn decode(row: UserRow) -> Result<User, StoreError> {
     User::try_from(row).map_err(corrupt_row)
 }
 
+pub(crate) async fn by_id_in(tx: &mut super::Tx, id: i64) -> Result<Option<User>, sqlx::Error> {
+    let row: Option<UserRow> = sqlx::query_as(&format!("SELECT {COLUMNS} FROM users WHERE id = ?1"))
+        .bind(id)
+        .fetch_optional(&mut **tx)
+        .await?;
+    Ok(row.and_then(|r| decode(r).ok()))
+}
+
+/// `Conflict` if the name is taken, inside a caller's transaction.
+pub(crate) async fn insert_in(
+    tx: &mut super::Tx,
+    user: &NewUser<'_>,
+    now: DateTime<Utc>,
+) -> Result<Result<User, StoreError>, sqlx::Error> {
+    let taken: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM users WHERE username = ?1)")
+        .bind(user.username)
+        .fetch_one(&mut **tx)
+        .await?;
+    if taken {
+        return Ok(Err(StoreError::Conflict));
+    }
+    let row: UserRow = sqlx::query_as(&format!(
+        "INSERT INTO users (username, email, password_hash, role, created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?5) RETURNING {COLUMNS}"
+    ))
+    .bind(user.username)
+    .bind(user.email)
+    .bind(user.password_hash)
+    .bind(user.role)
+    .bind(bind_ts(now))
+    .fetch_one(&mut **tx)
+    .await?;
+    Ok(decode(row))
+}
+
 pub struct SqliteUserStore {
     pool: SqlitePool,
 }

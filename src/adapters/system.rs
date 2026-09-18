@@ -32,9 +32,8 @@ impl Ids for UuidIds {
     }
 }
 
-/// Secrets that live as long as the process: today's behaviour, where a
-/// restart invalidates every registry token. The persisted store lands with
-/// the first of migrations 021/022, which creates `server_secrets`.
+/// Secrets that live as long as the process, for callers with no database;
+/// the server keeps its own in `server_secrets` (migration 021).
 #[derive(Default)]
 pub struct ProcessSecrets {
     secrets: Mutex<HashMap<String, Vec<u8>>>,

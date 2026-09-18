@@ -23,6 +23,9 @@ use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
 use crate::ports::multipart::MultipartLedger;
 use crate::ports::maven::MavenFileStore;
+use crate::ports::handoffs::LoginHandoffStore;
+use crate::ports::identities::IdentityStore;
+use crate::ports::secrets::ServerSecretStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
@@ -42,6 +45,7 @@ pub mod audit;
 pub mod dashboard;
 pub mod deps;
 pub mod maven;
+pub mod identities;
 pub mod migrate;
 pub mod multipart;
 pub mod nuget;
@@ -331,6 +335,18 @@ impl SqliteStores {
 
     pub fn maven(&self) -> Arc<dyn MavenFileStore> {
         Arc::new(maven::SqliteMavenFileStore::new(self.pool.clone()))
+    }
+
+    pub fn identities(&self) -> Arc<dyn IdentityStore> {
+        Arc::new(identities::SqliteIdentityStore::new(self.pool.clone()))
+    }
+
+    pub fn handoffs(&self) -> Arc<dyn LoginHandoffStore> {
+        Arc::new(identities::SqliteHandoffStore::new(self.pool.clone()))
+    }
+
+    pub fn secrets(&self) -> Arc<dyn ServerSecretStore> {
+        Arc::new(identities::SqliteSecretStore::new(self.pool.clone()))
     }
 
     pub fn dashboard(&self) -> Arc<dyn DashboardRead> {

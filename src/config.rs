@@ -271,6 +271,96 @@ pub struct AuthConfig {
     pub admin: AdminConfig,
     /// Peers whose `X-Forwarded-For` names the client for the token limiter.
     pub trusted_proxies: Vec<std::net::IpAddr>,
+    pub sso: SsoConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct SsoConfig {
+    /// `enabled`, `admins_only` or `disabled`.
+    pub password_mode: String,
+    pub session_ttl: String,
+    /// Empty: an SSO user's credentials never need a fresh login.
+    pub reauth_after: String,
+    pub reauth_grace_max: String,
+    pub handoff_ttl: String,
+    pub probe_interval: String,
+    /// Plain-HTTP cookies for a loopback development server only.
+    pub dev_insecure_http: bool,
+    pub providers: Vec<SsoProviderConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct SsoProviderConfig {
+    pub name: String,
+    /// `google`, `entra`, `gitlab` or `generic`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Required for `gitlab` and `generic`; an Entra issuer template with
+    /// `{tid}` overrides Microsoft's.
+    pub issuer: String,
+    /// Entra only: a tenant id, or `common` / `organizations`.
+    pub tenant: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub scopes: Vec<String>,
+    pub groups_claim: Option<String>,
+    pub open: Option<bool>,
+    pub allow_open: bool,
+    pub authoritative_domains: Vec<String>,
+    pub allowed_domains: Vec<String>,
+    pub required_groups: Vec<String>,
+    pub default_role: Option<String>,
+    pub grants: Vec<SsoGrantConfig>,
+    /// Declares a provider removed: its credentials are revoked at startup.
+    pub retired: bool,
+    /// Declares the issuer this provider was known under before.
+    pub issuer_was: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SsoGrantConfig {
+    pub group: String,
+    pub repository: String,
+    pub role: String,
+}
+
+impl Default for SsoConfig {
+    fn default() -> Self {
+        Self {
+            password_mode: "enabled".to_string(),
+            session_ttl: "12h".to_string(),
+            reauth_after: String::new(),
+            reauth_grace_max: "72h".to_string(),
+            handoff_ttl: "120s".to_string(),
+            probe_interval: "60s".to_string(),
+            dev_insecure_http: false,
+            providers: Vec::new(),
+        }
+    }
+}
+
+/// `90s`, `15m`, `12h`, `30d` or bare seconds; anything else is refused
+/// rather than defaulted.
+pub fn parse_duration(s: &str) -> Result<chrono::Duration> {
+    let s = s.trim();
+    let (n, unit) = match s.char_indices().last() {
+        Some((i, c)) if c.is_ascii_alphabetic() => (&s[..i], c),
+        _ => (s, 's'),
+    };
+    let n: i64 = n
+        .parse()
+        .with_context(|| format!("invalid duration {s:?}"))?;
+    let secs = match unit {
+        's' => n,
+        'm' => n * 60,
+        'h' => n * 3600,
+        'd' => n * 86400,
+        _ => anyhow::bail!("invalid duration unit in {s:?}"),
+    };
+    anyhow::ensure!(secs >= 0, "negative duration {s:?}");
+    Ok(chrono::Duration::seconds(secs))
 }
 
 impl Default for AuthConfig {
@@ -281,6 +371,7 @@ impl Default for AuthConfig {
             static_tokens: Vec::new(),
             admin: AdminConfig::default(),
             trusted_proxies: Vec::new(),
+            sso: SsoConfig::default(),
         }
     }
 }

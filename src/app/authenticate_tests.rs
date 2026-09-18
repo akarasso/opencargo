@@ -17,9 +17,15 @@ struct Gate {
     refuse: Vec<CredentialKind>,
 }
 
+#[async_trait::async_trait]
 impl LoginGate for Gate {
-    fn login_allowed(&self, _user: &User, kind: CredentialKind, _now: DateTime<Utc>) -> bool {
-        !self.refuse.contains(&kind)
+    async fn login_allowed(
+        &self,
+        _user: &User,
+        kind: CredentialKind,
+        _now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        Ok(!self.refuse.contains(&kind))
     }
 }
 
@@ -281,4 +287,133 @@ async fn api_and_oci_tokens_refused_when_login_is_not_allowed() {
         credential: Credential::Registry(registry),
     }];
     assert_eq!(fx.who(&presented, "s2").await, Err(Refusal::Invalid));
+}
+
+/// A clock the SSO cases move by hand.
+struct Settable(std::sync::Mutex<DateTime<Utc>>);
+
+impl crate::ports::clock::Clock for Settable {
+    fn now(&self) -> DateTime<Utc> {
+        *self.0.lock().unwrap()
+    }
+}
+
+struct Sso {
+    fx: Fx,
+    clock: Arc<Settable>,
+}
+
+fn sso_fixture(policy: crate::domain::identity::GatePolicy) -> Sso {
+    use crate::app::login_gate::PolicyGate;
+    let db = FakeDb::new();
+    let signer = Arc::new(TokenSigner::random());
+    let clock = Arc::new(Settable(std::sync::Mutex::new(Utc::now())));
+    let auth = Authenticate::new(AuthenticateDeps {
+        static_tokens: vec![],
+        token_prefix: "trg_".to_string(),
+        users: db.users(),
+        tokens: db.tokens(),
+        signer: signer.clone(),
+        login_limiter: Arc::new(RateLimiter::new(3, 60)),
+        token_limiter: Arc::new(RateLimiter::new(100, 60)),
+        gate: Arc::new(PolicyGate::new(db.identities(), policy, Some("root".into()))),
+        clock: clock.clone(),
+    });
+    Sso {
+        fx: Fx { store: db, signer, auth },
+        clock,
+    }
+}
+
+fn registry_for(fx: &Fx, sub: &str, api_token_id: Option<&str>) -> Presented {
+    let raw = fx.signer.sign(&Claims {
+        sub: Some(sub.into()),
+        exp: i64::MAX,
+        scope: Vec::new(),
+        static_token: false,
+        api_token_id: api_token_id.map(str::to_string),
+    });
+    Presented {
+        transport: Transport::Authorization,
+        credential: Credential::Registry(raw),
+    }
+}
+
+/// An SSO user who does not log in again within `reauth_after` loses every
+/// credential it holds, whatever the scheme it arrives in.
+#[tokio::test]
+async fn api_and_oci_tokens_refused_after_reauth_after_without_login() {
+    use crate::domain::identity::{Authority, GatePolicy, IdentityKey, PasswordMode};
+    use crate::ports::identities::Admission;
+    let sso = sso_fixture(GatePolicy {
+        password_mode: PasswordMode::Enabled,
+        reauth_after: Some(chrono::Duration::hours(8)),
+        grace_max: chrono::Duration::zero(),
+    });
+    let fx = &sso.fx;
+    let key = IdentityKey {
+        authority: Authority::new("corp", "https://idp.example"),
+        subject: "s-1".into(),
+    };
+    let dev = fx
+        .store
+        .identities()
+        .provision(
+            &NewUser { username: "dev", email: None, password_hash: "!", role: "reader" },
+            &Admission { key: &key, email: None, role: "reader", grants: &[], managed: &[] },
+            sso.clock.now(),
+        )
+        .await
+        .unwrap();
+    let raw = token_of(&fx.store, &dev, "t1").await;
+    assert_eq!(fx.who(&[bearer(&raw)], "s").await, Ok(Some("dev".into())));
+    assert_eq!(fx.who(&[registry_for(fx, "dev", Some("t1"))], "s").await, Ok(Some("dev".into())));
+
+    *sso.clock.0.lock().unwrap() += chrono::Duration::hours(9);
+    assert_eq!(fx.who(&[bearer(&raw)], "s").await, Err(Refusal::Invalid));
+    assert_eq!(fx.who(&[basic("dev", &raw)], "s").await, Err(Refusal::Invalid));
+    assert_eq!(fx.who(&[registry_for(fx, "dev", Some("t1"))], "s").await, Err(Refusal::Invalid));
+    assert_eq!(fx.who(&[registry_for(fx, "dev", None)], "s").await, Err(Refusal::Invalid));
+}
+
+#[tokio::test]
+async fn password_refused_in_disabled_mode_token_accepted() {
+    use crate::domain::identity::{GatePolicy, PasswordMode};
+    let sso = sso_fixture(GatePolicy {
+        password_mode: PasswordMode::Disabled,
+        ..GatePolicy::default()
+    });
+    let fx = &sso.fx;
+    let dev = user(&fx.store, "dev").await;
+    let raw = token_of(&fx.store, &dev, "t1").await;
+    assert_eq!(fx.who(&[basic("dev", PASSWORD)], "s").await, Err(Refusal::Invalid));
+    assert_eq!(fx.who(&[basic("dev", &raw)], "s").await, Ok(Some("dev".into())));
+    user(&fx.store, "root").await;
+    assert_eq!(
+        fx.who(&[basic("root", PASSWORD)], "s").await,
+        Ok(Some("root".into())),
+        "the bootstrap account is never locked out"
+    );
+}
+
+#[tokio::test]
+async fn a_disabled_account_is_refused_on_every_scheme_and_a_store_fault_is_503() {
+    use crate::domain::identity::GatePolicy;
+    use crate::ports::identities::DisabledBy;
+    use crate::testing::fakes::PortId;
+    let sso = sso_fixture(GatePolicy::default());
+    let fx = &sso.fx;
+    let dev = user(&fx.store, "dev").await;
+    let raw = token_of(&fx.store, &dev, "t1").await;
+    fx.store
+        .identities()
+        .disable_user(dev.id, DisabledBy::Admin, Utc::now())
+        .await
+        .unwrap();
+    assert_eq!(fx.who(&[bearer(&raw)], "s").await, Err(Refusal::Invalid));
+    assert_eq!(fx.who(&[basic("dev", PASSWORD)], "s").await, Err(Refusal::Invalid));
+    assert_eq!(fx.who(&[registry_for(fx, "dev", None)], "s").await, Err(Refusal::Invalid));
+    fx.store.identities().enable_user(dev.id).await.unwrap();
+    fx.store.fail_next(PortId::Identities, StoreError::Unavailable);
+    assert_eq!(fx.who(&[bearer(&raw)], "s").await, Err(Refusal::Unavailable));
 }

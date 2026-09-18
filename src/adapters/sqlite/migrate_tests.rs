@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "024", "025"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.
@@ -897,4 +897,56 @@ async fn migration_025_before_or_after_020_keeps_incarnations() {
             "the cascade of 025 survives the rebuild: {order:?}"
         );
     }
+}
+
+/// The `server_secrets` half of ha-options' 022, as A1 C2 fixes it: the same
+/// definition, created only if 021 did not.
+const SECRETS_022: &str = "CREATE TABLE IF NOT EXISTS server_secrets (
+    name TEXT PRIMARY KEY,
+    value BLOB NOT NULL,
+    created_at TEXT NOT NULL
+);";
+
+async fn secrets_definition(pool: &SqlitePool) -> String {
+    sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'server_secrets'")
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// 021 alone on a pre-018 database, twice: the SSO tables appear once and a
+/// second apply changes nothing.
+#[tokio::test]
+async fn migration_021_alone_on_a_pre_018_database_is_idempotent() {
+    let (_tmp, pool) = pool().await;
+    legacy_migrate(&pool).await;
+    sqlx::raw_sql(file_of("021")).execute(&pool).await.unwrap();
+    let before = objects(&pool).await;
+    sqlx::raw_sql(file_of("021")).execute(&pool).await.unwrap();
+    assert_eq!(objects(&pool).await, before);
+    for table in ["server_secrets", "sso_identities", "login_handoffs", "sso_token_provenance"] {
+        assert!(before.contains(&format!("table {table}")), "{table}");
+    }
+}
+
+/// `server_secrets` is created by whichever of 021 and 022 ships first; the
+/// other checks and skips, in both orders, and ends on one definition.
+#[tokio::test]
+async fn migrations_021_and_022_create_server_secrets_in_either_order() {
+    let (_a, first) = pool().await;
+    legacy_migrate(&first).await;
+    sqlx::raw_sql(file_of("021")).execute(&first).await.unwrap();
+    sqlx::raw_sql(SECRETS_022).execute(&first).await.unwrap();
+
+    let (_b, second) = pool().await;
+    legacy_migrate(&second).await;
+    sqlx::raw_sql(SECRETS_022).execute(&second).await.unwrap();
+    sqlx::raw_sql(file_of("021")).execute(&second).await.unwrap();
+
+    assert_eq!(objects(&first).await, objects(&second).await);
+    let normalize = |s: String| s.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert_eq!(
+        normalize(secrets_definition(&first).await),
+        normalize(secrets_definition(&second).await)
+    );
 }

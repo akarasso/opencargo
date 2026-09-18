@@ -24,6 +24,14 @@ All notable changes to this project will be documented in this file.
   while a repository is named `maven`, because `/maven/` becomes the Maven
   endpoint: rename that repository with the previous release before
   upgrading. `maven` is a reserved repository name from now on.
+- Single sign-on through OpenID Connect (Google, Entra ID, GitLab, any
+  provider): accounts created or linked on first login, groups mapped to
+  roles and grants at every login, credentials revoked with the provider or
+  the account, and `password_mode` to retire local passwords. See
+  `docs/sso.md`.
+- Registry token signing keys survive a restart (`server_secrets`).
+- An admin can disable and re-enable an account; its SSO credentials are
+  revoked at once and every credential it holds is refused.
 
 ### Changed
 - OCI: a `PATCH` whose `Content-Range` does not start where the upload

@@ -145,6 +145,7 @@ pub const MIGRATIONS: &[Migration] = &[
         sentinel: Sentinel::Unprovable,
         step: Step::Rust(nuget_format),
     },
+    sql_migration!("021", "021_sso.sql", Sentinel::Object("idx_login_handoffs_expires")),
     Migration {
         id: "024",
         sentinel: Sentinel::Object("idx_maven_units_pending"),
