@@ -10,6 +10,7 @@
 import { createResource, createRoot, createSignal } from 'solid-js';
 import { fetchMyPermissions, npmLogin, whoami } from '../api.ts';
 import { ApiError } from '../http.ts';
+import { serverLogout } from '../sso.ts';
 import { setToken, token } from '../token.ts';
 import { connectWs, onEvent, reconnectWs } from '../ws.ts';
 import type { EffectivePermission, MyPermissions, SessionUser } from '../types.ts';
@@ -113,7 +114,22 @@ function createSessionStore() {
     return null;
   }
 
+  /** An SSO handoff ends here: the token is an ordinary API token. */
+  async function loginWithToken(value: string): Promise<void> {
+    setToken(value);
+    await refreshIdentity();
+    reconnectWs();
+    void refetchPermissions();
+  }
+
   function logout(): void {
+    if (token()) {
+      void serverLogout()
+        .then((r) => {
+          if (r?.end_session_url) window.location.assign(r.end_session_url);
+        })
+        .catch(() => undefined);
+    }
     setToken(null);
     setUser(null);
     setIdentityError(false);
@@ -136,8 +152,7 @@ function createSessionStore() {
   }
 
   /** True when the user can publish somewhere at all. */
-  const canWriteAnywhere = () =>
-    permissions()?.permissions.some((p) => p.can_write) ?? false;
+  const canWriteAnywhere = () => permissions()?.permissions.some((p) => p.can_write) ?? false;
 
   // --- Live updates ---------------------------------------------------------
   // Rights change server-side → refresh what this session can see/do.
@@ -166,6 +181,7 @@ function createSessionStore() {
     permissionFor,
     canWriteAnywhere,
     login,
+    loginWithToken,
     logout,
     clearMustChangePassword,
     isAuthenticated,

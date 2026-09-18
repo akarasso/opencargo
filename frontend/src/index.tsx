@@ -12,6 +12,9 @@ import OciImages from './pages/OciImages.tsx';
 import GoModules from './pages/GoModules.tsx';
 import Login from './pages/Login.tsx';
 import MyAccess from './pages/MyAccess.tsx';
+import SsoAccount from './pages/SsoAccount.tsx';
+import SsoComplete from './pages/SsoComplete.tsx';
+import SsoLink from './pages/SsoLink.tsx';
 import AdminDashboard from './pages/admin/AdminDashboard.tsx';
 import Repositories from './pages/admin/Repositories.tsx';
 import Users from './pages/admin/Users.tsx';
@@ -34,14 +37,13 @@ if (!root) throw new Error('Root element not found');
  * throw again.
  */
 function CrashScreen(props: { error: unknown }) {
-  const message = () =>
-    props.error instanceof Error ? props.error.message : String(props.error);
+  const message = () => (props.error instanceof Error ? props.error.message : String(props.error));
   return (
     <div class="empty" style={{ 'min-height': '100vh' }}>
       <div class="empty-title">Something went wrong</div>
       <div class="empty-text" style={{ 'margin-bottom': '14px' }}>
-        The interface hit an unexpected error and stopped rendering. Reloading
-        usually fixes it — your session is kept.
+        The interface hit an unexpected error and stopped rendering. Reloading usually fixes it —
+        your session is kept.
       </div>
       <div class="alert alert-error" role="alert" style={{ 'max-width': '520px' }}>
         <span class="mono small" style={{ 'word-break': 'break-word' }}>
@@ -62,6 +64,7 @@ render(
         {/* Mirror of the explicit SPA route list in src/web/mod.rs — keep both lists in sync. */}
         {/* Login page has its own layout (no shell) */}
         <Route path="/login" component={Login} />
+        <Route path="/login/sso/complete" component={SsoComplete} />
 
         {/* All other routes share the shell */}
         <Route path="/" component={Layout}>
@@ -72,6 +75,8 @@ render(
           <Route path="/oci" component={OciImages} />
           <Route path="/go" component={GoModules} />
           <Route path="/account/access" component={MyAccess} />
+          <Route path="/account/sso" component={SsoAccount} />
+          <Route path="/login/sso/link" component={SsoLink} />
           <Route path="/admin" component={AdminDashboard} />
           <Route path="/admin/repositories" component={Repositories} />
           <Route path="/admin/users" component={Users} />

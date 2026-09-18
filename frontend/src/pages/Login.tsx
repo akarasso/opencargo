@@ -1,5 +1,6 @@
-import { Show, createEffect, createSignal } from 'solid-js';
-import { A, useNavigate } from '@solidjs/router';
+import { For, Show, createEffect, createResource, createSignal } from 'solid-js';
+import { A, useNavigate, useSearchParams } from '@solidjs/router';
+import { ssoErrorMessage, ssoProviders, startUrl } from '../core/sso.ts';
 import Icon from '../components/Icon.tsx';
 import { session } from '../core/stores/session.ts';
 import { toasts } from '../core/stores/toasts.ts';
@@ -11,6 +12,12 @@ export default function Login() {
   const [showPassword, setShowPassword] = createSignal(false);
   const [error, setError] = createSignal<string | null>(null);
   const [loading, setLoading] = createSignal(false);
+  const [params] = useSearchParams();
+  const [sso] = createResource(ssoProviders);
+  const ssoError = () => {
+    const code = params.sso_error;
+    return typeof code === 'string' ? ssoErrorMessage(code) : null;
+  };
 
   // Already signed in (or becomes signed in): leave the login page.
   createEffect(() => {
@@ -58,6 +65,25 @@ export default function Login() {
             <div class="login-sub">sign in to your registry</div>
           </div>
         </div>
+
+        <Show when={(sso()?.providers.length ?? 0) > 0}>
+          <div class="login-card" style={{ 'margin-bottom': '12px' }}>
+            <Show when={ssoError()}>
+              <div class="alert alert-error" role="alert">
+                <Icon name="alert-circle" size={15} />
+                <span>{ssoError()}</span>
+              </div>
+            </Show>
+            <For each={sso()?.providers ?? []}>
+              {(name) => (
+                <a class="btn btn-ghost" style={{ width: '100%' }} href={startUrl(name, '/')}>
+                  <Icon name="log-in" size={15} />
+                  Sign in with {name}
+                </a>
+              )}
+            </For>
+          </div>
+        </Show>
 
         <form class="login-card" onSubmit={handleSubmit}>
           <Show when={error()}>
@@ -111,7 +137,11 @@ export default function Login() {
             </div>
           </div>
 
-          <button class="btn btn-primary" style={{ width: '100%', 'margin-top': '6px' }} disabled={loading()}>
+          <button
+            class="btn btn-primary"
+            style={{ width: '100%', 'margin-top': '6px' }}
+            disabled={loading()}
+          >
             <Show when={loading()} fallback={<Icon name="log-in" size={15} />}>
               <span class="spinner" style={{ 'border-top-color': 'var(--accent-ink)' }} />
             </Show>
