@@ -57,6 +57,9 @@ async fn main() -> anyhow::Result<()> {
     if let Some(base_url) = cli.base_url {
         cfg.server.base_url = base_url.trim_end_matches('/').to_string();
     }
+    if let Some(bind) = &cli.bind {
+        cfg.server.bind = bind.clone();
+    }
     if let Some(osv_base_url) = cli.osv_base_url {
         cfg.vuln_scan.osv_base_url = osv_base_url.trim_end_matches('/').to_string();
     }
@@ -74,6 +77,10 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let app_state = server::build_state(&cfg).await?;
+            let probe_every = config::parse_duration(&cfg.auth.sso.probe_interval)?
+                .to_std()
+                .unwrap_or(std::time::Duration::from_secs(60));
+            tokio::spawn(server::start_sso_probe(app_state.sso.clone(), probe_every));
 
             // Spawn the periodic cleanup/GC task before the router consumes
             // app_state: the pre-release sweep needs cleanup.enabled, the proxy

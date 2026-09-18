@@ -1,4 +1,5 @@
 pub mod audit;
+pub mod auth_sso;
 pub mod dashboard;
 pub mod deps;
 pub mod me;

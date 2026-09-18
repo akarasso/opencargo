@@ -148,6 +148,43 @@ pub struct SsoConfig {
     pub probe_interval: String,
     /// Plain-HTTP cookies for a loopback development server only.
     pub dev_insecure_http: bool,
+    pub providers: Vec<SsoProviderConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct SsoProviderConfig {
+    pub name: String,
+    /// `google`, `entra`, `gitlab` or `generic`.
+    #[serde(rename = "type")]
+    pub kind: String,
+    /// Required for `gitlab` and `generic`; an Entra issuer template with
+    /// `{tid}` overrides Microsoft's.
+    pub issuer: String,
+    /// Entra only: a tenant id, or `common` / `organizations`.
+    pub tenant: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub scopes: Vec<String>,
+    pub groups_claim: Option<String>,
+    pub open: Option<bool>,
+    pub allow_open: bool,
+    pub authoritative_domains: Vec<String>,
+    pub allowed_domains: Vec<String>,
+    pub required_groups: Vec<String>,
+    pub default_role: Option<String>,
+    pub grants: Vec<SsoGrantConfig>,
+    /// Declares a provider removed: its credentials are revoked at startup.
+    pub retired: bool,
+    /// Declares the issuer this provider was known under before.
+    pub issuer_was: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+pub struct SsoGrantConfig {
+    pub group: String,
+    pub repository: String,
+    pub role: String,
 }
 
 impl Default for SsoConfig {
@@ -160,6 +197,7 @@ impl Default for SsoConfig {
             handoff_ttl: "120s".to_string(),
             probe_interval: "60s".to_string(),
             dev_insecure_http: false,
+            providers: Vec::new(),
         }
     }
 }

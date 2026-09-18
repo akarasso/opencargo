@@ -45,6 +45,9 @@ pub struct SpawnOpts {
     pub policy: HashMap<String, PolicyConfig>,
     /// Replaces the policy engine's timing knobs after `build_state`.
     pub policy_tuning: Option<Tuning>,
+    pub sso: opencargo::config::SsoConfig,
+    /// The public URL the server believes it has, instead of its loopback one.
+    pub public_url: Option<String>,
 }
 
 impl Default for SpawnOpts {
@@ -56,6 +59,8 @@ impl Default for SpawnOpts {
             vuln: VulnScanConfig::default(),
             policy: HashMap::new(),
             policy_tuning: None,
+            sso: Default::default(),
+            public_url: None,
         }
     }
 }
@@ -74,7 +79,10 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
     Config {
         server: ServerConfig {
             bind: base_url.trim_start_matches("http://").to_string(),
-            base_url: base_url.to_string(),
+            base_url: opts
+                .public_url
+                .clone()
+                .unwrap_or_else(|| base_url.to_string()),
             storage_path: storage_path
                 .to_str()
                 .expect("non-utf8 temp path")
@@ -90,6 +98,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         auth: AuthConfig {
             anonymous_read: opts.anonymous_read,
             static_tokens: vec![STATIC_TOKEN.to_string()],
+            sso: opts.sso.clone(),
             ..Default::default()
         },
         proxy: opts.proxy,
@@ -156,6 +165,17 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
         handle,
         tmp,
     }
+}
+
+/// The error a restart of `server` on its own database refuses to start
+/// with under `opts`; the running server is left alone.
+pub async fn start_error_in(server: &TestServer, opts: SpawnOpts) -> String {
+    let config = test_config(&server.tmp, "http://127.0.0.1:0", opts);
+    server::build_state(&config)
+        .await
+        .err()
+        .expect("the start should be refused")
+        .to_string()
 }
 
 /// The error a server refuses to start with under this repository seed.

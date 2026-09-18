@@ -114,6 +114,12 @@ pub struct AppState {
     pub ids: Arc<dyn Ids>,
     /// Records proxy resolutions for the policy report; off until a rule is on.
     pub policy: PolicyEngine,
+    pub identities: Arc<dyn crate::ports::identities::IdentityStore>,
+    /// The SSO use cases, with no provider when none is configured.
+    pub sso: Arc<crate::app::sso::Sso>,
+    /// Plain-HTTP attempt cookies, only on a loopback development server.
+    pub sso_insecure_cookies: bool,
+    pub password_mode: crate::domain::identity::PasswordMode,
 }
 
 impl AppState {
@@ -284,6 +290,17 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let auth = auth_state(config, &users, &tokens, &registry_tokens, &identities)?;
 
     ensure_admin_user(users.as_ref(), config).await?;
+    let providers = sso_providers(config, identities.as_ref()).await?;
+    let sso = Arc::new(
+        sso_use_cases(
+            config,
+            &stores,
+            providers,
+            auth.authenticate.clone(),
+            secrets.as_ref(),
+        )
+        .await?,
+    );
 
     let cache = stores.proxy_cache();
     let proxy = proxy_engine(config, storage.clone(), cache.clone(), &stores);
@@ -343,6 +360,10 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         clock: Arc::new(crate::adapters::system::SystemClock),
         ids: Arc::new(crate::adapters::system::UuidIds),
         policy,
+        sso,
+        identities,
+        sso_insecure_cookies: config.auth.sso.dev_insecure_http,
+        password_mode: gate_policy(&config.auth.sso)?.password_mode,
     })
 }
 
@@ -382,6 +403,234 @@ fn auth_state(
         ],
         trusted_proxies: config.auth.trusted_proxies.clone(),
     }))
+}
+
+fn is_loopback(bind: &str) -> bool {
+    let host = bind.rsplit_once(':').map_or(bind, |(h, _)| h);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Decision 17: plain-HTTP cookies only for a loopback server with an
+/// `http` public URL; otherwise SSO needs an `https` public URL for its
+/// `__Host-` cookies.
+pub fn check_sso_transport(config: &Config) -> anyhow::Result<()> {
+    let sso = &config.auth.sso;
+    let https = config.server.base_url.starts_with("https://");
+    if sso.dev_insecure_http {
+        anyhow::ensure!(
+            !https,
+            "auth.sso.dev_insecure_http is refused with an https base_url"
+        );
+        anyhow::ensure!(
+            is_loopback(&config.server.bind),
+            "auth.sso.dev_insecure_http is refused unless the server listens on loopback"
+        );
+        warn!("auth.sso.dev_insecure_http is on: SSO cookies are sent over plain HTTP");
+        return Ok(());
+    }
+    let active = sso.providers.iter().any(|p| !p.retired);
+    anyhow::ensure!(
+        !active || https,
+        "SSO needs an https base_url (or dev_insecure_http on a loopback server)"
+    );
+    Ok(())
+}
+
+/// One configured provider turned into the domain's profile and the OIDC
+/// adapter's settings.
+fn sso_provider(
+    p: &crate::config::SsoProviderConfig,
+) -> anyhow::Result<Arc<dyn crate::ports::identity_provider::IdentityProvider>> {
+    use crate::adapters::oidc::profiles::{Kind, ENTRA_ISSUER_TEMPLATE, GOOGLE_ISSUER};
+    use crate::domain::identity::{
+        Authority, ConfigRefusal, GrantRole, GroupGrant, LoginPolicy, ProviderProfile,
+    };
+    let name = &p.name;
+    anyhow::ensure!(
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "auth.sso.providers: invalid name {name:?}"
+    );
+    anyhow::ensure!(
+        !matches!(name.as_str(), "link" | "providers" | "exchange"),
+        "auth.sso.providers: {name:?} is a reserved route name"
+    );
+    let (kind, issuer) = match p.kind.as_str() {
+        "google" => (Kind::Google, GOOGLE_ISSUER.to_string()),
+        "entra" => {
+            anyhow::ensure!(!p.tenant.is_empty(), "provider {name}: entra needs a tenant");
+            let template = if p.issuer.is_empty() {
+                ENTRA_ISSUER_TEMPLATE.to_string()
+            } else {
+                p.issuer.clone()
+            };
+            anyhow::ensure!(
+                template.contains("{tid}"),
+                "provider {name}: an entra issuer is a template holding the tenant placeholder"
+            );
+            (
+                Kind::Entra {
+                    tenant: p.tenant.clone(),
+                },
+                template,
+            )
+        }
+        "gitlab" => {
+            let issuer = if p.issuer.is_empty() {
+                "https://gitlab.com".to_string()
+            } else {
+                p.issuer.clone()
+            };
+            (Kind::Gitlab, issuer)
+        }
+        "generic" => {
+            anyhow::ensure!(!p.issuer.is_empty(), "provider {name}: generic needs an issuer");
+            (
+                Kind::Generic {
+                    groups_claim: p.groups_claim.clone(),
+                    open: p.open.unwrap_or(true),
+                },
+                p.issuer.clone(),
+            )
+        }
+        other => anyhow::bail!("provider {name}: unknown type {other:?}"),
+    };
+    let mut grants = Vec::new();
+    for g in &p.grants {
+        let role = GrantRole::parse(&g.role)
+            .ok_or_else(|| anyhow::anyhow!("{}", ConfigRefusal::AdminGrant(name.clone())))?;
+        grants.push(GroupGrant {
+            group: g.group.clone(),
+            repository: g.repository.clone(),
+            role,
+        });
+    }
+    let profile = ProviderProfile {
+        authority: Authority::new(name, &issuer),
+        open: false,
+        allow_open: p.allow_open,
+        tenant_pinned: false,
+        authoritative_domains: p.authoritative_domains.clone(),
+        policy: LoginPolicy {
+            required_groups: p.required_groups.clone(),
+            allowed_domains: p.allowed_domains.clone(),
+            default_role: p
+                .default_role
+                .clone()
+                .unwrap_or_else(|| "reader".to_string()),
+            grants,
+        },
+    };
+    let settings = crate::adapters::oidc::OidcSettings {
+        name: name.clone(),
+        kind,
+        issuer,
+        client_id: p.client_id.clone(),
+        client_secret: p.client_secret.clone(),
+        extra_scopes: p.scopes.clone(),
+        timeout: std::time::Duration::from_secs(10),
+        jwks_refresh_floor: std::time::Duration::from_secs(10),
+    };
+    Ok(Arc::new(crate::adapters::oidc::OidcProvider::new(
+        settings, profile,
+    )?))
+}
+
+/// The active providers, validated as a set, after every known authority
+/// was reconciled against the declarations: this runs before the listener
+/// opens.
+async fn sso_providers(
+    config: &Config,
+    identities: &dyn crate::ports::identities::IdentityStore,
+) -> anyhow::Result<Vec<Arc<dyn crate::ports::identity_provider::IdentityProvider>>> {
+    use crate::domain::identity::{validate_profiles, Authority, Declared};
+    check_sso_transport(config)?;
+    let mut active = Vec::new();
+    let mut retired = Vec::new();
+    let mut migrated = Vec::new();
+    for p in &config.auth.sso.providers {
+        let provider = sso_provider(p)?;
+        let authority = provider.profile().authority.clone();
+        if p.retired {
+            retired.push(authority);
+            continue;
+        }
+        if let Some(was) = &p.issuer_was {
+            migrated.push((Authority::new(&p.name, was), authority.clone()));
+        }
+        active.push(provider);
+    }
+    let profiles: Vec<_> = active.iter().map(|p| p.profile().clone()).collect();
+    for opened in validate_profiles(&profiles).map_err(|e| anyhow::anyhow!("{e}"))? {
+        warn!(provider = %opened, "SSO provider accepts an open issuer by explicit opt-in (allow_open)");
+    }
+    let authorities: Vec<Authority> = profiles.iter().map(|p| p.authority.clone()).collect();
+    crate::app::sso::reconcile_providers(
+        identities,
+        &Declared {
+            active: &authorities,
+            retired: &retired,
+            migrated: &migrated,
+        },
+    )
+    .await?;
+    Ok(active)
+}
+
+const SSO_COOKIE_KEY: &str = "sso_cookie_key";
+
+async fn sso_use_cases(
+    config: &Config,
+    stores: &SqliteStores,
+    providers: Vec<Arc<dyn crate::ports::identity_provider::IdentityProvider>>,
+    authenticate: Arc<Authenticate>,
+    secrets: &dyn ServerSecretStore,
+) -> anyhow::Result<crate::app::sso::Sso> {
+    use crate::auth::seal::Sealer;
+    use crate::config::parse_duration;
+    let key = secrets
+        .get_or_init(SSO_COOKIE_KEY, &Sealer::random_key())
+        .await?;
+    let sso = &config.auth.sso;
+    Ok(crate::app::sso::Sso::new(crate::app::sso::SsoDeps {
+        providers,
+        identities: stores.identities(),
+        handoffs: stores.handoffs(),
+        users: stores.users(),
+        tokens: stores.tokens(),
+        repos: stores.repositories(),
+        audit: stores.audit(),
+        ids: Arc::new(crate::adapters::system::UuidIds),
+        clock: Arc::new(crate::adapters::system::SystemClock),
+        authenticate,
+        sealer: Arc::new(Sealer::new(&key)?),
+        settings: crate::app::sso::SsoSettings {
+            base_url: config.server.base_url.clone(),
+            session_ttl: parse_duration(&sso.session_ttl)?,
+            handoff_ttl: parse_duration(&sso.handoff_ttl)?,
+            attempt_ttl: chrono::Duration::minutes(10),
+            bootstrap: Some(config.auth.admin.username.clone()).filter(|b| !b.is_empty()),
+        },
+    }))
+}
+
+/// The server's own probe of every provider, and the purge of unclaimed
+/// handoffs, every `every`.
+pub async fn start_sso_probe(sso: Arc<crate::app::sso::Sso>, every: std::time::Duration) {
+    if sso.provider_names().is_empty() {
+        return;
+    }
+    let mut tick = tokio::time::interval(every.max(std::time::Duration::from_secs(1)));
+    loop {
+        tick.tick().await;
+        sso.probe_all().await;
+        if let Err(e) = sso.purge().await {
+            warn!(error = %e, "failed to purge expired SSO handoffs");
+        }
+    }
 }
 
 /// The password mode and the reauthentication bounds, refused at startup
@@ -764,6 +1013,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/-/user/org.couchdb.user:{username}", put(npm_login))
         .with_state(state.clone());
 
+    // SSO login — outside the auth middleware: the browser holds no
+    // credential yet.
+    let sso_public_routes = crate::api::auth_sso::public_routes().with_state(state.clone());
+
     // Real-time WebSocket — outside the auth middleware because browsers
     // cannot set an Authorization header on WebSocket handshakes; the client
     // authenticates with its first frame instead (see api::ws).
@@ -790,6 +1043,7 @@ pub fn build_router(state: AppState) -> Router {
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
         .merge(dashboard_routes)
+        .merge(crate::api::auth_sso::user_routes())
         // Auth middleware
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -798,6 +1052,7 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
         // npm login (outside auth middleware — uses password auth)
         .merge(npm_login_route)
+        .merge(sso_public_routes)
         // Real-time WebSocket (outside auth middleware — first-frame auth)
         .merge(ws_route)
         .merge(oci_token_route)
