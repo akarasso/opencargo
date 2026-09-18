@@ -208,6 +208,8 @@ async fn npm_two_tokens_two_rows_with_dates() {
     let dev = named_token(&client, &a.base_url, "alice", "dev-laptop").await;
     let url = tarball_url(&a, "npm-proxy", "@acme/widget", "widget-1.0.0.tgz");
     get_ok(&url, Some(&ci)).await;
+    // Gathers run concurrently and rows land in completion order.
+    wait_for_policy_rows(&a, 1).await;
     get_ok(&url, Some(&dev)).await;
 
     let rows = wait_for_policy_rows(&a, 2).await;
