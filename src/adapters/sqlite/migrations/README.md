@@ -35,7 +35,7 @@ checksum in the same commit.
 | 014 | 014_policy.sql | shipped before the migrator | e434fd9b03944f09f108e5b5325dd994834c9e77c1dccafcdaf784cbd169d0aa |
 | 015 | 015_fts_rebuild.sql | ports-and-adapters.md 8a | b90a86c09e6b6c263cd75735e2ebe253eb1d15a73266be08bb5b9fd7db18aaf5 |
 | 016 | - | (free, slack) | - |
-| 017 | - | s3.md (storage_multipart) | - |
+| 017 | 017_storage_multipart.sql | s3.md (storage_multipart) | d33bf7772baee4f379535f7983837a5c56e0f707211e3e4cbf00b359efe0f6d2 |
 | 018 | - | s3.md (oci_upload_progress) | - |
 | 019 | - | pypi.md (pypi_files) | - |
 | 020 | - | nuget.md (nuget_format + its Step::Rust rebuild) | - |

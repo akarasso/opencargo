@@ -32,7 +32,9 @@ async fn pool() -> (TempDir, SqlitePool) {
 /// `004`, `005` and `007` swallowing their errors. Every database older than
 /// the version table was built by it, so the baseline has to face one.
 async fn legacy_migrate(pool: &SqlitePool) {
-    for migration in MIGRATIONS.iter().filter(|m| m.id != "015") {
+    // The fourteen files that shipped before the version table; every id
+    // above them postdates the scheme this stands in for.
+    for migration in MIGRATIONS.iter().filter(|m| m.id <= "014") {
         let Step::Sql(sql) = migration.step else {
             unreachable!("no Rust step shipped before the migrator")
         };
@@ -91,16 +93,16 @@ async fn assert_alters_ran_once(pool: &SqlitePool) {
 }
 
 /// (a) A database the old `migrate()` built adopts what it already has, runs
-/// only the file it never saw, and ends with the object set of a fresh
+/// only the files it never saw, and ends with the object set of a fresh
 /// database — the property that makes adoption safe at all.
 #[tokio::test]
-async fn a_fully_migrated_database_is_adopted_and_only_015_runs() {
+async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
     let (_legacy_tmp, legacy) = pool().await;
     legacy_migrate(&legacy).await;
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -143,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -172,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.

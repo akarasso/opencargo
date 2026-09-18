@@ -7,6 +7,7 @@ pub mod domain;
 pub mod error;
 pub mod events;
 pub mod policy;
+pub mod ports;
 pub mod proxy;
 pub mod registry;
 pub mod server;

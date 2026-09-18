@@ -129,6 +129,11 @@ pub const MIGRATIONS: &[Migration] = &[
     ),
     sql_migration!("014", "014_policy.sql", Sentinel::Object("idx_policy_verdicts_res")),
     sql_migration!("015", "015_fts_rebuild.sql", Sentinel::Unprovable),
+    sql_migration!(
+        "017",
+        "017_storage_multipart.sql",
+        Sentinel::Object("idx_storage_multipart_touched")
+    ),
 ];
 
 /// Bring a database up to date with every migration this binary carries.
@@ -284,10 +289,7 @@ async fn record<'e, E: Executor<'e, Database = Sqlite>>(
 ) -> Result<(), StoreError> {
     sqlx::query("INSERT INTO schema_migrations (id, applied_at) VALUES (?1, ?2)")
         .bind(id)
-        // The adapter's stored timestamp format, second precision: the 23
-        // columns defaulting to `datetime('now')` are written this way and are
-        // compared lexicographically elsewhere.
-        .bind(Utc::now().format("%Y-%m-%d %H:%M:%S").to_string())
+        .bind(super::bind_ts(Utc::now()))
         .execute(executor)
         .await
         .map_err(other)?;
