@@ -36,7 +36,7 @@ spec:
         # the volume once at startup (root + only the CHOWN capability).
         - name: fix-data-perms
           image: busybox:1.36
-          command: ["sh", "-c", "chown -R 10001:10001 /data"]
+          command: ["sh", "-c", "mkdir -p /data/db /data/storage && chown 10001:10001 /data && chown -R 10001:10001 /data/db /data/storage"]
           securityContext:
             runAsNonRoot: false
             runAsUser: 0

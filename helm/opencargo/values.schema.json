@@ -53,6 +53,29 @@
           "minimum": 0
         }
       }
+    },
+    "storage": {
+      "type": "object",
+      "properties": {
+        "accessMode": {
+          "type": "string",
+          "enum": [
+            "ReadWriteOnce",
+            "ReadWriteOncePod"
+          ]
+        }
+      }
+    },
+    "restore": {
+      "type": "object",
+      "properties": {
+        "enabled": {
+          "type": "boolean"
+        },
+        "from": {
+          "type": "string"
+        }
+      }
     }
   }
 }

@@ -760,3 +760,48 @@ fn readiness_probe_keeps_the_default_failure_threshold() {
         assert_eq!(number(&readiness, "timeoutSeconds"), 3);
     }
 }
+
+#[test]
+fn helm_restore_job_is_absent_by_default_and_mounts_the_data_pvc() {
+    let Some(defaults) = helm_renders(&[]) else { return };
+    assert!(defaults.iter().all(|r| document(r, "Job").is_none()), "no Job unless asked for");
+    let renders = helm_renders(&["--set", "restore.enabled=true", "--set", "restore.from=/data/backups/opencargo-x"]).unwrap();
+    for render in &renders {
+        let job = document(render, "Job").expect("the restore Job");
+        let deployment = document(render, "Deployment").unwrap();
+        let claim = |doc: &str| scalar(&block(doc, "persistentVolumeClaim"), "claimName").unwrap();
+        assert_eq!(claim(&job), claim(&deployment), "the same data volume");
+        assert_eq!(
+            items(&block(&job, "command")),
+            ["opencargo", "--config", "/etc/opencargo/config.toml", "restore", "--from", "/data/backups/opencargo-x"]
+        );
+        assert_eq!(number(&job, "backoffLimit"), 0);
+        assert_eq!(scalar(&job, "restartPolicy").as_deref(), Some("Never"));
+    }
+    let plain = common::manifests::read(std::path::Path::new("k8s/restore-job.yaml"));
+    assert_eq!(items(&block(&plain, "command"))[..4], ["opencargo", "--config", "/etc/opencargo/config.toml", "restore"]);
+    assert_eq!(scalar(&block(&plain, "persistentVolumeClaim"), "claimName").as_deref(), Some("opencargo-data"));
+    for kustomization in ["k8s/kustomization.yaml", "k8s/base/kustomization.yaml"] {
+        let text = common::manifests::read(std::path::Path::new(kustomization));
+        assert!(!text.contains("restore-job"), "{kustomization} never reconciles the restore Job");
+    }
+}
+
+#[test]
+fn the_ownership_init_container_does_not_walk_the_backup_directory() {
+    let deployment = kustomize_deployment();
+    let init = block(&deployment, "initContainers");
+    let command = scalar(&init, "command").unwrap();
+    assert!(command.contains("/data/db") && command.contains("/data/storage"), "{command}");
+    assert!(!command.contains("-R 10001:10001 /data\""), "a recursive walk of the whole volume: {command}");
+}
+
+#[test]
+fn helm_access_mode_defaults_to_read_write_once() {
+    let Some(renders) = helm_renders(&["--set", "storage.accessMode=ReadWriteOncePod"]) else { return };
+    let pvc = document(&renders[0], "PersistentVolumeClaim").unwrap();
+    assert_eq!(items(&block(&pvc, "accessModes")), ["ReadWriteOncePod"]);
+    let defaults = helm_renders(&[]).unwrap();
+    let pvc = document(&defaults[0], "PersistentVolumeClaim").unwrap();
+    assert_eq!(items(&block(&pvc, "accessModes")), ["ReadWriteOnce"]);
+}
