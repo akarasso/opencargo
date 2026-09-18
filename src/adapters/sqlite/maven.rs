@@ -547,7 +547,14 @@ impl MavenFileStore for SqliteMavenFileStore {
         let rows: Vec<(i64, String, String, String, String)> = sqlx::query_as(
             "SELECT v.repository_id, v.ga, v.version, u.build, u.created_at
              FROM maven_units u JOIN maven_values v ON v.id = u.value_id
-             WHERE u.visible_at IS NULL AND u.refused = 0 AND u.created_at < ?1
+             WHERE u.visible_at IS NULL AND u.refused = 0 AND u.contested = 0
+               AND u.created_at < ?1
+               AND EXISTS (SELECT 1 FROM maven_files f WHERE f.unit_id = u.id)
+               AND NOT EXISTS (
+                   SELECT 1 FROM maven_declarations d
+                   WHERE d.unit_id = u.id AND NOT EXISTS (
+                       SELECT 1 FROM maven_files f
+                       WHERE f.unit_id = u.id AND f.filename = d.filename))
              ORDER BY u.created_at, u.id LIMIT ?2",
         )
         .bind(bind_ts(before))
@@ -568,14 +575,22 @@ impl MavenFileStore for SqliteMavenFileStore {
             .collect()
     }
 
-    async fn unversioned(&self, limit: u32) -> Result<Vec<Unversioned>, StoreError> {
+    async fn unversioned(
+        &self,
+        after: Option<&Unversioned>,
+        limit: u32,
+    ) -> Result<Vec<Unversioned>, StoreError> {
         let rows: Vec<(i64, String, String)> = sqlx::query_as(
             "SELECT v.repository_id, v.ga, v.version FROM maven_values v
              WHERE v.versioned = 0 AND EXISTS (
                  SELECT 1 FROM maven_units u
                  WHERE u.value_id = v.id AND u.visible_at IS NOT NULL AND u.refused = 0)
-             ORDER BY v.id LIMIT ?1",
+               AND (?1 IS NULL OR (v.repository_id, v.ga, v.version) > (?1, ?2, ?3))
+             ORDER BY v.repository_id, v.ga, v.version LIMIT ?4",
         )
+        .bind(after.map(|a| a.repository))
+        .bind(after.map(|a| a.ga.as_str()))
+        .bind(after.map(|a| a.version.as_str()))
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await

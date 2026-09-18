@@ -2476,22 +2476,41 @@ macro_rules! maven_contract {
             #[tokio::test]
             async fn pending_and_unversioned_list_what_the_reconciler_needs() {
                 let h = $open().await;
-                let (r, _) = repo(&h).await;
+                let (r, prefix) = repo(&h).await;
                 let d = digests("a");
                 let s = scopes();
-                deposit(&h, plain(r, None, &[], &d, &s)).await.unwrap();
+                let waiting = [Declaration {
+                    filename: "lib-sources.jar".to_string(),
+                    algorithm: SumAlgorithm::Sha1,
+                    value: d.sha1.clone(),
+                }];
+                for (i, version) in ["0.1", "0.2", "0.3", "1.0"].into_iter().enumerate() {
+                    let pins = pin(&h, &prefix, &format!("{prefix}/{i}"), 9).await;
+                    let files: &[PinToken] = if version == "0.3" { &[] } else { &pins };
+                    let declarations: &[Declaration] = if version == "0.2" { &waiting } else { &[] };
+                    deposit(&h, Deposit { version, contest: version == "0.1", declarations, ..plain(r, None, files, &d, &s) })
+                        .await
+                        .unwrap();
+                }
                 deposit(&h, Deposit { version: "2.0", now: 4, reveal: true, ..plain(r, None, &[], &d, &s) })
                     .await
                     .unwrap();
-                let pending = h.maven.pending(at(3), 10).await.unwrap();
-                assert_eq!(pending.len(), 1);
+                deposit(&h, Deposit { version: "3.0", now: 4, reveal: true, ..plain(r, None, &[], &d, &s) })
+                    .await
+                    .unwrap();
+                let pending = h.maven.pending(at(3), 1).await.unwrap();
+                assert_eq!(pending.len(), 1, "contested, waiting and empty units are not offered");
                 assert_eq!((pending[0].ga.as_str(), pending[0].version.as_str()), (GA, "1.0"));
                 assert!(h.maven.pending(at(2), 10).await.unwrap().is_empty(), "created at 2, not before");
-                let unversioned = h.maven.unversioned(10).await.unwrap();
-                assert_eq!(unversioned.len(), 1);
-                assert_eq!(unversioned[0].version, "2.0");
+                let first = h.maven.unversioned(None, 1).await.unwrap();
+                assert_eq!(first.len(), 1);
+                assert_eq!(first[0].version, "2.0");
+                let next = h.maven.unversioned(Some(&first[0]), 10).await.unwrap();
+                assert_eq!(next.len(), 1);
+                assert_eq!(next[0].version, "3.0", "paged past the cursor");
                 h.maven.mark_versioned(r, GA, "2.0").await.unwrap();
-                assert!(h.maven.unversioned(10).await.unwrap().is_empty());
+                h.maven.mark_versioned(r, GA, "3.0").await.unwrap();
+                assert!(h.maven.unversioned(None, 10).await.unwrap().is_empty());
             }
 
             #[tokio::test]

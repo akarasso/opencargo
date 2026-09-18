@@ -2797,7 +2797,15 @@ impl MavenFileStore for Maven {
                 .maven
                 .units
                 .iter()
-                .filter(|u| u.unit.visible_at.is_none() && !u.unit.refused && u.unit.created_at < before)
+                .filter(|u| {
+                    let unit = &u.unit;
+                    unit.visible_at.is_none()
+                        && !unit.refused
+                        && !unit.contested
+                        && unit.created_at < before
+                        && !unit.files.is_empty()
+                        && unit.declarations.iter().all(|d| unit.file(&d.filename).is_some())
+                })
                 .filter_map(|u| {
                     let value = state.maven.values.iter().find(|v| v.id == u.value)?;
                     Some(PendingUnit {
@@ -2815,13 +2823,24 @@ impl MavenFileStore for Maven {
         })
     }
 
-    async fn unversioned(&self, limit: u32) -> Result<Vec<Unversioned>, StoreError> {
+    async fn unversioned(
+        &self,
+        after: Option<&Unversioned>,
+        limit: u32,
+    ) -> Result<Vec<Unversioned>, StoreError> {
+        let key = |r: i64, ga: &str, v: &str| (r, ga.to_string(), v.to_string());
+        let after = after.map(|a| key(a.repository, &a.ga, &a.version));
         self.with(|state| {
-            Ok(state
+            let mut values: Vec<_> = state
                 .maven
                 .values
                 .iter()
                 .filter(|v| !v.versioned)
+                .filter(|v| after.as_ref().is_none_or(|a| key(v.repository, &v.ga, &v.version) > *a))
+                .collect();
+            values.sort_by_key(|v| key(v.repository, &v.ga, &v.version));
+            Ok(values
+                .into_iter()
                 .filter(|v| {
                     state
                         .maven

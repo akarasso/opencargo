@@ -258,15 +258,22 @@ pub trait MavenFileStore: Send + Sync {
         dir: &str,
     ) -> Result<Option<ClientMetadata>, StoreError>;
 
-    /// Units neither visible nor refused, created before `before`, oldest
-    /// first.
+    /// Units created before `before` that nothing but the window holds
+    /// back: neither visible, refused nor contested, with a file and no
+    /// declaration waiting for its file. Oldest first.
     async fn pending(
         &self,
         before: DateTime<Utc>,
         limit: u32,
     ) -> Result<Vec<PendingUnit>, StoreError>;
 
-    async fn unversioned(&self, limit: u32) -> Result<Vec<Unversioned>, StoreError>;
+    /// Values strictly after `after` in (repository, ga, version) order,
+    /// so a pass can page past values that keep failing.
+    async fn unversioned(
+        &self,
+        after: Option<&Unversioned>,
+        limit: u32,
+    ) -> Result<Vec<Unversioned>, StoreError>;
 
     async fn mark_versioned(
         &self,

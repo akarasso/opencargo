@@ -110,8 +110,8 @@ impl MavenFileStore for Hooked {
         self.inner.pending(before, limit).await
     }
 
-    async fn unversioned(&self, limit: u32) -> Result<Vec<Unversioned>, StoreError> {
-        self.inner.unversioned(limit).await
+    async fn unversioned(&self, after: Option<&Unversioned>, limit: u32) -> Result<Vec<Unversioned>, StoreError> {
+        self.inner.unversioned(after, limit).await
     }
 
     async fn mark_versioned(&self, repository: i64, ga: &str, version: &str) -> Result<(), StoreError> {
@@ -193,10 +193,14 @@ impl Fx {
     }
 
     fn reconciler(&self) -> super::reconcile::MavenReconcile {
+        self.reconciler_of(100)
+    }
+
+    fn reconciler_of(&self, limit: u32) -> super::reconcile::MavenReconcile {
         super::reconcile::MavenReconcile::new(
             self.versions(),
             TimeDelta::minutes(10),
-            100,
+            limit,
             hosted::scopes_of_unit,
         )
     }
@@ -514,7 +518,7 @@ async fn a_failed_version_row_leaves_the_file_served_and_unversioned() {
     let done = fx.put("1.0", "lib-1.0.pom", "alice", b"<project/>").await.unwrap();
     assert_eq!(done, Deposited::Stored { revealed: true });
     assert_eq!(fx.version_rows().await, 0);
-    assert_eq!(fx.store.maven().unversioned(10).await.unwrap().len(), 1);
+    assert_eq!(fx.store.maven().unversioned(None, 10).await.unwrap().len(), 1);
     assert_eq!(fx.announcements(), 0);
 }
 
@@ -553,7 +557,7 @@ async fn a_conflict_on_one_item_does_not_stop_the_pass() {
     assert!(matches!(outcomes[0].1, Reconciled::Failed(_)), "{outcomes:?}");
     assert_eq!(outcomes[1].1, Reconciled::Repaired, "the pass went on");
     fx.reconciler().pass(Utc::now()).await;
-    assert_eq!(fx.store.maven().unversioned(10).await.unwrap().len(), 0);
+    assert_eq!(fx.store.maven().unversioned(None, 10).await.unwrap().len(), 0);
     assert_eq!(fx.announcements(), 2);
 }
 
@@ -584,7 +588,7 @@ async fn publishing_over_an_existing_base_version_does_not_abandon_the_deposit()
     let done = fx.put("1.0", "lib-1.0.pom", "alice", b"<project/>").await.unwrap();
     assert_eq!(done, Deposited::Stored { revealed: true });
     assert_eq!(fx.version_rows().await, 1);
-    assert!(fx.store.maven().unversioned(10).await.unwrap().is_empty());
+    assert!(fx.store.maven().unversioned(None, 10).await.unwrap().is_empty());
     assert_eq!(fx.announcements(), 0);
 }
 
@@ -602,14 +606,54 @@ async fn a_quiet_jar_without_pom_is_promoted_once_the_window_has_passed() {
 }
 
 #[tokio::test]
+async fn contested_and_waiting_units_beyond_the_limit_do_not_hold_back_a_promotable_one() {
+    use crate::app::reconcile::{Reconciled, Reconciler};
+    let fx = Fx::new().await;
+    for v in ["1.0", "1.1", "1.2"] {
+        let jar = format!("lib-{v}.jar");
+        fx.put(v, &jar, "alice", b"jar").await.unwrap();
+        fx.put(v, &jar, "bob", b"evil").await.unwrap_err();
+    }
+    for v in ["1.3", "1.4", "1.5"] {
+        fx.put(v, &format!("lib-{v}.jar"), "alice", b"jar").await.unwrap();
+        let sum = digests(b"src").sha1;
+        fx.sum(v, &format!("lib-{v}-sources.jar"), "alice", SumAlgorithm::Sha1, &sum).await.unwrap();
+    }
+    fx.put("2.0", "lib-2.0.jar", "alice", b"jar2").await.unwrap();
+
+    let pass = fx.reconciler_of(2).pass(Utc::now() + TimeDelta::days(1)).await;
+    assert_eq!(outcomes(&pass), vec![(format!("promote {GA}:2.0:"), Reconciled::Repaired)]);
+    assert!(fx.unit("2.0", "").await.unwrap().visible());
+    assert_eq!(fx.version_rows().await, 1);
+}
+
+#[tokio::test]
+async fn a_value_that_keeps_failing_does_not_hold_back_the_next_one() {
+    use crate::app::reconcile::{Reconciled, Reconciler};
+    let fx = Fx::new().await;
+    for v in ["1.0", "2.0"] {
+        fx.store.fail_next(crate::testing::fakes::PortId::Packages, StoreError::Unavailable);
+        fx.put(v, &format!("lib-{v}.pom"), "alice", b"<project/>").await.unwrap();
+    }
+    let reconciler = fx.reconciler_of(1);
+    fx.store.fail_next(crate::testing::fakes::PortId::Packages, StoreError::Unavailable);
+    let first = reconciler.pass(Utc::now()).await;
+    assert_eq!(first.len(), 1);
+    assert_eq!(first[0].name, format!("version {GA}:1.0"));
+    assert!(matches!(first[0].outcome, Reconciled::Failed(_)), "{first:?}");
+    let second = reconciler.pass(Utc::now()).await;
+    assert_eq!(outcomes(&second), vec![(format!("version {GA}:2.0"), Reconciled::Repaired)], "paged past 1.0");
+}
+
+#[tokio::test]
 async fn a_contested_unit_is_never_promoted_and_an_administrator_decides() {
     use crate::app::maven::admin::{Decision, DecideUnit};
-    use crate::app::reconcile::{Reconciled, Reconciler};
+    use crate::app::reconcile::Reconciler;
     let fx = Fx::new().await;
     fx.put("1.0", "lib-1.0.jar", "alice", b"jar").await.unwrap();
     fx.put("1.0", "lib-1.0.jar", "bob", b"evil").await.unwrap_err();
     let later = fx.reconciler().pass(Utc::now() + TimeDelta::days(3)).await;
-    assert!(matches!(outcomes(&later)[0].1, Reconciled::Skipped(_)), "{later:?}");
+    assert!(later.is_empty(), "left to the administrator, not offered to the pass: {later:?}");
     assert!(!fx.unit("1.0", "").await.unwrap().visible());
 
     let decide = DecideUnit::new(fx.versions(), fx.store.audit(), crate::server::event_bus());

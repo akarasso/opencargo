@@ -4,7 +4,7 @@
 //! once. The client's own metadata needs no repair: it is never served, and
 //! only its hints naming a visible version are rendered.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -20,6 +20,8 @@ pub struct MavenReconcile {
     versions: Arc<MavenVersions>,
     window: chrono::Duration,
     limit: u32,
+    /// Where the last pass stopped scanning unversioned values.
+    cursor: Mutex<Option<Unversioned>>,
     /// The metadata counters of a unit, as the protocol adapter scopes them.
     scopes: fn(&str, &str) -> Vec<String>,
 }
@@ -36,6 +38,7 @@ impl MavenReconcile {
             versions,
             window,
             limit,
+            cursor: Mutex::new(None),
             scopes,
         }
     }
@@ -135,8 +138,14 @@ impl Reconciler for MavenReconcile {
                 outcome: Reconciled::Failed(e.to_string()),
             }),
         }
-        match self.maven.unversioned(self.limit).await {
+        let after = self.cursor.lock().unwrap().clone();
+        match self.maven.unversioned(after.as_ref(), self.limit).await {
             Ok(unversioned) => {
+                *self.cursor.lock().unwrap() = if unversioned.len() < self.limit as usize {
+                    None
+                } else {
+                    unversioned.last().cloned()
+                };
                 for u in &unversioned {
                     items.push(Item {
                         name: format!("version {}:{}", u.ga, u.version),
