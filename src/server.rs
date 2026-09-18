@@ -11,6 +11,7 @@ use axum::{
     routing::{delete, get, post, put},
     Json, Router,
 };
+use chrono::{DateTime, Utc};
 use metrics_exporter_prometheus::PrometheusHandle;
 use serde::Deserialize;
 use serde_json::json;
@@ -19,8 +20,10 @@ use tracing::{info, warn};
 
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::auth::rate_limit::RateLimiter;
-use crate::config::{Config, RepositoryConfig};
+use crate::config::{Config, RepositoryConfig, WebhookConfig};
+use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
+use crate::ports::webhooks::{NewWebhook, WebhookStore};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
 use crate::storage::StorageBackend;
 use crate::telemetry;
@@ -52,6 +55,7 @@ pub struct AppState {
     pub publish_rate_limiter: Arc<RateLimiter>,
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
+    pub webhooks: Arc<dyn WebhookStore>,
     pub vuln_scanner: Arc<VulnScanner>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
@@ -189,11 +193,10 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     // Initialize Prometheus metrics
     let metrics_handle = telemetry::init_metrics();
 
-    // Seed webhooks from config into DB (only if no webhooks exist yet)
-    crate::db::seed_webhooks(&db, &config.webhooks).await?;
+    let webhooks = crate::adapters::sqlite::SqliteStores::new(db.clone()).webhooks();
+    seed_webhooks(webhooks.as_ref(), &config.webhooks, Utc::now()).await?;
 
-    // Initialize webhook dispatcher (DB-backed)
-    let webhook_dispatcher = Arc::new(WebhookDispatcher::new(db.clone()));
+    let webhook_dispatcher = Arc::new(WebhookDispatcher::new(webhooks.clone()));
 
     // Initialize vulnerability scanner
     let vuln_scanner = Arc::new(VulnScanner::new(&config.vuln_scan)?);
@@ -227,11 +230,35 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         publish_rate_limiter: Arc::new(RateLimiter::new(30, 60)),
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
+        webhooks,
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,
         policy,
     })
+}
+
+/// The configured registrations, in the port's vocabulary: the config file
+/// seeds a deployment and the store owns them afterwards.
+async fn seed_webhooks(
+    store: &dyn WebhookStore,
+    configured: &[WebhookConfig],
+    now: DateTime<Utc>,
+) -> Result<(), crate::error::StoreError> {
+    let events: Vec<Subscription> = configured
+        .iter()
+        .map(|hook| Subscription::of_names(&hook.events))
+        .collect();
+    let hooks: Vec<NewWebhook<'_>> = configured
+        .iter()
+        .zip(&events)
+        .map(|(hook, events)| NewWebhook {
+            url: &hook.url,
+            events,
+            secret: hook.secret.as_deref(),
+        })
+        .collect();
+    store.ensure_seeded(&hooks, now).await
 }
 
 /// Recording is personal data: say which members do it, at startup.

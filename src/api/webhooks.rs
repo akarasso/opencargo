@@ -8,7 +8,10 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::{require_admin, require_auth};
-use crate::error::{AppError, AppResult};
+use crate::app::webhooks::{CreateWebhook, NewHook};
+use crate::domain::{Subscription, Webhook};
+use crate::error::{AppError, AppResult, StoreError};
+use crate::ports::webhooks::WebhookPatch;
 use crate::server::AppState;
 
 // ---------------------------------------------------------------------------
@@ -35,21 +38,32 @@ pub struct UpdateWebhookRequest {
 // Helpers
 // ---------------------------------------------------------------------------
 
-fn format_webhook(wh: &crate::db::Webhook) -> serde_json::Value {
-    let events: Vec<String> = if wh.events == "*" {
-        vec!["*".to_string()]
-    } else {
-        wh.events.split(',').map(|s| s.trim().to_string()).collect()
-    };
-
+fn format_webhook(wh: &Webhook) -> serde_json::Value {
     json!({
         "id": wh.id,
         "url": wh.url,
-        "events": events,
-        "active": wh.active != 0,
+        "events": wh.events.names(),
+        "active": wh.active,
         "created_at": wh.created_at,
         "updated_at": wh.updated_at,
     })
+}
+
+/// The store's "no such row" in this endpoint's words.
+fn missing(err: StoreError, id: i64) -> AppError {
+    match err {
+        StoreError::NotFound => AppError::NotFound(format!("webhook not found: {id}")),
+        other => other.into(),
+    }
+}
+
+async fn read_body<T: serde::de::DeserializeOwned>(
+    request: axum::http::Request<axum::body::Body>,
+) -> AppResult<T> {
+    let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
+        .await
+        .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
+    Ok(serde_json::from_slice(&bytes)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -64,7 +78,7 @@ pub async fn list_webhooks(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let webhooks = crate::db::list_webhooks(&state.db).await?;
+    let webhooks = state.webhooks.all().await?;
     let result: Vec<serde_json::Value> = webhooks.iter().map(format_webhook).collect();
 
     Ok(Json(json!({ "webhooks": result })))
@@ -78,34 +92,17 @@ pub async fn create_webhook(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let body: CreateWebhookRequest = {
-        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
-        serde_json::from_slice(&bytes)?
-    };
-
-    if body.url.is_empty() {
-        return Err(AppError::BadRequest("url is required".to_string()));
-    }
-
-    let events = if body.events.is_empty() {
-        "*".to_string()
-    } else {
-        body.events.join(",")
-    };
-
-    let id = crate::db::create_webhook(
-        &state.db,
-        &body.url,
-        &events,
-        body.secret.as_deref(),
-    )
-    .await?;
-
-    let wh = crate::db::get_webhook_by_id(&state.db, id)
-        .await?
-        .ok_or_else(|| AppError::Internal("failed to fetch created webhook".to_string()))?;
+    let body: CreateWebhookRequest = read_body(request).await?;
+    let wh = CreateWebhook::new(state.webhooks.clone())
+        .run(
+            &NewHook {
+                url: body.url,
+                events: body.events,
+                secret: body.secret,
+            },
+            chrono::Utc::now(),
+        )
+        .await?;
 
     crate::api::record_audit(&state, &caller, "webhook.create", Some(&wh.url)).await;
 
@@ -121,48 +118,24 @@ pub async fn update_webhook(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let body: UpdateWebhookRequest = {
-        let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
-            .await
-            .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
-        serde_json::from_slice(&bytes)?
-    };
-
-    if crate::db::get_webhook_by_id(&state.db, id)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::NotFound(format!("webhook not found: {id}")));
-    }
-
-    let events_str = body.events.map(|e| {
-        if e.is_empty() {
-            "*".to_string()
-        } else {
-            e.join(",")
-        }
-    });
-
-    // Handle secret: if present in the request body, update it (including to null)
-    let secret_update = if body.secret.is_some() {
-        Some(body.secret.as_deref())
-    } else {
-        None
-    };
-
-    crate::db::update_webhook(
-        &state.db,
-        id,
-        body.url.as_deref(),
-        events_str.as_deref(),
-        secret_update,
-        body.active,
-    )
-    .await?;
-
-    let updated = crate::db::get_webhook_by_id(&state.db, id)
-        .await?
-        .ok_or_else(|| AppError::Internal("failed to fetch updated webhook".to_string()))?;
+    let body: UpdateWebhookRequest = read_body(request).await?;
+    let events = body.events.map(|names| Subscription::of_names(&names));
+    let updated = state
+        .webhooks
+        .update(
+            id,
+            &WebhookPatch {
+                url: body.url.as_deref(),
+                events: events.as_ref(),
+                // A secret absent from the body is left alone; one present is
+                // written.
+                secret: body.secret.as_deref().map(Some),
+                active: body.active,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|err| missing(err, id))?;
 
     crate::api::record_audit(&state, &caller, "webhook.update", Some(&updated.url)).await;
 
@@ -178,14 +151,11 @@ pub async fn delete_webhook(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    if crate::db::get_webhook_by_id(&state.db, id)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::NotFound(format!("webhook not found: {id}")));
-    }
-
-    crate::db::delete_webhook(&state.db, id).await?;
+    state
+        .webhooks
+        .delete(id)
+        .await
+        .map_err(|err| missing(err, id))?;
 
     crate::api::record_audit(&state, &caller, "webhook.delete", Some(&id.to_string())).await;
 
@@ -201,7 +171,9 @@ pub async fn test_webhook(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let wh = crate::db::get_webhook_by_id(&state.db, id)
+    let wh = state
+        .webhooks
+        .by_id(id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("webhook not found: {id}")))?;
 
@@ -214,11 +186,10 @@ pub async fn test_webhook(
     });
 
     // Dispatch via the webhook dispatcher
-    state.webhook_dispatcher.dispatch_to_url(
-        &wh.url,
-        wh.secret.as_deref(),
-        &test_payload,
-    ).await;
+    state
+        .webhook_dispatcher
+        .dispatch_to_url(&wh.url, wh.secret.as_deref(), &test_payload)
+        .await;
 
     Ok(Json(json!({"ok": true, "message": "test webhook sent"})))
 }

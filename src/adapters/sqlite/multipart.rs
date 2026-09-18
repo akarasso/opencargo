@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, TimeDelta, Utc};
 use sqlx::SqlitePool;
 
-use super::bind_ts;
+use super::{bind_ts, store_error};
 use crate::error::StoreError;
 use crate::ports::multipart::{Abandoned, MultipartLedger};
 
@@ -91,22 +91,6 @@ impl MultipartLedger for SqliteMultipartLedger {
             .map_err(store_error)?;
         Ok(open.unsigned_abs())
     }
-}
-
-/// The driver's failures in the store's vocabulary. `Unavailable` is the one
-/// that must not collapse into `Other`: SQLite has a single writer, so a busy
-/// database is a retry (503), never an internal error (500).
-fn store_error(err: sqlx::Error) -> StoreError {
-    if let sqlx::Error::Database(ref db) = err {
-        if db.is_unique_violation() {
-            return StoreError::Conflict;
-        }
-        // SQLITE_BUSY and SQLITE_BUSY_SNAPSHOT, as extended result codes.
-        if matches!(db.code().as_deref(), Some("5") | Some("517")) {
-            return StoreError::Unavailable;
-        }
-    }
-    StoreError::Other(Box::new(err))
 }
 
 #[cfg(test)]

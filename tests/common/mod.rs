@@ -1,5 +1,6 @@
 #![allow(dead_code)]
 
+pub mod contract;
 pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;

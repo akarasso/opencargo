@@ -6,6 +6,7 @@ pub mod error;
 pub mod kinds;
 pub mod names;
 pub mod repository;
+pub mod webhook;
 
 pub use error::{Action, DomainError, Resource};
 pub use kinds::{Format, RepoKind, Visibility};
@@ -13,3 +14,4 @@ pub use names::{
     validate_npm_read_name, validate_oci_tag, validate_package_name, validate_version,
 };
 pub use repository::{DistTag, Package, RepoConfig, Repository, Version};
+pub use webhook::{Subscription, Webhook};
