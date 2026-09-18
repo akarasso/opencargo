@@ -637,9 +637,10 @@ fn auth_state(
         gate: Arc::new(gate),
         clock: Arc::new(crate::adapters::system::SystemClock),
     });
+    let authenticate = Arc::new(authenticate);
     Ok(Arc::new(AuthState {
         anonymous_read: config.auth.anonymous_read,
-        authenticate: Arc::new(authenticate),
+        authenticate: authenticate.clone(),
         routes: vec![
             Arc::new(crate::registry::oci::auth_rules::OciRouteRules {
                 base_url: config.server.base_url.clone(),
@@ -647,7 +648,12 @@ fn auth_state(
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
             Arc::new(crate::registry::pypi::auth_rules::PypiRouteRules),
             Arc::new(crate::registry::maven::auth_rules::MavenRouteRules),
-            Arc::new(crate::registry::nuget::auth_rules::NugetRouteRules),
+            Arc::new(crate::registry::nuget::auth_rules::NugetRouteRules {
+                token_shaped: {
+                    let authenticate = authenticate.clone();
+                    Arc::new(move |raw: &str| authenticate.is_token_shaped(raw))
+                },
+            }),
         ],
         trusted_proxies: config.auth.trusted_proxies.clone(),
     }))

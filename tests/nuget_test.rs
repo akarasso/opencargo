@@ -226,6 +226,27 @@ async fn a_push_takes_its_api_key_as_primary_and_refuses_any_invalid_credential(
 }
 
 #[tokio::test]
+async fn a_placeholder_key_beside_valid_basic_credentials_is_ignored() {
+    let server = setup().await;
+    let c = reqwest::Client::new();
+    let base = &server.base_url;
+    create_user(&c, base, STATIC_TOKEN, "pusher", "publisher").await;
+    let pusher = add_token(&c, base, "pusher", "p").await;
+    let push = |key: &str, version: &str| {
+        c.put(format!("{base}/nuget/v3/package"))
+            .header("X-NuGet-ApiKey", key.to_string())
+            .header("Authorization", basic_auth_header("pusher", &pusher))
+            .multipart(common::nuget::form(nupkg("az.placeholder", version, &[])))
+    };
+    let resp = push("az", "1.0.0").send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "a dummy key is not a credential");
+    let resp = push("trg_notatoken_notatoken", "2.0.0").send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "a token-shaped key is verified");
+    let status = push_as(&c, base, "nuget", "az", nupkg("az.alone", "1.0.0", &[])).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
 async fn npm_gains_no_basic_challenge() {
     let server = setup().await;
     let resp = reqwest::Client::new()

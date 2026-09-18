@@ -164,8 +164,9 @@ version): a second push of any spelling is `409`, an invalid package `400`, a pa
 its share is `503`. A push takes an API token as `X-NuGet-ApiKey` (`dotnet nuget push -k`) or as
 the Basic password of `packageSourceCredentials`; every credential presented is verified, one
 invalid is `401`, and when the key and the Basic credential name different users the key wins
-on push and delete. `dotnet nuget push` sends no key of its own when only Basic credentials are
-configured, so `-k az` with Basic credentials is refused. The service index is read before the
+on push and delete. A key that is neither an API token (`trg_` prefix) nor a static token is not a credential: Azure
+Artifacts' convention `-k az` beside Basic credentials pushes with the Basic credential alone,
+while a `trg_` key that fails verification is still `401`. The service index is read before the
 push, so a private repository needs `packageSourceCredentials` even when `-k` is given.
 
 Delete is an unlist: the version leaves search and stays restorable by exact version. A 401

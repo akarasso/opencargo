@@ -272,6 +272,12 @@ impl Authenticate {
         Ok(Some(AuthUser::from_user(user, raw, Some(stored.name))))
     }
 
+    /// An API token or a configured static token, by form, before any
+    /// lookup.
+    pub fn is_token_shaped(&self, raw: &str) -> bool {
+        raw.starts_with(&self.token_prefix) || self.is_static(raw)
+    }
+
     fn is_static(&self, raw: &str) -> bool {
         self.static_tokens.iter().any(|st| {
             st.len() == raw.len()

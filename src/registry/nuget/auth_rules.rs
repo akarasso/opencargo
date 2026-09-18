@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method};
 
 use crate::app::authenticate::{Credential, Presented, Transport};
@@ -9,8 +11,11 @@ pub const API_KEY_HEADER: HeaderName = HeaderName::from_static("x-nuget-apikey")
 /// `/{repo}/api/v2/package` push alias. Its 401 carries a Basic challenge
 /// so `dotnet` asks for credentials instead of reporting NU1101, and
 /// `X-NuGet-ApiKey` is one more transport of an API token, primary on the
-/// write routes.
-pub struct NugetRouteRules;
+/// write routes. A key that is not token-shaped is the placeholder Azure
+/// Artifacts' convention sends beside Basic credentials, not a credential.
+pub struct NugetRouteRules {
+    pub token_shaped: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+}
 
 fn segments(path: &str) -> Vec<&str> {
     path.split('/').skip(1).collect()
@@ -44,7 +49,7 @@ impl RouteRules for NugetRouteRules {
             .get(API_KEY_HEADER)
             .and_then(|v| v.to_str().ok())
             .map(str::trim)
-            .filter(|v| !v.is_empty())
+            .filter(|v| (self.token_shaped)(v))
             .map(|key| Presented {
                 transport: Transport::ApiKeyHeader,
                 credential: Credential::ApiKey(key.to_string()),
@@ -66,9 +71,15 @@ impl RouteRules for NugetRouteRules {
 mod tests {
     use super::*;
 
+    fn rules() -> NugetRouteRules {
+        NugetRouteRules {
+            token_shaped: Arc::new(|v| v.starts_with("trg_")),
+        }
+    }
+
     #[test]
     fn owns_only_the_nuget_surface() {
-        let r = NugetRouteRules;
+        let r = rules();
         for p in [
             "/nuget/v3/index.json",
             "/nuget/v3/search",
@@ -93,7 +104,7 @@ mod tests {
 
     #[test]
     fn the_api_key_is_primary_on_writes_only() {
-        let r = NugetRouteRules;
+        let r = rules();
         assert_eq!(
             r.primary(&Method::PUT, "/n/v3/package"),
             Some(Transport::ApiKeyHeader)
@@ -110,5 +121,15 @@ mod tests {
         assert!(r.extra_credentials(&headers).is_empty());
         headers.insert(API_KEY_HEADER, HeaderValue::from_static("trg_x"));
         assert_eq!(r.extra_credentials(&headers).len(), 1);
+    }
+
+    #[test]
+    fn a_key_that_is_not_token_shaped_is_no_credential() {
+        let r = rules();
+        let mut headers = HeaderMap::new();
+        for placeholder in ["az", "  ", "not-a-token"] {
+            headers.insert(API_KEY_HEADER, HeaderValue::from_static(placeholder));
+            assert!(r.extra_credentials(&headers).is_empty(), "{placeholder}");
+        }
     }
 }
