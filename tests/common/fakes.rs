@@ -1470,6 +1470,50 @@ impl ProxyCacheStore for ProxyCache {
             Ok(())
         })
     }
+
+    async fn quarantine(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let key = format!("{kind}/{key}");
+        let entry = NewEntry {
+            repository_id: repo,
+            kind: "quarantine",
+            cache_key: &key,
+            status: 502,
+            storage_path: None,
+            content_type: Some(reason),
+            etag: None,
+            digest: Some(announced),
+            size: 0,
+            ttl_secs: None,
+        };
+        self.upsert(&entry, now).await
+    }
+
+    async fn quarantined(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let key = format!("{kind}/{key}");
+        with(&self.0, PortId::ProxyCache, |state| {
+            let at = Self::at(state, repo, "quarantine", &key)
+                .filter(|&at| state.cache[at].digest.as_deref() == Some(announced));
+            if let Some(at) = at {
+                state.cache[at].last_used_at = now;
+            }
+            Ok(at.is_some())
+        })
+    }
 }
 
 struct Oci(Arc<Mutex<State>>);

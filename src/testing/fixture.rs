@@ -262,6 +262,33 @@ impl ProxyCacheStore for Shifted {
     async fn delete(&self, id: CacheEntryId) -> Result<(), StoreError> {
         self.inner.delete(id).await
     }
+
+    async fn quarantine(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .quarantine(repo, kind, key, announced, reason, self.at(now))
+            .await
+    }
+
+    async fn quarantined(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .quarantined(repo, kind, key, announced, self.at(now))
+            .await
+    }
 }
 
 pub(crate) struct Fx {

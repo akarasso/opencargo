@@ -197,4 +197,61 @@ impl ProxyCacheStore for SqliteProxyCacheStore {
             .map_err(store_error)?;
         Ok(())
     }
+
+    async fn quarantine(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let entry = NewEntry {
+            repository_id: repo,
+            kind: QUARANTINE,
+            cache_key: &quarantine_key(kind, key),
+            status: QUARANTINE_STATUS,
+            storage_path: None,
+            content_type: Some(reason),
+            etag: None,
+            digest: Some(announced),
+            size: 0,
+            ttl_secs: None,
+        };
+        self.upsert(&entry, now).await
+    }
+
+    async fn quarantined(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let hit = sqlx::query(
+            "UPDATE proxy_cache_entries SET last_used_at = ?1
+             WHERE repository_id = ?2 AND kind = ?3 AND cache_key = ?4 AND digest = ?5",
+        )
+        .bind(bind_ts(now))
+        .bind(repo)
+        .bind(QUARANTINE)
+        .bind(quarantine_key(kind, key))
+        .bind(announced)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)?
+        .rows_affected();
+        Ok(hit > 0)
+    }
+}
+
+/// A quarantine lives in the cache table under a kind no strategy uses, so
+/// no lookup ever resolves it to a body; the reason sits in `content_type`.
+const QUARANTINE: &str = "quarantine";
+const QUARANTINE_STATUS: i64 = 502;
+
+fn quarantine_key(kind: &str, key: &str) -> String {
+    format!("{kind}/{key}")
 }

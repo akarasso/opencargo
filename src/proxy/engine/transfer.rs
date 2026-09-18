@@ -20,12 +20,14 @@ use super::super::strategy::{
 use super::{cache_path, Pass, ProxyEngine, Stale};
 
 /// What one upstream exchange ended in; `Failed` is stale-eligible, an
-/// integrity refusal (cap, digest, headers) is an `Err` and never serves stale.
+/// integrity refusal (cap, headers) is an `Err` and never serves stale.
 pub(super) enum Reply {
     NotModified,
     Stored(Box<CacheEntry>),
     Miss(StatusCode),
     Refused,
+    /// A digest or redirect refusal: quarantined, never served stale.
+    Rejected(String),
     Failed(String),
     /// An upstream await outran its deadline.
     TimedOut(String),
@@ -104,7 +106,7 @@ impl ProxyEngine {
             Ok(Err(e)) => return Err(e),
         };
         if !redirect_allowed(s.final_url_must_match(a), asked, resp.url()) {
-            return Err(AppError::BadGateway("upstream redirected off its origin".into()));
+            return Ok(Reply::Rejected("upstream redirected off its origin".into()));
         }
         let status = resp.status();
         if status == StatusCode::NOT_MODIFIED {
@@ -121,6 +123,7 @@ impl ProxyEngine {
         match body {
             Ok(body) => self.record(s, member, a, body, now).await,
             Err(Cut::Transport(why)) => Ok(Reply::Failed(why)),
+            Err(Cut::Rejected(why)) => Ok(Reply::Rejected(why)),
             Err(Cut::Deadline) => Ok(Reply::TimedOut(format!("upstream {asked} body exceeded its deadline"))),
         }
     }
@@ -166,10 +169,10 @@ impl ProxyEngine {
         }
         let computed = digests.finish();
         if let Some(wrong) = expected.mismatch(|alg| computed.get(alg)) {
-            return Err(AppError::BadGateway(format!(
+            return Ok(Err(Cut::Rejected(format!(
                 "upstream body digest mismatch ({:?} {:?})",
                 wrong.source, wrong.algorithm
-            )));
+            ))));
         }
         let sha256 = computed.sha256.clone();
         let path = cache_path(&root, &s.store_key(a, &sha256));
@@ -251,6 +254,7 @@ struct Leg<'u> {
 /// Why a body stopped arriving.
 enum Cut {
     Transport(String),
+    Rejected(String),
     Deadline,
 }
 

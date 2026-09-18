@@ -57,4 +57,28 @@ pub trait ProxyCacheStore: Send + Sync {
 
     /// Forget one row. Idempotent: the sweep and a purge can race for it.
     async fn delete(&self, id: CacheEntryId) -> Result<(), StoreError>;
+
+    /// Record that the body under `kind`/`key` was refused while its
+    /// upstream announced `announced`; a quarantine is never served.
+    #[allow(clippy::too_many_arguments)]
+    async fn quarantine(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
+
+    /// Whether `kind`/`key` is quarantined under `announced`. A hit counts
+    /// as a use, so the sweep keeps a quarantine that is still asked for.
+    async fn quarantined(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError>;
 }

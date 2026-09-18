@@ -901,6 +901,62 @@ async fn a_body_contradicting_its_known_digest_is_refused() {
     assert!(fx.row("t-item", "art/x").await.is_none(), "nothing recorded");
 }
 
+#[tokio::test]
+async fn a_refused_known_digest_is_quarantined_until_the_announcement_changes() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/q".to_string();
+    let announced = sha256_hex(b"something else");
+    let strat = Strat {
+        known: Some(announced.clone()),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let res = engine.fetch(&strat, &fx.up, fx.member(), &art).await;
+        assert!(matches!(res, Err(AppError::BadGateway(_))), "{res:?}");
+    }
+    assert_eq!(fx.hits().len(), 1, "a quarantined key is not fetched again");
+    let key = format!("sha256:{announced}");
+    assert!(fx
+        .cache
+        .quarantined(fx.repo.id, "t-item", &art, &key, Utc::now())
+        .await
+        .unwrap());
+    assert!(fx.row("t-item", &art).await.is_none(), "never served");
+
+    let matching = Strat {
+        known: Some(sha256_hex(b"hello upstream")),
+        ..Default::default()
+    };
+    let got = found(engine.fetch(&matching, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 2, "a new announced digest refetches");
+    assert_eq!(engine.bytes(&got).await.unwrap().as_ref(), b"hello upstream");
+}
+
+#[tokio::test]
+async fn an_unavailable_upstream_is_never_quarantined() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/down".to_string();
+    let strat = Strat {
+        known: Some(sha256_hex(b"hello upstream")),
+        ..Default::default()
+    };
+    fx.set(|s| s.status = Some(StatusCode::SERVICE_UNAVAILABLE));
+    let res = engine.fetch(&strat, &fx.up, fx.member(), &art).await;
+    assert!(matches!(res, Err(AppError::BadGateway(_))), "{res:?}");
+    let key = format!("sha256:{}", sha256_hex(b"hello upstream"));
+    assert!(!fx
+        .cache
+        .quarantined(fx.repo.id, "t-item", &art, &key, Utc::now())
+        .await
+        .unwrap());
+
+    fx.set(|s| s.status = None);
+    found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 2, "an outage is retried");
+}
+
 /// The fixture's storage with its writer's `reserve` and `commit` slowed:
 /// the queue and the completion no caller may bound.
 struct Slow {

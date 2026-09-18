@@ -273,9 +273,10 @@ async fn files_off_the_allowed_hosts_are_dropped_and_credentials_stay_on_the_ind
 }
 
 /// The page is the only authority on a file's bytes: a body off its
-/// announced digest is refused and never stored; a new digest refetches.
+/// announced digest is quarantined under that digest and not fetched again;
+/// a new digest refetches.
 #[tokio::test]
-async fn a_body_off_its_announced_digest_is_refused_until_the_page_announces_it() {
+async fn a_body_off_its_announced_digest_is_quarantined_until_the_page_announces_another() {
     let upstream = fake::start().await;
     let name = sdist_name("demo", "1.0");
     let served = b"what the host serves".to_vec();
@@ -294,7 +295,7 @@ async fn a_body_off_its_announced_digest_is_refused_until_the_page_announces_it(
         let resp = get(&client, &s, &format!("/pypi-proxy/files/demo/{name}")).await;
         assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
     }
-    assert_eq!(upstream.hits(&format!("/files/{name}")).len(), 2, "nothing refused was kept");
+    assert_eq!(upstream.hits(&format!("/files/{name}")).len(), 1, "quarantined under the announced digest");
 
     upstream.set(
         "/simple/demo/",
@@ -304,6 +305,33 @@ async fn a_body_off_its_announced_digest_is_refused_until_the_page_announces_it(
     let resp = get(&client, &s, &format!("/pypi-proxy/files/demo/{name}")).await;
     assert_eq!(resp.status(), StatusCode::OK);
     assert_eq!(resp.bytes().await.unwrap().as_ref(), served.as_slice());
+    assert_eq!(upstream.hits(&format!("/files/{name}")).len(), 2, "a new digest refetches");
+}
+
+#[tokio::test]
+async fn an_upstream_5xx_on_a_file_is_never_quarantined() {
+    let upstream = fake::start().await;
+    let name = sdist_name("demo", "1.0");
+    let served = b"what the host serves".to_vec();
+    upstream.set(
+        "/simple/demo/",
+        Answer::Body("text/html", page_html(&[(&name, format!("/files/{name}"), Some(sha(&served)))])),
+    );
+    upstream.set(&format!("/files/{name}"), Answer::Status(503));
+    let s = spawn_server(SpawnOpts {
+        repositories: vec![proxy_with("pypi-proxy", RepositoryFormat::Pypi, &format!("{}/simple", upstream.base_url), opts())],
+        ..Default::default()
+    })
+    .await;
+    let client = Client::new();
+    let path = format!("/pypi-proxy/files/demo/{name}");
+    assert!(get(&client, &s, &path).await.status().is_server_error());
+
+    upstream.set(&format!("/files/{name}"), Answer::Body("application/octet-stream", served.clone()));
+    let resp = get(&client, &s, &path).await;
+    assert_eq!(resp.status(), StatusCode::OK, "an outage is retried under the same digest");
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), served.as_slice());
+    assert_eq!(upstream.hits(&format!("/files/{name}")).len(), 2);
 }
 
 #[tokio::test]
