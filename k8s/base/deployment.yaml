@@ -67,6 +67,13 @@ spec:
             - name: http
               containerPort: 6789
               protocol: TCP
+          # failureThreshold * periodSeconds > OPENCARGO_LEASE_WAIT + 60
+          startupProbe:
+            httpGet:
+              path: /health/live
+              port: http
+            periodSeconds: 5
+            failureThreshold: 24
           livenessProbe:
             httpGet:
               path: /health/live
@@ -86,6 +93,9 @@ spec:
             limits:
               cpu: 500m
               memory: 512Mi
+          env:
+            - name: OPENCARGO_LEASE_WAIT
+              value: "60"
           volumeMounts:
             - name: data
               mountPath: /data

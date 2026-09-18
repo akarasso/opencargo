@@ -60,6 +60,7 @@ async fn test_tls_server() {
                 cert_path: cert_path.to_str().unwrap().to_string(),
                 key_path: key_path.to_str().unwrap().to_string(),
             },
+            ..Default::default()
         },
         database: DatabaseConfig { url: db_url },
         auth: AuthConfig {

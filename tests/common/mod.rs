@@ -9,6 +9,7 @@ pub mod fake_idp;
 pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;
+pub mod manifests;
 pub mod pypi;
 pub mod faults;
 pub mod nuget;
@@ -53,6 +54,8 @@ pub struct SpawnOpts {
     pub sso: opencargo::config::SsoConfig,
     /// The URL clients reach the server by, when a reverse proxy fronts it.
     pub public_url: Option<String>,
+    /// Take the writer lease, on terms short enough for a test to outwait.
+    pub lease: bool,
 }
 
 impl Default for SpawnOpts {
@@ -67,6 +70,7 @@ impl Default for SpawnOpts {
             outage: None,
             sso: Default::default(),
             public_url: None,
+            lease: false,
         }
     }
 }
@@ -78,6 +82,24 @@ pub struct TestServer {
     pub tmp: TempDir,
     /// The store the server ran on, kept so a restart finds its bytes.
     pub storage: opencargo::config::StorageConfig,
+    pub lease: Option<opencargo::app::lease::LeaseGuard>,
+}
+
+impl TestServer {
+    /// Stop serving and give the lease back, as a clean shutdown would.
+    pub async fn stop(&mut self) {
+        self.handle.abort();
+        if let Some(lease) = self.lease.take() {
+            lease.release().await;
+        }
+    }
+}
+
+/// Lease terms a test can outwait: renewed every second, stale after three.
+pub fn short_lease(server: &mut ServerConfig) {
+    server.lease_wait = "4s".to_string();
+    server.lease_stale_after = "3s".to_string();
+    server.lease_renew = "1s".to_string();
 }
 
 /// The config every spawned server runs with: storage and database under `tmp`.
@@ -85,7 +107,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
     let public_url = opts.public_url.clone().unwrap_or_else(|| base_url.to_string());
     let storage_path = tmp.path().join("storage");
     let db_path = tmp.path().join("opencargo.db");
-    Config {
+    let mut config = Config {
         server: ServerConfig {
             bind: base_url.trim_start_matches("http://").to_string(),
             base_url: public_url,
@@ -93,6 +115,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
                 .to_str()
                 .expect("non-utf8 temp path")
                 .to_string(),
+            lease: opts.lease,
             ..Default::default()
         },
         database: DatabaseConfig {
@@ -112,7 +135,9 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         vuln_scan: opts.vuln,
         policy: opts.policy,
         ..Default::default()
-    }
+    };
+    short_lease(&mut config.server);
+    config
 }
 
 /// Whether this run puts every test server on S3 (`OPENCARGO_TEST_STORAGE=s3`,
@@ -139,12 +164,18 @@ pub fn switch_storage(config: &mut Config) {
 
 /// `server::build_state` behind the switch, refusing a vacuous S3 run: a
 /// switched server that did not build an S3 store fails the test.
-pub async fn build_state(config: &mut Config) -> anyhow::Result<opencargo::server::AppState> {
+pub async fn start(config: &mut Config) -> anyhow::Result<server::Started> {
     switch_storage(config);
-    let state = server::build_state(config).await?;
+    let started = server::build_state(config).await?;
     let want = if storage_is_s3() { "s3" } else { "fs" };
-    assert_eq!(state.storage_backend, want, "the storage switch was not applied");
-    Ok(state)
+    assert_eq!(started.state.storage_backend, want, "the storage switch was not applied");
+    Ok(started)
+}
+
+/// The state alone, for the files that build their own config; a lease it
+/// took stops renewing when its guard drops here.
+pub async fn build_state(config: &mut Config) -> anyhow::Result<opencargo::server::AppState> {
+    Ok(start(config).await?.state)
 }
 
 /// Start an opencargo on a random loopback port, ready to serve.
@@ -154,8 +185,8 @@ pub async fn spawn_server(opts: SpawnOpts) -> TestServer {
 }
 
 /// Stop `server` and start another on its database and storage: a restart.
-pub async fn respawn(server: TestServer, opts: SpawnOpts) -> TestServer {
-    server.handle.abort();
+pub async fn respawn(mut server: TestServer, opts: SpawnOpts) -> TestServer {
+    server.stop().await;
     spawn_in(server.tmp, opts, Some(server.storage)).await
 }
 
@@ -207,7 +238,7 @@ async fn spawn_in(
     if let Some(storage) = storage {
         config.storage = storage;
     }
-    let mut state = build_state(&mut config)
+    let server::Started { mut state, lease } = start(&mut config)
         .await
         .expect("failed to build app state");
     if let Some(tuning) = tuning {
@@ -245,6 +276,7 @@ async fn spawn_in(
         handle,
         tmp,
         storage: config.storage.clone(),
+        lease,
     }
 }
 
@@ -279,11 +311,28 @@ pub async fn seed_error_opts(opts: SpawnOpts) -> String {
         .to_string()
 }
 
-async fn open_db(server: &TestServer) -> sqlx::SqlitePool {
-    let db_path = server.tmp.path().join("opencargo.db");
-    sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+type Db = sqlx::SqlitePool;
+
+async fn open_db(server: &TestServer) -> Db {
+    open_db_at(&server.tmp.path().join("opencargo.db")).await
+}
+
+async fn open_db_at(db_path: &Path) -> Db {
+    Db::connect(&format!("sqlite:{}", db_path.display()))
         .await
         .expect("failed to open the server database")
+}
+
+/// Every table of the SQLite file at `db_path`, sorted: what proves a
+/// refused start wrote nothing.
+pub async fn table_names(db_path: &Path) -> Vec<String> {
+    let pool = open_db_at(db_path).await;
+    let names = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .fetch_all(&pool)
+        .await
+        .expect("failed to list tables");
+    pool.close().await;
+    names
 }
 
 /// One `policy_resolutions` row as the report will read it.

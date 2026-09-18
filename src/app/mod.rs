@@ -45,6 +45,7 @@ pub mod authenticate;
 pub mod events;
 pub mod maven;
 pub mod nuget;
+pub mod lease;
 pub mod login_gate;
 pub mod oci;
 pub mod permissions;

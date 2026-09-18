@@ -31,6 +31,8 @@ use crate::ports::multipart::MultipartLedger;
 use crate::ports::reclaim::ReclaimStore;
 use crate::ports::referenced::ReferencedKeys;
 use crate::app::authenticate::{Authenticate, AuthenticateDeps, Refusal};
+use crate::app::lease::{LeaseGuard, LeaseHandle};
+use crate::ports::leases::ServerStateStore;
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::ports::secrets::ServerSecretStore;
 use crate::ports::signing::RegistryTokenSigner;
@@ -140,6 +142,17 @@ pub struct AppState {
     /// Plain-HTTP attempt cookies, only on a loopback development server.
     pub sso_insecure_cookies: bool,
     pub password_mode: crate::domain::identity::PasswordMode,
+    /// A view of the writer lease; `main` owns the lease itself.
+    pub lease: LeaseHandle,
+    pub server_state: Arc<dyn ServerStateStore>,
+}
+
+/// What a started server is made of: the state every request clones, and
+/// the one thing only its owner may give back.
+pub struct Started {
+    pub state: AppState,
+    /// `None` when the config takes no lease.
+    pub lease: Option<LeaseGuard>,
 }
 
 impl AppState {
@@ -245,32 +258,68 @@ const MAVEN_PROMOTION_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
 /// new repository may be named after.
 pub const RESERVED_NAMES: &[&str] = &[crate::registry::maven::MOUNT];
 
-/// Migrate a database and nothing else: the `opencargo migrate` subcommand, so
-/// the binary reaches the adapter through the composition root rather than
-/// importing it.
-pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
-    let db = crate::adapters::sqlite::connect(&config.database.url).await?;
-    crate::adapters::sqlite::migrate::run_all(&db).await?;
+/// Migrate a database and nothing else: the `opencargo migrate` subcommand.
+/// It takes the writer lease first, so it never replays migrations under a
+/// live server; `force` skips the lease, for a holder known to be dead.
+pub async fn run_migrations(config: &Config, force: bool) -> anyhow::Result<()> {
+    let stores = open_unmigrated(config).await?;
+    let lease = if force {
+        None
+    } else {
+        take_writer_lease(config, &stores).await?
+    };
+    stores.migrate().await?;
+    if let Some(lease) = lease {
+        lease.release().await;
+    }
     Ok(())
 }
 
-/// Until ha-options' writer lease lands, a server listening on the
-/// configured address is how a storage command learns it is not alone.
-/// Weaker than the lease: a server that is starting is not seen.
-async fn refuse_running_server(config: &Config) -> anyhow::Result<()> {
-    let bind = config.server.bind.replace("0.0.0.0", "127.0.0.1");
-    let probe = tokio::time::timeout(
-        std::time::Duration::from_secs(1),
-        tokio::net::TcpStream::connect(&bind),
+/// The database, connected and not migrated: the lease is taken before
+/// anything is written to it.
+async fn open_unmigrated(config: &Config) -> anyhow::Result<SqliteStores> {
+    let db = crate::adapters::sqlite::connect(&config.database.url).await?;
+    let stores = SqliteStores::new(db);
+    stores.leases().ensure().await?;
+    Ok(stores)
+}
+
+/// The lease table of `config`'s database, created if absent and nothing
+/// else: what a test holds the lease through without starting a server.
+pub async fn lease_store(config: &Config) -> anyhow::Result<Arc<dyn crate::ports::leases::LeaseStore>> {
+    Ok(open_unmigrated(config).await?.leases())
+}
+
+/// The writer lease under this process's identity, `None` when the config
+/// takes none. The lease table is the one thing created before it.
+pub async fn take_writer_lease(
+    config: &Config,
+    stores: &SqliteStores,
+) -> anyhow::Result<Option<LeaseGuard>> {
+    let Some(terms) = config.server.lease_terms()? else {
+        return Ok(None);
+    };
+    stores.leases().ensure().await?;
+    let owner = uuid::Uuid::new_v4().simple().to_string();
+    let guard = LeaseGuard::take(
+        stores.leases(),
+        Arc::new(crate::adapters::system::SystemClock),
+        &owner,
+        env!("CARGO_PKG_VERSION"),
+        terms,
     )
-    .await;
-    if matches!(probe, Ok(Ok(_))) {
-        anyhow::bail!(
-            "a server is listening on {}: stop it before running this storage command",
-            config.server.bind
-        );
-    }
-    Ok(())
+    .await?;
+    Ok(Some(guard))
+}
+
+/// A storage command that writes runs as the one instance: it holds the
+/// writer lease for its whole run, and a live server makes it refuse.
+async fn exclusive_stores(config: &Config) -> anyhow::Result<(SqliteStores, Option<LeaseGuard>)> {
+    let stores = open_unmigrated(config).await?;
+    let lease = take_writer_lease(config, &stores).await?;
+    stores.migrate().await?;
+    crate::app::repo_spec::check_repository_names(stores.repositories().as_ref()).await?;
+    Ok((stores, lease))
 }
 
 /// `opencargo storage check`: the probe, then every operation the backend
@@ -319,8 +368,7 @@ pub async fn storage_migrate(
     let identities: Vec<String> = config.store_identities().into_iter().chain(target.store_identities()).collect();
     crate::config::refuse_duplicate_identities(identities.iter().map(String::as_str))
         .map_err(|e| anyhow::anyhow!("{e}: set a distinct `storage.id` in the target config"))?;
-    refuse_running_server(config).await?;
-    let stores = connect_stores(config).await?;
+    let (stores, lease) = exclusive_stores(config).await?;
     let clock: Arc<dyn Clock> = Arc::new(crate::adapters::system::SystemClock);
     let source = build_configured_storage(config, Role::Artifacts, stores.multipart(), clock.clone())?;
     let sink = build_configured_storage(target, Role::Artifacts, stores.multipart(), clock)?;
@@ -328,7 +376,11 @@ pub async fn storage_migrate(
         anyhow::bail!("the target store overlaps the source: pick another path, bucket or prefix");
     }
     let migrate = crate::app::storage_ops::MigrateStorage::new(source.backend, sink.backend);
-    Ok(migrate.run(dry_run).await?)
+    let report = migrate.run(dry_run).await;
+    if let Some(lease) = lease {
+        lease.release().await;
+    }
+    Ok(report?)
 }
 
 /// `opencargo storage reclaim [--prefix P]`: one reclamation pass now, or
@@ -339,17 +391,21 @@ pub async fn storage_reclaim(
     now: chrono::DateTime<Utc>,
 ) -> anyhow::Result<crate::app::reclaim::ReclaimReport> {
     config.validate()?;
-    refuse_running_server(config).await?;
-    let stores = connect_stores(config).await?;
+    let (stores, lease) = exclusive_stores(config).await?;
     let storage = storage_for(config, stores.multipart())?;
     let policy = ReclaimPolicy::default();
     let reclaim = ReclaimOrphans::new(stores.reclaim(), stores.referenced(), storage, policy);
-    match prefix {
-        Some(prefix) => Ok(crate::app::storage_ops::ReclaimPrefix::new(stores.reclaim(), reclaim, policy.grace)
+    let report = match prefix {
+        Some(prefix) => crate::app::storage_ops::ReclaimPrefix::new(stores.reclaim(), reclaim, policy.grace)
             .run(prefix, now)
-            .await?),
+            .await
+            .map_err(anyhow::Error::from),
         None => Ok(reclaim.run(now).await),
+    };
+    if let Some(lease) = lease {
+        lease.release().await;
     }
+    report
 }
 
 /// A database URL turned into ports: the pool, migrated, with every store
@@ -499,15 +555,20 @@ pub fn event_bus() -> Arc<dyn Events> {
     Arc::new(crate::adapters::events::BroadcastEvents::new())
 }
 
-pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
+/// Everything a server needs, in the order that keeps a second instance
+/// from writing: the lease is taken before the first migration runs.
+pub async fn build_state(config: &Config) -> anyhow::Result<Started> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    config.validate()?;
     let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
     ensure_directories(config)?;
-    let stores = connect_stores(config).await?;
+    let stores = open_unmigrated(config).await?;
+    let lease = take_writer_lease(config, &stores).await?;
+    stores.migrate().await?;
+    crate::app::repo_spec::check_repository_names(stores.repositories().as_ref()).await?;
     let repos = stores.repositories();
     seed_repositories(repos.as_ref(), &config.repositories, Utc::now()).await?;
 
-    config.validate()?;
     let built = build_configured_storage(
         config,
         Role::Artifacts,
@@ -563,7 +624,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     );
     report_ready(config, &policy_notes);
 
-    Ok(AppState {
+    let state = AppState {
         storage_backend,
         storage_ready: Arc::new(StorageReadiness::new(storage.clone())),
         storage,
@@ -609,7 +670,10 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         identities,
         sso_insecure_cookies: config.auth.sso.dev_insecure_http,
         password_mode: gate_policy(&config.auth.sso)?.password_mode,
-    })
+        lease: lease.as_ref().map_or_else(LeaseHandle::disabled, LeaseGuard::handle),
+        server_state: stores.server_state(),
+    };
+    Ok(Started { state, lease })
 }
 
 /// The one `Authenticate` and what the protocol adapters declare about

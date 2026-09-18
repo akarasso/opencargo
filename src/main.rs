@@ -10,19 +10,19 @@ use opencargo::{config, server};
 #[command(name = "opencargo", version, about = "Lightweight universal package registry")]
 struct Cli {
     /// Path to config file
-    #[arg(short, long, env = "OPENCARGO_CONFIG")]
+    #[arg(short, long, env = "OPENCARGO_CONFIG", global = true)]
     config: Option<PathBuf>,
 
     /// Bind address (overrides config)
-    #[arg(short, long)]
+    #[arg(short, long, global = true)]
     bind: Option<String>,
 
     /// Public URL clients use to reach this server (overrides config)
-    #[arg(long, env = "OPENCARGO_BASE_URL")]
+    #[arg(long, env = "OPENCARGO_BASE_URL", global = true)]
     base_url: Option<String>,
 
     /// OSV API base URL for vulnerability scanning (overrides config)
-    #[arg(long, env = "OPENCARGO_OSV_BASE_URL")]
+    #[arg(long, env = "OPENCARGO_OSV_BASE_URL", global = true)]
     osv_base_url: Option<String>,
 
     #[command(subcommand)]
@@ -38,8 +38,12 @@ enum Commands {
         /// Path to config file to validate
         path: PathBuf,
     },
-    /// Run database migrations
-    Migrate,
+    /// Run database migrations, under the writer lease
+    Migrate {
+        /// Skip the writer lease, for a holder known to be dead
+        #[arg(long)]
+        force: bool,
+    },
     /// Operate on the artifact store; the server must be stopped for
     /// `migrate` and `reclaim`
     Storage {
@@ -106,7 +110,7 @@ async fn storage(cfg: &config::Config, command: StorageCommand) -> anyhow::Resul
             }
         }
         StorageCommand::Migrate { to, dry_run } => {
-            let target = config::load_config(Some(&to))?;
+            let target = config::load_config(Some(&to))?.config;
             let report = server::storage_migrate(cfg, &target, dry_run).await?;
             println!(
                 "{} {} objects ({} bytes), {} already there",
@@ -135,7 +139,7 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let mut cfg = config::load_config(cli.config.as_deref())?;
+    let config::Loaded { config: mut cfg, problems } = config::load_config(cli.config.as_deref())?;
     if let Some(base_url) = cli.base_url {
         cfg.server.base_url = base_url.trim_end_matches('/').to_string();
     }
@@ -146,7 +150,17 @@ async fn main() -> anyhow::Result<()> {
         cfg.vuln_scan.osv_base_url = osv_base_url.trim_end_matches('/').to_string();
     }
 
-    match cli.command.unwrap_or(Commands::Serve) {
+    let command = cli.command.unwrap_or(Commands::Serve);
+    if !problems.is_empty() {
+        for problem in &problems {
+            eprintln!("config: {problem}");
+        }
+        if matches!(command, Commands::Serve | Commands::Migrate { .. }) {
+            anyhow::bail!("invalid configuration ({} problems)", problems.len());
+        }
+    }
+
+    match command {
         Commands::Serve => {
             let bind = cli.bind.as_deref().unwrap_or(&cfg.server.bind);
             info!("Starting opencargo on {}", bind);
@@ -158,7 +172,7 @@ async fn main() -> anyhow::Result<()> {
                 );
             }
 
-            let app_state = server::build_state(&cfg).await?;
+            let server::Started { state: app_state, lease } = server::build_state(&cfg).await?;
             let probe_every = config::parse_chrono_duration(&cfg.auth.sso.probe_interval)?
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(60));
@@ -226,13 +240,22 @@ async fn main() -> anyhow::Result<()> {
                 info!("Listening on {}", listener.local_addr()?);
                 axum::serve(listener, app).await?;
             }
+            if let Some(lease) = lease {
+                lease.release().await;
+            }
         }
         Commands::ValidateConfig { path } => {
-            config::load_config(Some(&path))?.validate()?;
+            let checked = config::load_config(Some(&path))?;
+            if !checked.problems.is_empty() {
+                for problem in &checked.problems {
+                    println!("{}: {problem}", path.display());
+                }
+                anyhow::bail!("{} problems in {}", checked.problems.len(), path.display());
+            }
             println!("Config is valid.");
         }
-        Commands::Migrate => {
-            server::run_migrations(&cfg).await?;
+        Commands::Migrate { force } => {
+            server::run_migrations(&cfg, force).await?;
             println!("Migrations applied successfully.");
         }
         Commands::Storage { command } => storage(&cfg, command).await?,

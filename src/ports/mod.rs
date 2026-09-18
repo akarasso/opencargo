@@ -12,6 +12,7 @@ pub mod handoffs;
 pub mod identities;
 pub mod identity_provider;
 pub mod ids;
+pub mod leases;
 pub mod maven;
 pub mod multipart;
 pub mod nuget;

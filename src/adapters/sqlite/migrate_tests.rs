@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "022", "024", "025"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "022", "024", "025"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "022", "024", "025"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.
@@ -899,13 +899,21 @@ async fn migration_025_before_or_after_020_keeps_incarnations() {
     }
 }
 
-/// The `server_secrets` half of ha-options' 022, as A1 C2 fixes it: the same
-/// definition, created only if 021 did not.
-const SECRETS_022: &str = "CREATE TABLE IF NOT EXISTS server_secrets (
-    name TEXT PRIMARY KEY,
-    value BLOB NOT NULL,
-    created_at TEXT NOT NULL
-);";
+/// The `server_secrets` statement of a migration file, as written.
+fn secrets_statement(id: &str) -> &'static str {
+    file_of(id)
+        .split(';')
+        .map(str::trim)
+        .find(|s| s.contains("server_secrets"))
+        .expect("the file creates server_secrets")
+}
+
+/// 021 and 022 both declare `server_secrets` (A1 C2): the two statements are
+/// one string, or the table's type would depend on upgrade order.
+#[test]
+fn server_secrets_definition_matches_sso() {
+    assert_eq!(secrets_statement("021"), secrets_statement("022"));
+}
 
 async fn secrets_definition(pool: &SqlitePool) -> String {
     sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'server_secrets'")
@@ -936,11 +944,11 @@ async fn migrations_021_and_022_create_server_secrets_in_either_order() {
     let (_a, first) = pool().await;
     legacy_migrate(&first).await;
     sqlx::raw_sql(file_of("021")).execute(&first).await.unwrap();
-    sqlx::raw_sql(SECRETS_022).execute(&first).await.unwrap();
+    sqlx::raw_sql(file_of("022")).execute(&first).await.unwrap();
 
     let (_b, second) = pool().await;
     legacy_migrate(&second).await;
-    sqlx::raw_sql(SECRETS_022).execute(&second).await.unwrap();
+    sqlx::raw_sql(file_of("022")).execute(&second).await.unwrap();
     sqlx::raw_sql(file_of("021")).execute(&second).await.unwrap();
 
     assert_eq!(objects(&first).await, objects(&second).await);

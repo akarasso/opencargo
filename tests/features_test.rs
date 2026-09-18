@@ -610,3 +610,69 @@ async fn test_dashboard_hides_private_packages() {
         names
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deployment manifests
+// ---------------------------------------------------------------------------
+
+use common::manifests::{block, document, env_value, helm_renders, items, kustomize_deployment, number, scalar};
+
+fn helm_deployments(extra: &[&str]) -> Option<Vec<String>> {
+    Some(
+        helm_renders(extra)?
+            .iter()
+            .map(|r| document(r, "Deployment").expect("the chart renders a Deployment"))
+            .collect(),
+    )
+}
+
+#[test]
+fn helm_args_put_global_flags_before_the_subcommand() {
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in deployments.iter().chain([&kustomize_deployment()]) {
+        let args = items(&block(doc, "args"));
+        assert_eq!(args, ["--config", "/etc/opencargo/config.toml", "serve"], "{doc}");
+    }
+}
+
+#[test]
+fn helm_deployment_declares_recreate_strategy() {
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in deployments.iter().chain([&kustomize_deployment()]) {
+        assert_eq!(scalar(&block(doc, "strategy"), "type").as_deref(), Some("Recreate"));
+    }
+}
+
+#[test]
+fn helm_replica_count_is_one() {
+    let schema: Value = serde_json::from_str(&common::manifests::read(std::path::Path::new(
+        "helm/opencargo/values.schema.json",
+    )))
+    .unwrap();
+    assert_eq!(schema["properties"]["replicaCount"]["maximum"], 1);
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in &deployments {
+        assert_eq!(number(doc, "replicas"), 1);
+    }
+    let Some(helm) = common::client_bin("HELM_BIN") else { return };
+    let out = std::process::Command::new(helm)
+        .args(["template", "r", "helm/opencargo", "--set", "auth.adminPassword=x", "--set", "replicaCount=2"])
+        .current_dir(common::manifests::repo())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "two replicas are refused by the schema");
+}
+
+#[test]
+fn liveness_cannot_kill_a_pod_waiting_for_the_lease() {
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in deployments.iter().chain([&kustomize_deployment()]) {
+        let startup = block(doc, "startupProbe");
+        let budget = number(&startup, "failureThreshold") * number(&startup, "periodSeconds");
+        let wait: u64 = env_value(doc, "OPENCARGO_LEASE_WAIT")
+            .expect("the lease wait reaches the container")
+            .parse()
+            .unwrap();
+        assert!(budget > wait + 30, "startup budget {budget}s against a {wait}s lease wait:\n{doc}");
+    }
+}

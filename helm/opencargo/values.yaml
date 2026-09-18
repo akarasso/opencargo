@@ -1,5 +1,11 @@
 replicaCount: 1
 
+lease:
+  waitSeconds: 60
+
+startup:
+  periodSeconds: 5
+
 image:
   repository: ghcr.io/akarasso/opencargo
   # ":latest" is mutable and not reproducible. Prefer an immutable reference
