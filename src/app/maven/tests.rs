@@ -49,6 +49,7 @@ struct Hooked {
     delete: bool,
     armed: AtomicBool,
     during: Mutex<Option<Box<dyn Fn() + Send>>>,
+    after_read: Mutex<Option<futures_util::future::BoxFuture<'static, ()>>>,
 }
 
 #[async_trait]
@@ -85,7 +86,12 @@ impl MavenFileStore for Hooked {
     }
 
     async fn artifact(&self, repository: i64, ga: &str) -> Result<Vec<UnitView>, StoreError> {
-        self.inner.artifact(repository, ga).await
+        let units = self.inner.artifact(repository, ga).await;
+        let after = self.after_read.lock().unwrap().take();
+        if let Some(after) = after {
+            after.await;
+        }
+        units
     }
 
     async fn counter(&self, repository: i64, scope: &str) -> Result<Counter, StoreError> {
@@ -159,6 +165,7 @@ impl Fx {
             delete,
             armed: AtomicBool::new(false),
             during: Mutex::new(None),
+            after_read: Mutex::new(None),
         });
         self.maven = hooked.clone();
         (self, hooked)
@@ -364,6 +371,31 @@ async fn snapshot_build_announced_only_after_pom_commit() {
     assert!(after.contains("<buildNumber>2</buildNumber>"));
     assert_eq!(after.matches("<value>1.0-20260918.130000-2</value>").count(), 2, "pom and jar of one build");
     assert!(!after.contains("120000-1"), "no entry from an older build: {after}");
+}
+
+#[tokio::test]
+async fn a_commit_between_body_and_validator_reads_never_pairs_an_old_body_with_a_new_etag() {
+    let (fx, hooked) = Fx::new().await.hooked(false);
+    let fx = Arc::new(fx);
+    let v = "1.0-SNAPSHOT";
+    fx.put(v, "lib-1.0-20260918.120000-1.jar", "ci", b"jar1").await.unwrap();
+    fx.put(v, "lib-1.0-20260918.120000-1.pom", "ci", b"<project/>").await.unwrap();
+    fx.put(v, "lib-1.0-20260918.130000-2.jar", "ci", b"jar2").await.unwrap();
+
+    let racer = fx.clone();
+    *hooked.after_read.lock().unwrap() = Some(Box::pin(async move {
+        racer.put(v, "lib-1.0-20260918.130000-2.pom", "ci", b"<project/>").await.unwrap();
+    }));
+    let raced = hosted::snapshot_metadata(hooked.as_ref(), fx.store.packages().as_ref(), fx.repo, &gav(v))
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(hooked.after_read.lock().unwrap().is_none(), "the commit fired between the reads");
+    assert!(String::from_utf8_lossy(&raced.body).contains("<buildNumber>1</buildNumber>"));
+
+    let current = fx.snapshot(v).await.unwrap();
+    assert_ne!(raced.body, current.body);
+    assert_ne!(raced.etag, current.etag, "If-None-Match on the raced ETag must not answer 304");
 }
 
 #[tokio::test]

@@ -71,22 +71,37 @@ async fn version_stamp(
     Ok((format!("{}-{newest}-{yanked}", versions.len()), at))
 }
 
-async fn rendered(
+struct Validators {
+    etag: String,
+    last_modified: Option<DateTime<Utc>>,
+}
+
+/// Read before the units: a commit racing the read can then only pair a
+/// newer body with an older validator, never an older body with a newer one.
+async fn validators(
     maven: &dyn MavenFileStore,
     packages: &dyn PackageStore,
     repository: i64,
     ga: &str,
     scope: &str,
-    body: String,
-) -> Result<Rendered, StoreError> {
+) -> Result<Validators, StoreError> {
     let (stamp, published) = version_stamp(packages, repository, ga).await?;
     let counter = maven.counter(repository, scope).await?;
-    Ok(Rendered {
-        body: Bytes::from(body),
+    Ok(Validators {
         etag: format!("\"{stamp}.{}\"", counter.value),
         last_modified: published.max(counter.updated_at),
-        stale: false,
     })
+}
+
+impl Validators {
+    fn render(self, body: String) -> Rendered {
+        Rendered {
+            body: Bytes::from(body),
+            etag: self.etag,
+            last_modified: self.last_modified,
+            stale: false,
+        }
+    }
 }
 
 fn visible(units: Vec<UnitView>) -> Vec<UnitView> {
@@ -101,6 +116,7 @@ pub async fn artifact_metadata(
     artifact: &str,
 ) -> Result<Option<Rendered>, StoreError> {
     let ga = format!("{group}:{artifact}");
+    let validators = validators(maven, packages, repository, &ga, &scope_artifact(&ga)).await?;
     let units = visible(maven.artifact(repository, &ga).await?);
     if units.is_empty() {
         return Ok(None);
@@ -118,10 +134,7 @@ pub async fn artifact_metadata(
         ),
         last,
     );
-    let body = level.render();
-    rendered(maven, packages, repository, &ga, &scope_artifact(&ga), body)
-        .await
-        .map(Some)
+    Ok(Some(validators.render(level.render())))
 }
 
 /// The newest visible build only, every file of it: a build whose POM is
@@ -134,6 +147,7 @@ pub async fn snapshot_metadata(
     gav: &Gav,
 ) -> Result<Option<Rendered>, StoreError> {
     let ga = gav.ga();
+    let validators = validators(maven, packages, repository, &ga, &scope_snapshot(&ga, &gav.version)).await?;
     let units: Vec<UnitView> = visible(maven.artifact(repository, &ga).await?)
         .into_iter()
         .filter(|u| u.version == gav.version)
@@ -181,16 +195,7 @@ pub async fn snapshot_metadata(
         last_updated: Some(updated.clone()),
         entries,
     };
-    rendered(
-        maven,
-        packages,
-        repository,
-        &ga,
-        &scope_snapshot(&ga, &gav.version),
-        level.render(),
-    )
-    .await
-    .map(Some)
+    Ok(Some(validators.render(level.render())))
 }
 
 /// The plugins a client declared for a group, when it declared any.
@@ -200,20 +205,15 @@ pub async fn group_metadata(
     repository: i64,
     dir: &[String],
 ) -> Result<Option<Rendered>, StoreError> {
+    let group = dir.join(".");
+    let validators = validators(maven, packages, repository, &group, &scope_group(&group)).await?;
     let Some(doc) = maven.client_metadata(repository, &dir.join("/")).await? else {
         return Ok(None);
     };
     if doc.plugins.is_empty() {
         return Ok(None);
     }
-    let group = dir.join(".");
-    let body = GroupLevel {
-        plugins: doc.plugins,
-    }
-    .render();
-    rendered(maven, packages, repository, &group, &scope_group(&group), body)
-        .await
-        .map(Some)
+    Ok(Some(validators.render(GroupLevel { plugins: doc.plugins }.render())))
 }
 
 /// Whichever document the directory holds: a snapshot's, an artifact's, or
