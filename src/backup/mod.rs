@@ -473,3 +473,7 @@ fn collect_files(root: &Path, dir: &Path, out: &mut Vec<String>) -> io::Result<(
     }
     Ok(())
 }
+
+#[cfg(test)]
+#[path = "tests.rs"]
+mod tests;
