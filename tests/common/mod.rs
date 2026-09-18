@@ -48,6 +48,8 @@ pub struct SpawnOpts {
     pub policy_tuning: Option<Tuning>,
     /// Puts the storage and the permission store behind switches.
     pub outage: Option<faults::Outage>,
+    /// The URL clients reach the server by, when a reverse proxy fronts it.
+    pub public_url: Option<String>,
 }
 
 impl Default for SpawnOpts {
@@ -60,6 +62,7 @@ impl Default for SpawnOpts {
             policy: HashMap::new(),
             policy_tuning: None,
             outage: None,
+            public_url: None,
         }
     }
 }
@@ -73,12 +76,13 @@ pub struct TestServer {
 
 /// The config every spawned server runs with: storage and database under `tmp`.
 fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
+    let public_url = opts.public_url.clone().unwrap_or_else(|| base_url.to_string());
     let storage_path = tmp.path().join("storage");
     let db_path = tmp.path().join("opencargo.db");
     Config {
         server: ServerConfig {
             bind: base_url.trim_start_matches("http://").to_string(),
-            base_url: base_url.to_string(),
+            base_url: public_url,
             storage_path: storage_path
                 .to_str()
                 .expect("non-utf8 temp path")
