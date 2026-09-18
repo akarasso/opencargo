@@ -640,7 +640,7 @@ macro_rules! package_contract {
                     .unwrap();
 
                 assert!(matches!(
-                    handles.repos.delete_empty("npm-hosted").await.unwrap_err(),
+                    handles.repos.retire("npm-hosted", at(10)).await.unwrap_err(),
                     StoreError::Conflict
                 ));
                 assert_eq!(
@@ -655,10 +655,10 @@ macro_rules! package_contract {
                 let handles = $open().await;
                 hosted(&handles, "npm-hosted", Visibility::Public).await;
 
-                handles.repos.delete_empty("npm-hosted").await.unwrap();
+                handles.repos.retire("npm-hosted", at(10)).await.unwrap();
                 assert!(handles.repos.by_name("npm-hosted").await.unwrap().is_none());
                 assert!(matches!(
-                    handles.repos.delete_empty("npm-hosted").await.unwrap_err(),
+                    handles.repos.retire("npm-hosted", at(10)).await.unwrap_err(),
                     StoreError::NotFound
                 ));
             }
@@ -818,7 +818,7 @@ macro_rules! package_contract {
                     .unwrap();
                 store.record_download(landed.version.id).await.unwrap();
 
-                store.delete_version(landed.version.id).await.unwrap();
+                store.delete_version(landed.version.id, at(10)).await.unwrap();
 
                 assert!(store
                     .version(landed.package.id, "1.0.0")
@@ -845,7 +845,7 @@ macro_rules! package_contract {
                     "a sibling version is untouched"
                 );
                 assert!(matches!(
-                    store.delete_version(landed.version.id).await.unwrap_err(),
+                    store.delete_version(landed.version.id, at(10)).await.unwrap_err(),
                     StoreError::NotFound
                 ));
             }
@@ -1570,3 +1570,337 @@ macro_rules! cascade_contract {
 
 #[allow(unused_imports)]
 pub(crate) use cascade_contract;
+
+/// What `reclaim_contract!` needs of an adapter: port 22, port 23, and the
+/// ports whose rows reference keys or whose methods enqueue.
+pub struct ReclaimHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub packages: Arc<dyn PackageStore>,
+    pub oci: Arc<dyn OciStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+    pub referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+    _keep: Box<dyn Any + Send>,
+}
+
+impl ReclaimHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        packages: Arc<dyn PackageStore>,
+        oci: Arc<dyn OciStore>,
+        reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+        referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            packages,
+            oci,
+            reclaim,
+            referenced,
+            _keep: keep,
+        }
+    }
+}
+
+/// `reclaim_contract!(name, opener)`: port 22 and port 23 answer alike on
+/// every adapter, and agree with each other.
+#[allow(unused_macros)]
+macro_rules! reclaim_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, TimeZone, Utc};
+            use ::futures_util::TryStreamExt;
+            use ::opencargo::domain::{layout, Format, RepoKind, RepoSpec, Repository, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::packages::{NameMatch, NewRelease};
+            use ::opencargo::ports::reclaim::{Claim, PinToken, Pinned, Renewal};
+            use ::std::time::Duration;
+
+            const GRACE: Duration = Duration::from_secs(3600);
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 18, hour, 0, 0).unwrap()
+            }
+
+            async fn repo(h: &ReclaimHandles, name: &str) -> (Repository, String) {
+                let repo = h
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            name,
+                            kind: RepoKind::Hosted,
+                            format: Format::Npm,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                let incarnation = h.repos.incarnation(repo.id).await.unwrap().unwrap();
+                (repo, layout::incarnation_prefix(&incarnation))
+            }
+
+            async fn pin(h: &ReclaimHandles, prefix: &str, keys: &[&str], until: u32) -> Vec<PinToken> {
+                let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+                match h.reclaim.pin(prefix, &keys, at(until)).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("{prefix} is live"),
+                }
+            }
+
+            async fn publish(h: &ReclaimHandles, repo: i64, version: &str, key: &str) -> i64 {
+                h.packages
+                    .publish_version(&NewRelease {
+                        repository: repo,
+                        package: "p",
+                        match_name: NameMatch::Exact,
+                        description: None,
+                        readme: None,
+                        version,
+                        metadata_json: "{}",
+                        checksum_sha1: None,
+                        checksum_sha256: None,
+                        integrity: None,
+                        size: 1,
+                        tarball_path: key,
+                        dist_tags: &[],
+                        now: at(2),
+                    })
+                    .await
+                    .unwrap()
+                    .version
+                    .id
+            }
+
+            async fn listed(h: &ReclaimHandles, now: u32) -> Vec<String> {
+                h.referenced
+                    .referenced(GRACE, at(now))
+                    .map_ok(|r| r.key)
+                    .try_collect()
+                    .await
+                    .unwrap()
+            }
+
+            async fn claim(h: &ReclaimHandles, key: &str, now: u32) -> Claim {
+                h.reclaim.claim(key, GRACE, at(now), at(now + 1)).await.unwrap()
+            }
+
+            #[tokio::test]
+            async fn claim_revokes_every_pin_on_its_key() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let first = pin(&h, &prefix, &["r/x"], 2).await;
+                let key = first[0].physical_key.clone();
+                h.reclaim.enqueue(std::slice::from_ref(&key), at(1)).await.unwrap();
+                assert_eq!(claim(&h, &key, 2).await, Claim::Pinned, "a live pin protects");
+                assert!(matches!(claim(&h, &key, 5).await, Claim::Claimed(_)), "expired past the grace");
+                assert!(!listed(&h, 5).await.contains(&key));
+            }
+
+            #[tokio::test]
+            async fn an_expired_pin_within_the_grace_still_protects() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &["r/x"], 4).await;
+                let key = tokens[0].physical_key.clone();
+                h.reclaim.enqueue(std::slice::from_ref(&key), at(1)).await.unwrap();
+                assert_eq!(claim(&h, &key, 4).await, Claim::Pinned, "expired at the instant, inside the grace");
+                assert!(listed(&h, 4).await.contains(&key), "protecting pins are listed");
+            }
+
+            #[tokio::test]
+            async fn claimed_generation_is_never_pinned_again() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let first = pin(&h, &prefix, &["r/x"], 2).await;
+                let key = first[0].physical_key.clone();
+                h.reclaim.enqueue(std::slice::from_ref(&key), at(1)).await.unwrap();
+                assert!(matches!(claim(&h, &key, 5).await, Claim::Claimed(_)));
+                publish(&h, r.id, "1.0.0", &key).await;
+                let again = pin(&h, &prefix, &["r/x"], 9).await;
+                assert_ne!(again[0].physical_key, key, "a claimed generation is never reused");
+            }
+
+            #[tokio::test]
+            async fn pin_reuses_only_a_referenced_never_claimed_generation() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let fresh = pin(&h, &prefix, &["r/x"], 2).await;
+                let other = pin(&h, &prefix, &["r/x"], 2).await;
+                assert_ne!(fresh[0].physical_key, other[0].physical_key, "unreferenced: fresh each time");
+                publish(&h, r.id, "1.0.0", &fresh[0].physical_key).await;
+                let reused = pin(&h, &prefix, &["r/x"], 2).await;
+                assert_eq!(reused[0].physical_key, fresh[0].physical_key);
+                let batch = pin(&h, &prefix, &["r/x", "r/y"], 2).await;
+                assert_eq!(batch.len(), 2, "one transaction, one token per key");
+                assert!(batch[1].physical_key.starts_with("r/y~"));
+            }
+
+            #[tokio::test]
+            async fn pin_under_retired_incarnation_is_refused() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let (_, sibling) = repo(&h, "r2").await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                let keys = vec!["k".to_string()];
+                assert_eq!(h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(), Pinned::Retired);
+                assert!(matches!(
+                    h.reclaim.pin(&sibling, &keys, at(3)).await.unwrap(),
+                    Pinned::Tokens(_)
+                ));
+                let string_sibling = format!("{prefix}x");
+                assert_eq!(
+                    h.reclaim.pin(&string_sibling, &keys, at(3)).await.unwrap(),
+                    Pinned::Retired,
+                    "an unknown prefix is never live, whatever it starts with"
+                );
+            }
+
+            #[tokio::test]
+            async fn retire_revokes_pins_and_enqueues_its_prefixes() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &[&format!("{prefix}/p/f")], 9).await;
+                let prefixes = h.repos.retire("r", at(2)).await.unwrap();
+                assert!(prefixes.contains(&prefix));
+                assert!(prefixes.contains(&"npm/r".to_string()));
+                assert!(
+                    !listed(&h, 2).await.contains(&tokens[0].physical_key),
+                    "the pin taken before retire is revoked"
+                );
+                let due = h.reclaim.due(GRACE, at(2), 10).await.unwrap();
+                assert!(due.iter().any(|c| c.key == prefix && c.prefix), "claimable without the grace");
+                assert!(matches!(claim(&h, &prefix, 2).await, Claim::Claimed(_)));
+            }
+
+            #[tokio::test]
+            async fn retire_rechecks_conflicts_in_the_transaction() {
+                let h = $open().await;
+                let (r, _) = repo(&h, "r").await;
+                let v = publish(&h, r.id, "1.0.0", "npm/r/p/p.tgz").await;
+                assert!(matches!(h.repos.retire("r", at(2)).await, Err(StoreError::Conflict)));
+                assert!(h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty(), "a refusal enqueues nothing");
+                h.packages.delete_version(v, at(3)).await.unwrap();
+                h.repos
+                    .create(
+                        &RepoSpec {
+                            name: "g",
+                            kind: RepoKind::Group,
+                            format: Format::Npm,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &["r".to_string()],
+                        },
+                        at(3),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(h.repos.retire("r", at(4)).await, Err(StoreError::Conflict)));
+            }
+
+            #[tokio::test]
+            async fn a_retired_group_enqueues_nothing() {
+                let h = $open().await;
+                h.repos
+                    .create(
+                        &RepoSpec {
+                            name: "g",
+                            kind: RepoKind::Group,
+                            format: Format::Npm,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                assert!(h.repos.retire("g", at(2)).await.unwrap().is_empty());
+                assert!(h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn delete_version_enqueues_and_deletes_nothing() {
+                let h = $open().await;
+                let (r, _) = repo(&h, "r").await;
+                let v = publish(&h, r.id, "1.0.0", "npm/r/p/p.tgz").await;
+                assert_eq!(claim(&h, "npm/r/p/p.tgz", 9).await, Claim::NotDue, "nothing queued yet");
+                h.packages.delete_version(v, at(3)).await.unwrap();
+                assert!(matches!(h.packages.delete_version(v, at(3)).await, Err(StoreError::NotFound)));
+                let due = h.reclaim.due(GRACE, at(5), 10).await.unwrap();
+                assert_eq!(due.len(), 1);
+                assert_eq!(due[0].key, "npm/r/p/p.tgz");
+                assert!(matches!(claim(&h, "npm/r/p/p.tgz", 5).await, Claim::Claimed(_)));
+            }
+
+            #[tokio::test]
+            async fn a_referenced_key_is_listed_and_never_claimed() {
+                let h = $open().await;
+                let (r, _) = repo(&h, "r").await;
+                publish(&h, r.id, "1.0.0", "npm/r/p/a.tgz").await;
+                h.reclaim.enqueue(&["npm/r/p/a.tgz".to_string()], at(1)).await.unwrap();
+                h.reclaim.enqueue(&["npm/r/p/a.tgz".to_string()], at(1)).await.unwrap();
+                assert!(listed(&h, 5).await.contains(&"npm/r/p/a.tgz".to_string()));
+                assert_eq!(claim(&h, "npm/r/p/a.tgz", 5).await, Claim::Referenced);
+                assert!(h.reclaim.due(GRACE, at(5), 10).await.unwrap().is_empty(), "Referenced drops the candidate");
+            }
+
+            #[tokio::test]
+            async fn segments_of_a_slow_session_are_never_claimable() {
+                let h = $open().await;
+                let (r, _) = repo(&h, "r").await;
+                h.oci.start_upload("u1", r.id, "app").await.unwrap();
+                let segment = "oci/_uploads/u1/00000000000000000000".to_string();
+                h.reclaim.enqueue(std::slice::from_ref(&segment), at(1)).await.unwrap();
+                assert_eq!(claim(&h, &segment, 20).await, Claim::Referenced);
+                let refs: Vec<_> = h.referenced.referenced(GRACE, at(20)).try_collect().await.unwrap();
+                assert!(refs.iter().any(|r| r.key == "oci/_uploads/u1" && r.prefix));
+            }
+
+            #[tokio::test]
+            async fn renew_after_takeover_is_superseded() {
+                let h = $open().await;
+                h.reclaim.enqueue(&["k".to_string()], at(1)).await.unwrap();
+                let Claim::Claimed(first) = claim(&h, "k", 3).await else { panic!("due") };
+                assert_eq!(claim(&h, "k", 3).await, Claim::NotDue, "a live claim is exclusive");
+                let Claim::Claimed(second) = claim(&h, "k", 6).await else {
+                    panic!("an expired claim is taken over")
+                };
+                assert_eq!(h.reclaim.renew(&first, at(6), at(7)).await.unwrap(), Renewal::Superseded);
+                assert_eq!(h.reclaim.renew(&second, at(6), at(7)).await.unwrap(), Renewal::Renewed);
+                h.reclaim.release(&first).await.unwrap();
+                assert_eq!(claim(&h, "k", 6).await, Claim::NotDue, "a stale release is a no-op");
+                h.reclaim.release(&second).await.unwrap();
+                assert!(h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn crashed_placer_pins_are_pruned_past_the_grace_and_bounded() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                pin(&h, &prefix, &["a", "b", "c"], 2).await;
+                let live = pin(&h, &prefix, &["d"], 9).await;
+                assert_eq!(h.reclaim.prune_pins(GRACE, at(2), 10).await.unwrap(), 0);
+                assert_eq!(h.reclaim.prune_pins(GRACE, at(4), 2).await.unwrap(), 2, "bounded");
+                assert_eq!(h.reclaim.prune_pins(GRACE, at(4), 10).await.unwrap(), 1);
+                assert_eq!(listed(&h, 4).await, vec![live[0].physical_key.clone()]);
+            }
+
+            #[tokio::test]
+            async fn forgetting_a_retired_prefix_keeps_the_rest_retired() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                h.reclaim.forget_retired("npm/r").await.unwrap();
+                let keys = vec!["k".to_string()];
+                assert_eq!(h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(), Pinned::Retired);
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use reclaim_contract;

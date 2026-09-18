@@ -35,7 +35,12 @@ use opencargo::ports::policy::{
     VerdictRow,
 };
 use opencargo::ports::permissions::{PermissionStore, RepoRights};
+use opencargo::domain::layout;
 use opencargo::ports::proxy_cache::ProxyCacheStore;
+use opencargo::ports::reclaim::{
+    Candidate, Claim, ClaimToken, PinToken, Pinned, ReclaimStore, Renewal,
+};
+use opencargo::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
 use opencargo::ports::search::{SearchIndex, SearchQuery, SearchScope};
 use opencargo::ports::tokens::{NewToken, TokenStore};
@@ -59,6 +64,7 @@ pub enum PortId {
     Dependencies,
     Vulns,
     Policy,
+    Reclaim,
 }
 
 /// One grant, keyed the way the table is.
@@ -157,6 +163,7 @@ struct State {
     oci_tags: Vec<TagRow>,
     oci_links: Vec<LinkRow>,
     oci_uploads: Vec<UploadRow>,
+    reclaim: ReclaimState,
     next_id: i64,
     next_cache_id: i64,
     /// Queued refusals: a fake that cannot fail only ever proves the happy
@@ -209,6 +216,27 @@ impl FakeDb {
 
     pub fn oci(&self) -> Arc<dyn OciStore> {
         Arc::new(Oci(self.0.clone()))
+    }
+
+    pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {
+        Arc::new(Reclaim(self.0.clone()))
+    }
+
+    pub fn referenced(&self) -> Arc<dyn ReferencedKeys> {
+        Arc::new(Reclaim(self.0.clone()))
+    }
+
+    /// The keys waiting for reclamation, sorted.
+    pub fn candidates(&self) -> Vec<String> {
+        let state = self.0.lock().unwrap();
+        let mut keys: Vec<String> = state
+            .reclaim
+            .candidates
+            .iter()
+            .map(|c| c.key.clone())
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// A blob a push is not being asked to land: the read half's tests want
@@ -456,6 +484,13 @@ impl Repositories {
             updated_at: now,
         };
         state.repositories.push(stored.clone());
+        let incarnation = uuid::Uuid::new_v4().simple().to_string();
+        state.reclaim.incarnations.push((stored.id, incarnation.clone()));
+        let own = std::iter::once(layout::incarnation_prefix(&incarnation));
+        for prefix in own.chain(layout::name_keyed_prefixes(spec.format.as_str(), spec.name)) {
+            state.reclaim.prefixes.retain(|(p, _)| *p != prefix);
+            state.reclaim.prefixes.push((prefix, incarnation.clone()));
+        }
         stored
     }
 }
@@ -526,14 +561,61 @@ impl RepositoryStore for Repositories {
         })
     }
 
-    async fn delete_empty(&self, name: &str) -> Result<(), StoreError> {
+    async fn retire(&self, name: &str, now: DateTime<Utc>) -> Result<Vec<String>, StoreError> {
         self.with(|state| {
-            let repo = found(state, name).ok_or(StoreError::NotFound)?.id;
-            if state.packages.iter().any(|pkg| pkg.repository_id == repo) {
+            let repo = found(state, name).ok_or(StoreError::NotFound)?.clone();
+            if state.packages.iter().any(|pkg| pkg.repository_id == repo.id) {
                 return Err(StoreError::Conflict);
             }
-            state.repositories.retain(|stored| stored.id != repo);
-            Ok(())
+            let held = state
+                .repositories
+                .iter()
+                .any(|r| r.repo_type == "group" && r.members().iter().any(|m| m == name));
+            if held {
+                return Err(StoreError::Conflict);
+            }
+            state.repositories.retain(|stored| stored.id != repo.id);
+            state.grants.retain(|g| g.repository_id != repo.id);
+            state.cache.retain(|e| e.repository_id != repo.id);
+            let Some(at) = state
+                .reclaim
+                .incarnations
+                .iter()
+                .position(|(id, _)| *id == repo.id)
+            else {
+                return Ok(Vec::new());
+            };
+            let (_, incarnation) = state.reclaim.incarnations.remove(at);
+            state.reclaim.retired.push(incarnation.clone());
+            let mut prefixes: Vec<String> = state
+                .reclaim
+                .prefixes
+                .iter()
+                .filter(|(_, i)| *i == incarnation)
+                .map(|(p, _)| p.clone())
+                .collect();
+            prefixes.sort();
+            for prefix in &prefixes {
+                state.reclaim.revoke_under(prefix);
+            }
+            if repo.repo_type == "group" {
+                return Ok(Vec::new());
+            }
+            for prefix in &prefixes {
+                state.reclaim.enqueue(prefix, true, now);
+            }
+            Ok(prefixes)
+        })
+    }
+
+    async fn incarnation(&self, repository: i64) -> Result<Option<String>, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .reclaim
+                .incarnations
+                .iter()
+                .find(|(id, _)| *id == repository)
+                .map(|(_, i)| i.clone()))
         })
     }
 
@@ -924,15 +1006,16 @@ impl PackageStore for Packages {
         })
     }
 
-    async fn delete_version(&self, version: i64) -> Result<(), StoreError> {
+    async fn delete_version(&self, version: i64, now: DateTime<Utc>) -> Result<(), StoreError> {
         self.with(|state| {
             let at = state
                 .versions
                 .iter()
                 .position(|v| v.id == version)
                 .ok_or(StoreError::NotFound)?;
-            state.versions.remove(at);
+            let gone = state.versions.remove(at);
             state.dist_tags.retain(|tag| tag.version_id != version);
+            state.reclaim.enqueue(&gone.tarball_path, false, now);
             Ok(())
         })
     }
@@ -2007,5 +2090,376 @@ impl PolicyStore for Policy {
             state.resolutions.retain(|e| e.row.user_id != Some(user_id));
             Ok((before - state.resolutions.len()) as u64)
         })
+    }
+}
+
+struct PinRow {
+    token: String,
+    physical_key: String,
+    repo_prefix: String,
+    until: DateTime<Utc>,
+}
+
+struct ClaimRow {
+    key: String,
+    token: String,
+    until: DateTime<Utc>,
+}
+
+struct CandidateRow {
+    key: String,
+    prefix: bool,
+    enqueued_at: DateTime<Utc>,
+}
+
+/// Port 22's tables: pins, claims, candidates, claimed generations, and the
+/// incarnations with their prefixes and retired marks.
+#[derive(Default)]
+struct ReclaimState {
+    incarnations: Vec<(i64, String)>,
+    prefixes: Vec<(String, String)>,
+    retired: Vec<String>,
+    pins: Vec<PinRow>,
+    claims: Vec<ClaimRow>,
+    candidates: Vec<CandidateRow>,
+    claimed: Vec<String>,
+}
+
+impl ReclaimState {
+    fn enqueue(&mut self, key: &str, prefix: bool, now: DateTime<Utc>) {
+        match self.candidates.iter_mut().find(|c| c.key == key) {
+            Some(existing) => existing.prefix |= prefix,
+            None => self.candidates.push(CandidateRow {
+                key: key.to_string(),
+                prefix,
+                enqueued_at: now,
+            }),
+        }
+    }
+
+    fn revoke_under(&mut self, prefix: &str) {
+        self.pins
+            .retain(|p| p.repo_prefix != prefix && !layout::under(&p.physical_key, prefix));
+    }
+
+    fn retired_prefix(&self, prefix: &str) -> bool {
+        self.prefixes
+            .iter()
+            .any(|(p, i)| p == prefix && self.retired.contains(i))
+    }
+
+    fn live_prefix(&self, prefix: &str) -> bool {
+        self.prefixes
+            .iter()
+            .any(|(p, i)| p == prefix && !self.retired.contains(i))
+    }
+}
+
+fn cutoff(grace: Duration, now: DateTime<Utc>) -> DateTime<Utc> {
+    now - chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::MAX)
+}
+
+/// What committed rows reference, the list the SQLite adapter's predicate
+/// yields: a key, and whether it covers everything under it.
+fn row_references(state: &State) -> Vec<(String, bool)> {
+    let name = |id: i64| {
+        state
+            .repositories
+            .iter()
+            .find(|r| r.id == id)
+            .map(|r| r.name.clone())
+    };
+    let mut refs: Vec<(String, bool)> = Vec::new();
+    refs.extend(state.versions.iter().map(|v| (v.tarball_path.clone(), false)));
+    refs.extend(
+        state
+            .cache
+            .iter()
+            .filter_map(|e| e.storage_path.clone())
+            .map(|k| (k, false)),
+    );
+    for b in &state.oci_blobs {
+        if let Some(repo) = name(b.repository_id) {
+            let hex = b.digest.trim_start_matches("sha256:");
+            refs.push((format!("oci/{repo}/_blobs/sha256/{hex}"), false));
+        }
+    }
+    for m in &state.oci_manifests {
+        if let Some(repo) = name(m.repository_id) {
+            let hex = m.digest.trim_start_matches("sha256:");
+            let image = &m.name;
+            refs.push((format!("oci/{repo}/{image}/manifests/{image}/sha256/{hex}"), false));
+        }
+    }
+    refs.extend(
+        state
+            .oci_uploads
+            .iter()
+            .map(|u| (format!("oci/_uploads/{}", u.id), true)),
+    );
+    refs
+}
+
+fn references(state: &State, key: &str, prefix: bool) -> bool {
+    row_references(state).iter().any(|(k, covers)| {
+        k == key || (prefix && layout::under(k, key)) || (*covers && layout::under(key, k))
+    })
+}
+
+struct Reclaim(Arc<Mutex<State>>);
+
+impl Reclaim {
+    fn with<T>(
+        &self,
+        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        with(&self.0, PortId::Reclaim, act)
+    }
+}
+
+#[async_trait]
+impl ReclaimStore for Reclaim {
+    async fn pin(
+        &self,
+        repo_prefix: &str,
+        logical_keys: &[String],
+        until: DateTime<Utc>,
+    ) -> Result<Pinned, StoreError> {
+        self.with(|state| {
+            if !state.reclaim.live_prefix(repo_prefix) {
+                return Ok(Pinned::Retired);
+            }
+            let mut tokens = Vec::new();
+            for logical in logical_keys {
+                let stem = layout::physical_key(logical, "");
+                let reusable = row_references(state).into_iter().find(|(k, covers)| {
+                    !covers
+                        && k.strip_prefix(&stem).is_some_and(|g| !g.contains('/'))
+                        && !state.reclaim.claimed.contains(k)
+                });
+                let physical = match reusable {
+                    Some((k, _)) => k,
+                    None => {
+                        layout::physical_key(logical, &uuid::Uuid::new_v4().simple().to_string())
+                    }
+                };
+                let token = uuid::Uuid::new_v4().to_string();
+                state.reclaim.pins.push(PinRow {
+                    token: token.clone(),
+                    physical_key: physical.clone(),
+                    repo_prefix: repo_prefix.to_string(),
+                    until,
+                });
+                tokens.push(PinToken {
+                    token,
+                    logical_key: logical.clone(),
+                    physical_key: physical,
+                });
+            }
+            Ok(Pinned::Tokens(tokens))
+        })
+    }
+
+    async fn enqueue(
+        &self,
+        physical_keys: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.with(|state| {
+            for key in physical_keys {
+                state.reclaim.enqueue(key, false, now);
+            }
+            Ok(())
+        })
+    }
+
+    async fn enqueue_prefix(&self, prefix: &str, now: DateTime<Utc>) -> Result<(), StoreError> {
+        self.with(|state| {
+            state.reclaim.enqueue(prefix, true, now);
+            Ok(())
+        })
+    }
+
+    async fn due(
+        &self,
+        grace: Duration,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<Candidate>, StoreError> {
+        self.with(|state| {
+            let r = &state.reclaim;
+            let mut due: Vec<&CandidateRow> = r
+                .candidates
+                .iter()
+                .filter(|c| {
+                    c.enqueued_at <= cutoff(grace, now) || (c.prefix && r.retired_prefix(&c.key))
+                })
+                .filter(|c| !r.claims.iter().any(|k| k.key == c.key && k.until > now))
+                .collect();
+            due.sort_by(|a, b| (a.enqueued_at, &a.key).cmp(&(b.enqueued_at, &b.key)));
+            Ok(due
+                .into_iter()
+                .take(limit as usize)
+                .map(|c| Candidate {
+                    key: c.key.clone(),
+                    prefix: c.prefix,
+                })
+                .collect())
+        })
+    }
+
+    async fn claim(
+        &self,
+        key: &str,
+        grace: Duration,
+        now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Claim, StoreError> {
+        self.with(|state| {
+            let Some(candidate) = state.reclaim.candidates.iter().find(|c| c.key == key) else {
+                return Ok(Claim::NotDue);
+            };
+            let prefix = candidate.prefix;
+            let retired = prefix && state.reclaim.retired_prefix(key);
+            if !retired && candidate.enqueued_at > cutoff(grace, now) {
+                return Ok(Claim::NotDue);
+            }
+            if state
+                .reclaim
+                .claims
+                .iter()
+                .any(|c| c.key == key && c.until > now)
+            {
+                return Ok(Claim::NotDue);
+            }
+            if references(state, key, prefix) {
+                state.reclaim.candidates.retain(|c| c.key != key);
+                return Ok(Claim::Referenced);
+            }
+            let protected = state.reclaim.pins.iter().any(|p| {
+                p.until > cutoff(grace, now)
+                    && (p.physical_key == key || (prefix && layout::under(&p.physical_key, key)))
+            });
+            if protected && !retired {
+                return Ok(Claim::Pinned);
+            }
+            if prefix {
+                state.reclaim.revoke_under(key);
+            } else {
+                state.reclaim.pins.retain(|p| p.physical_key != key);
+                if !state.reclaim.claimed.iter().any(|c| c == key) {
+                    state.reclaim.claimed.push(key.to_string());
+                }
+            }
+            let token = uuid::Uuid::new_v4().to_string();
+            state.reclaim.claims.retain(|c| c.key != key);
+            state.reclaim.claims.push(ClaimRow {
+                key: key.to_string(),
+                token: token.clone(),
+                until,
+            });
+            Ok(Claim::Claimed(ClaimToken(token)))
+        })
+    }
+
+    async fn renew(
+        &self,
+        token: &ClaimToken,
+        _now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Renewal, StoreError> {
+        self.with(|state| {
+            match state.reclaim.claims.iter_mut().find(|c| c.token == token.0) {
+                Some(claim) => {
+                    claim.until = until;
+                    Ok(Renewal::Renewed)
+                }
+                None => Ok(Renewal::Superseded),
+            }
+        })
+    }
+
+    async fn release(&self, token: &ClaimToken) -> Result<(), StoreError> {
+        self.with(|state| {
+            if let Some(at) = state.reclaim.claims.iter().position(|c| c.token == token.0) {
+                let claim = state.reclaim.claims.remove(at);
+                state.reclaim.candidates.retain(|c| c.key != claim.key);
+            }
+            Ok(())
+        })
+    }
+
+    async fn forget_claimed(&self, physical_key: &str) -> Result<(), StoreError> {
+        self.with(|state| {
+            state.reclaim.claimed.retain(|k| k != physical_key);
+            Ok(())
+        })
+    }
+
+    async fn forget_retired(&self, prefix: &str) -> Result<(), StoreError> {
+        self.with(|state| {
+            let r = &mut state.reclaim;
+            let Some(incarnation) = r
+                .prefixes
+                .iter()
+                .find(|(p, i)| p == prefix && r.retired.contains(i))
+                .map(|(_, i)| i.clone())
+            else {
+                return Ok(());
+            };
+            r.prefixes.retain(|(p, _)| p != prefix);
+            if !r.prefixes.iter().any(|(_, i)| *i == incarnation) {
+                r.retired.retain(|i| *i != incarnation);
+            }
+            Ok(())
+        })
+    }
+
+    async fn prune_pins(
+        &self,
+        grace: Duration,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u64, StoreError> {
+        self.with(|state| {
+            let cut = cutoff(grace, now);
+            let mut dead: Vec<(DateTime<Utc>, String)> = state
+                .reclaim
+                .pins
+                .iter()
+                .filter(|p| p.until <= cut)
+                .map(|p| (p.until, p.token.clone()))
+                .collect();
+            dead.sort();
+            dead.truncate(limit as usize);
+            state
+                .reclaim
+                .pins
+                .retain(|p| !dead.iter().any(|(_, t)| *t == p.token));
+            Ok(dead.len() as u64)
+        })
+    }
+}
+
+impl ReferencedKeys for Reclaim {
+    fn referenced(&self, grace: Duration, now: DateTime<Utc>) -> ReferencedStream {
+        let state = self.0.lock().unwrap();
+        let mut all: Vec<Referenced> = row_references(&state)
+            .into_iter()
+            .map(|(key, prefix)| Referenced { key, prefix })
+            .collect();
+        all.extend(
+            state
+                .reclaim
+                .pins
+                .iter()
+                .filter(|p| p.until > cutoff(grace, now))
+                .map(|p| Referenced {
+                    key: p.physical_key.clone(),
+                    prefix: false,
+                }),
+        );
+        all.sort();
+        Box::pin(futures_util::stream::iter(all.into_iter().map(Ok)))
     }
 }

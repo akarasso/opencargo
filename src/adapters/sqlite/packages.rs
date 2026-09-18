@@ -258,7 +258,15 @@ async fn write_audit(
 async fn purge_version(
     tx: &mut Transaction<'static, Sqlite>,
     version: i64,
+    now: DateTime<Utc>,
 ) -> Result<Result<(), StoreError>, sqlx::Error> {
+    let key: Option<String> = sqlx::query_scalar("SELECT tarball_path FROM versions WHERE id = ?1")
+        .bind(version)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(key) = key else {
+        return Ok(Err(StoreError::NotFound));
+    };
     for table in VERSION_DEPENDENTS {
         sqlx::query(&format!("DELETE FROM {table} WHERE version_id = ?1"))
             .bind(version)
@@ -272,6 +280,7 @@ async fn purge_version(
     if done.rows_affected() == 0 {
         return Ok(Err(StoreError::NotFound));
     }
+    super::reclaim::enqueue_keys(tx, &[key], now).await?;
     Ok(Ok(()))
 }
 
@@ -491,10 +500,10 @@ impl PackageStore for SqlitePackageStore {
         Ok(rows.into_iter().map(StalePrerelease::from).collect())
     }
 
-    async fn delete_version(&self, version: i64) -> Result<(), StoreError> {
+    async fn delete_version(&self, version: i64, now: DateTime<Utc>) -> Result<(), StoreError> {
         immediate(&self.pool, |mut tx| {
             Box::pin(async move {
-                let gone = purge_version(&mut tx, version).await;
+                let gone = purge_version(&mut tx, version, now).await;
                 (tx, gone)
             })
         })

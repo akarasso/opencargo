@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "025"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "025"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "025"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.
@@ -440,4 +440,47 @@ async fn a_failed_rust_step_leaves_no_connection_with_foreign_keys_off() {
     assert!(insert_repository(&pool, "n", "hosted", "nuget")
         .await
         .is_err());
+}
+
+/// 025 alone on a database that predates it: every repository gets one
+/// incarnation and its prefixes, and applying the file twice changes nothing.
+#[tokio::test]
+async fn migration_025_allocates_incarnations_and_legacy_prefixes_once() {
+    let (_tmp, pool) = pool().await;
+    legacy_migrate(&pool).await;
+    insert_repository(&pool, "npm-hosted", "hosted", "npm").await.unwrap();
+    insert_repository(&pool, "oci-proxy", "proxy", "oci").await.unwrap();
+    let file = MIGRATIONS.iter().find(|m| m.id == "025").unwrap();
+    let Step::Sql(sql) = file.step else {
+        unreachable!("025 is a file")
+    };
+    sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+    let incarnations: Vec<String> =
+        sqlx::query_scalar("SELECT incarnation FROM repository_incarnations ORDER BY repository_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(incarnations.len(), 2);
+    assert_ne!(incarnations[0], incarnations[1]);
+    let prefixes: Vec<String> =
+        sqlx::query_scalar("SELECT prefix FROM storage_prefixes WHERE legacy = 1 ORDER BY prefix")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        prefixes,
+        ["_proxy_cache/npm-hosted", "_proxy_cache/oci-proxy", "npm/npm-hosted", "oci/oci-proxy"]
+    );
+
+    sqlx::raw_sql(sql).execute(&pool).await.unwrap();
+    let again: Vec<String> =
+        sqlx::query_scalar("SELECT incarnation FROM repository_incarnations ORDER BY repository_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(again, incarnations, "a second apply is a no-op");
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM storage_prefixes").await, 6);
+
+    let ran = run_all(&pool).await.unwrap();
+    assert_eq!(outcomes(&ran, Outcome::Adopted).last(), Some(&"025"), "its sentinel is there");
 }

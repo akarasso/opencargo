@@ -2,10 +2,12 @@
 //! addressed to, and the row the resolver, the permission matrix and the
 //! proxy cache all hang off.
 //!
-//! One method is coarse. `delete_empty` refuses while packages or group
-//! memberships remain and then removes the row, its grants and its cache
-//! rows together, because a repository whose grants outlived it would hand
-//! the next repository of that name someone else's readers.
+//! Two methods are coarse. `create` allocates the repository's opaque
+//! incarnation, the owner of every new key it writes. `retire` refuses
+//! while packages or group memberships remain, then removes the row, its
+//! grants and its cache rows, marks the incarnation retired and enqueues its
+//! prefixes for reclamation, together: a repository whose grants outlived it
+//! would hand the next repository of that name someone else's readers.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -62,17 +64,17 @@ pub trait RepositoryStore: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<Repository, StoreError>;
 
-    /// The row, its grants and its proxy-cache rows in one transaction.
+    /// The row, its grants and its proxy-cache rows, the incarnation's
+    /// retired mark, the revocation of every pin under its prefixes and the
+    /// enqueue of those prefixes, in one transaction. Answers the prefixes
+    /// enqueued (none for a group). The name is free from this commit.
     ///
-    /// `Conflict` while any package remains — today's 409, and the reason the
-    /// method is coarse: the schema declares no cascade from `packages`, so a
-    /// bare `DELETE` is a foreign-key failure rather than a refusal the
-    /// caller can act on. Group memberships are the application's check, not
-    /// this one's: they live in other repositories' `config_json`.
-    ///
-    /// Purging the cached *files* is the caller's, after the commit: a store
-    /// method touches nothing but the database.
-    async fn delete_empty(&self, name: &str) -> Result<(), StoreError>;
+    /// `Conflict` while any package remains or a group lists it, both
+    /// re-checked inside the transaction. Nothing is deleted from storage.
+    async fn retire(&self, name: &str, now: DateTime<Utc>) -> Result<Vec<String>, StoreError>;
+
+    /// The opaque incarnation every new key of the repository lies under.
+    async fn incarnation(&self, repository: i64) -> Result<Option<String>, StoreError>;
 
     /// Insert the configured repositories, skipping the names already there:
     /// the config file seeds a deployment, it does not own it afterwards.

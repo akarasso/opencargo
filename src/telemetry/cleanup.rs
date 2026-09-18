@@ -95,7 +95,7 @@ impl RunCleanup<'_> {
         let mut stats = CleanupStats::default();
 
         if let Some(days) = config.prerelease_older_than_days.filter(|_| config.enabled) {
-            match sweep_prereleases(self.packages, self.storage, days, now).await {
+            match sweep_prereleases(self.packages, days, now).await {
                 Ok(deleted) => stats.prereleases = Some(deleted),
                 Err(e) => error!(error = %e, "Failed to clean up old pre-release versions"),
             }
@@ -121,12 +121,10 @@ impl RunCleanup<'_> {
     }
 }
 
-/// Drop the pre-release versions past their retention, artifact first: the
-/// version row carries the only record of its path, so losing the row first
-/// would strand the file with nothing left pointing at it.
+/// Drop the pre-release versions past their retention. Each delete enqueues
+/// its artifact in its own transaction and deletes nothing (A1 C5bis N1).
 pub(crate) async fn sweep_prereleases(
     packages: &dyn PackageStore,
-    storage: &Arc<dyn StorageBackend>,
     older_than_days: u64,
     now: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
@@ -140,15 +138,7 @@ pub(crate) async fn sweep_prereleases(
 
     info!(count = stale.len(), "Cleaning up old pre-release versions");
     for row in &stale {
-        if let Err(e) = storage.delete(&row.tarball_path).await {
-            warn!(
-                version_id = row.id,
-                path = %row.tarball_path,
-                error = %e,
-                "Failed to delete tarball for pre-release version"
-            );
-        }
-        packages.delete_version(row.id).await?;
+        packages.delete_version(row.id, now).await?;
         info!(
             package = %row.package,
             version = %row.version,
@@ -211,6 +201,7 @@ mod tests {
         cache: Arc<dyn ProxyCacheStore>,
         policy: Arc<dyn PolicyStore>,
         storage: Arc<dyn StorageBackend>,
+        fakes: FakeDb,
         /// The seeded repositories: a hosted npm one, a hosted go one, and
         /// the npm proxy whose answers the cache rows belong to.
         npm: i64,
@@ -248,6 +239,7 @@ mod tests {
             packages: db.packages(),
             cache: db.proxy_cache(),
             policy: db.policy(),
+            fakes: db,
             _tmp: tmp,
             npm: ids[0],
             go: ids[1],
@@ -409,7 +401,7 @@ mod tests {
         fx.publish(fx.go, "gomod", "v0.0.0-20200101000000-abcdef", days_ago(10))
             .await;
 
-        let deleted = sweep_prereleases(fx.packages.as_ref(), &fx.storage, 0, now())
+        let deleted = sweep_prereleases(fx.packages.as_ref(), 0, now())
             .await
             .unwrap();
 
@@ -420,8 +412,13 @@ mod tests {
             "the npm pre-release goes, and its dist-tag with it"
         );
         assert!(
-            fx.storage.stat("npmpkg/1.0.0-beta.tgz").await.unwrap().is_none(),
-            "the artifact goes before the row that names it"
+            fx.storage.stat("npmpkg/1.0.0-beta.tgz").await.unwrap().is_some(),
+            "delete_version deletes nothing"
+        );
+        assert_eq!(
+            fx.fakes.candidates(),
+            vec!["npmpkg/1.0.0-beta.tgz".to_string()],
+            "its artifact is enqueued for reclamation"
         );
         assert_eq!(
             fx.left(fx.go, "gomod").await,
@@ -437,7 +434,7 @@ mod tests {
         let fx = fixture().await;
         fx.publish(fx.npm, "npmpkg", "1.0.0-beta", days_ago(29)).await;
 
-        let deleted = sweep_prereleases(fx.packages.as_ref(), &fx.storage, 30, now())
+        let deleted = sweep_prereleases(fx.packages.as_ref(), 30, now())
             .await
             .unwrap();
 

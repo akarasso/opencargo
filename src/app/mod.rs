@@ -48,6 +48,7 @@ pub mod permissions;
 pub mod promote;
 pub mod publish;
 pub mod publish_tail;
+pub mod reclaim;
 pub mod releases;
 pub mod repo_spec;
 pub mod repositories;

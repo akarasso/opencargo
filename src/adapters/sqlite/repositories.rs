@@ -1,15 +1,18 @@
 //! `RepositoryStore` over SQLite.
 //!
-//! `delete_empty` is the one transaction here. `proxy_cache_entries` and the
-//! grants cascade through their foreign keys; `proxy_cache_meta` (declared
-//! before the tree used `ON DELETE CASCADE`) does not, so it goes explicitly.
+//! `create` and `retire` are the transactions here. `create` allocates the
+//! incarnation and records its prefixes; `retire` re-checks both conflicts,
+//! removes the row (grants and cache entries cascade, `proxy_cache_meta`
+//! goes explicitly), marks the incarnation retired, revokes every pin under
+//! its prefixes and enqueues them, all in one transaction.
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use super::{bind_ts, immediate, store_error, Tx};
+use super::{bind_ts, immediate, reclaim, store_error, Tx};
 use crate::adapters::sqlite::rows::RepositoryRow;
+use crate::domain::layout;
 use crate::domain::{RepoSpec, Repository};
 use crate::error::StoreError;
 use crate::ports::repositories::{RepoPatch, RepositoryStore};
@@ -47,20 +50,84 @@ fn decode(
         .collect()
 }
 
-/// The conflict check, the cache rows the schema does not cascade, and the
-/// row itself.
-async fn drop_empty(
+/// The repository row, its incarnation and the prefixes its bytes live
+/// under: the incarnation's own, and the name-keyed ones writers still use.
+async fn insert(
+    tx: &mut Tx,
+    spec: &RepoSpec<'_>,
+    now: DateTime<Utc>,
+) -> Result<RepositoryRow, sqlx::Error> {
+    let row: RepositoryRow = sqlx::query_as(&format!(
+        "INSERT INTO repositories
+             (name, repo_type, format, visibility, upstream_url, config_json,
+              created_at, updated_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) RETURNING {COLUMNS}"
+    ))
+    .bind(spec.name)
+    .bind(spec.kind.as_str())
+    .bind(spec.format.as_str())
+    .bind(spec.visibility.as_str())
+    .bind(spec.upstream)
+    .bind(spec.config().map(|config| config.to_json()))
+    .bind(bind_ts(now))
+    .fetch_one(&mut **tx)
+    .await?;
+    let incarnation = uuid::Uuid::new_v4().simple().to_string();
+    sqlx::query("INSERT INTO repository_incarnations (repository_id, incarnation) VALUES (?1, ?2)")
+        .bind(row.id)
+        .bind(&incarnation)
+        .execute(&mut **tx)
+        .await?;
+    let own = std::iter::once((layout::incarnation_prefix(&incarnation), 0));
+    let legacy = layout::name_keyed_prefixes(spec.format.as_str(), spec.name)
+        .into_iter()
+        .map(|p| (p, 1));
+    for (prefix, legacy) in own.chain(legacy) {
+        sqlx::query(
+            "INSERT INTO storage_prefixes (prefix, incarnation, legacy) VALUES (?1, ?2, ?3)
+             ON CONFLICT(prefix) DO UPDATE SET incarnation = excluded.incarnation,
+                                               legacy = excluded.legacy",
+        )
+        .bind(&prefix)
+        .bind(&incarnation)
+        .bind(legacy)
+        .execute(&mut **tx)
+        .await?;
+    }
+    Ok(row)
+}
+
+/// The groups listing `name` as a member, read inside the transaction.
+async fn holders(tx: &mut Tx, name: &str) -> Result<Result<Vec<String>, StoreError>, sqlx::Error> {
+    let rows: Vec<RepositoryRow> = sqlx::query_as(&format!(
+        "SELECT {COLUMNS} FROM repositories WHERE repo_type = 'group'"
+    ))
+    .fetch_all(&mut **tx)
+    .await?;
+    let groups = match decode(rows.into_iter()) {
+        Ok(groups) => groups,
+        Err(err) => return Ok(Err(err)),
+    };
+    Ok(Ok(groups
+        .into_iter()
+        .filter(|g| g.members().iter().any(|m| m == name))
+        .map(|g| g.name)
+        .collect()))
+}
+
+async fn retire_row(
     tx: &mut Tx,
     name: &str,
-) -> Result<Result<(), StoreError>, sqlx::Error> {
-    let repo: Option<i64> = sqlx::query_scalar("SELECT id FROM repositories WHERE name = ?1")
-        .bind(name)
-        .fetch_optional(&mut **tx)
-        .await?;
-    let Some(repo) = repo else {
+    now: DateTime<Utc>,
+) -> Result<Result<Vec<String>, StoreError>, sqlx::Error> {
+    let repo: Option<(i64, String)> =
+        sqlx::query_as("SELECT id, repo_type FROM repositories WHERE name = ?1")
+            .bind(name)
+            .fetch_optional(&mut **tx)
+            .await?;
+    let Some((repo, kind)) = repo else {
         return Ok(Err(StoreError::NotFound));
     };
-
     let packages: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = ?1")
             .bind(repo)
@@ -69,6 +136,17 @@ async fn drop_empty(
     if packages > 0 {
         return Ok(Err(StoreError::Conflict));
     }
+    match holders(tx, name).await? {
+        Ok(groups) if groups.is_empty() => {}
+        Ok(_) => return Ok(Err(StoreError::Conflict)),
+        Err(err) => return Ok(Err(err)),
+    }
+    let incarnation: Option<String> = sqlx::query_scalar(
+        "SELECT incarnation FROM repository_incarnations WHERE repository_id = ?1",
+    )
+    .bind(repo)
+    .fetch_optional(&mut **tx)
+    .await?;
 
     sqlx::query("DELETE FROM proxy_cache_meta WHERE repository_id = ?1")
         .bind(repo)
@@ -78,7 +156,33 @@ async fn drop_empty(
         .bind(repo)
         .execute(&mut **tx)
         .await?;
-    Ok(Ok(()))
+
+    let Some(incarnation) = incarnation else {
+        return Ok(Ok(Vec::new()));
+    };
+    sqlx::query(
+        "INSERT INTO retired_incarnations (incarnation, retired_at) VALUES (?1, ?2)
+         ON CONFLICT(incarnation) DO NOTHING",
+    )
+    .bind(&incarnation)
+    .bind(bind_ts(now))
+    .execute(&mut **tx)
+    .await?;
+    let prefixes: Vec<String> =
+        sqlx::query_scalar("SELECT prefix FROM storage_prefixes WHERE incarnation = ?1 ORDER BY prefix")
+            .bind(&incarnation)
+            .fetch_all(&mut **tx)
+            .await?;
+    for prefix in &prefixes {
+        reclaim::revoke_under(tx, prefix).await?;
+    }
+    if kind == "group" {
+        return Ok(Ok(Vec::new()));
+    }
+    for prefix in &prefixes {
+        reclaim::enqueue_prefix(tx, prefix, now).await?;
+    }
+    Ok(Ok(prefixes))
 }
 
 #[async_trait]
@@ -120,22 +224,13 @@ impl RepositoryStore for SqliteRepositoryStore {
         spec: &RepoSpec<'_>,
         now: DateTime<Utc>,
     ) -> Result<Repository, StoreError> {
-        let row: RepositoryRow = sqlx::query_as(&format!(
-            "INSERT INTO repositories
-                 (name, repo_type, format, visibility, upstream_url, config_json,
-                  created_at, updated_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7) RETURNING {COLUMNS}"
-        ))
-        .bind(spec.name)
-        .bind(spec.kind.as_str())
-        .bind(spec.format.as_str())
-        .bind(spec.visibility.as_str())
-        .bind(spec.upstream)
-        .bind(spec.config().map(|config| config.to_json()))
-        .bind(bind_ts(now))
-        .fetch_one(&self.pool)
-        .await
-        .map_err(store_error)?;
+        let row = immediate(&self.pool, |mut tx| {
+            Box::pin(async move {
+                let row = insert(&mut tx, spec, now).await.map(Ok);
+                (tx, row)
+            })
+        })
+        .await?;
         decode(std::iter::once(row))?
             .pop()
             .ok_or(StoreError::NotFound)
@@ -170,14 +265,24 @@ impl RepositoryStore for SqliteRepositoryStore {
         self.row(name).await?.ok_or(StoreError::NotFound)
     }
 
-    async fn delete_empty(&self, name: &str) -> Result<(), StoreError> {
+    async fn retire(&self, name: &str, now: DateTime<Utc>) -> Result<Vec<String>, StoreError> {
         immediate(&self.pool, |mut tx| {
             Box::pin(async move {
-                let dropped = drop_empty(&mut tx, name).await;
-                (tx, dropped)
+                let retired = retire_row(&mut tx, name, now).await;
+                (tx, retired)
             })
         })
         .await
+    }
+
+    async fn incarnation(&self, repository: i64) -> Result<Option<String>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT incarnation FROM repository_incarnations WHERE repository_id = ?1",
+        )
+        .bind(repository)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(store_error)
     }
 
     async fn ensure_seeded(
@@ -186,22 +291,25 @@ impl RepositoryStore for SqliteRepositoryStore {
         now: DateTime<Utc>,
     ) -> Result<(), StoreError> {
         for spec in specs {
-            sqlx::query(
-                "INSERT OR IGNORE INTO repositories
-                     (name, repo_type, format, visibility, upstream_url, config_json,
-                      created_at, updated_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
-            )
-            .bind(spec.name)
-            .bind(spec.kind.as_str())
-            .bind(spec.format.as_str())
-            .bind(spec.visibility.as_str())
-            .bind(spec.upstream)
-            .bind(spec.config().map(|config| config.to_json()))
-            .bind(bind_ts(now))
-            .execute(&self.pool)
-            .await
-            .map_err(store_error)?;
+            immediate(&self.pool, |mut tx| {
+                Box::pin(async move {
+                    let done = async {
+                        let present: bool = sqlx::query_scalar(
+                            "SELECT EXISTS (SELECT 1 FROM repositories WHERE name = ?1)",
+                        )
+                        .bind(spec.name)
+                        .fetch_one(&mut *tx)
+                        .await?;
+                        if !present {
+                            insert(&mut tx, spec, now).await?;
+                        }
+                        Ok(Ok(()))
+                    }
+                    .await;
+                    (tx, done)
+                })
+            })
+            .await?;
         }
         Ok(())
     }

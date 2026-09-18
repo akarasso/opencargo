@@ -4,6 +4,8 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -69,6 +71,7 @@ pub async fn create_repository(
     let members = body.members.unwrap_or_default();
 
     let repo = CreateRepository::new(state.repos.clone(), state.audit.clone(), state.events.clone())
+        .guarding(state.storage.clone())
         .run(
             &RepoSpec {
                 name: &body.name,
@@ -156,7 +159,7 @@ pub async fn delete_repository(
         state.repos.clone(),
         state.audit.clone(),
         state.events.clone(),
-        state.proxy.clone(),
+        Arc::new(state.reclaim_orphans()),
     )
     .run(&name, &actor(&caller), chrono::Utc::now())
     .await?;

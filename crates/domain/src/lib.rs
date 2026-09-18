@@ -6,6 +6,7 @@ pub mod error;
 pub mod events;
 pub mod format_rules;
 pub mod kinds;
+pub mod layout;
 pub mod names;
 pub mod permission;
 pub mod policy;

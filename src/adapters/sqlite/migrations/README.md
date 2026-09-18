@@ -42,6 +42,9 @@ checksum in the same commit.
 | 021 | - | sso.md (sso) | - |
 | 022 | - | ha-options.md (server_leases) | - |
 | 023 | - | mcp-governance.md (mcp, reusing 020's rebuild) | - |
+| 024 | - | maven.md (maven format, through the shared rebuild helper) | - |
+| 025 | 025_reclaim.sql | s3.md S2r (reclamation, incarnations, retired prefixes) | aec372d3addae7af66c944632d4296f5041b659c5971a5f97569eef8aa8f2654 |
 
-`maven.md` gets no id: it reuses `020`'s rebuild. The Postgres side of this
-directory is `src/adapters/postgres/migrations/`, and it is empty.
+Ids from 018 on are order-independent: none reads or alters a table another
+of them creates, and `025` ships before `018`-`024`. The Postgres side of
+this directory is `src/adapters/postgres/migrations/`, and it is empty.

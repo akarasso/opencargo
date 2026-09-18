@@ -176,10 +176,9 @@ pub trait PackageStore: Send + Sync {
     /// it is gone. None of those four foreign keys cascades, so the deletion
     /// is this method's to perform and not the schema's.
     ///
-    /// The artifact is deliberately not part of it: the caller deletes the
-    /// blob *before* calling, because the version row holds the only record
-    /// of its path, and no store method is allowed to touch storage.
-    async fn delete_version(&self, version: i64) -> Result<(), StoreError>;
+    /// The artifact's key is enqueued for reclamation in the same
+    /// transaction; nothing is deleted from storage (A1 C5bis N1).
+    async fn delete_version(&self, version: i64, now: DateTime<Utc>) -> Result<(), StoreError>;
 
     /// One more download of a version, as a counter rather than a row per
     /// download. Best-effort at every call site: a served artifact is not

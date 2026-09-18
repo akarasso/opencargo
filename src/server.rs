@@ -20,6 +20,9 @@ use tracing::{info, warn};
 use crate::adapters::sqlite::SqliteStores;
 use crate::app::events::Announce;
 use crate::app::publish_tail::{PublishGate, PublishTail};
+use crate::app::reclaim::{ReclaimOrphans, ReclaimPolicy};
+use crate::ports::reclaim::ReclaimStore;
+use crate::ports::referenced::ReferencedKeys;
 use crate::app::authenticate::{Authenticate, AuthenticateDeps, OpenGate, Refusal};
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::ports::secrets::ServerSecretStore;
@@ -87,6 +90,8 @@ pub struct AppState {
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
     pub oci: Arc<dyn OciStore>,
+    pub reclaim: Arc<dyn ReclaimStore>,
+    pub referenced: Arc<dyn ReferencedKeys>,
     pub audit: Arc<dyn AuditStore>,
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
@@ -122,6 +127,16 @@ impl AppState {
             self.webhook_dispatcher.clone(),
             self.vuln_scanner.clone(),
             self.vulns.clone(),
+        )
+    }
+
+    /// The only deleter of shared keys, over this state's stores.
+    pub fn reclaim_orphans(&self) -> ReclaimOrphans {
+        ReclaimOrphans::new(
+            self.reclaim.clone(),
+            self.referenced.clone(),
+            self.storage.clone(),
+            ReclaimPolicy::default(),
         )
     }
 
@@ -294,6 +309,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         packages: stores.packages(),
         search: stores.search(),
         oci: stores.oci(),
+        reclaim: stores.reclaim(),
+        referenced: stores.referenced(),
         audit: stores.audit(),
         deps: stores.dependencies(),
         vulns: stores.vulns(),

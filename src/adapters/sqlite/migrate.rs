@@ -134,6 +134,11 @@ pub const MIGRATIONS: &[Migration] = &[
         "017_storage_multipart.sql",
         Sentinel::Object("idx_storage_multipart_touched")
     ),
+    sql_migration!(
+        "025",
+        "025_reclaim.sql",
+        Sentinel::Object("idx_reclaim_candidates_enqueued")
+    ),
 ];
 
 /// Bring a database up to date with every migration this binary carries.
