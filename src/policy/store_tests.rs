@@ -3,7 +3,7 @@ use std::str::FromStr;
 use sqlx::sqlite::SqliteConnectOptions;
 
 use super::*;
-use crate::proxy::engine::fixture::Fx;
+use crate::testing::fixture::Fx;
 
 /// The fixture's database with foreign keys off: a verdict left
 /// behind by a cascade shows.

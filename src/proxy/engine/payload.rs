@@ -8,7 +8,7 @@ use sha2::{Digest, Sha256};
 use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
-use crate::db::proxy_cache::CacheEntry;
+use crate::domain::CacheEntry;
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::{CacheRepo, Outcome};
 use crate::storage::{StorageBackend, StorageError};

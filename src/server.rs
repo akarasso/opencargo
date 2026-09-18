@@ -23,6 +23,7 @@ use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
+use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::webhooks::{NewWebhook, WebhookStore};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
 use crate::storage::StorageBackend;
@@ -45,6 +46,9 @@ const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 pub struct AppState {
     pub db: SqlitePool,
     pub storage: Arc<dyn StorageBackend>,
+    /// What the proxy remembers; the engine holds it too, and the background
+    /// sweep needs it without going through the engine.
+    pub cache: Arc<dyn ProxyCacheStore>,
     pub auth: Arc<AuthState>,
     pub proxy: ProxyEngine,
     /// Per-repository upstream credentials, keyed by name; a missing key is the default.
@@ -75,6 +79,13 @@ pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
 /// Bring an open pool's schema up to date. The composition root is the only
 /// place that names the SQLite adapter, so everything else — the server, the
 /// subcommand, the temp-database fixtures — comes through here.
+/// The proxy cache store over an open pool. Like `migrate` above, it exists
+/// so the fixtures reach the adapter through the composition root instead of
+/// naming it themselves.
+pub fn proxy_cache_store(db: &SqlitePool) -> Arc<dyn ProxyCacheStore> {
+    crate::adapters::sqlite::SqliteStores::new(db.clone()).proxy_cache()
+}
+
 pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
     crate::adapters::sqlite::migrate::run_all(db).await?;
     Ok(())
@@ -182,9 +193,10 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         default_secs: parse_duration_secs(&config.proxy.default_ttl),
         negative_secs: parse_duration_secs(&config.proxy.negative_cache_ttl),
     };
+    let cache = proxy_cache_store(&db);
     let proxy = ProxyEngine::new(
         storage.clone(),
-        db.clone(),
+        cache.clone(),
         Timeouts::from_connect_secs(connect_timeout_secs),
         ttl,
     );
@@ -221,6 +233,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     Ok(AppState {
         db,
         storage,
+        cache,
         auth,
         proxy,
         upstream_auth,

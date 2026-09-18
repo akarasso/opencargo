@@ -12,3 +12,10 @@
 #[cfg(test)]
 #[path = "../tests/common/fakes.rs"]
 pub mod fakes;
+
+/// The proxy-engine fixture: a temp database, a fake upstream and a storage
+/// root. It lives here rather than under `src/proxy/` because four other
+/// modules build their engine and their pool out of it, and because the proxy
+/// itself no longer knows what a pool is.
+#[cfg(test)]
+pub mod fixture;

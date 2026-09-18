@@ -1,15 +1,21 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 use tracing::{error, info, warn};
 
 use crate::config::CleanupConfig;
-use crate::db::proxy_cache;
+use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::storage::StorageBackend;
 
 /// Abandoned `*.part-*` files older than this are reclaimed by the sweep.
 const STALE_PART_AGE: Duration = Duration::from_secs(3600);
+
+/// How many cache rows one sweep may evict. A daily pass over a cache with
+/// more expired rows than this comes back the next day for the rest, which is
+/// the point: the sweep never holds an unbounded result set.
+const SWEEP_LIMIT: u32 = 10_000;
 
 #[derive(Debug, Default, PartialEq, Eq)]
 pub(crate) struct SweepStats {
@@ -46,6 +52,7 @@ pub(crate) fn sweeps_configured(config: &CleanupConfig) -> bool {
 /// their bound is set.
 pub async fn start_cleanup_task(
     db: SqlitePool,
+    cache: Arc<dyn ProxyCacheStore>,
     storage: Arc<dyn StorageBackend>,
     config: CleanupConfig,
 ) {
@@ -58,13 +65,14 @@ pub async fn start_cleanup_task(
     loop {
         // Run first, THEN sleep: a service restarted more often than daily
         // (common under k8s) would otherwise never clean up at all.
-        run_cleanup(&db, &storage, &config).await;
+        run_cleanup(&db, cache.as_ref(), &storage, &config).await;
         tokio::time::sleep(Duration::from_secs(86400)).await;
     }
 }
 
 pub(crate) async fn run_cleanup(
     db: &SqlitePool,
+    cache: &dyn ProxyCacheStore,
     storage: &Arc<dyn StorageBackend>,
     config: &CleanupConfig,
 ) -> CleanupStats {
@@ -79,7 +87,7 @@ pub(crate) async fn run_cleanup(
     }
 
     if let Some(days) = proxy_idle_days(config) {
-        match sweep_proxy_cache(db, storage, days).await {
+        match sweep_proxy_cache(cache, storage, days, Utc::now()).await {
             Ok(sweep) => stats.proxy = Some(sweep),
             Err(e) => error!(error = %e, "Failed to sweep the proxy cache"),
         }
@@ -178,22 +186,21 @@ async fn cleanup_old_prereleases(
 /// Evict expired negative entries and every row idle for `idle_days`, file
 /// first, then row; then reclaim abandoned part files.
 pub(crate) async fn sweep_proxy_cache(
-    db: &SqlitePool,
+    cache: &dyn ProxyCacheStore,
     storage: &Arc<dyn StorageBackend>,
     idle_days: u64,
+    now: DateTime<Utc>,
 ) -> anyhow::Result<SweepStats> {
     let mut stats = SweepStats::default();
-    for row in proxy_cache::evictable_entries(db, idle_days).await? {
+    let idle = Duration::from_secs(idle_days * 86_400);
+    for row in cache.evictable(idle, now, SWEEP_LIMIT).await? {
         if let Some(path) = &row.storage_path {
             match storage.delete(path).await {
                 Ok(()) => stats.files += 1,
                 Err(e) => warn!(path, error = %e, "Failed to delete an evicted cache file"),
             }
         }
-        sqlx::query("DELETE FROM proxy_cache_entries WHERE id = ?1")
-            .bind(row.id)
-            .execute(db)
-            .await?;
+        cache.delete(row.id).await?;
         stats.rows += 1;
     }
     stats.parts = storage
@@ -219,12 +226,27 @@ struct PrereleaseRow {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::proxy_cache::NewEntry;
+    use chrono::TimeZone;
+
+    use crate::domain::NewEntry;
 
     struct Fx {
         _tmp: tempfile::TempDir,
         pool: SqlitePool,
+        cache: Arc<dyn ProxyCacheStore>,
         storage: Arc<dyn StorageBackend>,
+    }
+
+    /// The instant the sweeps run at; every row is written relative to it, so
+    /// no test sleeps and none asks the database what time it is. It is in
+    /// the past, because the two `run_cleanup` cases below sweep at the real
+    /// clock and must still see an aged row as aged.
+    fn now() -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 1, 2, 12, 0, 0).unwrap()
+    }
+
+    fn days_ago(n: i64) -> DateTime<Utc> {
+        now() - chrono::TimeDelta::days(n)
     }
 
     async fn fixture() -> Fx {
@@ -241,9 +263,11 @@ mod tests {
         .await
         .unwrap();
         let storage = crate::storage::filesystem(tmp.path().join("storage"));
+        let cache = crate::server::proxy_cache_store(&pool);
         Fx {
             _tmp: tmp,
             pool,
+            cache,
             storage,
         }
     }
@@ -256,44 +280,38 @@ mod tests {
                 .unwrap();
         }
 
-        async fn entry(&self, kind: &str, key: &str, status: i64, ttl: Option<u64>) -> i64 {
+        /// A row as it would have been written at `at`: what the caller's
+        /// clock puts in `fetched_at`, `last_used_at` and the expiry.
+        async fn entry(
+            &self,
+            kind: &str,
+            key: &str,
+            status: i64,
+            ttl: Option<u64>,
+            at: DateTime<Utc>,
+        ) {
             let path = format!("_proxy_cache/p/{kind}/{key}");
             if status == 200 {
                 self.put(&path).await;
             }
-            proxy_cache::upsert_entry(
-                &self.pool,
-                &NewEntry {
-                    repository_id: 3,
-                    kind,
-                    cache_key: key,
-                    status,
-                    storage_path: (status == 200).then_some(path.as_str()),
-                    content_type: None,
-                    etag: None,
-                    digest: None,
-                    size: 6,
-                    ttl_secs: ttl,
-                },
-            )
-            .await
-            .unwrap();
-            proxy_cache::get_entry(&self.pool, 3, kind, key)
+            self.cache
+                .upsert(
+                    &NewEntry {
+                        repository_id: 3,
+                        kind,
+                        cache_key: key,
+                        status,
+                        storage_path: (status == 200).then_some(path.as_str()),
+                        content_type: None,
+                        etag: None,
+                        digest: None,
+                        size: 6,
+                        ttl_secs: ttl,
+                    },
+                    at,
+                )
                 .await
-                .unwrap()
-                .unwrap()
-                .0
-                .id
-        }
-
-        async fn set(&self, id: i64, column: &str, value: &str) {
-            sqlx::query(&format!(
-                "UPDATE proxy_cache_entries SET {column} = {value} WHERE id = ?1"
-            ))
-            .bind(id)
-            .execute(&self.pool)
-            .await
-            .unwrap();
+                .unwrap();
         }
 
         async fn keys(&self) -> Vec<String> {
@@ -346,15 +364,17 @@ mod tests {
     #[tokio::test]
     async fn sweep_evicts_idle_immutable_and_expired_negatives_keeps_stale_positive() {
         let fx = fixture().await;
-        let idle = fx.entry("npm-tarball", "idle", 200, None).await;
-        fx.set(idle, "last_used_at", "datetime('now', '-31 days')").await;
-        let negative = fx.entry("npm-metadata", "gone", 404, Some(60)).await;
-        fx.set(negative, "expires_at", "datetime('now', '-1 second')").await;
-        let stale = fx.entry("npm-metadata", "stale", 200, Some(60)).await;
-        fx.set(stale, "expires_at", "datetime('now', '-1 second')").await;
-        fx.entry("npm-metadata", "fresh-negative", 404, Some(60)).await;
+        fx.entry("npm-tarball", "idle", 200, None, days_ago(31)).await;
+        fx.entry("npm-metadata", "gone", 404, Some(60), days_ago(1))
+            .await;
+        fx.entry("npm-metadata", "stale", 200, Some(60), days_ago(1))
+            .await;
+        fx.entry("npm-metadata", "fresh-negative", 404, Some(60), now())
+            .await;
 
-        let stats = sweep_proxy_cache(&fx.pool, &fx.storage, 30).await.unwrap();
+        let stats = sweep_proxy_cache(fx.cache.as_ref(), &fx.storage, 30, now())
+            .await
+            .unwrap();
 
         assert_eq!(
             stats,
@@ -384,7 +404,9 @@ mod tests {
             .set_modified(two_hours_ago)
             .unwrap();
 
-        let stats = sweep_proxy_cache(&fx.pool, &fx.storage, 30).await.unwrap();
+        let stats = sweep_proxy_cache(fx.cache.as_ref(), &fx.storage, 30, now())
+            .await
+            .unwrap();
 
         assert_eq!(stats.parts, 1);
         assert!(!old.exists(), "an hour-old part is reclaimed");
@@ -395,8 +417,7 @@ mod tests {
     #[tokio::test]
     async fn run_cleanup_with_enabled_false_still_sweeps_proxy() {
         let fx = fixture().await;
-        let idle = fx.entry("npm-tarball", "idle", 200, None).await;
-        fx.set(idle, "last_used_at", "datetime('now', '-31 days')").await;
+        fx.entry("npm-tarball", "idle", 200, None, days_ago(31)).await;
         sqlx::query("INSERT INTO packages (repository_id, name) VALUES (1,'npmpkg')")
             .execute(&fx.pool)
             .await
@@ -415,7 +436,7 @@ mod tests {
             policy_report_older_than_days: None,
         };
 
-        let stats = run_cleanup(&fx.pool, &fx.storage, &config).await;
+        let stats = run_cleanup(&fx.pool, fx.cache.as_ref(), &fx.storage, &config).await;
 
         assert_eq!(stats.prereleases, None, "pre-release sweep needs enabled");
         assert_eq!(stats.proxy.map(|s| s.rows), Some(1));
@@ -430,7 +451,7 @@ mod tests {
             proxy_cache_older_than_days: Some(0),
             ..config
         };
-        let stats = run_cleanup(&fx.pool, &fx.storage, &disabled).await;
+        let stats = run_cleanup(&fx.pool, fx.cache.as_ref(), &fx.storage, &disabled).await;
         assert!(stats.prereleases.is_none() && stats.proxy.is_none() && stats.policy.is_none());
     }
 
@@ -507,7 +528,7 @@ mod tests {
             policy_report_older_than_days: Some(30),
         };
 
-        let stats = run_cleanup(&fx.pool, &fx.storage, &config).await;
+        let stats = run_cleanup(&fx.pool, fx.cache.as_ref(), &fx.storage, &config).await;
 
         assert_eq!(stats.policy, Some(2));
         assert!(stats.prereleases.is_none() && stats.proxy.is_none());
@@ -518,7 +539,7 @@ mod tests {
             policy_report_older_than_days: Some(0),
             ..config
         };
-        let stats = run_cleanup(&fx.pool, &fx.storage, &off).await;
+        let stats = run_cleanup(&fx.pool, fx.cache.as_ref(), &fx.storage, &off).await;
         assert_eq!(stats.policy, None);
         assert_eq!(fx.policy_names().await.len(), 2);
     }

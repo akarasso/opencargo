@@ -9,7 +9,6 @@ use crate::error::AppResult;
 
 pub mod kinds;
 pub mod oci;
-pub mod proxy_cache;
 
 // ---------------------------------------------------------------------------
 // Row types
@@ -95,6 +94,14 @@ pub fn parse_ts(stored: &str) -> Option<DateTime<Utc>> {
 /// `'T'` sorts above `' '`, so an RFC 3339 write would mis-evaluate every
 /// legacy row.
 const TS_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+/// The one spelling every statement binds, so no column default ever fires
+/// and every row carries the caller's clock. It lives beside `parse_ts`, its
+/// inverse, until the last free function here has become a store and the
+/// whole codec moves into the SQLite adapter with them.
+pub fn bind_ts(at: DateTime<Utc>) -> String {
+    at.format(TS_FORMAT).to_string()
+}
 
 fn ts(subject: &str, column: &'static str, stored: &str) -> Result<DateTime<Utc>, DomainError> {
     parse_ts(stored).ok_or_else(|| corrupt(subject, column, stored))

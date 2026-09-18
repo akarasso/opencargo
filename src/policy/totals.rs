@@ -95,7 +95,7 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::proxy::engine::fixture::Fx;
+    use crate::testing::fixture::Fx;
 
     async fn row(fx: &Fx, verdict: &str) {
         let flag = verdict == "would_block";

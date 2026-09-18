@@ -1,17 +1,23 @@
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use async_trait::async_trait;
 use axum::body::Body;
 use axum::extract::{Request, State};
 use axum::http::{header, HeaderMap, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
+use chrono::{DateTime, TimeDelta, Utc};
 use sqlx::SqlitePool;
 
-use super::*;
-use crate::domain::Repository;
+use crate::domain::{CacheEntry, CacheEntryId, NewEntry, RepoId, Repository};
+use crate::error::{AppResult, StoreError};
+use crate::ports::proxy_cache::ProxyCacheStore;
+use crate::proxy::engine::{ProxyEngine, Timeouts, TtlConfig};
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Transfer, Ttl, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
+    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
 };
+use crate::registry::resolve::{CacheRepo, Upstream};
 use crate::storage::StorageBackend;
 
 #[derive(Default)]
@@ -183,13 +189,77 @@ pub(crate) fn pointer_strat() -> Strat {
     }
 }
 
+/// Every instant the engine hands the store, moved forward by whatever the
+/// test has advanced.
+///
+/// The engine reads the wall clock, and a test cannot wait an hour for a ttl
+/// to run out. Shifting at the port moves the writing clock and the reading
+/// clock together, so a row written before the advance is judged against the
+/// same timeline as one written after it — which is what makes expiry
+/// assertable with no sleep and no zero ttl.
+struct Shifted {
+    inner: Arc<dyn ProxyCacheStore>,
+    seconds: Arc<AtomicI64>,
+}
+
+impl Shifted {
+    fn at(&self, now: DateTime<Utc>) -> DateTime<Utc> {
+        now + TimeDelta::seconds(self.seconds.load(Ordering::Relaxed))
+    }
+}
+
+#[async_trait]
+impl ProxyCacheStore for Shifted {
+    async fn entry(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<CacheEntry>, StoreError> {
+        self.inner.entry(repo, kind, key, self.at(now)).await
+    }
+
+    async fn upsert(&self, entry: &NewEntry<'_>, now: DateTime<Utc>) -> Result<(), StoreError> {
+        self.inner.upsert(entry, self.at(now)).await
+    }
+
+    async fn touch(
+        &self,
+        id: CacheEntryId,
+        ttl: Option<Duration>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.inner.touch(id, ttl, self.at(now)).await
+    }
+
+    async fn delete_for_repo(&self, repo: RepoId) -> Result<u64, StoreError> {
+        self.inner.delete_for_repo(repo).await
+    }
+
+    async fn evictable(
+        &self,
+        idle: Duration,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<CacheEntry>, StoreError> {
+        self.inner.evictable(idle, self.at(now), limit).await
+    }
+
+    async fn delete(&self, id: CacheEntryId) -> Result<(), StoreError> {
+        self.inner.delete(id).await
+    }
+}
+
 pub(crate) struct Fx {
     _tmp: tempfile::TempDir,
     pub pool: SqlitePool,
+    pub cache: Arc<dyn ProxyCacheStore>,
     pub storage: Arc<dyn StorageBackend>,
     pub repo: Repository,
     pub fake: Shared,
     pub up: Upstream,
+    clock: Arc<AtomicI64>,
 }
 
 pub(crate) fn timeouts() -> Timeouts {
@@ -227,6 +297,11 @@ impl Fx {
             .unwrap()
             .unwrap();
         let storage = crate::storage::filesystem(tmp.path().join("storage"));
+        let clock = Arc::new(AtomicI64::new(0));
+        let cache: Arc<dyn ProxyCacheStore> = Arc::new(Shifted {
+            inner: crate::server::proxy_cache_store(&pool),
+            seconds: clock.clone(),
+        });
         let up = Upstream {
             base,
             auth: None,
@@ -236,10 +311,12 @@ impl Fx {
         Self {
             _tmp: tmp,
             pool,
+            cache,
             storage,
             repo,
             fake,
             up,
+            clock,
         }
     }
 
@@ -248,7 +325,7 @@ impl Fx {
             default_secs: 3600,
             negative_secs: 600,
         };
-        ProxyEngine::new(self.storage.clone(), self.pool.clone(), timeouts, ttl)
+        ProxyEngine::new(self.storage.clone(), self.cache.clone(), timeouts, ttl)
     }
 
     pub fn member(&self) -> CacheRepo<'_> {
@@ -263,18 +340,23 @@ impl Fx {
         f(&mut self.fake.lock().unwrap());
     }
 
-    pub async fn expire(&self) {
-        sqlx::query("UPDATE proxy_cache_entries SET expires_at = datetime('now', '-1 second') WHERE expires_at IS NOT NULL")
-            .execute(&self.pool)
-            .await
-            .unwrap();
+    /// Move the clock every cache read and write sees forward.
+    pub fn advance(&self, by: Duration) {
+        self.clock
+            .fetch_add(by.as_secs() as i64, Ordering::Relaxed);
+    }
+
+    /// Past the fixture's longest ttl, so every row that has one is stale and
+    /// every immutable row is untouched -- what a day of traffic would do.
+    pub fn expire(&self) {
+        self.advance(Duration::from_secs(3601));
     }
 
     pub async fn row(&self, kind: &str, key: &str) -> Option<CacheEntry> {
-        proxy_cache::get_entry(&self.pool, self.repo.id, kind, key)
+        self.cache
+            .entry(self.repo.id, kind, key, Utc::now())
             .await
             .unwrap()
-            .map(|(r, _)| r)
     }
 
     pub fn files(&self) -> Vec<std::path::PathBuf> {
