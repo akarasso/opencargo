@@ -168,6 +168,10 @@ impl AppState {
     }
 }
 
+/// The path prefixes the protocol adapters mount under the root, which no
+/// new repository may be named after.
+pub const RESERVED_NAMES: &[&str] = &[crate::registry::maven::MOUNT];
+
 /// Migrate a database and nothing else: the `opencargo migrate` subcommand, so
 /// the binary reaches the adapter through the composition root rather than
 /// importing it.
@@ -532,6 +536,10 @@ async fn seed_repositories(
     // names a member seeded earlier in this same pass must see its row, or a
     // mutual membership would validate as two pending entries and be seeded.
     for spec in &specs {
+        if store.by_name(spec.name).await?.is_none() {
+            crate::app::repo_spec::refuse_reserved(spec.name, RESERVED_NAMES)
+                .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;
+        }
         crate::app::repo_spec::validate_spec(store, spec, &pending)
             .await
             .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;

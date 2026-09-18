@@ -46,6 +46,7 @@ pub mod permissions;
 pub mod policy;
 pub mod proxy_cache;
 pub mod reclaim;
+pub mod rebuild;
 pub mod repositories;
 pub mod rows;
 pub mod search;

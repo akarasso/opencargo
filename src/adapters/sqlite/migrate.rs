@@ -134,12 +134,50 @@ pub const MIGRATIONS: &[Migration] = &[
         "017_storage_multipart.sql",
         Sentinel::Object("idx_storage_multipart_touched")
     ),
+    Migration {
+        id: "024",
+        sentinel: Sentinel::Object("idx_maven_units_pending"),
+        step: Step::Rust(maven),
+    },
     sql_migration!(
         "025",
         "025_reclaim.sql",
         Sentinel::Object("idx_reclaim_candidates_enqueued")
     ),
 ];
+
+const MAVEN_TABLES: &str = include_str!("migrations/024_maven.sql");
+
+/// 024: the `maven` format and port 18's tables. A repository already named
+/// `maven` would be shadowed by the `/maven/` mount, so the step refuses
+/// before changing anything.
+fn maven(conn: &mut SqliteConnection) -> StepFuture<'_> {
+    Box::pin(maven_step(conn))
+}
+
+async fn maven_step(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    let taken: Option<i64> =
+        sqlx::query_scalar("SELECT id FROM repositories WHERE name = 'maven'")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(other)?;
+    if taken.is_some() {
+        return Err(StoreError::Other(
+            "migration 024: a repository is named 'maven', which the Maven endpoint \
+             now mounts at /maven/; delete or recreate it under another name with the \
+             previous release, then upgrade (nothing was changed)"
+                .into(),
+        ));
+    }
+    super::rebuild::widen_formats(conn, "maven").await?;
+    for statement in MAVEN_TABLES.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        sqlx::query(statement)
+            .execute(&mut *conn)
+            .await
+            .map_err(other)?;
+    }
+    Ok(())
+}
 
 /// Bring a database up to date with every migration this binary carries.
 pub async fn run_all(pool: &SqlitePool) -> Result<Vec<(&'static str, Outcome)>, StoreError> {

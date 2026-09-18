@@ -4,6 +4,12 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- The `maven` repository format. Migration 024 admits it and refuses to run
+  while a repository is named `maven`, because `/maven/` becomes the Maven
+  endpoint: rename that repository with the previous release before
+  upgrading. `maven` is a reserved repository name from now on.
+
 ### Changed
 - A credential that does not verify is refused with 401 on every route,
   including an invalid or revoked Bearer on a public repository, which used

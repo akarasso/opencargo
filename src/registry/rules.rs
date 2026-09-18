@@ -10,6 +10,7 @@ pub struct NpmRules;
 pub struct CargoRules;
 pub struct GoRules;
 pub struct OciRules;
+pub struct MavenRules;
 
 impl FormatRules for NpmRules {
     fn validate(&self, name: &str) -> Result<(), DomainError> {
@@ -100,6 +101,52 @@ impl FormatRules for OciRules {
     }
 }
 
+/// A name is `groupId:artifactId`, both case-sensitive; a version is one
+/// path segment, compared as published.
+impl FormatRules for MavenRules {
+    fn validate(&self, name: &str) -> Result<(), DomainError> {
+        let invalid = || DomainError::InvalidName(format!("invalid maven coordinates: '{name}'"));
+        let (group, artifact) = name.split_once(':').ok_or_else(invalid)?;
+        let segment = |s: &str| {
+            !s.is_empty()
+                && !s.starts_with('.')
+                && s.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
+        };
+        if name.len() > 255 || !group.split('.').all(segment) || !segment(artifact) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    fn normalize(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn reserved(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    fn validate_version(&self, version: &str) -> Result<(), DomainError> {
+        let ok = !version.is_empty()
+            && version.len() <= 128
+            && !version.starts_with('.')
+            && !version.contains("..")
+            && version
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-' | b'+'));
+        if ok {
+            Ok(())
+        } else {
+            Err(DomainError::InvalidName(format!("invalid version: '{version}'")))
+        }
+    }
+
+    fn normalize_version(&self, version: &str) -> String {
+        version.to_string()
+    }
+}
+
 /// `None` for a format whose rules ship with its own step.
 pub fn rules(format: Format) -> Option<&'static dyn FormatRules> {
     match format {
@@ -107,6 +154,7 @@ pub fn rules(format: Format) -> Option<&'static dyn FormatRules> {
         Format::Cargo => Some(&CargoRules),
         Format::Go => Some(&GoRules),
         Format::Oci => Some(&OciRules),
+        Format::Maven => Some(&MavenRules),
         Format::Pypi => None,
     }
 }
@@ -162,6 +210,21 @@ mod tests {
         assert!(!same_version(r, "Latest", "latest"));
         assert!(r.validate_version("v1_rc").is_ok(), "a tag, not a semver");
         assert!(r.validate("Upper/Case").is_err());
+    }
+
+    #[test]
+    fn maven_coordinates_are_group_colon_artifact() {
+        let r = rules_of(Format::Maven).unwrap();
+        assert!(r.validate("org.example:lib-core").is_ok());
+        assert!(!same(r, "org.Example:lib", "org.example:lib"));
+        for bad in ["lib", "org..x:lib", ":lib", "org.x:", "org/x:lib", "org.x:../lib", ".org:lib"] {
+            assert!(r.validate(bad).is_err(), "{bad}");
+        }
+        assert!(r.validate_version("1.0-SNAPSHOT").is_ok());
+        assert!(r.validate_version("1.0_beta+2").is_ok());
+        for bad in ["", "1/0", "..", ".1", "1 0"] {
+            assert!(r.validate_version(bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
