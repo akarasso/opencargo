@@ -25,7 +25,9 @@ use opencargo::domain::{
 };
 use opencargo::error::StoreError;
 use opencargo::ports::oci::{Blob, Manifest, OciStore};
-use opencargo::ports::packages::{NameMatch, NewRelease, PackageStore, Promotion, Release};
+use opencargo::ports::packages::{
+    NameMatch, NewRelease, PackageStore, Promotion, Release, StalePrerelease,
+};
 use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::ports::proxy_cache::ProxyCacheStore;
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
@@ -490,6 +492,25 @@ impl Packages {
         with(&self.0, PortId::Packages, act)
     }
 
+    /// The sweep's view of a version, when its repository is one of the two
+    /// formats whose `-` really marks a pre-release.
+    fn stale(state: &State, version: &Version) -> Option<StalePrerelease> {
+        let package = state
+            .packages
+            .iter()
+            .find(|pkg| pkg.id == version.package_id)?;
+        let repo = state
+            .repositories
+            .iter()
+            .find(|repo| repo.id == package.repository_id)?;
+        matches!(repo.format.as_str(), "npm" | "cargo").then(|| StalePrerelease {
+            id: version.id,
+            package: package.name.clone(),
+            version: version.version.clone(),
+            tarball_path: version.tarball_path.clone(),
+        })
+    }
+
     fn matched(package: &Package, name: &str, how: NameMatch) -> bool {
         match how {
             NameMatch::Exact => package.name == name,
@@ -777,6 +798,35 @@ impl PackageStore for Packages {
                 .find(|v| v.id == version)
                 .ok_or(StoreError::NotFound)?;
             stored.yanked = yanked;
+            Ok(())
+        })
+    }
+
+    async fn stale_prereleases(
+        &self,
+        older_than: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<StalePrerelease>, StoreError> {
+        let cutoff = now - older_than;
+        self.with(|state| {
+            Ok(state
+                .versions
+                .iter()
+                .filter(|v| v.version.contains('-') && v.published_at < cutoff)
+                .filter_map(|v| Self::stale(state, v))
+                .collect())
+        })
+    }
+
+    async fn delete_version(&self, version: i64) -> Result<(), StoreError> {
+        self.with(|state| {
+            let at = state
+                .versions
+                .iter()
+                .position(|v| v.id == version)
+                .ok_or(StoreError::NotFound)?;
+            state.versions.remove(at);
+            state.dist_tags.retain(|tag| tag.version_id != version);
             Ok(())
         })
     }

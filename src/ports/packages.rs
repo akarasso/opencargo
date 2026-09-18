@@ -1,9 +1,12 @@
 //! Packages, their versions and their dist-tags: the publish and resolve hot
 //! path of every format.
 //!
-//! Two methods are coarse, and both for the same reason — they write more
-//! than one row and a half-written publish is visible to the next reader.
-//! Everything else is a single statement and needs no boundary.
+//! Three methods are coarse, and all for the same reason — they write more
+//! than one row, and a half-written publish or a half-deleted version is
+//! visible to the next reader. Everything else is a single statement and
+//! needs no boundary.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -81,6 +84,17 @@ pub struct Promotion<'a> {
     pub now: DateTime<Utc>,
 }
 
+/// A pre-release version past its retention, with the two names its log
+/// line carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StalePrerelease {
+    /// The version row, which is what [`PackageStore::delete_version`] takes.
+    pub id: i64,
+    pub package: String,
+    pub version: String,
+    pub tarball_path: String,
+}
+
 #[async_trait]
 pub trait PackageStore: Send + Sync {
     async fn package(
@@ -134,6 +148,28 @@ pub trait PackageStore: Send + Sync {
     async fn set_metadata(&self, version: i64, metadata_json: &str) -> Result<(), StoreError>;
 
     async fn set_yanked(&self, version: i64, yanked: bool) -> Result<(), StoreError>;
+
+    /// The pre-releases published more than `older_than` before `now`, in
+    /// publication order — and only in npm and cargo repositories, because a Go
+    /// pseudo-version and an OCI tag carry a `-` while being permanent
+    /// artifacts that a retention sweep must never touch.
+    ///
+    /// `now` is the caller's, so the predicate never reads the store's clock.
+    async fn stale_prereleases(
+        &self,
+        older_than: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<StalePrerelease>, StoreError>;
+
+    /// The version row and everything hanging off it — its dist-tags, its
+    /// download rows and its counter — in one transaction; `NotFound` once
+    /// it is gone. None of those four foreign keys cascades, so the deletion
+    /// is this method's to perform and not the schema's.
+    ///
+    /// The artifact is deliberately not part of it: the caller deletes the
+    /// blob *before* calling, because the version row holds the only record
+    /// of its path, and no store method is allowed to touch storage.
+    async fn delete_version(&self, version: i64) -> Result<(), StoreError>;
 
     /// One more download of a version, as a counter rather than a row per
     /// download. Best-effort at every call site: a served artifact is not

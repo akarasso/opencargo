@@ -1,8 +1,11 @@
 //! `PackageStore` over SQLite.
 //!
-//! The two coarse methods share `write_release`: a publish and a promotion
-//! differ in where the bytes came from, not in what they land — a package
-//! upsert, a version row and the tags that point at it.
+//! Two of the three coarse methods share `write_release`: a publish and a
+//! promotion differ in where the bytes came from, not in what they land — a
+//! package upsert, a version row and the tags that point at it. The third
+//! takes the same rows away.
+
+use std::time::Duration;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -13,7 +16,7 @@ use crate::db::{DistTagRow, PackageRow, VersionRow};
 use crate::domain::{DistTag, Package, Version};
 use crate::error::StoreError;
 use crate::ports::packages::{
-    NameMatch, NewRelease, PackageStore, Promotion, PromotionAudit, Release,
+    NameMatch, NewRelease, PackageStore, Promotion, PromotionAudit, Release, StalePrerelease,
 };
 
 const PACKAGE_COLUMNS: &str =
@@ -87,6 +90,31 @@ impl<'a> From<&'a Promotion<'a>> for ReleaseSpec<'a> {
             },
             dist_tags: promotion.dist_tags,
             now: promotion.now,
+        }
+    }
+}
+
+/// The tables whose rows hang off a version. Not one of those foreign keys
+/// declares `ON DELETE CASCADE` (`001_initial.sql:41,43,49`), so the version
+/// row cannot go until they have.
+const VERSION_DEPENDENTS: [&str; 3] = ["dist_tags", "downloads", "download_counts"];
+
+/// A stale pre-release as the join reads it.
+#[derive(sqlx::FromRow)]
+struct StaleRow {
+    id: i64,
+    package: String,
+    version: String,
+    tarball_path: String,
+}
+
+impl From<StaleRow> for StalePrerelease {
+    fn from(row: StaleRow) -> Self {
+        Self {
+            id: row.id,
+            package: row.package,
+            version: row.version,
+            tarball_path: row.tarball_path,
         }
     }
 }
@@ -224,6 +252,27 @@ async fn write_audit(
     .execute(&mut **tx)
     .await?;
     Ok(())
+}
+
+/// The dependents then the version itself, inside the caller's transaction.
+async fn purge_version(
+    tx: &mut Transaction<'static, Sqlite>,
+    version: i64,
+) -> Result<Result<(), StoreError>, sqlx::Error> {
+    for table in VERSION_DEPENDENTS {
+        sqlx::query(&format!("DELETE FROM {table} WHERE version_id = ?1"))
+            .bind(version)
+            .execute(&mut **tx)
+            .await?;
+    }
+    let done = sqlx::query("DELETE FROM versions WHERE id = ?1")
+        .bind(version)
+        .execute(&mut **tx)
+        .await?;
+    if done.rows_affected() == 0 {
+        return Ok(Err(StoreError::NotFound));
+    }
+    Ok(Ok(()))
 }
 
 pub struct SqlitePackageStore {
@@ -398,6 +447,38 @@ impl PackageStore for SqlitePackageStore {
             return Err(StoreError::NotFound);
         }
         Ok(())
+    }
+
+    async fn stale_prereleases(
+        &self,
+        older_than: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<StalePrerelease>, StoreError> {
+        let rows: Vec<StaleRow> = sqlx::query_as(
+            "SELECT v.id, p.name AS package, v.version, v.tarball_path
+             FROM versions v
+             JOIN packages p ON p.id = v.package_id
+             JOIN repositories r ON r.id = p.repository_id
+             WHERE r.format IN ('npm', 'cargo')
+               AND v.version LIKE '%-%'
+               AND v.published_at < ?1
+             ORDER BY v.id",
+        )
+        .bind(bind_ts(now - older_than))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(rows.into_iter().map(StalePrerelease::from).collect())
+    }
+
+    async fn delete_version(&self, version: i64) -> Result<(), StoreError> {
+        immediate(&self.pool, |mut tx| {
+            Box::pin(async move {
+                let gone = purge_version(&mut tx, version).await;
+                (tx, gone)
+            })
+        })
+        .await
     }
 
     async fn record_download(&self, version: i64) -> Result<(), StoreError> {

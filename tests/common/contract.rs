@@ -798,6 +798,120 @@ macro_rules! package_contract {
                 assert_eq!(package.updated_at, at(11).trunc_subsecs(0));
             }
 
+            /// The delete cascade: none of the four foreign keys hanging off
+            /// a version declares `ON DELETE CASCADE`, so the store owes the
+            /// caller the whole of it — dist-tags, download rows and counter
+            /// included. Against SQLite the counter is not merely asserted,
+            /// it is enforced: `foreign_keys` is ON, so a `download_counts`
+            /// row left behind makes the version delete fail outright.
+            #[tokio::test]
+            async fn deleting_a_version_takes_everything_hanging_off_it() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let store = &handles.packages;
+                let tags = vec!["latest".to_string()];
+                let landed = store
+                    .publish_version(&release(repo.id, "left-pad", "1.0.0", &tags))
+                    .await
+                    .unwrap();
+                let kept = store
+                    .publish_version(&release(repo.id, "left-pad", "1.1.0", &[]))
+                    .await
+                    .unwrap();
+                store.record_download(landed.version.id).await.unwrap();
+
+                store.delete_version(landed.version.id).await.unwrap();
+
+                assert!(store
+                    .version(landed.package.id, "1.0.0")
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert!(
+                    store
+                        .dist_tags(landed.package.id)
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "the tag that pointed at it goes with it"
+                );
+                assert_eq!(
+                    store
+                        .versions(landed.package.id)
+                        .await
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.id)
+                        .collect::<Vec<_>>(),
+                    [kept.version.id],
+                    "a sibling version is untouched"
+                );
+                assert!(matches!(
+                    store.delete_version(landed.version.id).await.unwrap_err(),
+                    StoreError::NotFound
+                ));
+            }
+
+            /// The retention predicate reads the caller's clock and nothing
+            /// else, and only the two formats whose `-` marks a pre-release.
+            #[tokio::test]
+            async fn the_sweep_sees_aged_pre_releases_of_npm_and_cargo_only() {
+                use ::std::time::Duration;
+
+                let handles = $open().await;
+                let npm = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let go = handles
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            format: Format::Go,
+                            ..spec("go-hosted", Visibility::Public)
+                        },
+                        at(9),
+                    )
+                    .await
+                    .unwrap();
+                let store = &handles.packages;
+                let aged = store
+                    .publish_version(&release(npm.id, "left-pad", "1.0.0-beta", &[]))
+                    .await
+                    .unwrap();
+                store
+                    .publish_version(&release(npm.id, "left-pad", "1.0.0", &[]))
+                    .await
+                    .unwrap();
+                store
+                    .publish_version(&release(
+                        go.id,
+                        "example.com/m",
+                        "v0.0.0-20200101000000-abcdef",
+                        &[],
+                    ))
+                    .await
+                    .unwrap();
+
+                let day = Duration::from_secs(86_400);
+                let past_it = at(9) + day + Duration::from_secs(1);
+                let stale = store.stale_prereleases(day, past_it).await.unwrap();
+                assert_eq!(
+                    stale.iter().map(|s| s.id).collect::<Vec<_>>(),
+                    [aged.version.id],
+                    "a release version and a go pseudo-version are not pre-releases to sweep"
+                );
+                assert_eq!(stale[0].package, "left-pad");
+                assert_eq!(stale[0].version, "1.0.0-beta");
+                assert_eq!(stale[0].tarball_path, "npm/r/p/p.tgz");
+
+                assert!(
+                    store
+                        .stale_prereleases(day, at(9) + day)
+                        .await
+                        .unwrap()
+                        .is_empty(),
+                    "a version exactly at its bound is still inside it, on the caller's clock"
+                );
+            }
+
             #[tokio::test]
             async fn what_is_not_there_is_not_found() {
                 let handles = $open().await;
