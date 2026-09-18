@@ -40,6 +40,88 @@ enum Commands {
     },
     /// Run database migrations
     Migrate,
+    /// Operate on the artifact store; the server must be stopped for
+    /// `migrate` and `reclaim`
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum StorageCommand {
+    /// Probe the store and exercise every operation on its reserved tree
+    Check,
+    /// List keys rows reference with no object, and with --orphans the
+    /// objects nothing references
+    Verify {
+        #[arg(long)]
+        orphans: bool,
+    },
+    /// Copy every object into the store another config file declares
+    Migrate {
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run one reclamation pass, or empty a prefix no repository names
+    Reclaim {
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+}
+
+async fn storage(cfg: &config::Config, command: StorageCommand) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    match command {
+        StorageCommand::Check => {
+            let report = server::storage_check(cfg).await?;
+            for step in &report.steps {
+                match &step.outcome {
+                    Ok(()) => println!("ok    {}", step.operation),
+                    Err(e) => println!("FAIL  {}: {e}", step.operation),
+                }
+            }
+            if !report.ok() {
+                anyhow::bail!("storage check failed");
+            }
+        }
+        StorageCommand::Verify { orphans } => {
+            let report = server::storage_verify(cfg, orphans, now).await?;
+            for key in &report.missing {
+                println!("missing  {key}");
+            }
+            for key in &report.orphans {
+                println!("orphan   {key}");
+            }
+            println!(
+                "{} objects, {} missing, {} orphans",
+                report.objects,
+                report.missing.len(),
+                report.orphans.len()
+            );
+            if !report.missing.is_empty() {
+                anyhow::bail!("rows reference missing objects");
+            }
+        }
+        StorageCommand::Migrate { to, dry_run } => {
+            let target = config::load_config(Some(&to))?;
+            let report = server::storage_migrate(cfg, &target, dry_run).await?;
+            println!(
+                "{} {} objects ({} bytes), {} already there",
+                if dry_run { "would copy" } else { "copied" },
+                report.copied,
+                report.bytes,
+                report.skipped
+            );
+        }
+        StorageCommand::Reclaim { prefix } => {
+            let report = server::storage_reclaim(cfg, prefix.as_deref(), now).await?;
+            println!("{report:?}");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -141,6 +223,7 @@ async fn main() -> anyhow::Result<()> {
             server::run_migrations(&cfg).await?;
             println!("Migrations applied successfully.");
         }
+        Commands::Storage { command } => storage(&cfg, command).await?,
     }
 
     Ok(())

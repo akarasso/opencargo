@@ -66,6 +66,21 @@ pub fn logical_key(physical: &str) -> &str {
     }
 }
 
+fn is_sha256(segment: &str) -> bool {
+    segment.len() == 64 && segment.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+}
+
+/// The sha256 a key names its content by: a `HostedKey` or an OCI key of
+/// either layout. `None` for a key whose name says nothing of its bytes.
+pub fn content_digest(key: &str) -> Option<&str> {
+    let segments: Vec<&str> = logical_key(key).rsplit('/').take(2).collect();
+    match segments.as_slice() {
+        [last, prev] if is_sha256(last) && *prev == "sha256" => Some(last),
+        [_, prev] if is_sha256(prev) => Some(prev),
+        _ => None,
+    }
+}
+
 /// Whether `key` is `prefix` itself or lies under it, segment by segment:
 /// `r/ab` never contains `r/abc`.
 pub fn under(key: &str, prefix: &str) -> bool {
@@ -78,6 +93,15 @@ pub fn under(key: &str, prefix: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_content_addressed_key_names_its_digest() {
+        let hex = "a".repeat(64);
+        assert_eq!(content_digest(&physical_key(&hosted_key("r/i", "p", &hex, "p.tgz"), "g")), Some(hex.as_str()));
+        assert_eq!(content_digest(&format!("oci/r/_blobs/sha256/{hex}")), Some(hex.as_str()));
+        assert_eq!(content_digest("npm/r/p/p-1.0.0.tgz"), None);
+        assert_eq!(content_digest("_proxy_cache/p/npm-tarball/ab/abc"), None);
+    }
 
     #[test]
     fn prefixes_compare_as_segments() {

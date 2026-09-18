@@ -54,6 +54,7 @@ pub mod releases;
 pub mod repo_spec;
 pub mod repositories;
 pub mod scan;
+pub mod storage_ops;
 pub mod sweep_storage;
 pub mod tokens;
 pub mod users;

@@ -155,6 +155,13 @@ pub async fn storage_of(server: &TestServer) -> std::sync::Arc<dyn opencargo::st
     server::storage_for(&config, stores.multipart()).expect("failed to build the server's store")
 }
 
+/// The config `server` runs with, its store included.
+pub fn config_of(server: &TestServer) -> Config {
+    let mut config = test_config(&server.tmp, &server.base_url, SpawnOpts::default());
+    config.storage = server.storage.clone();
+    config
+}
+
 /// Every key the server's store holds, sorted.
 pub async fn stored_keys(server: &TestServer) -> Vec<String> {
     use futures_util::TryStreamExt;

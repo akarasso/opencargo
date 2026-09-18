@@ -180,6 +180,101 @@ pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Until ha-options' writer lease lands, a server listening on the
+/// configured address is how a storage command learns it is not alone.
+/// Weaker than the lease: a server that is starting is not seen.
+async fn refuse_running_server(config: &Config) -> anyhow::Result<()> {
+    let bind = config.server.bind.replace("0.0.0.0", "127.0.0.1");
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        tokio::net::TcpStream::connect(&bind),
+    )
+    .await;
+    if matches!(probe, Ok(Ok(_))) {
+        anyhow::bail!(
+            "a server is listening on {}: stop it before running this storage command",
+            config.server.bind
+        );
+    }
+    Ok(())
+}
+
+/// `opencargo storage check`: the probe, then every operation the backend
+/// exercises on its own reserved tree.
+pub async fn storage_check(config: &Config) -> anyhow::Result<crate::storage::CheckReport> {
+    config.validate()?;
+    let stores = connect_stores(config).await?;
+    let storage = storage_for(config, stores.multipart())?;
+    let mut report = storage.self_check().await;
+    report.steps.insert(
+        0,
+        crate::storage::CheckStep {
+            operation: "probe",
+            outcome: storage.probe().await.map_err(|e| e.to_string()),
+        },
+    );
+    Ok(report)
+}
+
+/// `opencargo storage verify [--orphans]`.
+pub async fn storage_verify(
+    config: &Config,
+    orphans: bool,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<crate::app::storage_ops::VerifyReport> {
+    config.validate()?;
+    let stores = connect_stores(config).await?;
+    let storage = storage_for(config, stores.multipart())?;
+    let verify = crate::app::storage_ops::VerifyStorage::new(
+        stores.referenced(),
+        storage,
+        ReclaimPolicy::default().grace,
+    );
+    Ok(verify.run(orphans, now).await?)
+}
+
+/// `opencargo storage migrate --to <config>`: the server stopped, the two
+/// stores disjoint, every object copied under its key.
+pub async fn storage_migrate(
+    config: &Config,
+    target: &Config,
+    dry_run: bool,
+) -> anyhow::Result<crate::app::storage_ops::MigrateReport> {
+    config.validate()?;
+    target.validate()?;
+    refuse_running_server(config).await?;
+    let stores = connect_stores(config).await?;
+    let clock: Arc<dyn Clock> = Arc::new(crate::adapters::system::SystemClock);
+    let source = build_configured_storage(config, Role::Artifacts, stores.multipart(), clock.clone())?;
+    let sink = build_configured_storage(target, Role::Artifacts, stores.multipart(), clock)?;
+    if !source.location.disjoint(&sink.location) {
+        anyhow::bail!("the target store overlaps the source: pick another path, bucket or prefix");
+    }
+    let migrate = crate::app::storage_ops::MigrateStorage::new(source.backend, sink.backend);
+    Ok(migrate.run(dry_run).await?)
+}
+
+/// `opencargo storage reclaim [--prefix P]`: one reclamation pass now, or
+/// the prefix no repository row names any more.
+pub async fn storage_reclaim(
+    config: &Config,
+    prefix: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<crate::app::reclaim::ReclaimReport> {
+    config.validate()?;
+    refuse_running_server(config).await?;
+    let stores = connect_stores(config).await?;
+    let storage = storage_for(config, stores.multipart())?;
+    let policy = ReclaimPolicy::default();
+    let reclaim = ReclaimOrphans::new(stores.reclaim(), stores.referenced(), storage, policy);
+    match prefix {
+        Some(prefix) => Ok(crate::app::storage_ops::ReclaimPrefix::new(stores.reclaim(), reclaim, policy.grace)
+            .run(prefix, now)
+            .await?),
+        None => Ok(reclaim.run(now).await),
+    }
+}
+
 /// A database URL turned into ports: the pool, migrated, with every store
 /// over it and the stored names checked. The other half of the composition
 /// root, so `main.rs` and the fixtures never name the adapter themselves.
