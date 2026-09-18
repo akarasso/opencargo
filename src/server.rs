@@ -124,6 +124,9 @@ pub struct AppState {
     /// The web UI's read model: one method per panel, and the only reader of
     /// the joins no store owns.
     pub dashboard: Arc<dyn DashboardRead>,
+    pub mcp: Arc<dyn crate::ports::mcp::McpStore>,
+    /// `[mcp.*]` by repository name; a repository with none takes the defaults.
+    pub mcp_settings: Arc<HashMap<String, crate::config::McpConfig>>,
     pub vuln_scanner: Arc<dyn VulnFeed>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
@@ -547,6 +550,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let webhooks = stores.webhooks();
     seed_webhooks(webhooks.as_ref(), &config.webhooks, Utc::now()).await?;
+    let mcp = stores.mcp();
+    seed_mcp(mcp.as_ref(), repos.as_ref(), config, Utc::now()).await?;
 
     let webhook_dispatcher = Arc::new(WebhookDispatcher::new(webhooks.clone()));
 
@@ -599,6 +604,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         vulns: stores.vulns(),
         policy_store,
         dashboard: stores.dashboard(),
+        mcp,
+        mcp_settings: Arc::new(config.mcp.clone()),
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,
@@ -1095,6 +1102,57 @@ async fn seed_webhooks(
     store.ensure_seeded(&hooks, now).await
 }
 
+/// `[mcp.*]` allow rules and suppressions, written once per repository and
+/// owned by the API afterwards; and what a gallery or a public hosted
+/// repository discloses, said at startup.
+async fn seed_mcp(
+    mcp: &dyn crate::ports::mcp::McpStore,
+    repos: &dyn RepositoryStore,
+    config: &Config,
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    use crate::domain::governance::{AllowRule, Effect};
+    for (name, cfg) in &config.mcp {
+        let Some(repo) = repos.by_name(name).await? else {
+            warn!(repository = %name, "[mcp.*] names no repository");
+            continue;
+        };
+        if repo.fmt()? != crate::domain::Format::Mcp {
+            anyhow::bail!("[mcp.{name}] names a {} repository", repo.fmt()?.as_str());
+        }
+        let rules = cfg
+            .allowlist
+            .iter()
+            .map(|p| AllowRule::new(p, Effect::Allow))
+            .chain(cfg.denylist.iter().map(|p| AllowRule::new(p, Effect::Deny)))
+            .collect::<Result<Vec<_>, _>>()?;
+        let suppressions: Vec<(String, String)> = cfg
+            .suppress
+            .iter()
+            .map(|s| match s.split_once(':') {
+                Some((pattern, tool)) => (pattern.to_string(), tool.to_string()),
+                None => (s.clone(), String::new()),
+            })
+            .collect();
+        mcp.seed(repo.id, &rules, &suppressions, now).await?;
+        if cfg.gallery && (repo.visibility != crate::domain::Visibility::Public || !config.auth.anonymous_read) {
+            warn!(repository = %name, "an MCP gallery must be public with anonymous_read on: VS Code reads a 401 as no registry at all");
+        }
+        if cfg.probe_allow_private {
+            warn!(repository = %name, "probe_allow_private is on: remotes on loopback and private addresses are probed");
+        }
+    }
+    for repo in repos.all().await? {
+        if repo.fmt().ok() == Some(crate::domain::Format::Mcp)
+            && repo.kind().ok() == Some(crate::domain::RepoKind::Hosted)
+            && repo.visibility == crate::domain::Visibility::Public
+        {
+            warn!(repository = %repo.name, "a public hosted MCP repository discloses its internal endpoints, env and header names to anyone");
+        }
+    }
+    Ok(())
+}
+
 /// Recording is personal data: say which members do it, at startup.
 /// What booted, and every configuration note worth a warning about it.
 fn report_ready(config: &Config, notes: &crate::policy::startup::StartupNotes) {
@@ -1303,6 +1361,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::oci::routes::routes())
         .merge(crate::registry::maven::routes::routes())
         .merge(crate::registry::nuget::routes::routes())
+        .merge(crate::registry::mcp::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
         .merge(dashboard_routes)
@@ -1659,11 +1718,9 @@ fn parse_duration_secs(s: &str) -> u64 {
 ///
 /// npm/pnpm clients send scoped package names with encoded slashes
 /// (e.g. `@scope%2fname`).  This function rewrites the URI in-place so
-/// that axum's router can match `/{repo}/@{scope}/{name}` patterns.
-///
-/// Must be applied as a `tower` `map_request` layer **outside** the
-/// axum `Router` — using `Router::layer()` would run _after_ route
-/// matching and therefore have no effect on 404s.
+/// that axum's router can match `/{repo}/@{scope}/{name}` patterns. The
+/// first step of `rewrite::pre_route`, so every caller of `build_router`
+/// gets it exactly once.
 pub fn decode_percent_encoded_slashes<B>(
     mut req: axum::http::Request<B>,
 ) -> axum::http::Request<B> {

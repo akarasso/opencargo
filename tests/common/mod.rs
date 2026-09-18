@@ -9,6 +9,7 @@ pub mod fake_idp;
 pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;
+pub mod mcp;
 pub mod pypi;
 pub mod faults;
 pub mod nuget;
@@ -20,13 +21,11 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use axum::ServiceExt as _;
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sha2::Digest;
 use tempfile::TempDir;
-use tower::ServiceExt as _;
 
 use opencargo::config::{
     AuthConfig, Config, DatabaseConfig, ProxyConfig, RepositoryConfig, RepositoryFormat,
@@ -226,9 +225,7 @@ async fn spawn_in(
     if let Some(outage) = outage {
         outage.install(&mut state);
     }
-    let app = server::build_router(state)
-        .map_request(server::decode_percent_encoded_slashes)
-        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let app = server::build_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();

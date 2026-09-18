@@ -2,8 +2,6 @@ use clap::Parser;
 use std::path::PathBuf;
 use tracing::info;
 
-use axum::ServiceExt as _;
-use tower::ServiceExt as _;
 use opencargo::{config, server};
 
 #[derive(Parser)]
@@ -190,19 +188,6 @@ async fn main() -> anyhow::Result<()> {
 
             let router = server::build_router(app_state);
 
-            // Decode percent-encoded slashes (%2f) before routing.
-            // npm/pnpm clients encode scoped package names this way.
-            // This must wrap the Router externally (not via Router::layer)
-            // because Router::layer runs after route matching.
-            // Decode %2f in scoped package names before routing, on BOTH the
-            // TLS and plaintext paths (Router::layer runs after route matching,
-            // so this must wrap the Router externally). Previously the decoder
-            // was only applied on the plaintext branch, so scoped npm packages
-            // (`@scope%2fname`) returned 404 over HTTPS — the normal mode for a
-            // private registry. The map_request is built inside each branch
-            // because the body type differs (axum_server hands the service a
-            // `Request<Incoming>`, axum::serve a `Request<Body>`); the decoder
-            // is generic over the body type and only rewrites the URI.
             if !cfg.server.tls.cert_path.is_empty() && !cfg.server.tls.key_path.is_empty() {
                 let tls_config = axum_server::tls_rustls::RustlsConfig::from_pem_file(
                     &cfg.server.tls.cert_path,
@@ -212,16 +197,10 @@ async fn main() -> anyhow::Result<()> {
                 let bind_addr: std::net::SocketAddr = bind.parse()?;
                 info!("Listening with TLS on {}", bind_addr);
                 axum_server::bind_rustls(bind_addr, tls_config)
-                    .serve(
-                        router
-                            .map_request(server::decode_percent_encoded_slashes)
-                            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
-                    )
+                    .serve(router.into_make_service_with_connect_info::<std::net::SocketAddr>())
                     .await?;
             } else {
-                let app = router
-                    .map_request(server::decode_percent_encoded_slashes)
-                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
+                let app = router.into_make_service_with_connect_info::<std::net::SocketAddr>();
                 let listener = tokio::net::TcpListener::bind(bind).await?;
                 info!("Listening on {}", listener.local_addr()?);
                 axum::serve(listener, app).await?;
