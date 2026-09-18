@@ -38,3 +38,26 @@ name = "npm-private"
 type = "hosted"
 format = "npm"
 visibility = "private"
+
+# [[repositories]]
+# name = "mcp-mirror"
+# type = "proxy"
+# format = "mcp"
+# upstream = "https://registry.modelcontextprotocol.io"
+# visibility = "public"
+
+# MCP governance per repository (docs/mcp.md). mode: off | warn | hide.
+# [mcp.mcp-mirror]
+# mode = "warn"
+# allowlist = ["io.github.acme/*"]
+# denylist = []
+# suppress = ["cross_tool:search"]
+# scan_medium = false
+# sync_interval = "1h"
+# probe_remotes = true
+# probe_interval = "24h"
+# probe_concurrency = 4
+# probe_allow_private = false
+# probe_auth = "Authorization: Bearer ..."
+# gallery = true
+# headers_helper = "/usr/local/bin/opencargo-auth-header"

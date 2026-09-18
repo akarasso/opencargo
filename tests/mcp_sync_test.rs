@@ -163,6 +163,50 @@ async fn a_mirror_created_at_runtime_syncs_on_demand_and_a_hosted_one_has_no_syn
     assert_eq!(status, 404);
 }
 
+/// The strongest available proof that we serve the shape an aggregator
+/// reads: a second opencargo mirrors ours, incrementally, over records we
+/// ingested late (their upstream `updatedAt` months old), and a takedown
+/// propagates one hop further.
+#[tokio::test]
+async fn mirror_of_a_mirror_serves_the_same_records() {
+    let fake = upstream::start().await;
+    let old = Utc::now() - Duration::days(120);
+    fake.put(server("io.github.acme/x", "1.0.0"), "active", old);
+    fake.put(server("io.github.acme/gone", "1.0.0"), "active", old);
+    let upstream_server = mirrored(&fake).await;
+    sync(&upstream_server, "mirror", false).await;
+
+    let downstream = spawn_server(SpawnOpts {
+        repositories: vec![common::proxy("downstream", MCP, &format!("{}/mirror", upstream_server.base_url))],
+        ..Default::default()
+    })
+    .await;
+    sync(&downstream, "downstream", false).await;
+    let ours = walk(&upstream_server, "mirror", 100, "").await;
+    assert_eq!(walk(&downstream, "downstream", 100, "").await, ours);
+    let (_, theirs) = get(&downstream, "/downstream/v0.1/servers/io.github.acme%2Fx/versions/1.0.0").await;
+    let (_, mine) = get(&upstream_server, "/mirror/v0.1/servers/io.github.acme%2Fx/versions/1.0.0").await;
+    assert_eq!(theirs["server"], mine["server"], "the record is re-emitted verbatim");
+    assert_eq!(theirs["_meta"][OFFICIAL], mine["_meta"][OFFICIAL], "the official block is the upstream's");
+    assert_ne!(theirs["_meta"][MIRROR]["repository"], mine["_meta"][MIRROR]["repository"]);
+
+    fake.put(server("io.github.acme/late", "1.0.0"), "active", old);
+    fake.put(server("io.github.acme/gone", "1.0.0"), "deleted", Utc::now());
+    sync(&upstream_server, "mirror", true).await;
+    let (_, body) = sync(&downstream, "downstream", false).await;
+    assert_eq!(body["report"]["full"], false, "the downstream's second run is incremental");
+    assert_eq!(body["report"]["changed"], 2, "a late ingest and a takedown both cross the hop: {body}");
+    assert!(walk(&downstream, "downstream", 100, "").await.contains(&"io.github.acme/late@1.0.0".to_string()));
+    let (_, deleted) = get(&downstream, "/downstream/v0.1/servers?include_deleted=true").await;
+    let gone = deleted["servers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|s| s["server"]["name"] == "io.github.acme/gone")
+        .unwrap();
+    assert_eq!(gone["_meta"][OFFICIAL]["status"], "deleted");
+}
+
 #[tokio::test]
 async fn deleting_a_mirror_stops_its_sync_task_and_takes_its_rows() {
     let fake = upstream::start().await;

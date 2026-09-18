@@ -5,6 +5,21 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Governance of MCP servers and agent skills, a preview. The `mcp` repository
+  format mirrors the MCP registry (`proxy`), hosts internal servers and
+  skills (`hosted`) and merges both for a team (`group`); migration 023
+  admits it. The catalog is the registry's own API, so another aggregator can
+  mirror this one: `/{repo}/v0.1/servers` with the upstream's cursor, aliased
+  under `/v0`. Every declared permission set and every observed tool list is
+  fingerprinted, approved per endpoint and re-reviewed on drift; an injection
+  scan keeps the offending text with its span; four policy rules
+  (`mcp_allowlist`, `mcp_injection`, `mcp_transport`, `mcp_drift`) record what
+  they would have blocked. Skills ship as Claude Code plugins with a gated
+  `marketplace.json`, and `/{repo}/clients/{client}/config.json` generates
+  `.mcp.json`, `managed-mcp.json`, the managed-settings fragment, Cursor and
+  VS Code files from the approved set. Admin routes under `/api/v1/mcp/`,
+  `opencargo mcp sync`, and an `/admin/mcp` screen. See `docs/mcp.md` for
+  what is enforceable and what is not.
 - S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
   validated against MinIO, not yet against a hosted provider. Credentials
   come only from an allowlisted environment; TLS trusts the compiled-in

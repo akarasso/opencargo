@@ -105,6 +105,13 @@ the enterprise ones.
   publish once enabled (`[vuln_scan] enabled = true`, off by default), with
   a per-advisory severity (OSV label, else CVSS 3.x/4.0 score) and an
   optional block of critical publishes before anything is written.
+- **MCP governance** (preview): an `mcp` repository mirrors the MCP registry,
+  hosts internal servers and agent skills, and governs what an agent may
+  install — an allowlist and an approval per repository, a fingerprint of
+  every declared permission set and every observed tool list with
+  re-approval on drift, an injection scan with the offending text, and
+  generated `.mcp.json`, `managed-mcp.json`, Cursor and VS Code files built
+  from the approved set. See [docs/mcp.md](docs/mcp.md).
 - **Webhooks** with HMAC signatures, **WebSocket event stream**, **Prometheus
   metrics**, full-text search, rate limiting, native TLS.
 - **Web UI** embedded in the binary: live dashboard, package pages with
@@ -123,9 +130,9 @@ engine, in audit mode first**: rules versioned with your code
 `license in [AGPL]`), evaluated at resolution time, scoped per repository so
 internal packages are not judged like public ones. The first deliverable is a
 weekly report of *what would have been blocked*, before anything is actually
-blocked. Then migration importers from Nexus / Artifactory / Verdaccio /
-GitHub Packages, and governance of MCP servers and agent skills distributed
-through npm, PyPI and OCI.
+blocked. Governance of MCP servers and agent skills is the second layer and
+landed in preview (see above); next are migration importers from Nexus /
+Artifactory / Verdaccio / GitHub Packages.
 
 The registry, audit mode and OIDC SSO are and will stay MIT. Organisation-level
 enforcement (quarantine, approvals, audit exports, compliance reports)
@@ -150,9 +157,21 @@ issue or write to the address in `SECURITY.md`.
 
 Read this before the comparison table sells you anything.
 
-- PyPI, Maven and NuGet (hosted, proxy, group), S3-compatible storage and
-  OIDC SSO are new and in preview: tested in CI, not yet validated on a
-  second deployment. The comparison table above does not count them yet.
+- PyPI, Maven and NuGet (hosted, proxy, group), S3-compatible storage,
+  OIDC SSO and MCP governance are new and in preview: tested in CI, not yet
+  validated on a second deployment. The comparison table above does not count
+  them yet.
+- MCP: the one client that enforces a catalog today is VS Code
+  (`chat.mcp.gallery.serviceUrl` with `chat.mcp.access = "registry"`). Neither
+  the setting's value shape nor its API version is documented and no automated
+  test can drive a real VS Code, so opencargo serves several spellings and
+  **that row is expected, not verified**. Such a gallery repository must be
+  `public` with `anonymous_read` on (VS Code reads a `401` as "no such API"),
+  which is why it should hold the mirror and not internal servers. Tool
+  descriptions exist only where someone observed them: opencargo probes remote
+  servers (never private addresses unless the repository opts in) and takes
+  attested snapshots for stdio servers, and never runs a package to harvest
+  them.
 - The Go checksum database is not proxied: exclude private modules with
   `GONOSUMDB` or run with `GOSUMDB=off`. `go` gets a `404` for an unknown
   module and moves on to the next `GOPROXY` entry, but a `502` (upstream down)
@@ -529,6 +548,8 @@ group whose proxy member fronts another instance; locally they print
 
 - [docs/api.md](docs/api.md): every HTTP route, the WebSocket protocol, webhook
   payloads and Prometheus metrics.
+- [docs/mcp.md](docs/mcp.md): MCP servers and agent skills — the mirror, the
+  approvals, the scan and the client files.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).
