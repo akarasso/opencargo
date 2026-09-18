@@ -10,6 +10,7 @@ pub mod deps;
 pub mod events;
 pub mod handoffs;
 pub mod identities;
+pub mod identity_provider;
 pub mod ids;
 pub mod multipart;
 pub mod oci;

@@ -87,6 +87,10 @@ url = "2"
 # Auth (password hashing)
 argon2 = "0.5"
 
+# SSO: ID Token verification and the sealed attempt cookie
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+aws-lc-rs = "1"
+
 # Metrics (Prometheus)
 metrics = "0.24"
 metrics-exporter-prometheus = "0.16"

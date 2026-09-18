@@ -6,5 +6,6 @@
 
 pub mod events;
 pub mod fs;
+pub mod oidc;
 pub mod sqlite;
 pub mod system;
