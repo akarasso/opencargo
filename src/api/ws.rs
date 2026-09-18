@@ -336,6 +336,12 @@ fn payload(event: &DomainEvent) -> serde_json::Value {
             "would_block": c.would_block,
             "unknown": c.unknown,
         }),
+        DomainEvent::McpSynced { repository, changed, failed } => {
+            json!({ "repository": repository, "changed": changed, "failed": failed })
+        }
+        DomainEvent::McpDrift { repository, server, version, drift } => {
+            json!({ "repository": repository, "server": server, "version": version, "drift": drift })
+        }
     }
 }
 

@@ -7,6 +7,9 @@ import type {
   AuditResponse,
   CreateTokenResponse,
   DashboardData,
+  McpEvidence,
+  McpRule,
+  McpServers,
   Dependency,
   Dependent,
   MyPermissions,
@@ -289,4 +292,66 @@ export function promotePackage(
   to: string,
 ): Promise<{ ok: boolean }> {
   return http.post(`/api/v1/promote/${name}/${enc(version)}`, { from, to });
+}
+
+// --- MCP governance --------------------------------------------------------------
+
+export function fetchMcpServers(repo: string, state: string, q: string): Promise<McpServers> {
+  const search = new URLSearchParams({ state });
+  if (q) search.set('q', q);
+  return http.get(`/api/v1/mcp/${enc(repo)}/servers?${search}`);
+}
+
+export function fetchMcpEvidence(
+  repo: string,
+  name: string,
+  version: string,
+): Promise<McpEvidence> {
+  const search = new URLSearchParams({ name, version });
+  return http.get(`/api/v1/mcp/${enc(repo)}/evidence?${search}`);
+}
+
+export function decideMcp(
+  repo: string,
+  body: {
+    name: string;
+    version: string;
+    state: 'approved' | 'blocked';
+    skill?: boolean;
+    note?: string;
+  },
+): Promise<{ decided: number }> {
+  return http.post(`/api/v1/mcp/${enc(repo)}/approvals`, body);
+}
+
+export function fetchMcpRules(repo: string): Promise<McpRule[]> {
+  return http.get(`/api/v1/mcp/${enc(repo)}/allow-rules`);
+}
+
+export function addMcpRule(
+  repo: string,
+  pattern: string,
+  effect: 'allow' | 'deny',
+): Promise<{ id: number }> {
+  return http.post(`/api/v1/mcp/${enc(repo)}/allow-rules`, { pattern, effect });
+}
+
+export function deleteMcpRule(repo: string, id: number): Promise<void> {
+  return http.del(`/api/v1/mcp/${enc(repo)}/allow-rules/${id}`);
+}
+
+export function suppressMcpFinding(
+  repo: string,
+  pattern: string,
+  tool: string,
+): Promise<{ id: number }> {
+  return http.post(`/api/v1/mcp/${enc(repo)}/suppressions`, { pattern, tool });
+}
+
+export function syncMcp(repo: string, full = false): Promise<unknown> {
+  return http.post(`/api/v1/mcp/${enc(repo)}/sync`, { full });
+}
+
+export function probeMcp(repo: string, name?: string, version?: string): Promise<unknown> {
+  return http.post(`/api/v1/mcp/${enc(repo)}/probe`, { name, version });
 }

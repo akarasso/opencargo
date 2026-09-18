@@ -320,6 +320,90 @@ export interface WsEvent {
   anonymous?: boolean;
 }
 
+// --- MCP governance --------------------------------------------------------------
+
+export type McpState = 'approved' | 'pending' | 'drifted' | 'blocked';
+
+export interface McpServerRow {
+  name: string;
+  version: string;
+  member: string;
+  status: string;
+  isLatest: boolean;
+  hosted: boolean;
+  state: McpState;
+  drift: string;
+  driftedRemote: string | null;
+  endpoints: { approved: number; total: number };
+  transports: { packages: string; remotes: string };
+  toolsSource: 'declared' | 'probe' | 'attested' | null;
+  findings: { high: number; medium: number };
+  syncedAt: string;
+}
+
+export interface McpServers {
+  repository: string;
+  servers: McpServerRow[];
+  sync: {
+    lastRunAt: string | null;
+    lastError: string | null;
+    skipped: number;
+    consecutiveFailures: number;
+  } | null;
+}
+
+export interface McpFinding {
+  id: number;
+  pattern: string;
+  confidence: 'high' | 'medium';
+  promotedBy: string | null;
+  field: string;
+  tool: string;
+  span: [number, number];
+  excerpt: string;
+  suppressed: boolean;
+}
+
+export interface McpSurface {
+  id: number;
+  source: string;
+  remoteUrl: string;
+  toolsSha256: string | null;
+  permissionsSha256: string;
+  capturedAt: string;
+  tools: { name: string; description?: string | null }[];
+  headerParams: { tool: string; pointer: string; header?: string; why?: string; valid: boolean }[];
+}
+
+export interface McpEvidence {
+  row: McpServerRow;
+  server: Record<string, unknown>;
+  permissions: Record<string, unknown>;
+  surfaces: McpSurface[];
+  findings: McpFinding[];
+  approvals: {
+    remoteUrl: string;
+    decision: string;
+    decidedBy: string;
+    decidedAt: string;
+    note: string | null;
+    own: boolean;
+  }[];
+  probeRuns: {
+    remoteUrl: string;
+    ranAt: string;
+    ok: boolean;
+    protocolVersion: string | null;
+    error: string | null;
+  }[];
+}
+
+export interface McpRule {
+  id: number;
+  pattern: string;
+  effect: 'allow' | 'deny';
+}
+
 /** `GET /api/v1/system/storage`: the adapter and its health, never where it points. */
 export interface StorageStatus {
   backend: 'fs' | 's3';

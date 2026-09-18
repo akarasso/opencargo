@@ -232,6 +232,7 @@ impl AppState {
             self.mcp.clone(),
             self.mcp_feed.clone(),
             self.clock.clone(),
+            self.events.clone(),
             crate::registry::mcp::ingest::translate,
         )
     }
@@ -241,6 +242,7 @@ impl AppState {
             self.mcp.clone(),
             self.mcp_probe.clone(),
             self.clock.clone(),
+            self.events.clone(),
             crate::registry::mcp::probe::remotes,
             crate::registry::mcp::probe::surface,
         )
@@ -440,7 +442,7 @@ pub async fn mcp_sync(config: &Config, repo: Option<&str>, full: bool) -> anyhow
         let Some(upstream) = r.upstream_url.clone() else {
             continue;
         };
-        let line = match crate::app::mcp::supervisor::run_locked(&state.mcp_sync, &sync, r.id, &upstream, full).await {
+        let line = match crate::app::mcp::supervisor::run_locked(&state.mcp_sync, &sync, r.id, &r.name, &upstream, full).await {
             Ok(report) => serde_json::to_string(&report)?,
             Err(e) => format!("failed: {e}"),
         };
@@ -1356,6 +1358,19 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/maven/{repo}/decide", post(crate::api::maven::decide))
         .route("/api/v1/mcp/{repo}/sync", post(crate::api::mcp::sync))
         .route("/api/v1/mcp/{repo}/probe", post(crate::api::mcp::probe))
+        .route(
+            "/api/v1/mcp/{repo}/allow-rules",
+            get(crate::api::mcp_admin::list_rules).post(crate::api::mcp_admin::add_rule),
+        )
+        .route("/api/v1/mcp/{repo}/allow-rules/{id}", delete(crate::api::mcp_admin::delete_rule))
+        .route(
+            "/api/v1/mcp/{repo}/suppressions",
+            get(crate::api::mcp_admin::list_suppressions).post(crate::api::mcp_admin::add_suppression),
+        )
+        .route("/api/v1/mcp/{repo}/suppressions/{id}", delete(crate::api::mcp_admin::delete_suppression))
+        .route("/api/v1/mcp/{repo}/servers", get(crate::api::mcp_admin::servers))
+        .route("/api/v1/mcp/{repo}/evidence", get(crate::api::mcp_admin::evidence))
+        .route("/api/v1/mcp/{repo}/approvals", post(crate::api::mcp_admin::decide))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),

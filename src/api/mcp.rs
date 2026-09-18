@@ -66,7 +66,7 @@ pub async fn probe(
     };
     let cfg = state.mcp_settings.get(&name).cloned().unwrap_or_default();
     let settings = crate::server::probe_settings_of(&cfg).map_err(|e| AppError::Internal(e.to_string()))?;
-    let report = state.probe_mirror().run(repo.id, &settings, true, only).await?;
+    let report = state.probe_mirror().run(repo.id, &repo.name, &settings, true, only).await?;
     Ok(Json(json!({"repository": name, "report": report})))
 }
 
@@ -93,7 +93,7 @@ pub async fn sync(
         .clone()
         .ok_or_else(|| AppError::BadRequest(format!("{name} has no upstream")))?;
     let request: SyncRequest = body(request).await?;
-    let report = run_locked(&state.mcp_sync, &state.sync_mirror(), repo.id, &upstream, request.full)
+    let report = run_locked(&state.mcp_sync, &state.sync_mirror(), repo.id, &repo.name, &upstream, request.full)
         .await
         .map_err(|e| match e {
             SyncError::Store(e) => AppError::from(e),

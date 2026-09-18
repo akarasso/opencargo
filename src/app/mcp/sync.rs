@@ -12,8 +12,10 @@ use chrono::{DateTime, Duration, Utc};
 use serde_json::Value;
 use tracing::warn;
 
+use crate::domain::{Audience, DomainEvent, Drift};
 use crate::error::StoreError;
 use crate::ports::clock::Clock;
+use crate::ports::events::Events;
 use crate::ports::mcp::{McpStore, RecordWrite, SyncState};
 use crate::ports::mcp_feed::{FeedError, FeedQuery, RegistryFeed};
 
@@ -48,25 +50,58 @@ pub struct SyncMirror {
     mcp: Arc<dyn McpStore>,
     feed: Arc<dyn RegistryFeed>,
     clock: Arc<dyn Clock>,
+    events: Arc<dyn Events>,
     translate: Translate,
 }
 
+/// A version whose verdict moved, announced to the admins.
+pub async fn announce_drift(mcp: &dyn McpStore, events: &dyn Events, repository: &str, version_id: i64, member: i64) {
+    if let Ok(Some(row)) = mcp.version_by_id(version_id, member).await {
+        if row.worst_drift != Drift::None {
+            events.emit(
+                DomainEvent::McpDrift {
+                    repository: repository.to_string(),
+                    server: row.name,
+                    version: row.version,
+                    drift: row.worst_drift.as_str().to_string(),
+                },
+                Audience::Admin,
+            );
+        }
+    }
+}
+
 impl SyncMirror {
-    pub fn new(mcp: Arc<dyn McpStore>, feed: Arc<dyn RegistryFeed>, clock: Arc<dyn Clock>, translate: Translate) -> Self {
+    pub fn new(
+        mcp: Arc<dyn McpStore>,
+        feed: Arc<dyn RegistryFeed>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn Events>,
+        translate: Translate,
+    ) -> Self {
         Self {
             mcp,
             feed,
             clock,
+            events,
             translate,
         }
     }
 
     /// One run. The mirror keeps serving its last good rows whatever
     /// happens; a failure is recorded with its count for the backoff.
-    pub async fn run(&self, repository: i64, upstream: &str, force_full: bool) -> Result<SyncReport, SyncError> {
+    pub async fn run(&self, repository: i64, name: &str, upstream: &str, force_full: bool) -> Result<SyncReport, SyncError> {
         let mut state = self.mcp.sync_state(repository).await?;
         let started = self.clock.now();
-        let outcome = self.pages(repository, upstream, &state, started, force_full).await;
+        let outcome = self.pages(repository, name, upstream, &state, started, force_full).await;
+        self.events.emit(
+            DomainEvent::McpSynced {
+                repository: name.to_string(),
+                changed: outcome.as_ref().map_or(0, |r| r.changed as u64),
+                failed: outcome.is_err(),
+            },
+            Audience::Admin,
+        );
         state.last_run_at = Some(started);
         match &outcome {
             Ok(report) => {
@@ -90,6 +125,7 @@ impl SyncMirror {
     async fn pages(
         &self,
         repository: i64,
+        name: &str,
         upstream: &str,
         state: &SyncState,
         started: DateTime<Utc>,
@@ -118,6 +154,9 @@ impl SyncMirror {
                         let done = self.mcp.upsert_record(&write).await?;
                         report.upserted += 1;
                         report.changed += usize::from(done.changed);
+                        if done.changed {
+                            announce_drift(self.mcp.as_ref(), self.events.as_ref(), name, done.version_id, repository).await;
+                        }
                     }
                     Err(why) => {
                         let name = envelope.pointer("/server/name").and_then(Value::as_str).unwrap_or("?");

@@ -10,6 +10,7 @@ use serde_json::Value;
 
 use crate::error::StoreError;
 use crate::ports::clock::Clock;
+use crate::ports::events::Events;
 use crate::ports::mcp::{McpStore, NewSurface, ProbeRun, ProbeRunRow};
 use crate::ports::mcp_feed::{ProbeOptions, ToolProbe};
 
@@ -42,6 +43,7 @@ pub struct ProbeMirror {
     mcp: Arc<dyn McpStore>,
     probe: Arc<dyn ToolProbe>,
     clock: Arc<dyn Clock>,
+    events: Arc<dyn Events>,
     remotes: Remotes,
     surface: SurfaceOf,
 }
@@ -54,11 +56,19 @@ fn history<'a>(runs: &'a [ProbeRunRow], url: &str) -> (Option<&'a ProbeRunRow>, 
 }
 
 impl ProbeMirror {
-    pub fn new(mcp: Arc<dyn McpStore>, probe: Arc<dyn ToolProbe>, clock: Arc<dyn Clock>, remotes: Remotes, surface: SurfaceOf) -> Self {
+    pub fn new(
+        mcp: Arc<dyn McpStore>,
+        probe: Arc<dyn ToolProbe>,
+        clock: Arc<dyn Clock>,
+        events: Arc<dyn Events>,
+        remotes: Remotes,
+        surface: SurfaceOf,
+    ) -> Self {
         Self {
             mcp,
             probe,
             clock,
+            events,
             remotes,
             surface,
         }
@@ -66,7 +76,26 @@ impl ProbeMirror {
 
     /// Every due endpoint of the repository's latest versions; `force`
     /// ignores the schedule, never the SSE rule.
-    pub async fn run(&self, repository: i64, settings: &ProbeSettings, force: bool, only: Option<i64>) -> Result<ProbeReport, StoreError> {
+    pub async fn run(
+        &self,
+        repository: i64,
+        name: &str,
+        settings: &ProbeSettings,
+        force: bool,
+        only: Option<i64>,
+    ) -> Result<ProbeReport, StoreError> {
+        let report = self.probe_due(repository, settings, force, only).await?;
+        if report.answered > 0 {
+            for target in self.mcp.probe_targets(repository).await? {
+                if only.is_none_or(|id| id == target.version_id) {
+                    super::sync::announce_drift(self.mcp.as_ref(), self.events.as_ref(), name, target.version_id, repository).await;
+                }
+            }
+        }
+        Ok(report)
+    }
+
+    async fn probe_due(&self, repository: i64, settings: &ProbeSettings, force: bool, only: Option<i64>) -> Result<ProbeReport, StoreError> {
         let now = self.clock.now();
         let mut report = ProbeReport::default();
         let mut due = Vec::new();

@@ -66,6 +66,15 @@ pub enum DomainEvent {
         target: Option<String>,
     },
     PolicyResolution(ResolutionCounts),
+    /// A mirror finished a sync run.
+    McpSynced { repository: String, changed: u64, failed: bool },
+    /// A served version no longer matches what was approved.
+    McpDrift {
+        repository: String,
+        server: String,
+        version: String,
+        drift: String,
+    },
 }
 
 impl DomainEvent {
@@ -79,6 +88,8 @@ impl DomainEvent {
             Self::PermissionsChanged { .. } => "permissions.changed",
             Self::AuditEntry { .. } => "audit.entry",
             Self::PolicyResolution(_) => "policy.resolution",
+            Self::McpSynced { .. } => "mcp.sync",
+            Self::McpDrift { .. } => "mcp.drift",
         }
     }
 }

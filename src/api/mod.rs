@@ -4,6 +4,7 @@ pub mod dashboard;
 pub mod deps;
 pub mod maven;
 pub mod mcp;
+pub mod mcp_admin;
 pub mod me;
 pub mod permissions;
 pub mod policy;

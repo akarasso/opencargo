@@ -62,12 +62,13 @@ pub async fn run_locked(
     handles: &SyncHandles,
     sync: &SyncMirror,
     repository: i64,
+    name: &str,
     upstream: &str,
     full: bool,
 ) -> Result<SyncReport, SyncError> {
     let lock = handles.lock_for(repository);
     let _held = lock.lock().await;
-    sync.run(repository, upstream, full).await
+    sync.run(repository, name, upstream, full).await
 }
 
 pub struct SyncSupervisor {
@@ -210,13 +211,13 @@ async fn child(m: Mirror, notify: Arc<Notify>) {
     } = m;
     let mut failures = 0u32;
     loop {
-        let outcome = run_locked(&handles, &sync, repository, &upstream, false).await;
+        let outcome = run_locked(&handles, &sync, repository, &name, &upstream, false).await;
         let wait = match &outcome {
             Ok(report) => {
                 failures = 0;
                 info!(repository = %name, pages = report.pages, changed = report.changed, skipped = report.skipped, "MCP mirror synced");
                 if let Some((probe, settings)) = &probe {
-                    match probe.run(repository, settings, false, None).await {
+                    match probe.run(repository, &name, settings, false, None).await {
                         Ok(r) => info!(repository = %name, probed = r.probed, answered = r.answered, "MCP remotes probed"),
                         Err(e) => warn!(repository = %name, error = %e, "MCP probe run failed"),
                     }
