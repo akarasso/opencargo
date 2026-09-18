@@ -45,6 +45,7 @@ pub mod authenticate;
 pub mod events;
 pub mod oci;
 pub mod permissions;
+pub mod place;
 pub mod promote;
 pub mod publish;
 pub mod publish_tail;

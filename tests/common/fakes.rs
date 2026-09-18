@@ -880,7 +880,9 @@ impl PackageStore for Packages {
             now: release.now,
         };
         self.with(|state| {
+            state.reclaim.live_pins(release.pins)?;
             let (package, version) = Self::write_release(state, &spec)?;
+            state.reclaim.spend(release.pins);
             Ok(Release { package, version })
         })
     }
@@ -906,7 +908,9 @@ impl PackageStore for Packages {
             now: promotion.now,
         };
         self.with(|state| {
+            state.reclaim.live_pins(promotion.pins)?;
             let (_, version) = Self::write_release(state, &spec)?;
+            state.reclaim.spend(promotion.pins);
             let id = state.id();
             state.audit.push(AuditEntry {
                 id,
@@ -2135,6 +2139,30 @@ impl ReclaimState {
                 enqueued_at: now,
             }),
         }
+    }
+
+    /// The compare-and-set a committing method runs first: every token
+    /// still names its pin, or the commit writes nothing.
+    fn live_pins(&self, tokens: &[PinToken]) -> Result<(), StoreError> {
+        let revoked: Vec<String> = tokens
+            .iter()
+            .filter(|t| {
+                !self
+                    .pins
+                    .iter()
+                    .any(|p| p.token == t.token && p.physical_key == t.physical_key)
+            })
+            .map(|t| t.physical_key.clone())
+            .collect();
+        if revoked.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::Superseded(revoked))
+        }
+    }
+
+    fn spend(&mut self, tokens: &[PinToken]) {
+        self.pins.retain(|p| !tokens.iter().any(|t| t.token == p.token));
     }
 
     fn revoke_under(&mut self, prefix: &str) {

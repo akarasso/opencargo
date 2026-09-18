@@ -9,7 +9,7 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
 
-use crate::app::promote::{is_conflict, PromoteVersion, Promoter, Request};
+use crate::app::promote::{is_conflict, Promoter, Request};
 use crate::auth::middleware::AuthUser;
 use crate::domain::{
     can_admin, Audience, DomainEvent, PackagePromotion, RepoKind, Repository, Visibility,
@@ -57,16 +57,6 @@ fn rewrite_tarball_url(
     }
 
     serde_json::to_string(&meta).unwrap_or_else(|_| metadata_json.to_string())
-}
-
-/// A path the target version owns: the layout is `{format}/{repo}/{...}`, so
-/// only the repository segment changes.
-fn target_path(source: &str, to_repo: &str) -> String {
-    let parts: Vec<&str> = source.splitn(3, '/').collect();
-    match parts.len() {
-        3 => format!("{}/{to_repo}/{}", parts[0], parts[2]),
-        _ => format!("{to_repo}/{source}"),
-    }
 }
 
 /// The tags the source version holds; the promoted one inherits exactly
@@ -178,10 +168,6 @@ async fn move_version(
     // safety net for the race.
     refuse_existing(state, to_repo, name, version).await?;
 
-    // The target version owns its artifact. Sharing the source path let the
-    // cleanup GC, deleting the older pre-release source file, make the
-    // promoted production artifact undownloadable — silent data loss.
-    let target_tarball_path = target_path(&from_version.tarball_path, &to_repo.name);
     let metadata_json = rewrite_tarball_url(
         &from_version.metadata_json,
         &state.base_url,
@@ -191,7 +177,8 @@ async fn move_version(
     let inherited = inherited_tags(state, from_package.id, from_version.id).await?;
     let details = json!({ "from": body.from, "to": body.to });
 
-    PromoteVersion::new(state.packages.clone(), state.storage.clone())
+    state
+        .promote_version()
         .run(
             Request {
                 source: &from_version,
@@ -199,7 +186,6 @@ async fn move_version(
                 package: name,
                 description: from_package.description.as_deref(),
                 metadata_json: &metadata_json,
-                target_path: &target_tarball_path,
                 dist_tags: &inherited,
                 details_json: &details.to_string(),
             },

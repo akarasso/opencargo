@@ -407,6 +407,7 @@ macro_rules! package_contract {
                     size: 4,
                     tarball_path: "npm/r/p/p.tgz",
                     dist_tags: tags,
+                    pins: &[],
                     now: at(9),
                 }
             }
@@ -689,6 +690,7 @@ macro_rules! package_contract {
                         metadata_json: "{}",
                         tarball_path: "npm/npm-prod/left-pad/p.tgz",
                         dist_tags: &tags,
+                        pins: &[],
                         audit: PromotionAudit {
                             user_id: None,
                             username: "alex",
@@ -726,6 +728,7 @@ macro_rules! package_contract {
                             metadata_json: "{}",
                             tarball_path: "npm/npm-prod/left-pad/p.tgz",
                             dist_tags: &[],
+                            pins: &[],
                             audit: PromotionAudit {
                                 user_id: None,
                                 username: "alex",
@@ -1667,6 +1670,7 @@ macro_rules! reclaim_contract {
                         size: 1,
                         tarball_path: key,
                         dist_tags: &[],
+                        pins: &[],
                         now: at(2),
                     })
                     .await
@@ -1887,6 +1891,133 @@ macro_rules! reclaim_contract {
                 assert_eq!(h.reclaim.prune_pins(GRACE, at(4), 2).await.unwrap(), 2, "bounded");
                 assert_eq!(h.reclaim.prune_pins(GRACE, at(4), 10).await.unwrap(), 1);
                 assert_eq!(listed(&h, 4).await, vec![live[0].physical_key.clone()]);
+            }
+
+            fn release_with<'a>(
+                repo: i64,
+                version: &'a str,
+                pins: &'a [PinToken],
+            ) -> NewRelease<'a> {
+                NewRelease {
+                    repository: repo,
+                    package: "p",
+                    match_name: NameMatch::Exact,
+                    description: None,
+                    readme: None,
+                    version,
+                    metadata_json: "{}",
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    integrity: None,
+                    size: 1,
+                    tarball_path: &pins[0].physical_key,
+                    dist_tags: &[],
+                    pins,
+                    now: at(2),
+                }
+            }
+
+            #[tokio::test]
+            async fn commit_with_revoked_pin_is_superseded() {
+                use ::opencargo::ports::packages::{Promotion, PromotionAudit};
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &["r/x"], 2).await;
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&tokens[0].physical_key), at(1))
+                    .await
+                    .unwrap();
+                assert!(matches!(claim(&h, &tokens[0].physical_key, 5).await, Claim::Claimed(_)));
+                let refused = h
+                    .packages
+                    .publish_version(&release_with(r.id, "1.0.0", &tokens))
+                    .await;
+                match &refused {
+                    Err(StoreError::Superseded(keys)) => {
+                        assert_eq!(keys, &vec![tokens[0].physical_key.clone()])
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert!(
+                    h.packages.package(r.id, "p", NameMatch::Exact).await.unwrap().is_none(),
+                    "nothing written"
+                );
+
+                let live = pin(&h, &prefix, &["r/y"], 9).await;
+                let landed = h
+                    .packages
+                    .publish_version(&release_with(r.id, "1.0.0", &live))
+                    .await
+                    .unwrap();
+                let (target, target_prefix) = repo(&h, "t").await;
+                let revoked = pin(&h, &target_prefix, &["t/x"], 2).await;
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&revoked[0].physical_key), at(1))
+                    .await
+                    .unwrap();
+                assert!(matches!(claim(&h, &revoked[0].physical_key, 5).await, Claim::Claimed(_)));
+                let promoted = h
+                    .packages
+                    .promote_metadata(&Promotion {
+                        source: &landed.version,
+                        target_repository: target.id,
+                        package: "p",
+                        description: None,
+                        metadata_json: "{}",
+                        tarball_path: &revoked[0].physical_key,
+                        dist_tags: &[],
+                        pins: &revoked,
+                        audit: PromotionAudit {
+                            user_id: None,
+                            username: "u",
+                            target: "p@1.0.0",
+                            repository: "t",
+                            details_json: "{}",
+                        },
+                        now: at(6),
+                    })
+                    .await;
+                assert!(matches!(promoted, Err(StoreError::Superseded(_))), "{promoted:?}");
+                assert!(h
+                    .packages
+                    .package(target.id, "p", NameMatch::Exact)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+
+            #[tokio::test]
+            async fn a_spent_pin_is_gone_and_a_row_references_its_key() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &["r/x"], 9).await;
+                h.packages
+                    .publish_version(&release_with(r.id, "1.0.0", &tokens))
+                    .await
+                    .unwrap();
+                let again = h
+                    .packages
+                    .publish_version(&release_with(r.id, "1.0.1", &tokens))
+                    .await;
+                assert!(matches!(again, Err(StoreError::Superseded(_))), "a token is spent once");
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&tokens[0].physical_key), at(1))
+                    .await
+                    .unwrap();
+                assert_eq!(claim(&h, &tokens[0].physical_key, 5).await, Claim::Referenced);
+            }
+
+            #[tokio::test]
+            async fn commit_after_retire_is_superseded_not_fk_error() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &[&format!("{prefix}/p/f")], 9).await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                let refused = h
+                    .packages
+                    .publish_version(&release_with(r.id, "1.0.0", &tokens))
+                    .await;
+                assert!(matches!(refused, Err(StoreError::Superseded(_))), "{refused:?}");
             }
 
             #[tokio::test]

@@ -402,9 +402,9 @@ async fn oci_proxy_purge_removes_rows_and_files_and_leaves_oci_tables_untouched(
             .status(),
         StatusCode::OK
     );
-    let cache_dir = a.tmp.path().join("storage/_proxy_cache/oci-proxy");
     assert_eq!(cache_rows(&a).await.len(), 3);
-    assert!(cache_dir.is_dir());
+    let cached = cache_files(&a).len();
+    assert!(cached > 0);
     assert_eq!(oci_table_rows(&a).await, 0);
 
     let resp = reqwest::Client::new()
@@ -418,9 +418,10 @@ async fn oci_proxy_purge_removes_rows_and_files_and_leaves_oci_tables_untouched(
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "{:?}", resp.text().await);
     assert!(cache_rows(&a).await.is_empty());
-    assert!(
-        !cache_dir.exists(),
-        "purge removes the member's cache directory"
+    assert_eq!(
+        cache_files(&a).len(),
+        cached,
+        "purge enqueues the member's files and deletes none inline"
     );
     assert_eq!(oci_table_rows(&a).await, 0);
     assert_eq!(
@@ -756,7 +757,7 @@ fn basic(user: &str, pass: &str) -> ProxyOpts {
 
 fn cache_files(server: &TestServer) -> Vec<std::path::PathBuf> {
     let mut out = Vec::new();
-    let mut stack = vec![server.tmp.path().join("storage/_proxy_cache")];
+    let mut stack = vec![server.tmp.path().join("storage/r")];
     while let Some(dir) = stack.pop() {
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;

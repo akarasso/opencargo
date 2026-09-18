@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{DistTag, Package, Version};
+use crate::ports::reclaim::PinToken;
 use crate::error::StoreError;
 
 /// How a package name is matched. Cargo's names are unique regardless of
@@ -45,6 +46,9 @@ pub struct NewRelease<'a> {
     pub tarball_path: &'a str,
     /// The tags that point at this version once it exists.
     pub dist_tags: &'a [String],
+    /// The pins of the keys the row references, spent by compare-and-set in
+    /// the transaction; a revoked one makes the publish write nothing.
+    pub pins: &'a [PinToken],
     pub now: DateTime<Utc>,
 }
 
@@ -68,9 +72,8 @@ pub struct PromotionAudit<'a> {
 
 /// A version already published elsewhere, arriving in another repository.
 ///
-/// The blob is the caller's business and is copied *before* this runs: a
-/// gigabyte-long copy inside the transaction would hold SQLite's single
-/// writer for its whole duration.
+/// The blob is placed *before* this runs: a gigabyte-long copy inside the
+/// transaction would hold SQLite's single writer for its whole duration.
 pub struct Promotion<'a> {
     pub source: &'a Version,
     pub target_repository: i64,
@@ -80,6 +83,8 @@ pub struct Promotion<'a> {
     pub tarball_path: &'a str,
     /// The tags the source version holds, which the promoted one inherits.
     pub dist_tags: &'a [String],
+    /// As for a publish: spent in the transaction, all or none.
+    pub pins: &'a [PinToken],
     pub audit: PromotionAudit<'a>,
     pub now: DateTime<Utc>,
 }
@@ -127,7 +132,7 @@ pub trait PackageStore: Send + Sync {
     ///
     /// `Conflict` when that `package@version` is already there, including
     /// when two callers race for it: the unique constraint is the arbiter,
-    /// not a preceding read.
+    /// not a preceding read. `Superseded` when a pin was revoked.
     async fn publish_version(&self, release: &NewRelease<'_>) -> Result<Release, StoreError>;
 
     /// The package upsert in the target repository, the version row, its

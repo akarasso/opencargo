@@ -9,7 +9,7 @@ use crate::ports::clock::Clock;
 use crate::ports::packages::PackageStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
-use crate::storage::StorageBackend;
+use crate::ports::reclaim::ReclaimStore;
 
 /// A retention bound in days, as the duration the ports take.
 fn retention(days: u64) -> Duration {
@@ -57,7 +57,7 @@ pub async fn start_cleanup_task(
     packages: Arc<dyn PackageStore>,
     cache: Arc<dyn ProxyCacheStore>,
     policy: Arc<dyn PolicyStore>,
-    storage: Arc<dyn StorageBackend>,
+    reclaim: Arc<dyn ReclaimStore>,
     clock: Arc<dyn Clock>,
     config: CleanupConfig,
 ) {
@@ -74,7 +74,7 @@ pub async fn start_cleanup_task(
             packages: packages.as_ref(),
             cache: cache.as_ref(),
             policy: policy.as_ref(),
-            storage: &storage,
+            reclaim: reclaim.as_ref(),
         };
         sweeps.run(&config, clock.now()).await;
         tokio::time::sleep(Duration::from_secs(86400)).await;
@@ -86,7 +86,7 @@ pub(crate) struct RunCleanup<'a> {
     pub packages: &'a dyn PackageStore,
     pub cache: &'a dyn ProxyCacheStore,
     pub policy: &'a dyn PolicyStore,
-    pub storage: &'a Arc<dyn StorageBackend>,
+    pub reclaim: &'a dyn ReclaimStore,
 }
 
 impl RunCleanup<'_> {
@@ -102,7 +102,7 @@ impl RunCleanup<'_> {
         }
 
         if let Some(idle) = proxy_idle_days(config) {
-            match sweep_proxy_cache(self.cache, self.storage, idle, now).await {
+            match sweep_proxy_cache(self.cache, self.reclaim, idle, now).await {
                 Ok(sweep) => stats.proxy = Some(sweep),
                 Err(e) => error!(error = %e, "Failed to sweep the proxy cache"),
             }
@@ -148,23 +148,23 @@ pub(crate) async fn sweep_prereleases(
     Ok(stale.len() as u64)
 }
 
-/// Evict expired negative entries and every row idle for `idle_days`, file
-/// first, then row.
+/// Evict expired negative entries and every row idle for `idle_days`: the
+/// row goes and its file is enqueued, never deleted here.
 pub(crate) async fn sweep_proxy_cache(
     cache: &dyn ProxyCacheStore,
-    storage: &Arc<dyn StorageBackend>,
+    reclaim: &dyn ReclaimStore,
     idle_days: u64,
     now: DateTime<Utc>,
 ) -> anyhow::Result<SweepStats> {
     let mut stats = SweepStats::default();
     for row in cache.evictable(retention(idle_days), now, SWEEP_LIMIT).await? {
+        cache.delete(row.id).await?;
         if let Some(path) = &row.storage_path {
-            match storage.delete(path).await {
+            match reclaim.enqueue(std::slice::from_ref(path), now).await {
                 Ok(()) => stats.files += 1,
-                Err(e) => warn!(path, error = %e, "Failed to delete an evicted cache file"),
+                Err(e) => warn!(path, error = %e, "Failed to enqueue an evicted cache file"),
             }
         }
-        cache.delete(row.id).await?;
         stats.rows += 1;
     }
     info!(
@@ -178,6 +178,7 @@ pub(crate) async fn sweep_proxy_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageBackend;
     use chrono::TimeZone;
 
     use crate::domain::{Format, NewEntry, RepoKind, RepoSpec, RuleVerdict, Verdict, Visibility};
@@ -202,6 +203,7 @@ mod tests {
         policy: Arc<dyn PolicyStore>,
         storage: Arc<dyn StorageBackend>,
         fakes: FakeDb,
+        reclaim: Arc<dyn ReclaimStore>,
         /// The seeded repositories: a hosted npm one, a hosted go one, and
         /// the npm proxy whose answers the cache rows belong to.
         npm: i64,
@@ -239,6 +241,7 @@ mod tests {
             packages: db.packages(),
             cache: db.proxy_cache(),
             policy: db.policy(),
+            reclaim: db.reclaim(),
             fakes: db,
             _tmp: tmp,
             npm: ids[0],
@@ -253,7 +256,7 @@ mod tests {
                 packages: self.packages.as_ref(),
                 cache: self.cache.as_ref(),
                 policy: self.policy.as_ref(),
-                storage: &self.storage,
+                reclaim: self.reclaim.as_ref(),
             }
         }
 
@@ -325,6 +328,7 @@ mod tests {
                     size: 6,
                     tarball_path: &tarball_path,
                     dist_tags: &["latest".to_string()],
+                    pins: &[],
                     now: at,
                 })
                 .await
@@ -453,7 +457,7 @@ mod tests {
         fx.entry("npm-metadata", "fresh-negative", 404, Some(60), now())
             .await;
 
-        let stats = sweep_proxy_cache(fx.cache.as_ref(), &fx.storage, 30, now())
+        let stats = sweep_proxy_cache(fx.cache.as_ref(), fx.fakes.reclaim().as_ref(), 30, now())
             .await
             .unwrap();
 
@@ -465,7 +469,11 @@ mod tests {
         assert!(!fx.cached("npm-metadata", "gone").await);
         assert!(fx.cached("npm-metadata", "stale").await);
         assert!(fx.cached("npm-metadata", "fresh-negative").await);
-        assert!(fx.storage.stat("_proxy_cache/p/npm-tarball/idle").await.unwrap().is_none());
+        assert_eq!(
+            fx.fakes.candidates(),
+            vec!["_proxy_cache/p/npm-tarball/idle".to_string()],
+            "the evicted file is enqueued, not deleted"
+        );
         assert!(fx.storage.stat("_proxy_cache/p/npm-metadata/stale").await.unwrap().is_some());
     }
 

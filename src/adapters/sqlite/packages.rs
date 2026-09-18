@@ -377,7 +377,11 @@ impl PackageStore for SqlitePackageStore {
         let (package, version) = immediate(&self.pool, |mut tx| {
             let spec = &spec;
             Box::pin(async move {
-                let landed = write_release(&mut tx, spec).await.map(Ok);
+                let landed = match super::reclaim::spend_pins(&mut tx, release.pins).await {
+                    Ok(Ok(())) => write_release(&mut tx, spec).await.map(Ok),
+                    Ok(Err(revoked)) => Ok(Err(StoreError::Superseded(revoked))),
+                    Err(e) => Err(e),
+                };
                 (tx, landed)
             })
         })
@@ -393,7 +397,11 @@ impl PackageStore for SqlitePackageStore {
         let version = immediate(&self.pool, |mut tx| {
             let spec = &spec;
             Box::pin(async move {
-                let landed = promote(&mut tx, spec, &promotion.audit).await.map(Ok);
+                let landed = match super::reclaim::spend_pins(&mut tx, promotion.pins).await {
+                    Ok(Ok(())) => promote(&mut tx, spec, &promotion.audit).await.map(Ok),
+                    Ok(Err(revoked)) => Ok(Err(StoreError::Superseded(revoked))),
+                    Err(e) => Err(e),
+                };
                 (tx, landed)
             })
         })

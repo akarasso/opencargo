@@ -5,7 +5,6 @@ use tokio::io::AsyncReadExt;
 
 use super::*;
 use crate::testing::fixture::*;
-use crate::domain::{Repository, Visibility};
 use crate::proxy::strategy::{CacheKey, Transfer, UrlSource};
 
 fn found(o: AppResult<Outcome<Cached>>) -> Cached {
@@ -17,40 +16,18 @@ fn found(o: AppResult<Outcome<Cached>>) -> Cached {
 
 #[test]
 fn prefix_keys_do_not_collide() {
-    let repo = Repository {
-        id: 1,
-        name: "p".into(),
-        repo_type: "proxy".into(),
-        format: "go".into(),
-        visibility: Visibility::Public,
-        upstream_url: None,
-        config: None,
-        created_at: chrono::DateTime::UNIX_EPOCH,
-        updated_at: chrono::DateTime::UNIX_EPOCH,
+    let key = |k: &str| CacheKey {
+        kind: "go-list",
+        key: k.into(),
     };
-    let short = cache_path(
-        CacheRepo(&repo),
-        &CacheKey {
-            kind: "go-list",
-            key: "github.com/org/repo".into(),
-        },
-    );
-    let long = cache_path(
-        CacheRepo(&repo),
-        &CacheKey {
-            kind: "go-list",
-            key: "github.com/org/repo/v2".into(),
-        },
-    );
+    let short = cache_path("r/inc", &key("github.com/org/repo"));
+    let long = cache_path("r/inc", &key("github.com/org/repo/v2"));
     assert!(!long.starts_with(&short) && !short.starts_with(&long));
     let segs: Vec<&str> = short.split('/').collect();
-    assert_eq!(&segs[..3], &["_proxy_cache", "p", "go-list"]);
-    assert_eq!((segs[3].len(), segs[4].len()), (2, 64));
-    assert!(segs[4].starts_with(segs[3]));
-    assert!(
-        !short.contains("github.com"),
-        "the human key never reaches the path"
-    );
+    assert_eq!(&segs[..4], &["r", "inc", "_proxy", "go-list"]);
+    assert_eq!((segs[4].len(), segs[5].len()), (2, 64));
+    assert!(segs[5].starts_with(segs[4]));
+    assert!(!short.contains("github.com"), "the human key never reaches the path");
 }
 
 #[tokio::test]
@@ -680,10 +657,9 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
     let row = fx.row("t-item", "art/x").await.unwrap();
     assert_eq!((row.status, row.storage_path), (404, None));
     assert!(
-        fx.storage.stat(&path).await.unwrap().is_none(),
-        "no row references the old body any more"
+        fx.storage.stat(&path).await.unwrap().is_some(),
+        "no row references the old body; it is enqueued, not deleted"
     );
-    assert!(fx.files().is_empty(), "{:?}", fx.files());
 
     fx.set(|s| s.gone = false);
     let shared = found(
@@ -1051,9 +1027,9 @@ fn slow(fx: &Fx, reserve: Duration, commit: Duration) -> Arc<dyn crate::storage:
 async fn queued_writer_is_not_bounded_by_a_write_deadline() {
     let fx = Fx::new().await;
     let engine = fx.engine_over(
-        slow(&fx, Duration::from_millis(600), Duration::ZERO),
+        slow(&fx, Duration::from_secs(3), Duration::ZERO),
         Timeouts {
-            buffered_total: Duration::from_millis(200),
+            buffered_total: Duration::from_secs(1),
             ..timeouts()
         },
     );
@@ -1068,10 +1044,10 @@ async fn queued_writer_is_not_bounded_by_a_write_deadline() {
 #[tokio::test]
 async fn recorder_timeout_does_not_abort_a_completed_upload() {
     let fx = Fx::new().await;
-    let engine = fx.engine_over(slow(&fx, Duration::ZERO, Duration::from_millis(600)), timeouts());
+    let engine = fx.engine_over(slow(&fx, Duration::ZERO, Duration::from_secs(3)), timeouts());
     let art = "art/rec".to_string();
     let observed = engine
-        .observe_within(&Strat::default(), &fx.up, fx.member(), &art, Duration::from_millis(200))
+        .observe_within(&Strat::default(), &fx.up, fx.member(), &art, Duration::from_secs(1))
         .await
         .unwrap();
     let Some(Outcome::Found(cached)) = observed else {
@@ -1083,7 +1059,7 @@ async fn recorder_timeout_does_not_abort_a_completed_upload() {
 #[tokio::test]
 async fn upstream_deadline_does_not_cover_the_writer() {
     let fx = Fx::new().await;
-    fx.set(|s| s.delay = Duration::from_millis(800));
+    fx.set(|s| s.delay = Duration::from_secs(3));
     let engine = fx.engine(timeouts());
     let observed = engine
         .observe_within(
@@ -1091,7 +1067,7 @@ async fn upstream_deadline_does_not_cover_the_writer() {
             &fx.up,
             fx.member(),
             &"art/late".to_string(),
-            Duration::from_millis(200),
+            Duration::from_secs(1),
         )
         .await
         .unwrap();
@@ -1108,7 +1084,7 @@ async fn warm_hits_of_one_key_do_not_serialize() {
     let key = strat.cache_key(&art);
     let _held = engine.lock(fx.member(), &key, false).await;
     let warm = tokio::time::timeout(
-        Duration::from_millis(500),
+        Duration::from_secs(2),
         engine.fetch(&strat, &fx.up, fx.member(), &art),
     )
     .await

@@ -12,7 +12,10 @@ use tracing::warn;
 
 use crate::domain::{CacheEntry, CacheRepo, NewEntry, Outcome};
 use crate::error::{AppError, AppResult};
+use crate::domain::layout;
 use crate::ports::proxy_cache::ProxyCacheStore;
+use crate::ports::reclaim::ReclaimStore;
+use crate::ports::repositories::RepositoryStore;
 use crate::registry::resolve::Upstream;
 use crate::storage::StorageBackend;
 
@@ -22,7 +25,7 @@ use super::strategy::{
     CacheKey, CachePolicy, Classified, DigestAlgorithm, Ttl, UpstreamStrategy, UrlSource,
 };
 
-pub use payload::{cache_path, Cached, IntoPayload, Payload, Src};
+pub use payload::{cache_path, Cached, IntoPayload, Payload, Src, CACHE_SEGMENT};
 use transfer::Reply;
 
 #[derive(Clone, Copy, Debug)]
@@ -55,6 +58,8 @@ pub struct ProxyEngine {
     http: reqwest::Client,
     storage: Arc<dyn StorageBackend>,
     cache: Arc<dyn ProxyCacheStore>,
+    repos: Arc<dyn RepositoryStore>,
+    reclaim: Arc<dyn ReclaimStore>,
     tokens: Arc<TokenCache>,
     inflight: Arc<Singleflight>,
     ttl: TtlConfig,
@@ -111,6 +116,8 @@ impl ProxyEngine {
     pub fn new(
         storage: Arc<dyn StorageBackend>,
         cache: Arc<dyn ProxyCacheStore>,
+        repos: Arc<dyn RepositoryStore>,
+        reclaim: Arc<dyn ReclaimStore>,
         timeouts: Timeouts,
         ttl: TtlConfig,
     ) -> Self {
@@ -125,6 +132,8 @@ impl ProxyEngine {
             http,
             storage,
             cache,
+            repos,
+            reclaim,
             tokens: Arc::new(TokenCache::default()),
             inflight: Arc::new(Singleflight::default()),
             ttl,
@@ -461,18 +470,46 @@ impl ProxyEngine {
         p.to_response(self.storage.as_ref(), extra).await
     }
 
+    /// Where a member's cached bodies live: under its incarnation, never
+    /// its name, so a recreated repository shares no key with the old one.
+    pub(super) async fn cache_root(&self, member: CacheRepo<'_>) -> AppResult<String> {
+        let incarnation = self
+            .repos
+            .incarnation(member.0.id)
+            .await?
+            .ok_or_else(|| AppError::NotFound("repository was removed".into()))?;
+        Ok(layout::incarnation_prefix(&incarnation))
+    }
+
+    /// Cache keys take no pin and are never deleted inline: every release
+    /// is enqueued, and a row left without bytes is healed by a refetch.
+    pub(super) async fn release(&self, keys: &[String], now: DateTime<Utc>) {
+        if keys.is_empty() {
+            return;
+        }
+        if let Err(e) = self.reclaim.enqueue(keys, now).await {
+            warn!(error = %e, ?keys, "cache files not enqueued; the scan will find them");
+        }
+    }
+
+    /// The rows go, and every file under the member's cache prefixes, its
+    /// incarnation's and its legacy name-keyed one, is enqueued.
     pub async fn purge_repo(&self, member: CacheRepo<'_>) -> AppResult<()> {
         use futures_util::TryStreamExt;
         self.cache.delete_for_repo(member.0.id).await?;
-        let prefix = format!("_proxy_cache/{}", member.0.name);
-        let keys: Vec<String> = self
-            .storage
-            .list(&prefix)
-            .map_ok(|meta| meta.key)
-            .try_collect()
-            .await?;
-        for batch in keys.chunks(self.storage.upload_plan().delete_batch.max(1)) {
-            self.storage.delete_batch(batch).await?;
+        let mut prefixes = vec![format!("_proxy_cache/{}", member.0.name)];
+        if let Ok(root) = self.cache_root(member).await {
+            prefixes.push(format!("{root}/{CACHE_SEGMENT}"));
+        }
+        let now = Utc::now();
+        for prefix in prefixes {
+            let keys: Vec<String> = self
+                .storage
+                .list(&prefix)
+                .map_ok(|meta| meta.key)
+                .try_collect()
+                .await?;
+            self.reclaim.enqueue(&keys, now).await?;
         }
         Ok(())
     }
@@ -489,7 +526,7 @@ impl ProxyEngine {
         now: DateTime<Utc>,
     ) -> AppResult<()> {
         if let Some(path) = stale.and_then(|st| st.row.storage_path.as_deref()) {
-            self.storage.delete(path).await?;
+            self.release(&[path.to_string()], now).await;
         }
         let entry = NewEntry {
             repository_id: member.0.id,

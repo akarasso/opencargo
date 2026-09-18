@@ -269,6 +269,8 @@ pub(crate) struct Fx {
     db_path: std::path::PathBuf,
     pub cache: Arc<dyn ProxyCacheStore>,
     policy: Arc<dyn crate::ports::policy::PolicyStore>,
+    pub repos: Arc<dyn crate::ports::repositories::RepositoryStore>,
+    pub reclaim: Arc<dyn crate::ports::reclaim::ReclaimStore>,
     pub storage: Arc<dyn StorageBackend>,
     pub repo: Repository,
     pub fake: Shared,
@@ -332,6 +334,8 @@ impl Fx {
             db_path,
             cache,
             policy: stores.policy(),
+            repos: stores.repositories(),
+            reclaim: stores.reclaim(),
             storage,
             repo,
             fake,
@@ -362,7 +366,14 @@ impl Fx {
             default_secs: 3600,
             negative_secs: 600,
         };
-        ProxyEngine::new(storage, self.cache.clone(), timeouts, ttl)
+        ProxyEngine::new(
+            storage,
+            self.cache.clone(),
+            self.repos.clone(),
+            self.reclaim.clone(),
+            timeouts,
+            ttl,
+        )
     }
 
     pub fn member(&self) -> CacheRepo<'_> {

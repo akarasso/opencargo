@@ -84,6 +84,8 @@ impl Resolver {
         let proxy = ProxyEngine::new(
             Arc::new(NoStorage),
             db.proxy_cache(),
+            db.repositories(),
+            db.reclaim(),
             Timeouts::from_connect_secs(1),
             TtlConfig {
                 default_secs: 60,

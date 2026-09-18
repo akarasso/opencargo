@@ -19,6 +19,9 @@ use tracing::{info, warn};
 
 use crate::adapters::sqlite::SqliteStores;
 use crate::app::events::Announce;
+use crate::app::place::Placer;
+use crate::app::promote::PromoteVersion;
+use crate::app::publish::PublishVersion;
 use crate::app::publish_tail::{PublishGate, PublishTail};
 use crate::app::reclaim::{ReclaimOrphans, ReclaimPolicy};
 use crate::ports::reclaim::ReclaimStore;
@@ -127,6 +130,24 @@ impl AppState {
             self.webhook_dispatcher.clone(),
             self.vuln_scanner.clone(),
             self.vulns.clone(),
+        )
+    }
+
+    /// The only placer of shared keys.
+    pub fn placer(&self) -> Arc<Placer> {
+        Arc::new(Placer::new(self.reclaim.clone(), self.storage.clone()))
+    }
+
+    pub fn publish_version(&self) -> PublishVersion {
+        PublishVersion::new(self.packages.clone(), self.repos.clone(), self.placer())
+    }
+
+    pub fn promote_version(&self) -> PromoteVersion {
+        PromoteVersion::new(
+            self.packages.clone(),
+            self.repos.clone(),
+            self.storage.clone(),
+            self.placer(),
         )
     }
 
@@ -265,7 +286,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     ensure_admin_user(users.as_ref(), config).await?;
 
     let cache = stores.proxy_cache();
-    let proxy = proxy_engine(config, storage.clone(), cache.clone());
+    let proxy = proxy_engine(config, storage.clone(), cache.clone(), &stores);
     let upstream_auth = Arc::new(upstream_creds(repos.as_ref(), config).await?);
 
     let metrics_handle = telemetry::init_metrics();
@@ -375,6 +396,7 @@ fn proxy_engine(
     config: &Config,
     storage: Arc<dyn StorageBackend>,
     cache: Arc<dyn ProxyCacheStore>,
+    stores: &SqliteStores,
 ) -> ProxyEngine {
     let ttl = TtlConfig {
         default_secs: parse_duration_secs(&config.proxy.default_ttl),
@@ -384,6 +406,8 @@ fn proxy_engine(
     ProxyEngine::new(
         storage,
         cache,
+        stores.repositories(),
+        stores.reclaim(),
         Timeouts::from_connect_secs(connect_timeout_secs),
         ttl,
     )

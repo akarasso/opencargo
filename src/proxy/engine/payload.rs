@@ -5,7 +5,7 @@ use bytes::Bytes;
 use sha2::{Digest, Sha256};
 use tokio_util::io::ReaderStream;
 
-use crate::domain::{CacheEntry, CacheRepo, Outcome};
+use crate::domain::{CacheEntry, Outcome};
 use crate::error::{AppError, AppResult};
 use crate::storage::{StorageBackend, StorageError};
 
@@ -137,14 +137,12 @@ fn unreadable(e: StorageError) -> AppError {
     AppError::from(e)
 }
 
-/// `_proxy_cache/{member}/{kind}/{h[..2]}/{h}`, `h = hex(sha256(key))`, so a
-/// key that prefixes another never needs one path to be file and directory.
-pub fn cache_path(member: CacheRepo<'_>, key: &CacheKey) -> String {
+pub const CACHE_SEGMENT: &str = "_proxy";
+
+/// `{root}/_proxy/{kind}/{h[..2]}/{h}`, `h = hex(sha256(key))`, under the
+/// member's incarnation root, so a key that prefixes another never needs one
+/// path to be file and directory, and no repository name reaches a key.
+pub fn cache_path(root: &str, key: &CacheKey) -> String {
     let h = format!("{:x}", Sha256::digest(key.key.as_bytes()));
-    format!(
-        "_proxy_cache/{}/{}/{}/{h}",
-        member.0.name,
-        key.kind,
-        &h[..2]
-    )
+    format!("{root}/{CACHE_SEGMENT}/{}/{}/{h}", key.kind, &h[..2])
 }

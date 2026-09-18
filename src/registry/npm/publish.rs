@@ -13,7 +13,7 @@ use serde_json::{json, Value};
 use sha1::Digest;
 use tracing::info;
 
-use crate::app::publish::{Artifact, PublishVersion};
+use crate::app::publish::Artifact;
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Package, Repository, Version};
 use crate::error::{AppError, AppResult};
@@ -56,7 +56,7 @@ struct NewVersion {
     sha1: String,
     sha256: String,
     integrity: String,
-    storage_path: String,
+    filename: String,
     meta: Value,
     metadata_json: String,
     pre: PreScan,
@@ -206,7 +206,6 @@ async fn prepare_version(
     }
 
     let tarball_filename = build_tarball_filename(package_name, version_str);
-    let storage_path = format!("npm/{repo_name}/{package_name}/{tarball_filename}");
     let tarball_url = format!(
         "{}/{repo_name}/{package_name}/-/{tarball_filename}",
         state.base_url
@@ -221,7 +220,7 @@ async fn prepare_version(
         sha1,
         sha256,
         integrity,
-        storage_path,
+        filename: tarball_filename,
         meta,
         metadata_json,
         pre,
@@ -274,7 +273,7 @@ async fn store_version(
 ) -> AppResult<()> {
     let size = v.tarball.len() as i64;
     let tags = tags_for(&body.dist_tags, &v.version);
-    let landed = PublishVersion::new(state.packages.clone(), state.storage.clone())
+    let landed = state.publish_version()
         .run(
             Artifact {
                 repository: repo.id,
@@ -287,7 +286,7 @@ async fn store_version(
                 checksum_sha1: Some(&v.sha1),
                 checksum_sha256: Some(&v.sha256),
                 integrity: Some(&v.integrity),
-                storage_path: &v.storage_path,
+                filename: &v.filename,
                 dist_tags: &tags,
                 bytes: v.tarball,
             },

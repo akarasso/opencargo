@@ -83,7 +83,7 @@ impl Leaf for TarballLeaf {
         let versions = cx.packages.versions(package.id).await?;
         let Some(version) = versions
             .iter()
-            .find(|v| v.tarball_path.ends_with(&self.filename))
+            .find(|v| crate::domain::layout::logical_key(&v.tarball_path).ends_with(&self.filename))
         else {
             return Ok(Outcome::NotFound);
         };

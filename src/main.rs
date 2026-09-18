@@ -82,7 +82,7 @@ async fn main() -> anyhow::Result<()> {
                 app_state.packages.clone(),
                 app_state.cache.clone(),
                 app_state.policy_store.clone(),
-                app_state.storage.clone(),
+                app_state.reclaim.clone(),
                 app_state.clock.clone(),
                 cfg.cleanup.clone(),
             ));

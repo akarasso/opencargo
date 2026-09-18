@@ -95,6 +95,38 @@ pub(crate) async fn revoke_under(tx: &mut Tx, prefix: &str) -> Result<(), sqlx::
     Ok(())
 }
 
+/// The tokens a commit spends, all or none: `Err` names the physical keys
+/// whose pin was revoked or pruned. Called inside the committing method's
+/// own transaction.
+pub(crate) async fn spend_pins(
+    tx: &mut Tx,
+    tokens: &[PinToken],
+) -> Result<Result<(), Vec<String>>, sqlx::Error> {
+    let mut revoked = Vec::new();
+    for pin in tokens {
+        let live: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM reclaim_pins WHERE token = ?1 AND physical_key = ?2)",
+        )
+        .bind(&pin.token)
+        .bind(&pin.physical_key)
+        .fetch_one(&mut **tx)
+        .await?;
+        if !live {
+            revoked.push(pin.physical_key.clone());
+        }
+    }
+    if !revoked.is_empty() {
+        return Ok(Err(revoked));
+    }
+    for pin in tokens {
+        sqlx::query("DELETE FROM reclaim_pins WHERE token = ?1")
+            .bind(&pin.token)
+            .execute(&mut **tx)
+            .await?;
+    }
+    Ok(Ok(()))
+}
+
 async fn is_retired(tx: &mut Tx, repo_prefix: &str) -> Result<bool, sqlx::Error> {
     let live: bool = sqlx::query_scalar(
         "SELECT EXISTS (

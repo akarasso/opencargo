@@ -142,8 +142,9 @@ impl ProxyEngine {
         let expected = s.expected_digests(a, &headers);
         let mut digests = Hashers::for_expected(&expected);
         let max = s.max_bytes(a);
+        let root = self.cache_root(member).await?;
         let mut sink = match digest_independent_key(s, a) {
-            Some(key) => Sink::Stream(self.storage.writer(&cache_path(member, &key)).await?),
+            Some(key) => Sink::Stream(self.storage.writer(&cache_path(&root, &key)).await?),
             None => Sink::Buffer(BytesMut::new()),
         };
         let mut size = 0u64;
@@ -171,7 +172,7 @@ impl ProxyEngine {
             )));
         }
         let sha256 = computed.sha256.clone();
-        let path = cache_path(member, &s.store_key(a, &sha256));
+        let path = cache_path(&root, &s.store_key(a, &sha256));
         match sink {
             Sink::Stream(writer) => {
                 writer.commit().await?;
@@ -212,7 +213,10 @@ impl ProxyEngine {
             size: body.size as i64,
             ttl_secs: if pointer { None } else { ttl },
         };
-        self.cache.upsert(&body_row, now).await?;
+        if let Err(e) = self.cache.upsert(&body_row, now).await {
+            self.release(std::slice::from_ref(&body.path), now).await;
+            return Err(e.into());
+        }
         if pointer {
             let pointer_row = NewEntry {
                 kind: key.kind,
