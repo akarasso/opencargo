@@ -1,22 +1,25 @@
 //! Publishing one version of a package.
 //!
-//! npm, cargo and go differ in what they parse, what they checksum and where
-//! they file the blob, and not at all in the order those land: the artifact
-//! first, then the rows that claim it. One use case therefore serves the
-//! three, and the differences ride in the command — a second copy of this
-//! ordering per format would be three chances to get it wrong.
+//! npm, cargo and go differ in what they parse and what they checksum, and
+//! not at all in the order the version lands: its bytes under a `HostedKey`
+//! of the repository's incarnation, placed by `place_shared`, then the rows
+//! that claim them, which spend the placement's pin in their transaction.
 
 use std::sync::Arc;
 
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 
+use crate::app::place::{Entry, PlaceError, Placer, Source};
+use crate::domain::layout;
 use crate::error::{AppError, StoreError};
 use crate::ports::packages::{NameMatch, NewRelease, PackageStore, Release};
-use crate::storage::{StorageBackend, StorageError};
+use crate::ports::repositories::RepositoryStore;
+use crate::storage::StorageError;
 
-/// How a publish refuses. The two are kept apart because a full disk and a
-/// duplicate version are not the same answer to the client.
+/// How a publish refuses. A full disk, a duplicate version and a placement
+/// that must be retried are not the same answer to the client.
 #[derive(Debug, thiserror::Error)]
 pub enum PublishError {
     #[error(transparent)]
@@ -24,6 +27,23 @@ pub enum PublishError {
 
     #[error(transparent)]
     Storage(#[from] StorageError),
+
+    #[error("the repository was removed")]
+    Retired,
+
+    #[error("the placement was superseded and could not be replayed, try again")]
+    Unavailable,
+}
+
+impl From<PlaceError> for PublishError {
+    fn from(err: PlaceError) -> Self {
+        match err {
+            PlaceError::Retired => PublishError::Retired,
+            PlaceError::Refused(err) | PlaceError::Store(err) => PublishError::Store(err),
+            PlaceError::Unavailable => PublishError::Unavailable,
+            PlaceError::Storage(err) => PublishError::Storage(err),
+        }
+    }
 }
 
 impl From<PublishError> for AppError {
@@ -31,6 +51,8 @@ impl From<PublishError> for AppError {
         match err {
             PublishError::Store(err) => err.into(),
             PublishError::Storage(err) => err.into(),
+            PublishError::Retired => AppError::NotFound(err.to_string()),
+            PublishError::Unavailable => AppError::ServiceUnavailable(err.to_string()),
         }
     }
 }
@@ -48,136 +70,94 @@ pub struct Artifact<'a> {
     pub checksum_sha1: Option<&'a str>,
     pub checksum_sha256: Option<&'a str>,
     pub integrity: Option<&'a str>,
-    pub storage_path: &'a str,
+    /// The name the file keeps inside its `HostedKey`.
+    pub filename: &'a str,
     /// The tags that point at this version once it exists.
     pub dist_tags: &'a [String],
     pub bytes: Bytes,
 }
 
+/// The incarnation prefix of a repository, the root of its new keys.
+pub async fn repo_prefix(repos: &dyn RepositoryStore, repository: i64) -> Result<String, PublishError> {
+    let incarnation = repos
+        .incarnation(repository)
+        .await?
+        .ok_or(PublishError::Retired)?;
+    Ok(layout::incarnation_prefix(&incarnation))
+}
+
 pub struct PublishVersion {
     packages: Arc<dyn PackageStore>,
-    storage: Arc<dyn StorageBackend>,
+    repos: Arc<dyn RepositoryStore>,
+    placer: Arc<Placer>,
 }
 
 impl PublishVersion {
-    pub fn new(packages: Arc<dyn PackageStore>, storage: Arc<dyn StorageBackend>) -> Self {
-        Self { packages, storage }
+    pub fn new(
+        packages: Arc<dyn PackageStore>,
+        repos: Arc<dyn RepositoryStore>,
+        placer: Arc<Placer>,
+    ) -> Self {
+        Self {
+            packages,
+            repos,
+            placer,
+        }
     }
 
-    /// The blob, then the package, version and dist-tag rows in one
-    /// transaction.
-    ///
-    /// This way round because the version row carries the key: a failed
-    /// transaction leaves a file no row claims, which costs space, while
-    /// rows-first would leave a version whose artifact cannot be downloaded.
-    /// Writing the same bytes to the same key twice is a no-op, so a retried
-    /// publish repeats the first step harmlessly.
+    /// The bytes under a fresh generation, then the package, version and
+    /// dist-tag rows in one transaction that spends the pin. A `Conflict`
+    /// loser enqueues its generation and deletes nothing.
     pub async fn run(
         &self,
         artifact: Artifact<'_>,
         now: DateTime<Utc>,
     ) -> Result<Release, PublishError> {
         let size = artifact.bytes.len() as i64;
-        self.storage
-            .put(artifact.storage_path, artifact.bytes.clone())
-            .await?;
-
+        let sha256 = format!("{:x}", Sha256::digest(&artifact.bytes));
+        let prefix = repo_prefix(self.repos.as_ref(), artifact.repository).await?;
+        let entries = [Entry {
+            logical_key: layout::hosted_key(&prefix, artifact.package, &sha256, artifact.filename),
+            source: Source::Bytes(artifact.bytes.clone()),
+        }];
+        let artifact = &artifact;
         let landed = self
-            .packages
-            .publish_version(&NewRelease {
-                repository: artifact.repository,
-                package: artifact.package,
-                match_name: artifact.match_name,
-                description: artifact.description,
-                readme: artifact.readme,
-                version: artifact.version,
-                metadata_json: artifact.metadata_json,
-                checksum_sha1: artifact.checksum_sha1,
-                checksum_sha256: artifact.checksum_sha256,
-                integrity: artifact.integrity,
-                size,
-                tarball_path: artifact.storage_path,
-                dist_tags: artifact.dist_tags,
+            .placer
+            .place_shared(
+                &prefix,
+                &entries,
+                |pins| {
+                    let packages = self.packages.clone();
+                    async move {
+                        packages
+                            .publish_version(&NewRelease {
+                                repository: artifact.repository,
+                                package: artifact.package,
+                                match_name: artifact.match_name,
+                                description: artifact.description,
+                                readme: artifact.readme,
+                                version: artifact.version,
+                                metadata_json: artifact.metadata_json,
+                                checksum_sha1: artifact.checksum_sha1,
+                                checksum_sha256: artifact.checksum_sha256,
+                                integrity: artifact.integrity,
+                                size,
+                                tarball_path: &pins[0].physical_key,
+                                dist_tags: artifact.dist_tags,
+                                dependencies: &[],
+                                pins: &pins,
+                                now,
+                            })
+                            .await
+                    }
+                },
                 now,
-            })
+            )
             .await?;
         Ok(landed)
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::testing::fakes::{FakeDb, PortId};
-
-    fn artifact<'a>(package: &'a str, version: &'a str, tags: &'a [String]) -> Artifact<'a> {
-        Artifact {
-            repository: 1,
-            package,
-            match_name: NameMatch::Exact,
-            description: Some("a package"),
-            readme: None,
-            version,
-            metadata_json: "{}",
-            checksum_sha1: None,
-            checksum_sha256: None,
-            integrity: None,
-            storage_path: "npm/r/p/p-1.0.0.tgz",
-            dist_tags: tags,
-            bytes: Bytes::from_static(b"tarball"),
-        }
-    }
-
-    fn now() -> DateTime<Utc> {
-        DateTime::UNIX_EPOCH
-    }
-
-    fn use_case(db: &FakeDb, root: &tempfile::TempDir) -> PublishVersion {
-        PublishVersion::new(
-            db.packages(),
-            crate::storage::filesystem(root.path().to_str().unwrap()),
-        )
-    }
-
-    #[tokio::test]
-    async fn a_second_publish_of_the_same_version_is_a_conflict() {
-        let db = FakeDb::new();
-        let root = tempfile::TempDir::new().unwrap();
-        let tags = vec!["latest".to_string()];
-        let publish = use_case(&db, &root);
-
-        publish.run(artifact("left-pad", "1.0.0", &tags), now()).await.unwrap();
-        let refused = publish
-            .run(artifact("left-pad", "1.0.0", &tags), now())
-            .await
-            .unwrap_err();
-
-        assert!(matches!(refused, PublishError::Store(StoreError::Conflict)));
-        assert!(matches!(AppError::from(refused), AppError::Conflict(_)));
-    }
-
-    /// The package row is upserted inside the transaction, so a refused
-    /// version leaves no package behind for the search index to find.
-    #[tokio::test]
-    async fn a_refused_write_leaves_no_package_row() {
-        let db = FakeDb::new();
-        let root = tempfile::TempDir::new().unwrap();
-        db.fail_next(PortId::Packages, StoreError::Unavailable);
-
-        let refused = use_case(&db, &root)
-            .run(artifact("left-pad", "1.0.0", &[]), now())
-            .await
-            .unwrap_err();
-
-        assert!(matches!(
-            refused,
-            PublishError::Store(StoreError::Unavailable)
-        ));
-        assert!(db
-            .packages()
-            .package(1, "left-pad", NameMatch::Exact)
-            .await
-            .unwrap()
-            .is_none());
-    }
-}
+#[path = "publish_tests.rs"]
+mod tests;

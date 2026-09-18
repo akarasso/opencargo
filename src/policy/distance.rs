@@ -21,7 +21,7 @@ impl Edit {
 }
 
 /// A name as the lists spell it: lowercase, `_` as `-`, an npm scope kept
-/// apart, a Go major suffix stripped.
+/// apart, a Go major suffix stripped, a PyPI name as PEP 503 spells it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Normalized {
     pub scope: Option<String>,
@@ -56,6 +56,10 @@ pub fn normalize(format: Format, name: &str) -> Normalized {
         Format::Go => Normalized {
             scope: None,
             word: strip_go_major(&lower).to_string(),
+        },
+        Format::Pypi => Normalized {
+            scope: None,
+            word: crate::registry::pypi::names::normalize(&lower),
         },
         _ => Normalized {
             scope: None,

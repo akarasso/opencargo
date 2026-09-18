@@ -21,11 +21,19 @@ use crate::error::StoreError;
 use crate::ports::audit::AuditStore;
 use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
+use crate::ports::multipart::MultipartLedger;
+use crate::ports::maven::MavenFileStore;
+use crate::ports::handoffs::LoginHandoffStore;
+use crate::ports::identities::IdentityStore;
+use crate::ports::secrets::ServerSecretStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
+use crate::ports::pypi::PypiFileStore;
+use crate::ports::reclaim::ReclaimStore;
+use crate::ports::referenced::ReferencedKeys;
 use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::SearchIndex;
 use crate::ports::tokens::TokenStore;
@@ -36,13 +44,19 @@ use crate::ports::webhooks::WebhookStore;
 pub mod audit;
 pub mod dashboard;
 pub mod deps;
+pub mod maven;
+pub mod identities;
 pub mod migrate;
 pub mod multipart;
+pub mod nuget;
 pub mod oci;
 pub mod packages;
 pub mod permissions;
 pub mod policy;
 pub mod proxy_cache;
+pub mod pypi;
+pub mod reclaim;
+pub mod rebuild;
 pub mod repositories;
 pub mod rows;
 pub mod search;
@@ -275,6 +289,10 @@ impl SqliteStores {
         Arc::new(packages::SqlitePackageStore::new(self.pool.clone()))
     }
 
+    pub fn nuget_feed(&self) -> Arc<dyn crate::ports::nuget::NugetFeedRead> {
+        Arc::new(nuget::SqliteNugetFeed::new(self.pool.clone()))
+    }
+
     pub fn search(&self) -> Arc<dyn SearchIndex> {
         Arc::new(search::SqliteSearchIndex::new(self.pool.clone()))
     }
@@ -297,6 +315,38 @@ impl SqliteStores {
 
     pub fn policy(&self) -> Arc<dyn PolicyStore> {
         Arc::new(policy::SqlitePolicyStore::new(self.pool.clone()))
+    }
+
+    pub fn multipart(&self) -> Arc<dyn MultipartLedger> {
+        Arc::new(multipart::SqliteMultipartLedger::new(self.pool.clone()))
+    }
+
+    pub fn pypi(&self) -> Arc<dyn PypiFileStore> {
+        Arc::new(pypi::SqlitePypiFileStore::new(self.pool.clone()))
+    }
+
+    pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {
+        Arc::new(reclaim::SqliteReclaimStore::new(self.pool.clone()))
+    }
+
+    pub fn referenced(&self) -> Arc<dyn ReferencedKeys> {
+        Arc::new(reclaim::SqliteReferencedKeys::new(self.pool.clone()))
+    }
+
+    pub fn maven(&self) -> Arc<dyn MavenFileStore> {
+        Arc::new(maven::SqliteMavenFileStore::new(self.pool.clone()))
+    }
+
+    pub fn identities(&self) -> Arc<dyn IdentityStore> {
+        Arc::new(identities::SqliteIdentityStore::new(self.pool.clone()))
+    }
+
+    pub fn handoffs(&self) -> Arc<dyn LoginHandoffStore> {
+        Arc::new(identities::SqliteHandoffStore::new(self.pool.clone()))
+    }
+
+    pub fn secrets(&self) -> Arc<dyn ServerSecretStore> {
+        Arc::new(identities::SqliteSecretStore::new(self.pool.clone()))
     }
 
     pub fn dashboard(&self) -> Arc<dyn DashboardRead> {

@@ -11,7 +11,7 @@ use bytes::Bytes;
 use serde_json::json;
 use tracing::info;
 
-use crate::app::publish::{Artifact, PublishVersion};
+use crate::app::publish::Artifact;
 use crate::app::publish_tail::Published;
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Repository};
@@ -44,8 +44,8 @@ pub async fn publish_module(
     let repo_name = param(&params, "repo")?;
     let module_name = param(&params, "module")?;
     let version_str = param(&params, "version")?;
-    crate::domain::validate_package_name("go", module_name)?;
-    crate::domain::validate_version(version_str)?;
+    crate::registry::rules::rules_of(crate::domain::Format::Go)?.validate(module_name)?;
+    crate::registry::rules::rules_of(crate::domain::Format::Go)?.validate_version(version_str)?;
 
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_can_write(&*state.permissions, &repo, &auth_user).await?;
@@ -125,8 +125,8 @@ async fn store_version(
     }
 
     let description = format!("Go module {module_name}");
-    let storage_path = format!("go/{}/{module_name}/{version_str}.zip", repo.name);
-    let landed = PublishVersion::new(state.packages.clone(), state.storage.clone())
+    let filename = format!("{version_str}.zip");
+    let landed = state.publish_version()
         .run(
             Artifact {
                 repository: repo.id,
@@ -139,7 +139,7 @@ async fn store_version(
                 checksum_sha1: None,
                 checksum_sha256: None,
                 integrity: None,
-                storage_path: &storage_path,
+                filename: &filename,
                 dist_tags: &[],
                 bytes: zip_data,
             },

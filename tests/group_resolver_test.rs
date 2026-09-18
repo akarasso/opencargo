@@ -159,8 +159,14 @@ async fn seed_upstream() -> Upstream {
     }
 }
 
-fn cache_dir(server: &TestServer, repo: &str) -> std::path::PathBuf {
-    server.tmp.path().join("storage/_proxy_cache").join(repo)
+/// How many cached bodies the proxies hold: every key under an
+/// incarnation's `_proxy` segment.
+async fn cached_files(server: &TestServer) -> usize {
+    common::stored_keys(server)
+        .await
+        .iter()
+        .filter(|k| k.starts_with("r/") && k.contains("/_proxy/"))
+        .count()
 }
 
 // ---------------------------------------------------------------------------
@@ -512,17 +518,11 @@ async fn delete_then_recreate_never_serves_old_cache() {
 
     assert_eq!(get_status(&url).await, StatusCode::OK);
     assert_eq!(up.packument_hits(), 1);
-    assert!(
-        cache_dir(&server, "p").is_dir(),
-        "the proxy wrote its cache"
-    );
+    assert!(cached_files(&server).await > 0, "the proxy wrote its cache");
 
     let (status, text) = admin.delete("p").await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert!(
-        !cache_dir(&server, "p").exists(),
-        "delete purges the cache files"
-    );
+    assert_eq!(cached_files(&server).await, 0, "delete reclaims the cache files");
     let pool = db(&server).await;
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await,
@@ -565,22 +565,24 @@ async fn changing_the_upstream_purges_the_cache() {
 
     assert_eq!(get_status(&url).await, StatusCode::OK);
     assert_eq!(old.packument_hits(), 1);
-    assert!(cache_dir(&server, "p").is_dir());
+    let before = cached_files(&server).await;
+    assert!(before > 0);
 
     let (status, text) = admin.update("p", json!({ "visibility": "public" })).await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert!(
-        cache_dir(&server, "p").is_dir(),
-        "a patch that keeps the upstream keeps the cache"
-    );
+    assert_eq!(cached_files(&server).await, before, "a patch that keeps the upstream keeps the cache");
 
     let (status, text) = admin.update("p", json!({ "upstream": new.url() })).await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert!(!cache_dir(&server, "p").exists(), "the old upstream's files are gone");
     let pool = db(&server).await;
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await,
         0
+    );
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM reclaim_candidates").await,
+        before as i64,
+        "the old upstream's files are enqueued for reclamation"
     );
     pool.close().await;
 
@@ -603,11 +605,12 @@ async fn delete_group_keeps_member_caches() {
     })
     .await;
     assert_eq!(get_status(&format!("{}/g/{PKG}", server.base_url)).await, StatusCode::OK);
-    assert!(cache_dir(&server, "p").is_dir());
+    let before = cached_files(&server).await;
+    assert!(before > 0);
 
     let (status, text) = Admin::of(&server).delete("g").await;
     assert_eq!(status, StatusCode::OK, "{text}");
-    assert!(cache_dir(&server, "p").is_dir(), "the member's files survive");
+    assert_eq!(cached_files(&server).await, before, "the member's files survive");
     assert_eq!(get_status(&format!("{}/p/{PKG}", server.base_url)).await, StatusCode::OK);
     assert_eq!(up.packument_hits(), 1, "served from the surviving cache");
 }
@@ -704,8 +707,8 @@ async fn purge_group_purges_proxy_members_only() {
         0
     );
     assert!(
-        !cache_dir(&server, "p").exists(),
-        "the proxy member's files are gone"
+        count(&pool, "SELECT COUNT(*) FROM reclaim_candidates").await >= 1,
+        "the proxy member's files are enqueued for reclamation"
     );
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM packages").await,

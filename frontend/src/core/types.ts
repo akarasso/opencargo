@@ -34,7 +34,7 @@ export interface RecentVersion {
 }
 
 export type RepoType = 'hosted' | 'proxy' | 'group';
-export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go';
+export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go' | 'pypi' | 'maven' | 'nuget';
 export type RepoVisibility = 'public' | 'private';
 
 export interface Repository {
@@ -318,4 +318,14 @@ export interface WsEvent {
   username?: string;
   role?: string;
   anonymous?: boolean;
+}
+
+/** `GET /api/v1/system/storage`: the adapter and its health, never where it points. */
+export interface StorageStatus {
+  backend: 'fs' | 's3';
+  identity: string;
+  ready: boolean;
+  multipart_in_flight: number;
+  reclaim_candidates: number;
+  reclaim_prefixes: number;
 }

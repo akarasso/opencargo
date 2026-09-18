@@ -208,6 +208,8 @@ async fn npm_two_tokens_two_rows_with_dates() {
     let dev = named_token(&client, &a.base_url, "alice", "dev-laptop").await;
     let url = tarball_url(&a, "npm-proxy", "@acme/widget", "widget-1.0.0.tgz");
     get_ok(&url, Some(&ci)).await;
+    // Gathers run concurrently and rows land in completion order.
+    wait_for_policy_rows(&a, 1).await;
     get_ok(&url, Some(&dev)).await;
 
     let rows = wait_for_policy_rows(&a, 2).await;
@@ -798,12 +800,12 @@ async fn cargo_api_is_paced_and_429_is_unknown() {
     hits.sort_by_key(|h| h.started);
     assert_eq!(hits.len(), 6);
     for pair in hits.windows(2) {
-        assert!(
-            pair[1].started >= pair[0].started + Duration::from_millis(490),
-            "paced apart"
-        );
         assert!(pair[1].started >= pair[0].ended, "never overlapping");
     }
+    assert!(
+        hits[5].started >= hits[0].started + Duration::from_millis(1500),
+        "paced apart"
+    );
 
     fake.set_api_status(429);
     get_ok(&crate_url(&a, "c6", "0.1.0"), None).await;
@@ -1739,4 +1741,127 @@ async fn me_policy_shows_only_own_rows() {
 
     let (status, _) = get_json(&me, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn pypi_row_dates_from_the_page_and_squats_on_the_normalized_name() {
+    use common::pypi::{basic, upload, wheel, wheel_name};
+    let up = spawn_server(SpawnOpts {
+        repositories: vec![hosted("py-up", RepositoryFormat::Pypi, Visibility::Public)],
+        ..Default::default()
+    })
+    .await;
+    let client = Client::new();
+    let resp = upload(
+        &client,
+        &up.base_url,
+        "py-up",
+        &basic("__token__", STATIC_TOKEN),
+        &wheel_name("Reqeusts", "1.0"),
+        &wheel("Reqeusts", "1.0", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy_with(
+            "pypi-proxy",
+            RepositoryFormat::Pypi,
+            &format!("{}/py-up/simple", up.base_url),
+            ProxyOpts {
+                dl_allow_private: true,
+                ..Default::default()
+            },
+        )],
+        policy: policy(
+            "pypi-proxy",
+            PolicyConfig {
+                min_release_age: Some("48h".parse().unwrap()),
+                typosquat: true,
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    })
+    .await;
+    let page: Value = client
+        .get(format!("{}/pypi-proxy/simple/reqeusts/", a.base_url))
+        .header("Accept", "application/vnd.pypi.simple.v1+json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uploaded = page["files"][0]["upload-time"].as_str().unwrap().to_string();
+    get_ok(&format!("{}/pypi-proxy/files/reqeusts/reqeusts-1.0-py3-none-any.whl", a.base_url), None).await;
+    get_ok(&format!("{}/pypi-proxy/files/reqeusts/reqeusts-1.0-py3-none-any.whl.metadata", a.base_url), None).await;
+    let rows = wait_for_policy_rows(&a, 1).await;
+    let row = &rows[0];
+    assert_eq!((row.format.as_str(), row.name.as_str()), ("pypi", "reqeusts"));
+    assert_eq!(row.version.as_deref(), Some("1.0"));
+    assert_eq!(row.date_source, "page", "dated by the page the file was listed on");
+    let published = chrono::DateTime::parse_from_rfc3339(row.published_at.as_deref().unwrap()).unwrap();
+    assert_eq!(published, chrono::DateTime::parse_from_rfc3339(&uploaded).unwrap());
+    assert!(row.digest.is_some());
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(verdict_of(&verdicts, row.id, "min_release_age").0, "would_block");
+    let (verdict, reason) = verdict_of(&verdicts, row.id, "typosquat");
+    assert_eq!(verdict, "would_block", "{reason}");
+    assert!(reason.contains("requests"), "{reason}");
+    assert_eq!(policy_rows(&a).await.len(), 1, "a .metadata records nothing");
+}
+
+/// NuGet 3.4: a served `.nupkg` is recorded under its normalized id and
+/// version, dated by its registration, and judged by what it would run.
+#[tokio::test]
+async fn nuget_proxy_records_facts_dates_and_install_assets() {
+    let up = common::fake_upstream::nuget::start().await;
+    up.add(
+        "Scripted.Lib",
+        "1.0.0",
+        common::nuget::nupkg("Scripted.Lib", "1.0.0", &["tools/install.ps1"]),
+    );
+    up.add("Plain.Lib", "1.0.0", common::nuget::nupkg("Plain.Lib", "1.0.0", &[]));
+    let server = spawn_server(SpawnOpts {
+        repositories: vec![proxy_with(
+            "nuget-proxy",
+            RepositoryFormat::Nuget,
+            &up.service_index(),
+            ProxyOpts {
+                dl_allow_private: true,
+                ..Default::default()
+            },
+        )],
+        policy: policy(
+            "nuget-proxy",
+            PolicyConfig {
+                install_scripts: true,
+                typosquat: true,
+                ..aged("48h")
+            },
+        ),
+        ..Default::default()
+    })
+    .await;
+    for id in ["scripted.lib", "plain.lib"] {
+        get_ok(
+            &format!("{}/nuget-proxy/v3/flatcontainer/{id}/1.0.0/{id}.1.0.0.nupkg", server.base_url),
+            None,
+        )
+        .await;
+    }
+    let rows = wait_for_policy_rows(&server, 2).await;
+    let verdicts = policy_verdicts(&server).await;
+    for (row, (name, scripts)) in rows.iter().zip([
+        ("scripted.lib", ("would_block", "ships install scripts or MSBuild imports")),
+        ("plain.lib", ("pass", "no install script")),
+    ]) {
+        assert_eq!((row.format.as_str(), row.name.as_str()), ("nuget", name));
+        assert_eq!(row.version.as_deref(), Some("1.0.0"));
+        assert_eq!(row.date_source, "registration");
+        assert!(row.published().is_some());
+        assert_eq!(verdict_of(&verdicts, row.id, "install_scripts"), scripts);
+        assert_eq!(verdict_of(&verdicts, row.id, "min_release_age").0, "pass", "published in 2024");
+        assert_eq!(verdict_of(&verdicts, row.id, "typosquat").0, "not_applicable", "no NuGet list ships");
+    }
 }

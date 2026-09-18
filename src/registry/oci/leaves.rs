@@ -6,7 +6,7 @@ use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
 use super::manifests::resolve_hosted_digest;
 use super::upstream::{upstream_name, OciArtifact, OciUpstream};
-use super::{is_digest, paths};
+use super::is_digest;
 
 const OCTET_STREAM: &str = "application/octet-stream";
 
@@ -69,7 +69,7 @@ impl Leaf for BlobLeaf {
             Payload::head_only(size, content_type, Some(self.digest.clone()))
         } else {
             crate::telemetry::record_download(&member.0.name, &self.name);
-            let mut p = Payload::file(paths::blob_path(&member.0.name, &self.digest), size);
+            let mut p = Payload::file(blob.key, size);
             p.content_type = content_type;
             with_digest(p, self.digest.clone())
         };
@@ -124,8 +124,7 @@ impl Leaf for ManifestLeaf {
         let payload = if self.head {
             Payload::head_only(size, Some(manifest.content_type), Some(digest))
         } else {
-            let image = format!("{}/{}", member.0.name, self.name);
-            let mut p = Payload::file(paths::manifest_path(&image, &self.name, &digest), size);
+            let mut p = Payload::file(manifest.key, size);
             p.content_type = Some(manifest.content_type);
             with_digest(p, digest)
         };

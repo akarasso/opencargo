@@ -1,25 +1,36 @@
 use std::future::Future;
 
+use tokio::time::Instant;
+
 use axum::http::{header, HeaderMap, StatusCode};
+use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
-use sha2::{Digest, Sha256};
+use sha1::Sha1;
+use sha2::{Digest, Sha256, Sha512};
 
 use crate::domain::{CacheEntry, CacheRepo, NewEntry};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::Upstream;
+use crate::storage::ObjectWriter;
 
 use super::super::auth::send_with_auth;
-use super::super::strategy::{Classified, Transfer, UpstreamStrategy};
-use super::{cache_path, PartFile, ProxyEngine, Stale};
+use super::super::strategy::{
+    Classified, DigestAlgorithm, ExpectedDigests, RedirectRule, Transfer, UpstreamStrategy,
+};
+use super::{cache_path, Pass, ProxyEngine, Stale};
 
 /// What one upstream exchange ended in; `Failed` is stale-eligible, an
-/// integrity refusal (cap, digest, headers) is an `Err` and never serves stale.
+/// integrity refusal (cap, headers) is an `Err` and never serves stale.
 pub(super) enum Reply {
     NotModified,
     Stored(Box<CacheEntry>),
     Miss(StatusCode),
     Refused,
+    /// A digest or redirect refusal: quarantined, never served stale.
+    Rejected(String),
     Failed(String),
+    /// An upstream await outran its deadline.
+    TimedOut(String),
 }
 
 struct Body {
@@ -37,8 +48,9 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
         stale: Option<&Stale>,
-        now: DateTime<Utc>,
+        pass: Pass,
     ) -> AppResult<Reply> {
+        let now = pass.now;
         let url = self.guarded_url(s, up, a).await?;
         let mut req = self.http.get(url.clone());
         for (name, value) in s.request_headers(a) {
@@ -48,22 +60,30 @@ impl ProxyEngine {
             req = req.header(header::IF_NONE_MATCH, etag);
         }
         let scope = s.bearer_scope(a);
-        let send = send_with_auth(&self.http, &self.tokens, member, up, req, scope.as_deref());
-        match s.transfer(a) {
-            Transfer::Buffered => {
-                let bounded = tokio::time::timeout(
-                    self.timeouts.buffered_total,
-                    self.complete(s, member, a, send, now),
-                );
-                match bounded.await {
-                    Ok(reply) => reply,
-                    Err(_) => Ok(Reply::Failed(format!(
-                        "upstream {url} exceeded the buffered transfer timeout"
-                    ))),
-                }
+        let credentials = s.send_credentials(a);
+        let send = async {
+            if credentials {
+                send_with_auth(&self.http, &self.tokens, member, up, req, scope.as_deref()).await
+            } else {
+                req.send()
+                    .await
+                    .map_err(|e| AppError::BadGateway(format!("upstream request failed: {e}")))
             }
-            Transfer::Streamed => self.complete(s, member, a, send, now).await,
-        }
+        };
+        let buffered = match s.transfer(a) {
+            Transfer::Buffered => Some(Instant::now() + self.timeouts.buffered_total),
+            Transfer::Streamed => None,
+        };
+        let deadline = match (buffered, pass.deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let leg = Leg {
+            asked: &url,
+            now,
+            deadline,
+        };
+        self.complete(s, member, a, leg, send).await
     }
 
     async fn complete<S: UpstreamStrategy>(
@@ -71,14 +91,23 @@ impl ProxyEngine {
         s: &S,
         member: CacheRepo<'_>,
         a: &S::Artifact,
+        leg: Leg<'_>,
         send: impl Future<Output = AppResult<reqwest::Response>>,
-        now: DateTime<Utc>,
     ) -> AppResult<Reply> {
-        let resp = match send.await {
-            Ok(resp) => resp,
-            Err(AppError::BadGateway(why)) => return Ok(Reply::Failed(why)),
-            Err(e) => return Err(e),
+        let Leg {
+            asked,
+            now,
+            deadline,
+        } = leg;
+        let resp = match upstream(deadline, send).await {
+            Err(()) => return Ok(Reply::TimedOut(format!("upstream {asked} exceeded its deadline"))),
+            Ok(Ok(resp)) => resp,
+            Ok(Err(AppError::BadGateway(why))) => return Ok(Reply::Failed(why)),
+            Ok(Err(e)) => return Err(e),
         };
+        if !redirect_allowed(s.final_url_must_match(a), asked, resp.url()) {
+            return Ok(Reply::Rejected("upstream redirected off its origin".into()));
+        }
         let status = resp.status();
         if status == StatusCode::NOT_MODIFIED {
             return Ok(Reply::NotModified);
@@ -90,39 +119,44 @@ impl ProxyEngine {
                 Classified::Fail => Reply::Failed(format!("upstream answered {status}")),
             });
         }
-        let body = self.read_body(s, member, a, resp).await?;
+        let body = self.read_body(s, member, a, resp, deadline).await?;
         match body {
             Ok(body) => self.record(s, member, a, body, now).await,
-            Err(why) => Ok(Reply::Failed(why)),
+            Err(Cut::Transport(why)) => Ok(Reply::Failed(why)),
+            Err(Cut::Rejected(why)) => Ok(Reply::Rejected(why)),
+            Err(Cut::Deadline) => Ok(Reply::TimedOut(format!("upstream {asked} body exceeded its deadline"))),
         }
     }
 
-    /// Hash, cap and verify the body chunk by chunk into a part file, then
-    /// land it under `store_key` by rename: no transfer holds its body in
-    /// memory, `Transfer` only decides the timeout. The inner `Err` is a
-    /// mid-body transport failure.
+    /// Hash, cap and verify the body chunk by chunk into a writer that
+    /// commits only once every digest holds. A store key that does not
+    /// depend on the digest streams; a digest-dependent one (an OCI tag's
+    /// manifest, bounded by its cap) is buffered until the digest is known.
+    /// The inner `Err` is a mid-body transport failure.
     async fn read_body<S: UpstreamStrategy>(
         &self,
         s: &S,
         member: CacheRepo<'_>,
         a: &S::Artifact,
         mut resp: reqwest::Response,
-    ) -> AppResult<Result<Body, String>> {
+        deadline: Option<Instant>,
+    ) -> AppResult<Result<Body, Cut>> {
         let headers = resp.headers().clone();
+        let expected = s.expected_digests(a, &headers);
+        let mut digests = Hashers::for_expected(&expected);
         let max = s.max_bytes(a);
-        let part_rel = format!(
-            "{}.part-{}",
-            cache_path(member, &s.cache_key(a)),
-            uuid::Uuid::new_v4()
-        );
-        let mut part = PartFile::new(self.storage.as_ref(), part_rel).await?;
-        let mut hasher = Sha256::new();
+        let root = self.cache_root(member).await?;
+        let mut sink = match digest_independent_key(s, a) {
+            Some(key) => Sink::Stream(self.storage.writer(&cache_path(&root, &key)).await?),
+            None => Sink::Buffer(BytesMut::new()),
+        };
         let mut size = 0u64;
         loop {
-            let chunk = match resp.chunk().await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(e) => return Ok(Err(format!("upstream body read failed: {e}"))),
+            let chunk = match upstream(deadline, resp.chunk()).await {
+                Err(()) => return Ok(Err(Cut::Deadline)),
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Ok(Err(Cut::Transport(format!("upstream body read failed: {e}")))),
             };
             size += chunk.len() as u64;
             if size > max {
@@ -130,18 +164,24 @@ impl ProxyEngine {
                     "upstream body exceeds {max} bytes"
                 )));
             }
-            hasher.update(&chunk);
-            part.write_chunk(&chunk).await?;
+            digests.update(&chunk);
+            sink.write(chunk).await?;
         }
-        let sha256 = format!("{:x}", hasher.finalize());
-        if s.expected_sha256(a)
-            .is_some_and(|expected| expected != sha256)
-        {
-            return Err(AppError::BadGateway("upstream body digest mismatch".into()));
+        let computed = digests.finish();
+        if let Some(wrong) = expected.mismatch(|alg| computed.get(alg)) {
+            return Ok(Err(Cut::Rejected(format!(
+                "upstream body digest mismatch ({:?} {:?})",
+                wrong.source, wrong.algorithm
+            ))));
         }
-        s.verify_headers(a, &headers, &sha256)?;
-        let path = cache_path(member, &s.store_key(a, &sha256));
-        part.commit(self.storage.as_ref(), &path).await?;
+        let sha256 = computed.sha256.clone();
+        let path = cache_path(&root, &s.store_key(a, &sha256));
+        match sink {
+            Sink::Stream(writer) => {
+                writer.commit().await?;
+            }
+            Sink::Buffer(buf) => self.storage.put(&path, buf.freeze()).await?,
+        }
         Ok(Ok(Body {
             path,
             sha256,
@@ -176,7 +216,10 @@ impl ProxyEngine {
             size: body.size as i64,
             ttl_secs: if pointer { None } else { ttl },
         };
-        self.cache.upsert(&body_row, now).await?;
+        if let Err(e) = self.cache.upsert(&body_row, now).await {
+            self.release(std::slice::from_ref(&body.path), now).await;
+            return Err(e.into());
+        }
         if pointer {
             let pointer_row = NewEntry {
                 kind: key.kind,
@@ -198,4 +241,112 @@ impl ProxyEngine {
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// One upstream exchange: what was asked, the pass's clock, and the
+/// deadline its upstream awaits run under.
+struct Leg<'u> {
+    asked: &'u reqwest::Url,
+    now: DateTime<Utc>,
+    deadline: Option<Instant>,
+}
+
+/// Why a body stopped arriving.
+enum Cut {
+    Transport(String),
+    Rejected(String),
+    Deadline,
+}
+
+/// One upstream await under the pass's deadline, if it has one. Storage
+/// awaits never go through here.
+async fn upstream<T>(deadline: Option<Instant>, fut: impl Future<Output = T>) -> Result<T, ()> {
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at, fut).await.map_err(|_| ()),
+        None => Ok(fut.await),
+    }
+}
+
+enum Sink {
+    Stream(Box<dyn ObjectWriter>),
+    Buffer(BytesMut),
+}
+
+impl Sink {
+    async fn write(&mut self, chunk: Bytes) -> AppResult<()> {
+        match self {
+            Sink::Stream(writer) => {
+                writer.reserve(chunk.len()).await?;
+                writer.write(chunk).await?;
+            }
+            Sink::Buffer(buf) => buf.extend_from_slice(&chunk),
+        }
+        Ok(())
+    }
+}
+
+/// The store key when it is the same whatever the body's digest.
+fn digest_independent_key<S: UpstreamStrategy>(s: &S, a: &S::Artifact) -> Option<super::super::strategy::CacheKey> {
+    let low = s.store_key(a, &"0".repeat(64));
+    (low == s.store_key(a, &"f".repeat(64))).then_some(low)
+}
+
+/// sha256 always, for the store key; the others only when an expected digest
+/// names them.
+struct Hashers {
+    sha256: Sha256,
+    sha512: Option<Sha512>,
+    sha1: Option<Sha1>,
+}
+
+struct Computed {
+    sha256: String,
+    sha512: Option<String>,
+    sha1: Option<String>,
+}
+
+impl Hashers {
+    fn for_expected(expected: &ExpectedDigests) -> Self {
+        let wants = |alg| expected.entries().iter().any(|d| d.algorithm == alg);
+        Self {
+            sha256: Sha256::new(),
+            sha512: wants(DigestAlgorithm::Sha512).then(Sha512::new),
+            sha1: wants(DigestAlgorithm::Sha1).then(Sha1::new),
+        }
+    }
+
+    fn update(&mut self, chunk: &[u8]) {
+        self.sha256.update(chunk);
+        if let Some(h) = &mut self.sha512 {
+            h.update(chunk);
+        }
+        if let Some(h) = &mut self.sha1 {
+            h.update(chunk);
+        }
+    }
+
+    fn finish(self) -> Computed {
+        Computed {
+            sha256: format!("{:x}", self.sha256.finalize()),
+            sha512: self.sha512.map(|h| format!("{:x}", h.finalize())),
+            sha1: self.sha1.map(|h| format!("{:x}", h.finalize())),
+        }
+    }
+}
+
+impl Computed {
+    fn get(&self, alg: DigestAlgorithm) -> Option<String> {
+        match alg {
+            DigestAlgorithm::Sha256 => Some(self.sha256.clone()),
+            DigestAlgorithm::Sha512 => self.sha512.clone(),
+            DigestAlgorithm::Sha1 => self.sha1.clone(),
+        }
+    }
+}
+
+fn redirect_allowed(rule: RedirectRule, asked: &reqwest::Url, landed: &reqwest::Url) -> bool {
+    match rule {
+        RedirectRule::Unrestricted => true,
+        RedirectRule::SameOrigin => asked.origin() == landed.origin(),
+    }
 }

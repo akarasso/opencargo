@@ -15,7 +15,7 @@ use crate::registry::resolve::first_hit;
 use crate::server::AppState;
 
 use super::leaves::BlobLeaf;
-use super::{param, parse_digest, paths, respond, OciRef};
+use super::{param, parse_digest, respond, OciRef};
 
 pub async fn head_blob(
     State(state): State<AppState>,
@@ -71,8 +71,8 @@ pub async fn delete_blob(
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
 
-    DeleteBlob::new(state.oci.clone(), state.storage.clone())
-        .run(repo.id, &digest, &paths::blob_path(&repo.name, &digest))
+    DeleteBlob::new(state.oci.clone())
+        .run(repo.id, &digest, state.clock.now())
         .await
         .map_err(|err| match err {
             OciWriteError::NotFound => AppError::NotFound(format!(
@@ -80,8 +80,8 @@ pub async fn delete_blob(
                 digest,
                 r.image_name()
             )),
-            OciWriteError::Referenced(n) => AppError::Conflict(format!(
-                "blob {digest} is still referenced by {n} manifest(s); delete those manifests first"
+            OciWriteError::Referenced => AppError::Conflict(format!(
+                "blob {digest} is still referenced by a manifest; delete those manifests first"
             )),
             other => other.into(),
         })?;

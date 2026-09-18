@@ -1,3 +1,5 @@
+mod common;
+
 use reqwest::StatusCode;
 use serde_json::Value;
 use tempfile::TempDir;
@@ -45,7 +47,7 @@ async fn test_tls_server() {
 
     let base_url = format!("https://localhost:{}", addr.port());
 
-    let config = Config {
+    let mut config = Config {
         server: ServerConfig {
             bind: addr.to_string(),
             base_url: base_url.clone(),
@@ -75,7 +77,7 @@ async fn test_tls_server() {
         ..Default::default()
     };
 
-    let app_state = server::build_state(&config)
+    let app_state = common::build_state(&mut config)
         .await
         .expect("failed to build app state");
     let router = server::build_router(app_state);

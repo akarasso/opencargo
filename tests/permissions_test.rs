@@ -1,3 +1,5 @@
+mod common;
+
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -128,7 +130,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
 
     config.server.base_url = base_url.clone();
 
-    let state = server::build_state(&config)
+    let state = common::build_state(&mut config)
         .await
         .expect("failed to build app state");
     let router = server::build_router(state);
@@ -616,7 +618,7 @@ async fn test_delete_non_empty_repository_conflicts() {
     );
 }
 
-/// Proxy and group repositories exist for every format but pypi; a group's
+/// Proxy and group repositories exist for every format; a group's
 /// members must exist, share its format and not be empty. Hosted rows come
 /// first so the groups can name them.
 #[tokio::test]
@@ -631,7 +633,7 @@ async fn test_create_repository_validates_kind_format_and_members() {
         ("oci-proxy", "proxy", "oci", None, StatusCode::CREATED),
         ("go-proxy", "proxy", "go", None, StatusCode::CREATED),
         ("npm-group-ok", "group", "npm", Some(json!(["npm-hosted-ok"])), StatusCode::CREATED),
-        ("pypi-proxy", "proxy", "pypi", None, StatusCode::BAD_REQUEST),
+        ("pypi-proxy", "proxy", "pypi", None, StatusCode::CREATED),
         ("unknown-member", "group", "npm", Some(json!(["nope"])), StatusCode::BAD_REQUEST),
         ("cross-format", "group", "npm", Some(json!(["cargo-hosted-ok"])), StatusCode::BAD_REQUEST),
         ("empty-members", "group", "npm", Some(json!([])), StatusCode::BAD_REQUEST),

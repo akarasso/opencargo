@@ -113,6 +113,8 @@
   --fmt-oci-soft: rgba(126, 184, 255, 0.12);
   --fmt-go: #6fd8e8;
   --fmt-go-soft: rgba(111, 216, 232, 0.13);
+  --fmt-nuget: #b99bff;
+  --fmt-nuget-soft: rgba(185, 155, 255, 0.13);
 
   /* Geometry */
   --r-sm: 6px;
@@ -855,6 +857,11 @@ textarea {
   color: var(--fmt-go);
   background: var(--fmt-go-soft);
   border-color: rgba(111, 216, 232, 0.28);
+}
+.tag-nuget {
+  color: var(--fmt-nuget);
+  background: var(--fmt-nuget-soft);
+  border-color: rgba(185, 155, 255, 0.28);
 }
 
 /* Version pill — always mono */

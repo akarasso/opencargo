@@ -97,6 +97,11 @@ pub enum StoreError {
     #[error("the store is unavailable, try again")]
     Unavailable,
 
+    /// A commit whose pins were revoked wrote nothing; these physical keys
+    /// may already be gone.
+    #[error("the placement was superseded, try again")]
+    Superseded(Vec<String>),
+
     #[error(transparent)]
     Other(Box<dyn std::error::Error + Send + Sync>),
 }
@@ -137,7 +142,9 @@ impl From<StoreError> for AppError {
         match &err {
             StoreError::NotFound => AppError::NotFound(err.to_string()),
             StoreError::Conflict => AppError::Conflict(CONFLICT_BODY.to_string()),
-            StoreError::Unavailable => AppError::ServiceUnavailable(err.to_string()),
+            StoreError::Unavailable | StoreError::Superseded(_) => {
+                AppError::ServiceUnavailable(err.to_string())
+            }
             StoreError::Other(source) => {
                 tracing::error!("Store error: {source}");
                 AppError::Internal("internal server error".to_string())

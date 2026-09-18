@@ -5,7 +5,6 @@ use tokio::io::AsyncReadExt;
 
 use super::*;
 use crate::testing::fixture::*;
-use crate::domain::{Repository, Visibility};
 use crate::proxy::strategy::{CacheKey, Transfer, UrlSource};
 
 fn found(o: AppResult<Outcome<Cached>>) -> Cached {
@@ -17,40 +16,18 @@ fn found(o: AppResult<Outcome<Cached>>) -> Cached {
 
 #[test]
 fn prefix_keys_do_not_collide() {
-    let repo = Repository {
-        id: 1,
-        name: "p".into(),
-        repo_type: "proxy".into(),
-        format: "go".into(),
-        visibility: Visibility::Public,
-        upstream_url: None,
-        config: None,
-        created_at: chrono::DateTime::UNIX_EPOCH,
-        updated_at: chrono::DateTime::UNIX_EPOCH,
+    let key = |k: &str| CacheKey {
+        kind: "go-list",
+        key: k.into(),
     };
-    let short = cache_path(
-        CacheRepo(&repo),
-        &CacheKey {
-            kind: "go-list",
-            key: "github.com/org/repo".into(),
-        },
-    );
-    let long = cache_path(
-        CacheRepo(&repo),
-        &CacheKey {
-            kind: "go-list",
-            key: "github.com/org/repo/v2".into(),
-        },
-    );
+    let short = cache_path("r/inc", &key("github.com/org/repo"));
+    let long = cache_path("r/inc", &key("github.com/org/repo/v2"));
     assert!(!long.starts_with(&short) && !short.starts_with(&long));
     let segs: Vec<&str> = short.split('/').collect();
-    assert_eq!(&segs[..3], &["_proxy_cache", "p", "go-list"]);
-    assert_eq!((segs[3].len(), segs[4].len()), (2, 64));
-    assert!(segs[4].starts_with(segs[3]));
-    assert!(
-        !short.contains("github.com"),
-        "the human key never reaches the path"
-    );
+    assert_eq!(&segs[..4], &["r", "inc", "_proxy", "go-list"]);
+    assert_eq!((segs[4].len(), segs[5].len()), (2, 64));
+    assert!(segs[5].starts_with(segs[4]));
+    assert!(!short.contains("github.com"), "the human key never reaches the path");
 }
 
 #[tokio::test]
@@ -89,20 +66,8 @@ async fn singleflight_wait_timeout_proceeds_unlocked() {
 }
 
 #[tokio::test]
-async fn part_file_unlinked_on_drop_and_cap() {
+async fn an_oversized_body_leaves_nothing_behind() {
     let fx = Fx::new().await;
-    let mut part = PartFile::new(fx.storage.as_ref(), "_proxy_cache/p/x.part-1".into())
-        .await
-        .unwrap();
-    part.write_chunk(b"abc").await.unwrap();
-    let resolved = fx.storage.resolve("_proxy_cache/p/x.part-1").unwrap();
-    assert!(std::fs::metadata(&resolved).is_ok());
-    drop(part);
-    assert!(
-        std::fs::metadata(&resolved).is_err(),
-        "unlinked synchronously on drop"
-    );
-
     let engine = fx.engine(timeouts());
     for transfer in [Transfer::Buffered, Transfer::Streamed] {
         let strat = Strat {
@@ -123,28 +88,6 @@ async fn part_file_unlinked_on_drop_and_cap() {
         "nothing recorded"
     );
     assert!(fx.files().is_empty(), "nothing written: {:?}", fx.files());
-}
-
-#[tokio::test]
-async fn part_file_commit_keeps_file() {
-    let fx = Fx::new().await;
-    let mut part = PartFile::new(fx.storage.as_ref(), "_proxy_cache/p/k/x.part-1".into())
-        .await
-        .unwrap();
-    part.write_chunk(b"abc").await.unwrap();
-    part.write_chunk(b"def").await.unwrap();
-    part.commit(fx.storage.as_ref(), "_proxy_cache/p/k/x")
-        .await
-        .unwrap();
-    assert!(!fx
-        .storage
-        .exists("_proxy_cache/p/k/x.part-1")
-        .await
-        .unwrap());
-    assert_eq!(
-        fx.storage.get("_proxy_cache/p/k/x").await.unwrap().as_ref(),
-        b"abcdef"
-    );
 }
 
 /// The ttl is a fact about time, not about a row: nothing is rewritten, no
@@ -188,8 +131,9 @@ async fn buffered_refresh_never_truncates_reader() {
             .await,
     );
     let path = first.entry.storage_path.clone().unwrap();
-    let (len, mut reader) = fx.storage.read_stream(&path).await.unwrap();
-    assert_eq!(len, 5);
+    let read = fx.storage.read_stream(&path).await.unwrap();
+    assert_eq!(read.total, 5);
+    let mut reader = read.body;
 
     fx.expire();
     fx.set(|s| s.body = b"a much longer body than before".to_vec());
@@ -400,11 +344,7 @@ async fn stale_pointer_without_target_regets_without_if_none_match() {
             .await,
     );
     assert!(!regot.stale);
-    assert!(fx
-        .storage
-        .exists(regot.entry.storage_path.as_deref().unwrap())
-        .await
-        .unwrap());
+    assert!(fx.storage.stat(regot.entry.storage_path.as_deref().unwrap()).await.unwrap().is_some());
     let hits = fx.hits();
     assert_eq!(hits.len(), 3);
     assert!(
@@ -426,7 +366,7 @@ async fn buffered_bodies_land_on_disk_as_they_arrive() {
     let parts: Vec<_> = fx
         .files()
         .into_iter()
-        .filter(|p| p.to_string_lossy().contains(".part-"))
+        .filter(|p| p.to_string_lossy().contains("/_scratch/"))
         .collect();
     assert_eq!(parts.len(), 1, "a buffered body is on disk, not in memory");
     let done = found(fetch.await);
@@ -434,7 +374,7 @@ async fn buffered_bodies_land_on_disk_as_they_arrive() {
     assert!(fx
         .files()
         .iter()
-        .all(|p| !p.to_string_lossy().contains(".part-")));
+        .all(|p| !p.to_string_lossy().contains("/_scratch/")));
 }
 
 #[tokio::test]
@@ -706,7 +646,7 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
             .await,
     );
     let path = cached.entry.storage_path.unwrap();
-    assert!(fx.storage.exists(&path).await.unwrap());
+    assert!(fx.storage.stat(&path).await.unwrap().is_some());
 
     fx.expire();
     fx.set(|s| s.gone = true);
@@ -717,10 +657,9 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
     let row = fx.row("t-item", "art/x").await.unwrap();
     assert_eq!((row.status, row.storage_path), (404, None));
     assert!(
-        !fx.storage.exists(&path).await.unwrap(),
-        "no row references the old body any more"
+        fx.storage.stat(&path).await.unwrap().is_some(),
+        "no row references the old body; it is enqueued, not deleted"
     );
-    assert!(fx.files().is_empty(), "{:?}", fx.files());
 
     fx.set(|s| s.gone = false);
     let shared = found(
@@ -746,7 +685,7 @@ async fn negative_refresh_unlinks_the_body_it_replaces() {
         .await;
     assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
     assert!(
-        fx.storage.exists(&body_path).await.unwrap(),
+        fx.storage.stat(&body_path).await.unwrap().is_some(),
         "a digest-addressed body may be shared and stays for the sweep"
     );
 }
@@ -892,7 +831,7 @@ async fn refresh_never_records_a_miss() {
     assert!(matches!(res, Ok(Outcome::NotFound)), "{res:?}");
     let row = fx.row("t-item", "art/x").await.unwrap();
     assert_eq!(row.status, 200, "no negative row");
-    assert!(fx.storage.exists(&path).await.unwrap(), "no file deleted");
+    assert!(fx.storage.stat(&path).await.unwrap().is_some(), "no file deleted");
     fx.set(|s| s.fail = false);
     let served = found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
     assert_eq!(served.entry.id, first.entry.id);
@@ -911,4 +850,300 @@ async fn refresh_never_records_a_miss() {
         row.status, 404,
         "the same route under fetch writes the 404 row"
     );
+}
+
+fn sha256_hex(body: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(body))
+}
+
+#[tokio::test]
+async fn warm_entry_with_stale_digest_is_refetched() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/pinned".to_string();
+    let first = Strat {
+        policy: CachePolicy::Immutable,
+        known: Some(sha256_hex(b"hello upstream")),
+        ..Default::default()
+    };
+    found(engine.fetch(&first, &fx.up, fx.member(), &art).await);
+    found(engine.fetch(&first, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 1, "a matching warm entry is served");
+
+    fx.set(|s| s.body = b"republished".to_vec());
+    let republished = Strat {
+        policy: CachePolicy::Immutable,
+        known: Some(sha256_hex(b"republished")),
+        ..Default::default()
+    };
+    let got = found(engine.fetch(&republished, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 2, "a stale digest is a miss");
+    assert_eq!(
+        got.entry.digest.as_deref(),
+        Some(sha256_hex(b"republished").as_str())
+    );
+    assert_eq!(engine.bytes(&got).await.unwrap().as_ref(), b"republished");
+}
+
+#[tokio::test]
+async fn a_body_contradicting_its_known_digest_is_refused() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let strat = Strat {
+        known: Some(sha256_hex(b"something else")),
+        ..Default::default()
+    };
+    let res = engine
+        .fetch(&strat, &fx.up, fx.member(), &"art/x".to_string())
+        .await;
+    assert!(matches!(res, Err(AppError::BadGateway(_))), "{res:?}");
+    assert!(fx.row("t-item", "art/x").await.is_none(), "nothing recorded");
+}
+
+#[tokio::test]
+async fn a_refused_known_digest_is_quarantined_until_the_announcement_changes() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/q".to_string();
+    let announced = sha256_hex(b"something else");
+    let strat = Strat {
+        known: Some(announced.clone()),
+        ..Default::default()
+    };
+    for _ in 0..2 {
+        let res = engine.fetch(&strat, &fx.up, fx.member(), &art).await;
+        assert!(matches!(res, Err(AppError::BadGateway(_))), "{res:?}");
+    }
+    assert_eq!(fx.hits().len(), 1, "a quarantined key is not fetched again");
+    let key = format!("sha256:{announced}");
+    assert!(fx
+        .cache
+        .quarantined(fx.repo.id, "t-item", &art, &key, Utc::now())
+        .await
+        .unwrap());
+    assert!(fx.row("t-item", &art).await.is_none(), "never served");
+
+    let matching = Strat {
+        known: Some(sha256_hex(b"hello upstream")),
+        ..Default::default()
+    };
+    let got = found(engine.fetch(&matching, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 2, "a new announced digest refetches");
+    assert_eq!(engine.bytes(&got).await.unwrap().as_ref(), b"hello upstream");
+}
+
+#[tokio::test]
+async fn an_unavailable_upstream_is_never_quarantined() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let art = "art/down".to_string();
+    let strat = Strat {
+        known: Some(sha256_hex(b"hello upstream")),
+        ..Default::default()
+    };
+    fx.set(|s| s.status = Some(StatusCode::SERVICE_UNAVAILABLE));
+    let res = engine.fetch(&strat, &fx.up, fx.member(), &art).await;
+    assert!(matches!(res, Err(AppError::BadGateway(_))), "{res:?}");
+    let key = format!("sha256:{}", sha256_hex(b"hello upstream"));
+    assert!(!fx
+        .cache
+        .quarantined(fx.repo.id, "t-item", &art, &key, Utc::now())
+        .await
+        .unwrap());
+
+    fx.set(|s| s.status = None);
+    found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    assert_eq!(fx.hits().len(), 2, "an outage is retried");
+}
+
+/// The fixture's storage with its writer's `reserve` and `commit` slowed:
+/// the queue and the completion no caller may bound.
+struct Slow {
+    inner: Arc<dyn crate::storage::StorageBackend>,
+    reserve: Duration,
+    commit: Duration,
+}
+
+struct SlowWriter {
+    inner: Box<dyn crate::storage::ObjectWriter>,
+    reserve: Duration,
+    commit: Duration,
+}
+
+#[async_trait::async_trait]
+impl crate::storage::ObjectWriter for SlowWriter {
+    async fn reserve(&mut self, next_len: usize) -> Result<(), crate::storage::StorageError> {
+        tokio::time::sleep(self.reserve).await;
+        self.inner.reserve(next_len).await
+    }
+
+    async fn write(&mut self, chunk: bytes::Bytes) -> Result<(), crate::storage::StorageError> {
+        self.inner.write(chunk).await
+    }
+
+    async fn commit(self: Box<Self>) -> Result<u64, crate::storage::StorageError> {
+        tokio::time::sleep(self.commit).await;
+        self.inner.commit().await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for Slow {
+    async fn get(&self, key: &str) -> Result<bytes::Bytes, crate::storage::StorageError> {
+        self.inner.get(key).await
+    }
+
+    async fn writer(
+        &self,
+        key: &str,
+    ) -> Result<Box<dyn crate::storage::ObjectWriter>, crate::storage::StorageError> {
+        Ok(Box::new(SlowWriter {
+            inner: self.inner.writer(key).await?,
+            reserve: self.reserve,
+            commit: self.commit,
+        }))
+    }
+
+    async fn read_stream(
+        &self,
+        key: &str,
+    ) -> Result<crate::storage::ReadStream, crate::storage::StorageError> {
+        self.inner.read_stream(key).await
+    }
+
+    async fn copy_object(&self, from: &str, to: &str) -> Result<(), crate::storage::StorageError> {
+        self.inner.copy_object(from, to).await
+    }
+
+    async fn relocate(&self, from: &str, to: &str) -> Result<(), crate::storage::StorageError> {
+        self.inner.relocate(from, to).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::storage::ObjectMeta>, crate::storage::StorageError> {
+        self.inner.head(key).await
+    }
+
+    async fn stat(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::storage::ObjectMeta>, crate::storage::StorageError> {
+        self.inner.stat(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), crate::storage::StorageError> {
+        self.inner.delete(key).await
+    }
+
+    async fn delete_batch(&self, keys: &[String]) -> Result<(), crate::storage::StorageError> {
+        self.inner.delete_batch(keys).await
+    }
+
+    fn list(&self, prefix: &str) -> crate::storage::ObjectList {
+        self.inner.list(prefix)
+    }
+
+    async fn sweep_abandoned(
+        &self,
+        older_than: Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::storage::StorageError> {
+        self.inner.sweep_abandoned(older_than, now).await
+    }
+
+    async fn probe(&self) -> Result<(), crate::storage::StorageError> {
+        self.inner.probe().await
+    }
+
+    fn upload_plan(&self) -> crate::storage::UploadPlan {
+        self.inner.upload_plan()
+    }
+
+    async fn self_check(&self) -> crate::storage::CheckReport {
+        self.inner.self_check().await
+    }
+
+    fn identity(&self) -> crate::storage::StoreIdentity {
+        self.inner.identity()
+    }
+}
+
+fn slow(fx: &Fx, reserve: Duration, commit: Duration) -> Arc<dyn crate::storage::StorageBackend> {
+    Arc::new(Slow {
+        inner: fx.storage.clone(),
+        reserve,
+        commit,
+    })
+}
+
+#[tokio::test]
+async fn queued_writer_is_not_bounded_by_a_write_deadline() {
+    let fx = Fx::new().await;
+    let engine = fx.engine_over(
+        slow(&fx, Duration::from_secs(3), Duration::ZERO),
+        Timeouts {
+            buffered_total: Duration::from_secs(1),
+            ..timeouts()
+        },
+    );
+    let got = found(
+        engine
+            .fetch(&Strat::default(), &fx.up, fx.member(), &"art/q".to_string())
+            .await,
+    );
+    assert_eq!(engine.bytes(&got).await.unwrap().as_ref(), b"hello upstream");
+}
+
+#[tokio::test]
+async fn recorder_timeout_does_not_abort_a_completed_upload() {
+    let fx = Fx::new().await;
+    let engine = fx.engine_over(slow(&fx, Duration::ZERO, Duration::from_secs(3)), timeouts());
+    let art = "art/rec".to_string();
+    let observed = engine
+        .observe_within(&Strat::default(), &fx.up, fx.member(), &art, Duration::from_secs(1))
+        .await
+        .unwrap();
+    let Some(Outcome::Found(cached)) = observed else {
+        panic!("the body arrived in time, its commit is not cut: {observed:?}");
+    };
+    assert_eq!(engine.bytes(&cached).await.unwrap().as_ref(), b"hello upstream");
+}
+
+#[tokio::test]
+async fn upstream_deadline_does_not_cover_the_writer() {
+    let fx = Fx::new().await;
+    fx.set(|s| s.delay = Duration::from_secs(3));
+    let engine = fx.engine(timeouts());
+    let observed = engine
+        .observe_within(
+            &Strat::default(),
+            &fx.up,
+            fx.member(),
+            &"art/late".to_string(),
+            Duration::from_secs(1),
+        )
+        .await
+        .unwrap();
+    assert!(observed.is_none(), "a late upstream is the recorder's timeout");
+    assert!(fx.row("t-item", "art/late").await.is_none());
+}
+
+#[tokio::test]
+async fn warm_hits_of_one_key_do_not_serialize() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let (strat, art) = (Strat::default(), "art/warm".to_string());
+    found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    let key = strat.cache_key(&art);
+    let _held = engine.lock(fx.member(), &key, false).await;
+    let warm = tokio::time::timeout(
+        Duration::from_secs(2),
+        engine.fetch(&strat, &fx.up, fx.member(), &art),
+    )
+    .await
+    .expect("a warm hit never waits on the guard");
+    found(warm);
 }

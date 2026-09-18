@@ -3,9 +3,9 @@
 import { For, Show } from 'solid-js';
 import type { EffectivePermission, PermissionFlags } from '../core/types.ts';
 
-/** Ecosystem "container label" — npm / cargo / oci / go. */
+/** Ecosystem "container label" — npm / cargo / oci / go / nuget. */
 export function FormatTag(props: { format: string }) {
-  const known = ['npm', 'cargo', 'oci', 'go'];
+  const known = ['npm', 'cargo', 'oci', 'go', 'nuget'];
   const cls = () => (known.includes(props.format) ? `tag tag-${props.format}` : 'tag');
   return <span class={cls()}>{props.format}</span>;
 }

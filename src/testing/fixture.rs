@@ -17,7 +17,8 @@ use crate::error::StoreError;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::proxy::engine::{ProxyEngine, Timeouts, TtlConfig};
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
+    CacheKey, CachePolicy, DigestAlgorithm, DigestSource, ExpectedDigests, Transfer, Ttl,
+    UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
 };
 use crate::registry::resolve::{ResolveError, Upstream};
 use crate::storage::StorageBackend;
@@ -123,6 +124,8 @@ pub(crate) struct Strat {
     pub max: u64,
     pub via_get: bool,
     pub source: UrlSource,
+    /// The sha256 the artifact announces before any response.
+    pub known: Option<String>,
 }
 
 impl Default for Strat {
@@ -134,6 +137,7 @@ impl Default for Strat {
             max: DEFAULT_MAX_UPSTREAM_BYTES,
             via_get: true,
             source: UrlSource::Admin,
+            known: None,
         }
     }
 }
@@ -169,6 +173,13 @@ impl UpstreamStrategy for Strat {
 
     fn cache_policy(&self, _a: &String) -> CachePolicy {
         self.policy
+    }
+
+    fn expected_digests(&self, _a: &String, _h: &HeaderMap) -> ExpectedDigests {
+        match &self.known {
+            Some(hex) => ExpectedDigests::none().with(DigestAlgorithm::Sha256, hex, DigestSource::Known),
+            None => ExpectedDigests::none(),
+        }
     }
 
     fn transfer(&self, _a: &String) -> Transfer {
@@ -251,6 +262,33 @@ impl ProxyCacheStore for Shifted {
     async fn delete(&self, id: CacheEntryId) -> Result<(), StoreError> {
         self.inner.delete(id).await
     }
+
+    async fn quarantine(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.inner
+            .quarantine(repo, kind, key, announced, reason, self.at(now))
+            .await
+    }
+
+    async fn quarantined(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        self.inner
+            .quarantined(repo, kind, key, announced, self.at(now))
+            .await
+    }
 }
 
 pub(crate) struct Fx {
@@ -258,6 +296,8 @@ pub(crate) struct Fx {
     db_path: std::path::PathBuf,
     pub cache: Arc<dyn ProxyCacheStore>,
     policy: Arc<dyn crate::ports::policy::PolicyStore>,
+    pub repos: Arc<dyn crate::ports::repositories::RepositoryStore>,
+    pub reclaim: Arc<dyn crate::ports::reclaim::ReclaimStore>,
     pub storage: Arc<dyn StorageBackend>,
     pub repo: Repository,
     pub fake: Shared,
@@ -304,7 +344,7 @@ impl Fx {
             )
             .await
             .unwrap();
-        let storage = crate::storage::filesystem(tmp.path().join("storage"));
+        let storage = crate::server::filesystem(tmp.path().join("storage"));
         let clock = Arc::new(AtomicI64::new(0));
         let cache: Arc<dyn ProxyCacheStore> = Arc::new(Shifted {
             inner: stores.proxy_cache(),
@@ -321,6 +361,8 @@ impl Fx {
             db_path,
             cache,
             policy: stores.policy(),
+            repos: stores.repositories(),
+            reclaim: stores.reclaim(),
             storage,
             repo,
             fake,
@@ -342,11 +384,23 @@ impl Fx {
     }
 
     pub fn engine(&self, timeouts: Timeouts) -> ProxyEngine {
+        self.engine_over(self.storage.clone(), timeouts)
+    }
+
+    /// The engine over another storage, typically the fixture's own wrapped.
+    pub fn engine_over(&self, storage: Arc<dyn StorageBackend>, timeouts: Timeouts) -> ProxyEngine {
         let ttl = TtlConfig {
             default_secs: 3600,
             negative_secs: 600,
         };
-        ProxyEngine::new(self.storage.clone(), self.cache.clone(), timeouts, ttl)
+        ProxyEngine::new(
+            storage,
+            self.cache.clone(),
+            self.repos.clone(),
+            self.reclaim.clone(),
+            timeouts,
+            ttl,
+        )
     }
 
     pub fn member(&self) -> CacheRepo<'_> {
@@ -380,9 +434,11 @@ impl Fx {
             .unwrap()
     }
 
+    /// Every file under the storage root, scratch included: a leak there is
+    /// a leak too.
     pub fn files(&self) -> Vec<std::path::PathBuf> {
         let mut out = Vec::new();
-        let mut pending = vec![self.storage.resolve("").unwrap()];
+        let mut pending = vec![self._tmp.path().join("storage")];
         while let Some(dir) = pending.pop() {
             for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
                 if entry.path().is_dir() {

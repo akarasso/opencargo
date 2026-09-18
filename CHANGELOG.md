@@ -4,6 +4,63 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
+  validated against MinIO, not yet against a hosted provider. Credentials
+  come only from an allowlisted environment; TLS trusts the compiled-in
+  Mozilla roots. See `docs/storage.md`.
+- `opencargo storage check|verify|migrate|reclaim`, and
+  `GET /api/v1/system/storage` with a Storage tile on the System page.
+- OCI: `GET` on an upload location reports its range; the upload `POST`
+  answers `OCI-Chunk-Min-Length`.
+- Maven repositories under `/maven/{repo}/`: hosted (deploy with `mvn` or
+  Gradle's `maven-publish`), proxy and group. A deposit is visible once its
+  POM lands; checksums served are always computed by the server, and a
+  declared checksum that disagrees with the file is refused. A version
+  deposited without a POM is published after ten minutes unless another
+  user contested it, in which case an administrator decides through
+  `POST /api/v1/maven/{repo}/decide`.
+- The `maven` repository format. Migration 024 admits it and refuses to run
+  while a repository is named `maven`, because `/maven/` becomes the Maven
+  endpoint: rename that repository with the previous release before
+  upgrading. `maven` is a reserved repository name from now on.
+- Single sign-on through OpenID Connect (Google, Entra ID, GitLab, any
+  provider): accounts created or linked on first login, groups mapped to
+  roles and grants at every login, credentials revoked with the provider or
+  the account, and `password_mode` to retire local passwords. See
+  `docs/sso.md`.
+- Registry token signing keys survive a restart (`server_secrets`).
+- An admin can disable and re-enable an account; its SSO credentials are
+  revoked at once and every credential it holds is refused.
+
+### Changed
+- OCI: a `PATCH` whose `Content-Range` does not start where the upload
+  stands is `416` with the current `Range`; an unknown upload id, or one
+  started in another repository, is `404 BLOB_UPLOAD_UNKNOWN`; more than
+  10 000 chunks in one upload is `413`; upload, digest and manifest refusals
+  carry an `errors[]` body.
+- OCI: a manifest listing a config or layer blob the repository does not
+  hold is refused with `400 MANIFEST_BLOB_UNKNOWN` (it used to be stored).
+- OCI uploads started before this version are dropped by the storage sweep;
+  a client restarts them.
+- Deleting a manifest, a blob or a version, evicting a proxy entry or
+  removing a repository no longer frees its bytes at once: the keys are
+  queued and reclaimed by the storage sweep after a two-hour grace.
+- New artifacts are stored under an opaque per-repository incarnation and a
+  digest-keyed path (`r/<incarnation>/…`); existing files keep their paths
+  and keep serving.
+- Deprecated: legacy `.part-` scratch files beside finished objects are
+  still skipped by listings and swept; that carve-out will be removed in a
+  later release.
+- A credential that does not verify is refused with 401 on every route,
+  including an invalid or revoked Bearer on a public repository, which used
+  to fall back to anonymous. A request with no credential is still anonymous.
+- An API token is accepted as the Basic password on every format and is
+  never throttled by its account's password lockout. Password failures are
+  counted per account across Basic, `npm login` and the password change;
+  token failures are counted per client address. `auth.trusted_proxies`
+  names the proxies whose `X-Forwarded-For` is believed.
+
 ## [0.1.0-rc.1] - 2026-09-17
 
 First tagged release candidate.

@@ -3,6 +3,9 @@ bind = "127.0.0.1:6789"
 base_url = "http://localhost:6789"
 storage_path = "./data/storage"
 
+[storage]
+backend = "fs"
+
 [database]
 url = "sqlite:./data/db/opencargo.db"
 
@@ -21,6 +24,9 @@ username = "admin"
 # (must_change_password). Set a strong password, or supply it out-of-band via
 # the OPENCARGO_ADMIN_PASSWORD environment variable.
 password = "admin"
+
+[auth.sso]
+password_mode = "enabled"
 
 [proxy]
 default_ttl = "24h"

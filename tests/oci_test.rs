@@ -674,3 +674,107 @@ async fn test_oci_push_rejects_invalid_name_and_tag() {
         "a hostile image name must be rejected at upload start"
     );
 }
+
+async fn start(client: &reqwest::Client, base_url: &str, image: &str) -> String {
+    let resp = client
+        .post(format!("{base_url}/v2/{image}/blobs/uploads/"))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::ACCEPTED);
+    assert!(resp.headers().contains_key("oci-chunk-min-length"));
+    resp.headers()["location"].to_str().unwrap().to_string()
+}
+
+/// A chunk that does not start where the upload stands is a 416 carrying
+/// the range held so far; the status route reports it; an unknown id is a
+/// 404 in the distribution's error shape.
+#[tokio::test]
+async fn upload_ranges_status_and_unknown_ids() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    let location = start(&client, &base_url, "oci-private/myapp").await;
+
+    for want in [StatusCode::ACCEPTED, StatusCode::RANGE_NOT_SATISFIABLE] {
+        let resp = client
+            .patch(format!("{base_url}{location}"))
+            .bearer_auth("test-token")
+            .header("content-range", "0-3")
+            .body(b"abcd".to_vec())
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), want);
+        assert_eq!(resp.headers()["range"], "0-3");
+        if want == StatusCode::RANGE_NOT_SATISFIABLE {
+            let body: Value = resp.json().await.unwrap();
+            assert_eq!(body["errors"][0]["code"], "BLOB_UPLOAD_INVALID");
+        }
+    }
+
+    let resp = client
+        .get(format!("{base_url}{location}"))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    assert_eq!(resp.headers()["range"], "0-3");
+
+    let resp = client
+        .patch(format!("{base_url}/v2/oci-private/myapp/blobs/uploads/no-such-id"))
+        .bearer_auth("test-token")
+        .body(b"x".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "BLOB_UPLOAD_UNKNOWN");
+
+    let digest = sha256_digest(b"abcdef");
+    let resp = client
+        .put(format!("{base_url}{location}?digest={digest}"))
+        .bearer_auth("test-token")
+        .body(b"ef".to_vec())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED, "{:?}", resp.text().await);
+    let resp = client
+        .get(format!("{base_url}/v2/oci-private/myapp/blobs/{digest}"))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.bytes().await.unwrap().as_ref(), b"abcdef");
+}
+
+/// A manifest may only list blobs the repository holds.
+#[tokio::test]
+async fn a_manifest_with_an_unknown_blob_is_refused() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    let manifest = json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {
+            "mediaType": "application/vnd.oci.image.config.v1+json",
+            "digest": sha256_digest(b"never"),
+            "size": 5
+        },
+        "layers": []
+    });
+    let resp = client
+        .put(format!("{base_url}/v2/oci-private/myapp/manifests/v1"))
+        .bearer_auth("test-token")
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(serde_json::to_vec(&manifest).unwrap())
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["errors"][0]["code"], "MANIFEST_BLOB_UNKNOWN");
+}

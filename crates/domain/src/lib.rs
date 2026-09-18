@@ -4,7 +4,10 @@
 
 pub mod error;
 pub mod events;
+pub mod format_rules;
+pub mod identity;
 pub mod kinds;
+pub mod layout;
 pub mod names;
 pub mod permission;
 pub mod policy;
@@ -19,6 +22,8 @@ pub use error::{Action, DomainError, Resource};
 pub use events::{
     announce, Audience, DomainEvent, PackagePromotion, PackageRelease, ResolutionCounts,
 };
+pub use format_rules::FormatRules;
+pub use identity::CredentialKind;
 pub use kinds::{Format, RepoKind, Visibility};
 pub use names::{
     validate_npm_read_name, validate_oci_tag, validate_package_name, validate_version,
@@ -26,7 +31,8 @@ pub use names::{
 pub use permission::{allows, can_admin, effective_rights, RepoAction, Rights, RightsSource};
 pub use policy::{RuleVerdict, Verdict};
 pub use proxy::{
-    CacheEntry, CacheEntryId, CachePolicy, Classified, NewEntry, RepoId, Transfer, Ttl, UrlSource,
+    CacheEntry, CacheEntryId, CachePolicy, Classified, DigestAlgorithm, DigestSource,
+    ExpectedDigest, ExpectedDigests, NewEntry, RedirectRule, RepoId, Transfer, Ttl, UrlSource,
 };
 pub use repository::{DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version};
 pub use resolve::{CacheRepo, Miss, Outcome, UrlRepo, Visit, Walk, MAX_GROUP_DEPTH};

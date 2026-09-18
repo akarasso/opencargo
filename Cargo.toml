@@ -23,7 +23,7 @@ path = "src/main.rs"
 opencargo-domain = { path = "crates/domain" }
 
 # HTTP server
-axum = { version = "0.8", features = ["macros", "ws"] }
+axum = { version = "0.8", features = ["macros", "ws", "multipart"] }
 tokio = { version = "1", features = ["full"] }
 tower = { version = "0.5", features = ["util"] }
 tower-http = { version = "0.6", features = ["cors", "trace"] }
@@ -59,6 +59,7 @@ tar = "0.4"
 async-trait = "0.1"
 bytes = "1"
 tokio-util = { version = "0.7", features = ["io"] }
+futures-util = "0.3"
 
 # Version ordering (go @latest)
 semver = "1"
@@ -79,12 +80,20 @@ dirs = "6"
 # HTTP client (proxy upstream)
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
 
+# Object storage: named only under src/adapters/s3/ (boundary row object-store).
+object_store = { version = "0.14", default-features = false, features = ["aws"] }
+webpki-root-certs = "1"
+
 # URLs: the upstream vocabulary of the strategy port, which must not name the
 # HTTP client it happens to be re-exported from.
 url = "2"
 
 # Auth (password hashing)
 argon2 = "0.5"
+
+# SSO: ID Token verification and the sealed attempt cookie
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
+aws-lc-rs = "1"
 
 # Metrics (Prometheus)
 metrics = "0.24"
@@ -101,14 +110,18 @@ pulldown-cmark = "0.12"
 ammonia = "4"
 
 # TLS
-axum-server = { version = "0.7", features = ["tls-rustls"] }
+axum-server = { version = "0.8", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 zip = "8.3.1"
 cvss = "2.2"
+roxmltree = "0.20"
+md-5 = "0.10"
+quick-xml = "0.41"
 
 [dev-dependencies]
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "multipart", "rustls-tls-webpki-roots-no-provider"] }
 tempfile = "3"
+percent-encoding = "2"
 tokio-test = "0.4"
 rcgen = "0.13"
 # WebSocket client for tests/ws_test.rs. Already a transitive dependency of

@@ -1,3 +1,5 @@
+mod common;
+
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
@@ -138,7 +140,7 @@ async fn setup() -> (String, tokio::task::JoinHandle<()>, TempDir) {
 
     config.server.base_url = base_url.clone();
 
-    let state = server::build_state(&config)
+    let state = common::build_state(&mut config)
         .await
         .expect("failed to build app state");
     let router = server::build_router(state);
@@ -328,6 +330,10 @@ async fn test_promote_package() {
 /// shared-path behavior this download would 404.
 #[tokio::test]
 async fn test_promote_isolates_tarball_from_source() {
+    if common::storage_is_s3() {
+        eprintln!("skipped under S3: the test deletes the source's files on disk");
+        return;
+    }
     let (base_url, _handle, tmp) = setup().await;
     let client = reqwest::Client::new();
 
@@ -343,6 +349,9 @@ async fn test_promote_isolates_tarball_from_source() {
         .await
         .expect("publish request failed");
     assert_eq!(resp.status(), StatusCode::OK, "publish should succeed");
+
+    let source_files = files_under(&tmp.path().join("storage").join("r"));
+    assert!(!source_files.is_empty(), "the source landed under its incarnation");
 
     // Promote to npm-prod.
     let resp = client
@@ -363,13 +372,9 @@ async fn test_promote_isolates_tarball_from_source() {
         "prod download should work right after promote"
     );
 
-    // Simulate the cleanup GC removing the SOURCE repo's stored tarball(s).
-    let source_dir = tmp.path().join("storage").join("npm").join("npm-dev");
-    assert!(
-        source_dir.is_dir(),
-        "source storage subtree should exist before deletion: {source_dir:?}"
-    );
-    std::fs::remove_dir_all(&source_dir).expect("failed to delete source storage subtree");
+    for file in &source_files {
+        std::fs::remove_file(file).expect("failed to delete a source file");
+    }
 
     // The source download must now fail — confirms the deletion is meaningful
     // (otherwise the survival assertion below would be trivially true).
@@ -617,4 +622,19 @@ async fn test_list_promotions() {
         promotions[0]["promoted_at"].as_str().is_some(),
         "promoted_at should be present"
     );
+}
+
+fn files_under(root: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut out = Vec::new();
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+            if entry.path().is_dir() {
+                pending.push(entry.path());
+            } else {
+                out.push(entry.path());
+            }
+        }
+    }
+    out
 }

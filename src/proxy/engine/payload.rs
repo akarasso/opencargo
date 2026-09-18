@@ -1,14 +1,11 @@
-use std::path::PathBuf;
-
 use axum::body::Body;
 use axum::http::{header, HeaderName, HeaderValue, StatusCode};
 use axum::response::Response;
 use bytes::Bytes;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
 use tokio_util::io::ReaderStream;
 
-use crate::domain::{CacheEntry, CacheRepo, Outcome};
+use crate::domain::{CacheEntry, Outcome};
 use crate::error::{AppError, AppResult};
 use crate::storage::{StorageBackend, StorageError};
 
@@ -110,8 +107,8 @@ impl Payload {
     ) -> AppResult<Response> {
         let (length, body) = match &self.src {
             Src::File(path) => {
-                let (len, reader) = storage.read_stream(path).await.map_err(unreadable)?;
-                (len, Body::from_stream(ReaderStream::new(reader)))
+                let read = storage.read_stream(path).await.map_err(unreadable)?;
+                (read.total, Body::from_stream(ReaderStream::new(read.body)))
             }
             Src::Bytes(b) => (b.len() as u64, Body::from(b.clone())),
             Src::HeadOnly => (self.size, Body::empty()),
@@ -134,75 +131,18 @@ impl Payload {
     }
 }
 
-/// A missing file stays a 404; any other local fault is ours, not the upstream's.
+/// A missing file stays a 404; any other fault is ours, never the upstream's,
+/// and keeps the storage port's status.
 fn unreadable(e: StorageError) -> AppError {
-    match e {
-        StorageError::NotFound => AppError::NotFound(e.to_string()),
-        other => AppError::Internal(format!("stored file unreadable: {other}")),
-    }
+    AppError::from(e)
 }
 
-/// `_proxy_cache/{member}/{kind}/{h[..2]}/{h}`, `h = hex(sha256(key))`, so a
-/// key that prefixes another never needs one path to be file and directory.
-pub fn cache_path(member: CacheRepo<'_>, key: &CacheKey) -> String {
+pub const CACHE_SEGMENT: &str = "_proxy";
+
+/// `{root}/_proxy/{kind}/{h[..2]}/{h}`, `h = hex(sha256(key))`, under the
+/// member's incarnation root, so a key that prefixes another never needs one
+/// path to be file and directory, and no repository name reaches a key.
+pub fn cache_path(root: &str, key: &CacheKey) -> String {
     let h = format!("{:x}", Sha256::digest(key.key.as_bytes()));
-    format!(
-        "_proxy_cache/{}/{}/{}/{h}",
-        member.0.name,
-        key.kind,
-        &h[..2]
-    )
-}
-
-/// One open handle behind an RAII guard: `Drop` unlinks the part unless
-/// `commit` renamed it into place, so a refresh never truncates a reader's inode.
-pub struct PartFile {
-    rel: String,
-    resolved: PathBuf,
-    file: Option<tokio::fs::File>,
-    committed: bool,
-}
-
-impl PartFile {
-    pub async fn new(storage: &dyn StorageBackend, rel: String) -> AppResult<Self> {
-        let resolved = storage.resolve(&rel)?;
-        if let Some(parent) = resolved.parent() {
-            tokio::fs::create_dir_all(parent).await?;
-        }
-        let file = tokio::fs::File::create(&resolved).await?;
-        Ok(Self {
-            rel,
-            resolved,
-            file: Some(file),
-            committed: false,
-        })
-    }
-
-    pub async fn write_chunk(&mut self, chunk: &[u8]) -> AppResult<()> {
-        let file = self
-            .file
-            .as_mut()
-            .ok_or_else(|| AppError::Internal("part file already closed".into()))?;
-        file.write_all(chunk).await?;
-        Ok(())
-    }
-
-    pub async fn commit(mut self, storage: &dyn StorageBackend, final_rel: &str) -> AppResult<()> {
-        if let Some(mut file) = self.file.take() {
-            file.flush().await?;
-            file.sync_data().await?;
-        }
-        storage.rename(&self.rel, final_rel).await?;
-        self.committed = true;
-        Ok(())
-    }
-}
-
-impl Drop for PartFile {
-    // Synchronous: Drop cannot await and a spawned task would leak at shutdown.
-    fn drop(&mut self) {
-        if !self.committed {
-            let _ = std::fs::remove_file(&self.resolved);
-        }
-    }
+    format!("{root}/{CACHE_SEGMENT}/{}/{}/{h}", key.kind, &h[..2])
 }

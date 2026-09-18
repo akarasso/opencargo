@@ -69,14 +69,59 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # The real-client e2e suites shell out to `pnpm`, `cargo`, `go` and
-      # `docker`, resolved from PATH. Locally an absent client prints
-      # `skipped:`; OPENCARGO_E2E_REQUIRE=1 turns that into a failure so CI
-      # never silently skips a suite.
+      - name: Install PyPI clients
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pypi-clients"
+          "$RUNNER_TEMP/pypi-clients/bin/python" -m pip install --require-hashes -r tests/pypi-clients.txt
+          for client in pip twine uv poetry; do
+            echo "${client^^}_BIN=$RUNNER_TEMP/pypi-clients/bin/$client" >> "$GITHUB_ENV"
+          done
+
+      - name: Install nuget.exe
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/nuget.exe" https://dist.nuget.org/win-x86-commandline/v6.14.0/nuget.exe
+          echo "92dbed160ddee0f64b901e907439e021211b428e57c089ecc12fc38dcc4bd9a5  $RUNNER_TEMP/nuget.exe" | sha256sum -c -
+          echo "NUGET_EXE=$RUNNER_TEMP/nuget.exe" >> "$GITHUB_ENV"
+          echo "NUGET_BIN=$GITHUB_WORKSPACE/scripts/nuget-in-docker" >> "$GITHUB_ENV"
+
+      # The real-client e2e suites shell out to `pnpm`, `cargo`, `go`,
+      # `docker` and the PyPI clients, resolved from PATH or `*_BIN`. Locally
+      # an absent client prints `skipped:`; OPENCARGO_E2E_REQUIRE=1 turns that
+      # into a failure so CI never silently skips a suite.
       - name: Run tests
         env:
           OPENCARGO_E2E_REQUIRE: '1'
         run: cargo test
+
+  test-s3:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@283fb51ee3c8a49cd7c8ff30102f3fcf3cfbe0e1 # 1.93.0
+
+      - name: Cache Rust
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+
+      - name: Install pnpm
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
+        with:
+          version: 10
+
+      - name: Install Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 22
+
+      - name: Build frontend
+        run: cd frontend && pnpm install --frozen-lockfile && pnpm build
+
+      - name: Run tests on S3
+        run: scripts/test-s3.sh
 
   workflow-lint:
     runs-on: ubuntu-24.04

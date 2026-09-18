@@ -4,6 +4,8 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use std::sync::Arc;
+
 use serde::Deserialize;
 use serde_json::{json, Value};
 
@@ -58,17 +60,12 @@ pub async fn create_repository(
     let body: CreateRepositoryRequest = read_json(request).await?;
     let kind: RepoKind = body.repo_type.parse()?;
     let format: Format = body.format.parse()?;
-    // The API never exposes pypi: there is no registry module behind it.
-    if format == Format::Pypi {
-        return Err(AppError::BadRequest(format!(
-            "invalid repository format: {}",
-            body.format
-        )));
-    }
     let visibility: Visibility = body.visibility.parse()?;
     let members = body.members.unwrap_or_default();
 
     let repo = CreateRepository::new(state.repos.clone(), state.audit.clone(), state.events.clone())
+        .guarding(state.storage.clone())
+        .reserving(crate::server::RESERVED_NAMES)
         .run(
             &RepoSpec {
                 name: &body.name,
@@ -156,7 +153,7 @@ pub async fn delete_repository(
         state.repos.clone(),
         state.audit.clone(),
         state.events.clone(),
-        state.proxy.clone(),
+        Arc::new(state.reclaim_orphans()),
     )
     .run(&name, &actor(&caller), chrono::Utc::now())
     .await?;

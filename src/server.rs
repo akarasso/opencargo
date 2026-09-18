@@ -19,8 +19,21 @@ use tracing::{info, warn};
 
 use crate::adapters::sqlite::SqliteStores;
 use crate::app::events::Announce;
+use crate::app::maven::deposit::MavenDeposits;
+use crate::app::maven::versions::MavenVersions;
+use crate::app::place::Placer;
+use crate::app::promote::PromoteVersion;
+use crate::app::publish::PublishVersion;
+use crate::app::pypi::PublishPypiFile;
 use crate::app::publish_tail::{PublishGate, PublishTail};
+use crate::app::reclaim::{ReclaimOrphans, ReclaimPolicy};
+use crate::ports::multipart::MultipartLedger;
+use crate::ports::reclaim::ReclaimStore;
+use crate::ports::referenced::ReferencedKeys;
+use crate::app::authenticate::{Authenticate, AuthenticateDeps, Refusal};
 use crate::auth::middleware::{auth_middleware, AuthState};
+use crate::ports::secrets::ServerSecretStore;
+use crate::ports::signing::RegistryTokenSigner;
 use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
@@ -31,18 +44,20 @@ use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
 use crate::ports::events::Events;
 use crate::ports::ids::Ids;
+use crate::ports::maven::MavenFileStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
+use crate::ports::pypi::PypiFileStore;
 use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::SearchIndex;
 use crate::ports::tokens::{NewToken, TokenStore};
 use crate::ports::users::{NewUser, UserPatch, UserStore};
 use crate::ports::webhooks::{NewWebhook, WebhookStore};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
-use crate::storage::StorageBackend;
+use crate::storage::{StorageBackend, StoreIdentity};
 use crate::ports::vulns::{VulnFeed, VulnStore};
 use crate::telemetry;
 use crate::telemetry::vulns::VulnScanner;
@@ -59,9 +74,14 @@ use crate::telemetry::webhooks::WebhookDispatcher;
 /// storage to streaming (P1) is the follow-up that lets this grow safely.
 const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 
+const ARCHIVE_PERMITS: usize = 4;
+
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<dyn StorageBackend>,
+    /// `fs` or `s3`: which adapter the store is, never where it points.
+    pub storage_backend: &'static str,
+    pub storage_ready: Arc<StorageReadiness>,
     /// What the proxy remembers; the engine holds it too, and the background
     /// sweep needs it without going through the engine.
     pub cache: Arc<dyn ProxyCacheStore>,
@@ -71,7 +91,7 @@ pub struct AppState {
     pub upstream_auth: Arc<HashMap<String, UpstreamCreds>>,
     pub base_url: String,
     pub metrics_handle: PrometheusHandle,
-    pub login_rate_limiter: Arc<RateLimiter>,
+    pub registry_tokens: Arc<dyn RegistryTokenSigner>,
     pub publish_rate_limiter: Arc<RateLimiter>,
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
@@ -82,7 +102,19 @@ pub struct AppState {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub nuget_feed: Arc<dyn crate::ports::nuget::NugetFeedRead>,
+    /// NuGet's registration memo, per server: its keys are repository ids.
+    pub nuget_documents: Arc<crate::registry::nuget::merged::Documents>,
     pub oci: Arc<dyn OciStore>,
+    pub pypi: Arc<dyn PypiFileStore>,
+    /// Bounds the archives inspected at once; inspection is CPU on a blocking thread.
+    pub archive_permits: Arc<tokio::sync::Semaphore>,
+    /// Parsed upstream PyPI pages, shared by the leaves and the policy facts.
+    pub pypi_pages: Arc<crate::registry::pypi::memo::PageMemo>,
+    pub maven: Arc<dyn MavenFileStore>,
+    pub reclaim: Arc<dyn ReclaimStore>,
+    pub referenced: Arc<dyn ReferencedKeys>,
+    pub multipart: Arc<dyn MultipartLedger>,
     pub audit: Arc<dyn AuditStore>,
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
@@ -102,6 +134,12 @@ pub struct AppState {
     pub ids: Arc<dyn Ids>,
     /// Records proxy resolutions for the policy report; off until a rule is on.
     pub policy: PolicyEngine,
+    pub identities: Arc<dyn crate::ports::identities::IdentityStore>,
+    /// The SSO use cases, with no provider when none is configured.
+    pub sso: Arc<crate::app::sso::Sso>,
+    /// Plain-HTTP attempt cookies, only on a loopback development server.
+    pub sso_insecure_cookies: bool,
+    pub password_mode: crate::domain::identity::PasswordMode,
 }
 
 impl AppState {
@@ -121,12 +159,91 @@ impl AppState {
         )
     }
 
+    /// The only placer of shared keys.
+    pub fn placer(&self) -> Arc<Placer> {
+        Arc::new(Placer::new(self.reclaim.clone(), self.storage.clone()))
+    }
+
+    pub fn publish_version(&self) -> PublishVersion {
+        PublishVersion::new(self.packages.clone(), self.repos.clone(), self.placer())
+    }
+
+    pub fn publish_pypi_file(&self) -> PublishPypiFile {
+        PublishPypiFile::new(self.pypi.clone(), self.repos.clone(), self.placer())
+    }
+
+    pub fn promote_version(&self) -> PromoteVersion {
+        PromoteVersion::new(
+            self.packages.clone(),
+            self.repos.clone(),
+            self.storage.clone(),
+            self.placer(),
+        )
+    }
+
+    /// Maven's versions rows, announced through the shared publish tail.
+    pub fn maven_versions(&self) -> Arc<MavenVersions> {
+        Arc::new(MavenVersions::new(
+            self.maven.clone(),
+            self.packages.clone(),
+            self.repos.clone(),
+            self.storage.clone(),
+            Arc::new(self.publish_tail()),
+            crate::registry::maven::pom::metadata_json,
+        ))
+    }
+
+    pub fn maven_deposits(&self) -> MavenDeposits {
+        MavenDeposits::new(
+            self.repos.clone(),
+            self.storage.clone(),
+            self.placer(),
+            self.maven_versions(),
+        )
+    }
+
+    /// Every format's reconciler, for `RunCleanup` to iterate.
+    pub fn reconcilers(&self) -> Vec<Arc<dyn crate::app::reconcile::Reconciler>> {
+        vec![Arc::new(crate::app::maven::reconcile::MavenReconcile::new(
+            self.maven_versions(),
+            MAVEN_PROMOTION_WINDOW,
+            1000,
+            crate::registry::maven::hosted::scopes_of_unit,
+        ))]
+    }
+
+    pub fn decide_maven_unit(&self) -> crate::app::maven::admin::DecideUnit {
+        crate::app::maven::admin::DecideUnit::new(
+            self.maven_versions(),
+            self.audit.clone(),
+            self.events.clone(),
+        )
+    }
+
+    /// The only deleter of shared keys, over this state's stores.
+    pub fn reclaim_orphans(&self) -> ReclaimOrphans {
+        ReclaimOrphans::new(
+            self.reclaim.clone(),
+            self.referenced.clone(),
+            self.storage.clone(),
+            ReclaimPolicy::default(),
+        )
+    }
+
     /// The audience decision, for the one caller outside a publish: a
     /// promotion announces the same way.
     pub fn announce(&self) -> Announce {
         Announce::new(self.events.clone(), self.repos.clone())
     }
 }
+
+/// How long a Maven unit deposited without its POM waits before
+/// `RunCleanup` may make it visible.
+const MAVEN_PROMOTION_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
+
+/// The path prefixes the protocol adapters mount under the root, which no
+/// new repository may be named after.
+pub const RESERVED_NAMES: &[&str] = &[crate::registry::maven::MOUNT];
 
 /// Migrate a database and nothing else: the `opencargo migrate` subcommand, so
 /// the binary reaches the adapter through the composition root rather than
@@ -135,6 +252,104 @@ pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
     let db = crate::adapters::sqlite::connect(&config.database.url).await?;
     crate::adapters::sqlite::migrate::run_all(&db).await?;
     Ok(())
+}
+
+/// Until ha-options' writer lease lands, a server listening on the
+/// configured address is how a storage command learns it is not alone.
+/// Weaker than the lease: a server that is starting is not seen.
+async fn refuse_running_server(config: &Config) -> anyhow::Result<()> {
+    let bind = config.server.bind.replace("0.0.0.0", "127.0.0.1");
+    let probe = tokio::time::timeout(
+        std::time::Duration::from_secs(1),
+        tokio::net::TcpStream::connect(&bind),
+    )
+    .await;
+    if matches!(probe, Ok(Ok(_))) {
+        anyhow::bail!(
+            "a server is listening on {}: stop it before running this storage command",
+            config.server.bind
+        );
+    }
+    Ok(())
+}
+
+/// `opencargo storage check`: the probe, then every operation the backend
+/// exercises on its own reserved tree.
+pub async fn storage_check(config: &Config) -> anyhow::Result<crate::storage::CheckReport> {
+    config.validate()?;
+    let stores = connect_stores(config).await?;
+    let storage = storage_for(config, stores.multipart())?;
+    let mut report = storage.self_check().await;
+    report.steps.insert(
+        0,
+        crate::storage::CheckStep {
+            operation: "probe",
+            outcome: storage.probe().await.map_err(|e| e.to_string()),
+        },
+    );
+    Ok(report)
+}
+
+/// `opencargo storage verify [--orphans]`.
+pub async fn storage_verify(
+    config: &Config,
+    orphans: bool,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<crate::app::storage_ops::VerifyReport> {
+    config.validate()?;
+    let stores = connect_stores(config).await?;
+    let storage = storage_for(config, stores.multipart())?;
+    let verify = crate::app::storage_ops::VerifyStorage::new(
+        stores.referenced(),
+        storage,
+        ReclaimPolicy::default().grace,
+    );
+    Ok(verify.run(orphans, now).await?)
+}
+
+/// `opencargo storage migrate --to <config>`: the server stopped, the two
+/// stores disjoint, every object copied under its key.
+pub async fn storage_migrate(
+    config: &Config,
+    target: &Config,
+    dry_run: bool,
+) -> anyhow::Result<crate::app::storage_ops::MigrateReport> {
+    config.validate()?;
+    target.validate()?;
+    let identities: Vec<String> = config.store_identities().into_iter().chain(target.store_identities()).collect();
+    crate::config::refuse_duplicate_identities(identities.iter().map(String::as_str))
+        .map_err(|e| anyhow::anyhow!("{e}: set a distinct `storage.id` in the target config"))?;
+    refuse_running_server(config).await?;
+    let stores = connect_stores(config).await?;
+    let clock: Arc<dyn Clock> = Arc::new(crate::adapters::system::SystemClock);
+    let source = build_configured_storage(config, Role::Artifacts, stores.multipart(), clock.clone())?;
+    let sink = build_configured_storage(target, Role::Artifacts, stores.multipart(), clock)?;
+    if !source.location.disjoint(&sink.location) {
+        anyhow::bail!("the target store overlaps the source: pick another path, bucket or prefix");
+    }
+    let migrate = crate::app::storage_ops::MigrateStorage::new(source.backend, sink.backend);
+    Ok(migrate.run(dry_run).await?)
+}
+
+/// `opencargo storage reclaim [--prefix P]`: one reclamation pass now, or
+/// the prefix no repository row names any more.
+pub async fn storage_reclaim(
+    config: &Config,
+    prefix: Option<&str>,
+    now: chrono::DateTime<Utc>,
+) -> anyhow::Result<crate::app::reclaim::ReclaimReport> {
+    config.validate()?;
+    refuse_running_server(config).await?;
+    let stores = connect_stores(config).await?;
+    let storage = storage_for(config, stores.multipart())?;
+    let policy = ReclaimPolicy::default();
+    let reclaim = ReclaimOrphans::new(stores.reclaim(), stores.referenced(), storage, policy);
+    match prefix {
+        Some(prefix) => Ok(crate::app::storage_ops::ReclaimPrefix::new(stores.reclaim(), reclaim, policy.grace)
+            .run(prefix, now)
+            .await?),
+        None => Ok(reclaim.run(now).await),
+    }
 }
 
 /// A database URL turned into ports: the pool, migrated, with every store
@@ -155,6 +370,129 @@ pub async fn open_stores(path: &std::path::Path) -> anyhow::Result<SqliteStores>
     SqliteStores::open(path).await
 }
 
+/// What a store is built for; its identity defaults to the role's name.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Role {
+    Artifacts,
+}
+
+impl Role {
+    fn name(self) -> &'static str {
+        match self {
+            Role::Artifacts => "artifacts",
+        }
+    }
+}
+
+/// Where a built store really points, for disjointness checks only: no
+/// `Display`, no `Serialize`, and a `Debug` that names nothing.
+pub struct ResolvedLocation {
+    backend: &'static str,
+    root: std::path::PathBuf,
+    /// Endpoint, region and bucket of an S3 store, compared as a tuple
+    /// before its prefix.
+    service: Option<(String, String, String)>,
+}
+
+impl std::fmt::Debug for ResolvedLocation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ResolvedLocation(..)")
+    }
+}
+
+impl ResolvedLocation {
+    /// Two locations share nothing: another backend, or roots neither of
+    /// which contains the other.
+    pub fn disjoint(&self, other: &ResolvedLocation) -> bool {
+        self.backend != other.backend
+            || self.service != other.service
+            || !(self.root.starts_with(&other.root) || other.root.starts_with(&self.root))
+    }
+}
+
+pub struct BuiltStorage {
+    pub backend: Arc<dyn StorageBackend>,
+    pub identity: StoreIdentity,
+    pub location: ResolvedLocation,
+}
+
+pub fn build_storage(root: impl Into<std::path::PathBuf>, role: Role) -> BuiltStorage {
+    filesystem_store(root, StoreIdentity(role.name().to_string()))
+}
+
+fn filesystem_store(root: impl Into<std::path::PathBuf>, identity: StoreIdentity) -> BuiltStorage {
+    #[allow(clippy::disallowed_types)]
+    let fs = crate::adapters::fs::FilesystemStorage::new(root, identity.clone());
+    let location = ResolvedLocation {
+        backend: "fs",
+        root: fs.root().to_path_buf(),
+        service: None,
+    };
+    BuiltStorage {
+        backend: Arc::new(fs),
+        identity,
+        location,
+    }
+}
+
+/// The artifacts store `config` declares, on the system clock: what the test
+/// harness rebuilds to look at a server's bytes.
+pub fn storage_for(
+    config: &Config,
+    ledger: Arc<dyn MultipartLedger>,
+) -> anyhow::Result<Arc<dyn StorageBackend>> {
+    Ok(build_configured_storage(
+        config,
+        Role::Artifacts,
+        ledger,
+        Arc::new(crate::adapters::system::SystemClock),
+    )?
+    .backend)
+}
+
+/// The store `config` declares for `role`: the filesystem under the storage
+/// path, or S3 with its multipart uploads recorded in `ledger`.
+pub fn build_configured_storage(
+    config: &Config,
+    role: Role,
+    ledger: Arc<dyn MultipartLedger>,
+    clock: Arc<dyn Clock>,
+) -> anyhow::Result<BuiltStorage> {
+    let identity = StoreIdentity(
+        config
+            .storage
+            .id
+            .clone()
+            .unwrap_or_else(|| role.name().to_string()),
+    );
+    match config.storage.backend {
+        crate::config::StorageKind::Fs => Ok(filesystem_store(&config.server.storage_path, identity)),
+        crate::config::StorageKind::S3 => {
+            let settings = crate::adapters::s3::settings::S3Settings::from_process(&config.storage.s3)?;
+            let s3 = crate::adapters::s3::S3Storage::build(&settings, identity.clone(), ledger, clock)?;
+            Ok(BuiltStorage {
+                backend: Arc::new(s3),
+                identity,
+                location: ResolvedLocation {
+                    backend: "s3",
+                    root: std::path::PathBuf::from(&settings.prefix),
+                    service: Some((
+                        settings.endpoint.clone().unwrap_or_default(),
+                        settings.region.clone(),
+                        settings.bucket.clone(),
+                    )),
+                },
+            })
+        }
+    }
+}
+
+/// A filesystem store under `root`, for the fixtures that may not name an
+/// adapter.
+pub fn filesystem(root: impl Into<std::path::PathBuf>) -> Arc<dyn StorageBackend> {
+    build_storage(root, Role::Artifacts).backend
+}
+
 /// The real-time bus, for the same reason: `src/policy/`'s fixtures need one
 /// and may not name an adapter.
 pub fn event_bus() -> Arc<dyn Events> {
@@ -169,19 +507,40 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let repos = stores.repositories();
     seed_repositories(repos.as_ref(), &config.repositories, Utc::now()).await?;
 
-    let storage = crate::storage::filesystem(&config.server.storage_path);
-
-    // Shared between AuthState (Basic Auth throttling) and AppState (npm login).
-    let login_rate_limiter = Arc::new(RateLimiter::new(5, 60));
+    config.validate()?;
+    let built = build_configured_storage(
+        config,
+        Role::Artifacts,
+        stores.multipart(),
+        Arc::new(crate::adapters::system::SystemClock),
+    )?;
+    let storage_backend = built.location.backend;
+    let storage = built.backend;
 
     let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 
-    let auth = auth_state(config, &users, &tokens, &login_rate_limiter);
+    let secrets: Arc<dyn ServerSecretStore> = stores.secrets();
+    let registry_tokens: Arc<dyn RegistryTokenSigner> = Arc::new(
+        crate::registry::oci::token::TokenSigner::from_store(secrets.as_ref()).await?,
+    );
+    let identities = stores.identities();
+    let auth = auth_state(config, &users, &tokens, &registry_tokens, &identities)?;
 
     ensure_admin_user(users.as_ref(), config).await?;
+    let providers = sso_providers(config, identities.as_ref()).await?;
+    let sso = Arc::new(
+        sso_use_cases(
+            config,
+            &stores,
+            providers,
+            auth.authenticate.clone(),
+            secrets.as_ref(),
+        )
+        .await?,
+    );
 
     let cache = stores.proxy_cache();
-    let proxy = proxy_engine(config, storage.clone(), cache.clone());
+    let proxy = proxy_engine(config, storage.clone(), cache.clone(), &stores);
     let upstream_auth = Arc::new(upstream_creds(repos.as_ref(), config).await?);
 
     let metrics_handle = telemetry::init_metrics();
@@ -205,6 +564,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     report_ready(config, &policy_notes);
 
     Ok(AppState {
+        storage_backend,
+        storage_ready: Arc::new(StorageReadiness::new(storage.clone())),
         storage,
         cache,
         auth,
@@ -212,7 +573,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         upstream_auth,
         base_url: config.server.base_url.clone(),
         metrics_handle,
-        login_rate_limiter,
+        registry_tokens,
         publish_rate_limiter: Arc::new(RateLimiter::new(30, 60)),
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
@@ -223,7 +584,16 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         repos,
         packages: stores.packages(),
         search: stores.search(),
+        nuget_feed: stores.nuget_feed(),
+        nuget_documents: Arc::new(crate::registry::nuget::merged::documents()),
         oci: stores.oci(),
+        pypi: stores.pypi(),
+        archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
+        pypi_pages: Arc::new(crate::registry::pypi::memo::PageMemo::default()),
+        maven: stores.maven(),
+        reclaim: stores.reclaim(),
+        referenced: stores.referenced(),
+        multipart: stores.multipart(),
         audit: stores.audit(),
         deps: stores.dependencies(),
         vulns: stores.vulns(),
@@ -235,25 +605,303 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         clock: Arc::new(crate::adapters::system::SystemClock),
         ids: Arc::new(crate::adapters::system::UuidIds),
         policy,
+        sso,
+        identities,
+        sso_insecure_cookies: config.auth.sso.dev_insecure_http,
+        password_mode: gate_policy(&config.auth.sso)?.password_mode,
     })
 }
 
-/// What the auth middleware needs, which is two stores and the login
-/// throttle it shares with the npm login route.
+/// The one `Authenticate` and what the protocol adapters declare about
+/// their routes.
 fn auth_state(
     config: &Config,
     users: &Arc<dyn UserStore>,
     tokens: &Arc<dyn TokenStore>,
-    login_rate_limiter: &Arc<RateLimiter>,
-) -> Arc<AuthState> {
-    Arc::new(AuthState {
+    signer: &Arc<dyn RegistryTokenSigner>,
+    identities: &Arc<dyn crate::ports::identities::IdentityStore>,
+) -> anyhow::Result<Arc<AuthState>> {
+    let gate = crate::app::login_gate::PolicyGate::new(
+        identities.clone(),
+        gate_policy(&config.auth.sso)?,
+        Some(config.auth.admin.username.clone()),
+    );
+    let authenticate = Authenticate::new(AuthenticateDeps {
         static_tokens: config.auth.static_tokens.clone(),
-        anonymous_read: config.auth.anonymous_read,
+        token_prefix: config.auth.token_prefix.clone(),
         users: users.clone(),
         tokens: tokens.clone(),
-        login_rate_limiter: login_rate_limiter.clone(),
-        base_url: config.server.base_url.clone(),
-        registry_tokens: Arc::new(crate::registry::oci::token::TokenSigner::random()),
+        signer: signer.clone(),
+        login_limiter: Arc::new(RateLimiter::new(5, 60)),
+        token_limiter: Arc::new(RateLimiter::new(30, 60)),
+        gate: Arc::new(gate),
+        clock: Arc::new(crate::adapters::system::SystemClock),
+    });
+    let authenticate = Arc::new(authenticate);
+    Ok(Arc::new(AuthState {
+        anonymous_read: config.auth.anonymous_read,
+        authenticate: authenticate.clone(),
+        routes: vec![
+            Arc::new(crate::registry::oci::auth_rules::OciRouteRules {
+                base_url: config.server.base_url.clone(),
+            }),
+            Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
+            Arc::new(crate::registry::pypi::auth_rules::PypiRouteRules),
+            Arc::new(crate::registry::maven::auth_rules::MavenRouteRules),
+            Arc::new(crate::registry::nuget::auth_rules::NugetRouteRules {
+                token_shaped: {
+                    let authenticate = authenticate.clone();
+                    Arc::new(move |raw: &str| authenticate.is_token_shaped(raw))
+                },
+            }),
+        ],
+        trusted_proxies: config.auth.trusted_proxies.clone(),
+    }))
+}
+
+fn is_loopback(bind: &str) -> bool {
+    let host = bind.rsplit_once(':').map_or(bind, |(h, _)| h);
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    host == "localhost" || host.parse::<std::net::IpAddr>().is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Decision 17: plain-HTTP cookies only for a loopback server with an
+/// `http` public URL; otherwise SSO needs an `https` public URL for its
+/// `__Host-` cookies.
+pub fn check_sso_transport(config: &Config) -> anyhow::Result<()> {
+    let sso = &config.auth.sso;
+    let https = config.server.base_url.starts_with("https://");
+    if sso.dev_insecure_http {
+        anyhow::ensure!(
+            !https,
+            "auth.sso.dev_insecure_http is refused with an https base_url"
+        );
+        anyhow::ensure!(
+            is_loopback(&config.server.bind),
+            "auth.sso.dev_insecure_http is refused unless the server listens on loopback"
+        );
+        warn!("auth.sso.dev_insecure_http is on: SSO cookies are sent over plain HTTP");
+        return Ok(());
+    }
+    let active = sso.providers.iter().any(|p| !p.retired);
+    anyhow::ensure!(
+        !active || https,
+        "SSO needs an https base_url (or dev_insecure_http on a loopback server)"
+    );
+    Ok(())
+}
+
+/// One configured provider turned into the domain's profile and the OIDC
+/// adapter's settings.
+fn sso_provider(
+    p: &crate::config::SsoProviderConfig,
+) -> anyhow::Result<Arc<dyn crate::ports::identity_provider::IdentityProvider>> {
+    use crate::adapters::oidc::profiles::{Kind, ENTRA_ISSUER_TEMPLATE, GOOGLE_ISSUER};
+    use crate::domain::identity::{
+        Authority, ConfigRefusal, GrantRole, GroupGrant, LoginPolicy, ProviderProfile,
+    };
+    let name = &p.name;
+    anyhow::ensure!(
+        !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+        "auth.sso.providers: invalid name {name:?}"
+    );
+    anyhow::ensure!(
+        !matches!(name.as_str(), "link" | "providers" | "exchange"),
+        "auth.sso.providers: {name:?} is a reserved route name"
+    );
+    let (kind, issuer) = match p.kind.as_str() {
+        "google" => (Kind::Google, GOOGLE_ISSUER.to_string()),
+        "entra" => {
+            anyhow::ensure!(!p.tenant.is_empty(), "provider {name}: entra needs a tenant");
+            let template = if p.issuer.is_empty() {
+                ENTRA_ISSUER_TEMPLATE.to_string()
+            } else {
+                p.issuer.clone()
+            };
+            anyhow::ensure!(
+                template.contains("{tid}"),
+                "provider {name}: an entra issuer is a template holding the tenant placeholder"
+            );
+            (
+                Kind::Entra {
+                    tenant: p.tenant.clone(),
+                },
+                template,
+            )
+        }
+        "gitlab" => {
+            let issuer = if p.issuer.is_empty() {
+                "https://gitlab.com".to_string()
+            } else {
+                p.issuer.clone()
+            };
+            (Kind::Gitlab, issuer)
+        }
+        "generic" => {
+            anyhow::ensure!(!p.issuer.is_empty(), "provider {name}: generic needs an issuer");
+            (
+                Kind::Generic {
+                    groups_claim: p.groups_claim.clone(),
+                    open: p.open.unwrap_or(true),
+                },
+                p.issuer.clone(),
+            )
+        }
+        other => anyhow::bail!("provider {name}: unknown type {other:?}"),
+    };
+    let mut grants = Vec::new();
+    for g in &p.grants {
+        let role = GrantRole::parse(&g.role)
+            .ok_or_else(|| anyhow::anyhow!("{}", ConfigRefusal::AdminGrant(name.clone())))?;
+        grants.push(GroupGrant {
+            group: g.group.clone(),
+            repository: g.repository.clone(),
+            role,
+        });
+    }
+    let profile = ProviderProfile {
+        authority: Authority::new(name, &issuer),
+        open: false,
+        allow_open: p.allow_open,
+        tenant_pinned: false,
+        authoritative_domains: p.authoritative_domains.clone(),
+        policy: LoginPolicy {
+            required_groups: p.required_groups.clone(),
+            allowed_domains: p.allowed_domains.clone(),
+            default_role: p
+                .default_role
+                .clone()
+                .unwrap_or_else(|| "reader".to_string()),
+            grants,
+        },
+    };
+    let settings = crate::adapters::oidc::OidcSettings {
+        name: name.clone(),
+        kind,
+        issuer,
+        client_id: p.client_id.clone(),
+        client_secret: p.client_secret.clone(),
+        extra_scopes: p.scopes.clone(),
+        timeout: std::time::Duration::from_secs(10),
+        jwks_refresh_floor: std::time::Duration::from_secs(10),
+    };
+    Ok(Arc::new(crate::adapters::oidc::OidcProvider::new(
+        settings, profile,
+    )?))
+}
+
+/// The active providers, validated as a set, after every known authority
+/// was reconciled against the declarations: this runs before the listener
+/// opens.
+async fn sso_providers(
+    config: &Config,
+    identities: &dyn crate::ports::identities::IdentityStore,
+) -> anyhow::Result<Vec<Arc<dyn crate::ports::identity_provider::IdentityProvider>>> {
+    use crate::domain::identity::{validate_profiles, Authority, Declared};
+    check_sso_transport(config)?;
+    let mut active = Vec::new();
+    let mut retired = Vec::new();
+    let mut migrated = Vec::new();
+    for p in &config.auth.sso.providers {
+        let provider = sso_provider(p)?;
+        let authority = provider.profile().authority.clone();
+        if p.retired {
+            retired.push(authority);
+            continue;
+        }
+        if let Some(was) = &p.issuer_was {
+            migrated.push((Authority::new(&p.name, was), authority.clone()));
+        }
+        active.push(provider);
+    }
+    let profiles: Vec<_> = active.iter().map(|p| p.profile().clone()).collect();
+    for opened in validate_profiles(&profiles).map_err(|e| anyhow::anyhow!("{e}"))? {
+        warn!(provider = %opened, "SSO provider accepts an open issuer by explicit opt-in (allow_open)");
+    }
+    let authorities: Vec<Authority> = profiles.iter().map(|p| p.authority.clone()).collect();
+    crate::app::sso::reconcile_providers(
+        identities,
+        &Declared {
+            active: &authorities,
+            retired: &retired,
+            migrated: &migrated,
+        },
+    )
+    .await?;
+    Ok(active)
+}
+
+const SSO_COOKIE_KEY: &str = "sso_cookie_key";
+
+async fn sso_use_cases(
+    config: &Config,
+    stores: &SqliteStores,
+    providers: Vec<Arc<dyn crate::ports::identity_provider::IdentityProvider>>,
+    authenticate: Arc<Authenticate>,
+    secrets: &dyn ServerSecretStore,
+) -> anyhow::Result<crate::app::sso::Sso> {
+    use crate::auth::seal::Sealer;
+    use crate::config::parse_chrono_duration;
+    let key = secrets
+        .get_or_init(SSO_COOKIE_KEY, &Sealer::random_key())
+        .await?;
+    let sso = &config.auth.sso;
+    Ok(crate::app::sso::Sso::new(crate::app::sso::SsoDeps {
+        providers,
+        identities: stores.identities(),
+        handoffs: stores.handoffs(),
+        users: stores.users(),
+        tokens: stores.tokens(),
+        repos: stores.repositories(),
+        audit: stores.audit(),
+        ids: Arc::new(crate::adapters::system::UuidIds),
+        clock: Arc::new(crate::adapters::system::SystemClock),
+        authenticate,
+        sealer: Arc::new(Sealer::new(&key)?),
+        settings: crate::app::sso::SsoSettings {
+            base_url: config.server.base_url.clone(),
+            session_ttl: parse_chrono_duration(&sso.session_ttl)?,
+            handoff_ttl: parse_chrono_duration(&sso.handoff_ttl)?,
+            attempt_ttl: chrono::Duration::minutes(10),
+            bootstrap: Some(config.auth.admin.username.clone()).filter(|b| !b.is_empty()),
+        },
+    }))
+}
+
+/// The server's own probe of every provider, and the purge of unclaimed
+/// handoffs, every `every`.
+pub async fn start_sso_probe(sso: Arc<crate::app::sso::Sso>, every: std::time::Duration) {
+    if sso.provider_names().is_empty() {
+        return;
+    }
+    let mut tick = tokio::time::interval(every.max(std::time::Duration::from_secs(1)));
+    loop {
+        tick.tick().await;
+        sso.probe_all().await;
+        if let Err(e) = sso.purge().await {
+            warn!(error = %e, "failed to purge expired SSO handoffs");
+        }
+    }
+}
+
+/// The password mode and the reauthentication bounds, refused at startup
+/// when they do not parse.
+pub fn gate_policy(sso: &crate::config::SsoConfig) -> anyhow::Result<crate::domain::identity::GatePolicy> {
+    use crate::config::parse_chrono_duration;
+    let password_mode = crate::domain::identity::PasswordMode::parse(&sso.password_mode)
+        .ok_or_else(|| anyhow::anyhow!("auth.sso.password_mode: {:?} is not enabled, admins_only or disabled", sso.password_mode))?;
+    let reauth_after = if sso.reauth_after.trim().is_empty() {
+        None
+    } else {
+        Some(parse_chrono_duration(&sso.reauth_after)?)
+    };
+    Ok(crate::domain::identity::GatePolicy {
+        password_mode,
+        reauth_after,
+        grace_max: parse_chrono_duration(&sso.reauth_grace_max)?,
     })
 }
 
@@ -275,6 +923,7 @@ fn proxy_engine(
     config: &Config,
     storage: Arc<dyn StorageBackend>,
     cache: Arc<dyn ProxyCacheStore>,
+    stores: &SqliteStores,
 ) -> ProxyEngine {
     let ttl = TtlConfig {
         default_secs: parse_duration_secs(&config.proxy.default_ttl),
@@ -284,6 +933,8 @@ fn proxy_engine(
     ProxyEngine::new(
         storage,
         cache,
+        stores.repositories(),
+        stores.reclaim(),
         Timeouts::from_connect_secs(connect_timeout_secs),
         ttl,
     )
@@ -408,6 +1059,10 @@ async fn seed_repositories(
     // names a member seeded earlier in this same pass must see its row, or a
     // mutual membership would validate as two pending entries and be seeded.
     for spec in &specs {
+        if store.by_name(spec.name).await?.is_none() {
+            crate::app::repo_spec::refuse_reserved(spec.name, RESERVED_NAMES)
+                .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;
+        }
         crate::app::repo_spec::validate_spec(store, spec, &pending)
             .await
             .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;
@@ -539,6 +1194,8 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::api::webhooks::test_webhook),
         )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
+        .route("/api/v1/system/storage", get(crate::api::storage::storage_status))
+        .route("/api/v1/maven/{repo}/decide", post(crate::api::maven::decide))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),
@@ -616,6 +1273,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/-/user/org.couchdb.user:{username}", put(npm_login))
         .with_state(state.clone());
 
+    // SSO login — outside the auth middleware: the browser holds no
+    // credential yet.
+    let sso_public_routes = crate::api::auth_sso::public_routes().with_state(state.clone());
+
     // Real-time WebSocket — outside the auth middleware because browsers
     // cannot set an Authorization header on WebSocket handshakes; the client
     // authenticates with its first frame instead (see api::ws).
@@ -638,10 +1299,14 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::npm::routes::routes())
         .merge(crate::registry::cargo::routes::routes())
         .merge(crate::registry::go::routes::routes())
+        .merge(crate::registry::pypi::routes::routes())
         .merge(crate::registry::oci::routes::routes())
+        .merge(crate::registry::maven::routes::routes())
+        .merge(crate::registry::nuget::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
         .merge(dashboard_routes)
+        .merge(crate::api::auth_sso::user_routes())
         // Auth middleware
         .layer(axum::middleware::from_fn_with_state(
             auth_state,
@@ -650,6 +1315,7 @@ pub fn build_router(state: AppState) -> Router {
         .with_state(state)
         // npm login (outside auth middleware — uses password auth)
         .merge(npm_login_route)
+        .merge(sso_public_routes)
         // Real-time WebSocket (outside auth middleware — first-frame auth)
         .merge(ws_route)
         .merge(oci_token_route)
@@ -723,12 +1389,48 @@ async fn health_ready(
     // Wider than the `SELECT 1` this replaced, on purpose: a pool that is up
     // over a database with no `repositories` table is not ready either, and
     // used to report itself healthy.
-    match state.repos.by_name("").await {
-        Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))),
-        Err(_) => (
+    if state.repos.by_name("").await.is_err() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "unavailable", "reason": "database"})),
-        ),
+        );
+    }
+    if !state.storage_ready.ready().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "unavailable", "reason": "storage"})),
+        );
+    }
+    (StatusCode::OK, Json(json!({"status": "ok"})))
+}
+
+/// The storage probe behind `/health/ready`, memoized briefly so a probe
+/// storm never becomes a storage storm.
+pub struct StorageReadiness {
+    storage: Arc<dyn StorageBackend>,
+    last: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
+}
+
+impl StorageReadiness {
+    const MEMO: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            storage,
+            last: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    pub async fn ready(&self) -> bool {
+        let mut last = self.last.lock().await;
+        if let Some((at, ok)) = *last {
+            if at.elapsed() < Self::MEMO {
+                return ok;
+            }
+        }
+        let ok = self.storage.probe().await.is_ok();
+        *last = Some((std::time::Instant::now(), ok));
+        ok
     }
 }
 
@@ -768,16 +1470,6 @@ async fn npm_login(
     Path(_username): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    // Rate limit: 5 attempts per minute per username
-    let rate_key = format!("npm_login:{}", _username);
-    if !state.login_rate_limiter.check(&rate_key) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error": "too many login attempts, try again later"})),
-        )
-            .into_response();
-    }
-
     let login: NpmLoginBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(_) => {
@@ -789,10 +1481,23 @@ async fn npm_login(
         }
     };
 
-    // Look up the user
-    let user = match state.users.by_name(&login.name).await {
-        Ok(Some(u)) => u,
-        _ => {
+    let user = match state.auth.authenticate.password(&login.name, &login.password).await {
+        Ok(user) => user,
+        Err(Refusal::Throttled) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "too many login attempts, try again later"})),
+            )
+                .into_response();
+        }
+        Err(Refusal::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "authentication temporarily unavailable, try again"})),
+            )
+                .into_response();
+        }
+        Err(Refusal::Invalid) => {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "invalid credentials"})),
@@ -800,26 +1505,17 @@ async fn npm_login(
                 .into_response();
         }
     };
-
-    // Verify password
-    let password_ok = crate::auth::users::verify_password_async(
-        login.password.clone(),
-        user.password_hash.clone(),
-    )
-    .await
-    .unwrap_or(false);
-
-    if !password_ok {
+    let Some(user_id) = user.user_id else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
         )
             .into_response();
-    }
+    };
 
     let must_change = user.must_change_password;
 
-    let Ok(raw_token) = issue_login_token(&state, user.id).await else {
+    let Ok(raw_token) = issue_login_token(&state, user_id).await else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to create token"})),
@@ -916,6 +1612,7 @@ fn load_upstream_creds(
                 auth: repo.upstream_auth.clone(),
                 token_realms,
                 dl_allow_private: repo.dl_allow_private,
+                file_hosts: repo.file_hosts.clone(),
             },
         );
     }
@@ -989,6 +1686,64 @@ pub fn decode_percent_encoded_slashes<B>(
         }
     }
     req
+}
+
+#[cfg(test)]
+mod location_tests {
+    use super::ResolvedLocation;
+
+    fn location(backend: &'static str, root: &str, bucket: Option<&str>) -> ResolvedLocation {
+        ResolvedLocation {
+            backend,
+            root: std::path::PathBuf::from(root),
+            service: bucket.map(|b| ("http://s3".to_string(), "eu".to_string(), b.to_string())),
+        }
+    }
+
+    trait Fallback {
+        fn displays(&self) -> bool {
+            false
+        }
+        fn serializes(&self) -> bool {
+            false
+        }
+    }
+    impl<T> Fallback for T {}
+    struct Probe<T>(T);
+    impl<T: std::fmt::Display> Probe<T> {
+        #[allow(dead_code)]
+        fn displays(&self) -> bool {
+            true
+        }
+    }
+    impl<T: serde::Serialize> Probe<T> {
+        #[allow(dead_code)]
+        fn serializes(&self) -> bool {
+            true
+        }
+    }
+
+    /// The location may be compared, never rendered: no `Display`, no
+    /// `Serialize`, and a `Debug` that names nothing.
+    #[test]
+    fn resolved_location_has_no_display_or_serialize() {
+        let loc = location("s3", "inst", Some("secret-bucket"));
+        assert!(!Probe(&loc).displays());
+        assert!(!Probe(&loc).serializes());
+        assert!(Probe(&"a string").displays(), "the probe tells the two apart");
+        assert_eq!(format!("{loc:?}"), "ResolvedLocation(..)");
+    }
+
+    /// Tuple first, then prefix on segment boundaries.
+    #[test]
+    fn locations_are_disjoint_by_service_then_prefix() {
+        let a = location("s3", "inst/a", Some("b1"));
+        assert!(!a.disjoint(&location("s3", "inst", Some("b1"))), "a prefix inside another");
+        assert!(a.disjoint(&location("s3", "inst/ab", Some("b1"))), "a string-prefix sibling");
+        assert!(a.disjoint(&location("s3", "inst", Some("b2"))), "another bucket");
+        assert!(a.disjoint(&location("fs", "inst/a", None)), "another backend");
+        assert!(!location("fs", "/d", None).disjoint(&location("fs", "/d/sub", None)));
+    }
 }
 
 #[cfg(test)]

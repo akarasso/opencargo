@@ -1,0 +1,11 @@
+#!/usr/bin/env bash
+set -euo pipefail
+image=mono:6.12@sha256:34d816779b1248b5cfd095770b64ecbaf1798e2aca693a91c11a018dce9c7ad5
+exe=${NUGET_EXE:?NUGET_EXE must name nuget.exe}
+tmp=${TMPDIR:-/tmp}
+home=$(mktemp -d "$tmp/nuget-home.XXXXXX")
+trap 'rm -rf "$home"' EXIT
+docker run --rm -i --network host -u "$(id -u):$(id -g)" \
+  -e HOME="$home" -e SSL_CERT_FILE \
+  -v "$tmp:$tmp" -v "$exe:/opt/nuget.exe:ro" -v "$PWD:$PWD" -w "$PWD" "$image" \
+  sh -c 'if [ -n "$SSL_CERT_FILE" ]; then cert-sync --quiet --user "$SSL_CERT_FILE" >/dev/null; fi; exec mono /opt/nuget.exe "$@"' nuget "$@"

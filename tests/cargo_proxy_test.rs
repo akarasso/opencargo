@@ -572,15 +572,17 @@ async fn download_verifies_cksum_from_index() {
         !rows.iter().any(|(kind, _, _)| kind == "cargo-crate"),
         "nothing stored for the crate: {rows:?}"
     );
-    let crate_dir = a
-        .tmp
-        .path()
-        .join("storage/_proxy_cache/cargo-proxy/cargo-crate");
-    assert!(
-        files_under(&crate_dir).is_empty(),
-        "no file, not even a part, is left behind: {:?}",
-        files_under(&crate_dir)
-    );
+    let left: Vec<_> = common::stored_keys(&a)
+        .await
+        .into_iter()
+        .filter(|k| k.contains("/cargo-crate/"))
+        .collect();
+    assert!(left.is_empty(), "no object is left behind: {left:?}");
+    let parts: Vec<_> = files_under(&a.tmp.path().join("storage"))
+        .into_iter()
+        .filter(|p| p.to_string_lossy().contains("/_scratch/"))
+        .collect();
+    assert!(parts.is_empty(), "not even a part: {parts:?}");
 }
 
 #[tokio::test]

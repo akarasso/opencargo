@@ -19,6 +19,8 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
+use opencargo::domain::identity::{Authority, IdentityKey, LinkState, LoginState, Outage};
+use opencargo::domain::layout;
 use opencargo::domain::{
     ApiToken, CacheEntry, CacheEntryId, DistTag, NewEntry, Package, RepoConfig, RepoId, RepoSpec,
     Repository, Rights, ScanResult, User, Verdict, Version, Visibility, Webhook,
@@ -26,18 +28,34 @@ use opencargo::domain::{
 use opencargo::error::StoreError;
 use opencargo::ports::audit::{AuditEntry, AuditStore, NewAuditEntry};
 use opencargo::ports::deps::{Dependency, DependencyStore, Dependent, NewDependency};
-use opencargo::ports::oci::{Blob, Manifest, NewBlob, NewManifest, OciStore, Orphaned};
+use opencargo::ports::oci::{
+    BeginComplete, Blob, Finished, LeaseToken, Manifest, NewBlob, NewManifest, OciStore, Orphaned,
+    Segment, SegmentClaim, UploadSession,
+};
+use opencargo::ports::maven::{
+    Changed, ClientMetadata, Counter, MavenFileStore, PendingUnit, StoredFile, Unit, UnitChange,
+    UnitKey, UnitView, Unversioned,
+};
+use opencargo::ports::handoffs::{Consumption, LoginHandoffStore, NewHandoff};
+use opencargo::ports::identities::{Admission, DisabledBy, IdentityLink, IdentityStore};
 use opencargo::ports::packages::{
     NameMatch, NewRelease, PackageStore, Promotion, Release, StalePrerelease,
 };
+use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::ports::policy::{
     IdRange, NewResolution, PolicyStore, ReportFilter, ResolutionRow, RuleTotals, Subject, Totals,
     VerdictRow,
 };
-use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::ports::proxy_cache::ProxyCacheStore;
+use opencargo::ports::pypi::{NewPypiFile, Published, PypiFile, PypiFileStore};
+use opencargo::ports::reclaim::{
+    Backlog, Candidate, Claim, ClaimToken, PinToken, Pinned, ReclaimStore, Renewal,
+};
+use opencargo::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
+use opencargo::ports::nuget::{FeedPage, FeedQuery, NugetFeedRead};
 use opencargo::ports::search::{SearchIndex, SearchQuery, SearchScope};
+use opencargo::ports::secrets::ServerSecretStore;
 use opencargo::ports::tokens::{NewToken, TokenStore};
 use opencargo::ports::users::{NewUser, UserPatch, UserStore};
 use opencargo::ports::vulns::{VulnScan, VulnStore};
@@ -59,6 +77,11 @@ pub enum PortId {
     Dependencies,
     Vulns,
     Policy,
+    Reclaim,
+    Pypi,
+    Maven,
+    Identities,
+    Handoffs,
 }
 
 /// One grant, keyed the way the table is.
@@ -76,6 +99,7 @@ struct BlobRow {
     digest: String,
     size: i64,
     content_type: Option<String>,
+    key: String,
 }
 
 /// One layer a manifest lists, the row a blob's orphanhood is decided from.
@@ -91,6 +115,12 @@ struct LinkRow {
 struct UploadRow {
     id: String,
     repository_id: i64,
+    /// `None` with `received` for a session started before upload progress.
+    prefix: Option<String>,
+    received: Option<u64>,
+    segments: u32,
+    touched: DateTime<Utc>,
+    lease: Option<(String, DateTime<Utc>)>,
 }
 
 /// One stored manifest of an image.
@@ -101,6 +131,7 @@ struct ManifestRow {
     digest: String,
     content_type: String,
     size: i64,
+    key: String,
 }
 
 /// One tag, which is a name for a manifest digest.
@@ -157,6 +188,11 @@ struct State {
     oci_tags: Vec<TagRow>,
     oci_links: Vec<LinkRow>,
     oci_uploads: Vec<UploadRow>,
+    oci_segments: Vec<(String, Segment)>,
+    pypi_files: Vec<PypiFile>,
+    reclaim: ReclaimState,
+    maven: MavenState,
+    sso: SsoState,
     next_id: i64,
     next_cache_id: i64,
     /// Queued refusals: a fake that cannot fail only ever proves the happy
@@ -203,12 +239,45 @@ impl FakeDb {
         Arc::new(Search(self.0.clone()))
     }
 
+    pub fn nuget_feed(&self) -> Arc<dyn NugetFeedRead> {
+        Arc::new(NugetFeed(self.0.clone()))
+    }
+
     pub fn proxy_cache(&self) -> Arc<dyn ProxyCacheStore> {
         Arc::new(ProxyCache(self.0.clone()))
     }
 
     pub fn oci(&self) -> Arc<dyn OciStore> {
         Arc::new(Oci(self.0.clone()))
+    }
+
+    pub fn pypi(&self) -> Arc<dyn PypiFileStore> {
+        Arc::new(Pypi(self.0.clone()))
+    }
+
+    pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {
+        Arc::new(Reclaim(self.0.clone()))
+    }
+
+    pub fn referenced(&self) -> Arc<dyn ReferencedKeys> {
+        Arc::new(Reclaim(self.0.clone()))
+    }
+
+    pub fn maven(&self) -> Arc<dyn MavenFileStore> {
+        Arc::new(Maven(self.0.clone()))
+    }
+
+    /// The keys waiting for reclamation, sorted.
+    pub fn candidates(&self) -> Vec<String> {
+        let state = self.0.lock().unwrap();
+        let mut keys: Vec<String> = state
+            .reclaim
+            .candidates
+            .iter()
+            .map(|c| c.key.clone())
+            .collect();
+        keys.sort();
+        keys
     }
 
     /// A blob a push is not being asked to land: the read half's tests want
@@ -219,6 +288,20 @@ impl FakeDb {
             digest: digest.to_string(),
             size,
             content_type: content_type.map(str::to_string),
+            key: format!("oci/{repository}/_blobs/{digest}"),
+        });
+    }
+
+    /// A session as a server that predates upload progress left it.
+    pub fn add_legacy_upload(&self, id: &str, repository: i64) {
+        self.0.lock().unwrap().oci_uploads.push(UploadRow {
+            id: id.to_string(),
+            repository_id: repository,
+            prefix: None,
+            received: None,
+            segments: 0,
+            touched: DateTime::UNIX_EPOCH,
+            lease: None,
         });
     }
 
@@ -236,6 +319,7 @@ impl FakeDb {
             digest: digest.to_string(),
             content_type: content_type.to_string(),
             size,
+            key: format!("oci/{repository}/{name}/manifests/{digest}"),
         });
     }
 
@@ -456,6 +540,24 @@ impl Repositories {
             updated_at: now,
         };
         state.repositories.push(stored.clone());
+        let incarnation = uuid::Uuid::new_v4().simple().to_string();
+        state
+            .reclaim
+            .incarnations
+            .push((stored.id, incarnation.clone()));
+        let legacy = layout::name_keyed_prefixes(spec.format.as_str(), spec.name);
+        for prefix in &legacy {
+            state
+                .reclaim
+                .candidates
+                .retain(|c| !(c.prefix && c.key == *prefix));
+            state.reclaim.claims.retain(|c| c.key != *prefix);
+        }
+        let own = std::iter::once(layout::incarnation_prefix(&incarnation));
+        for prefix in own.chain(legacy) {
+            state.reclaim.prefixes.retain(|(p, _)| *p != prefix);
+            state.reclaim.prefixes.push((prefix, incarnation.clone()));
+        }
         stored
     }
 }
@@ -496,6 +598,18 @@ impl RepositoryStore for Repositories {
             if found(state, spec.name).is_some() {
                 return Err(StoreError::Conflict);
             }
+            let claimed = layout::name_keyed_prefixes(spec.format.as_str(), spec.name)
+                .iter()
+                .any(|p| {
+                    state
+                        .reclaim
+                        .claims
+                        .iter()
+                        .any(|c| c.key == *p && c.until > now)
+                });
+            if claimed {
+                return Err(StoreError::Conflict);
+            }
             Ok(Self::insert(state, spec, now))
         })
     }
@@ -526,14 +640,65 @@ impl RepositoryStore for Repositories {
         })
     }
 
-    async fn delete_empty(&self, name: &str) -> Result<(), StoreError> {
+    async fn retire(&self, name: &str, now: DateTime<Utc>) -> Result<Vec<String>, StoreError> {
         self.with(|state| {
-            let repo = found(state, name).ok_or(StoreError::NotFound)?.id;
-            if state.packages.iter().any(|pkg| pkg.repository_id == repo) {
+            let repo = found(state, name).ok_or(StoreError::NotFound)?.clone();
+            if state.packages.iter().any(|pkg| pkg.repository_id == repo.id)
+                || state.maven.values.iter().any(|v| v.repository == repo.id)
+            {
                 return Err(StoreError::Conflict);
             }
-            state.repositories.retain(|stored| stored.id != repo);
-            Ok(())
+            let held = state
+                .repositories
+                .iter()
+                .any(|r| r.repo_type == "group" && r.members().iter().any(|m| m == name));
+            if held {
+                return Err(StoreError::Conflict);
+            }
+            state.repositories.retain(|stored| stored.id != repo.id);
+            state.grants.retain(|g| g.repository_id != repo.id);
+            state.cache.retain(|e| e.repository_id != repo.id);
+            state.maven.client.retain(|m| m.repository != repo.id);
+            state.maven.counters.retain(|(r, _, _)| *r != repo.id);
+            let Some(at) = state
+                .reclaim
+                .incarnations
+                .iter()
+                .position(|(id, _)| *id == repo.id)
+            else {
+                return Ok(Vec::new());
+            };
+            let (_, incarnation) = state.reclaim.incarnations.remove(at);
+            state.reclaim.retired.push(incarnation.clone());
+            let mut prefixes: Vec<String> = state
+                .reclaim
+                .prefixes
+                .iter()
+                .filter(|(_, i)| *i == incarnation)
+                .map(|(p, _)| p.clone())
+                .collect();
+            prefixes.sort();
+            for prefix in &prefixes {
+                state.reclaim.revoke_under(prefix);
+            }
+            if repo.repo_type == "group" {
+                return Ok(Vec::new());
+            }
+            for prefix in &prefixes {
+                state.reclaim.enqueue(prefix, true, now);
+            }
+            Ok(prefixes)
+        })
+    }
+
+    async fn incarnation(&self, repository: i64) -> Result<Option<String>, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .reclaim
+                .incarnations
+                .iter()
+                .find(|(id, _)| *id == repository)
+                .map(|(_, i)| i.clone()))
         })
     }
 
@@ -722,11 +887,7 @@ impl PackageStore for Packages {
         self.with(|state| Ok(Self::lookup(state, repository, name, how)))
     }
 
-    async fn anywhere(
-        &self,
-        name: &str,
-        public_only: bool,
-    ) -> Result<Option<Package>, StoreError> {
+    async fn anywhere(&self, name: &str, public_only: bool) -> Result<Option<Package>, StoreError> {
         self.with(|state| {
             let public: Vec<i64> = state
                 .repositories
@@ -752,6 +913,18 @@ impl PackageStore for Packages {
                 .filter(|v| v.package_id == package)
                 .cloned()
                 .collect())
+        })
+    }
+
+    async fn stamp(&self, package: i64) -> Result<String, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .versions
+                .iter()
+                .filter(|v| v.package_id == package)
+                .map(|v| format!("{}:{}", v.id, u8::from(v.yanked)))
+                .collect::<Vec<_>>()
+                .join(","))
         })
     }
 
@@ -798,15 +971,22 @@ impl PackageStore for Packages {
             now: release.now,
         };
         self.with(|state| {
+            state.reclaim.live_pins(release.pins)?;
             let (package, version) = Self::write_release(state, &spec)?;
+            for dep in release.dependencies {
+                state.dependencies.push(DependencyRow {
+                    version_id: version.id,
+                    name: dep.name.to_string(),
+                    requirement: dep.requirement.to_string(),
+                    kind: dep.kind.to_string(),
+                });
+            }
+            state.reclaim.spend(release.pins);
             Ok(Release { package, version })
         })
     }
 
-    async fn promote_metadata(
-        &self,
-        promotion: &Promotion<'_>,
-    ) -> Result<Version, StoreError> {
+    async fn promote_metadata(&self, promotion: &Promotion<'_>) -> Result<Version, StoreError> {
         let mut version = blank_version(&promotion.source.version, promotion.metadata_json);
         version.checksum_sha1 = promotion.source.checksum_sha1.clone();
         version.checksum_sha256 = promotion.source.checksum_sha256.clone();
@@ -824,7 +1004,9 @@ impl PackageStore for Packages {
             now: promotion.now,
         };
         self.with(|state| {
+            state.reclaim.live_pins(promotion.pins)?;
             let (_, version) = Self::write_release(state, &spec)?;
+            state.reclaim.spend(promotion.pins);
             let id = state.id();
             state.audit.push(AuditEntry {
                 id,
@@ -842,12 +1024,7 @@ impl PackageStore for Packages {
         })
     }
 
-    async fn set_dist_tag(
-        &self,
-        package: i64,
-        tag: &str,
-        version: i64,
-    ) -> Result<(), StoreError> {
+    async fn set_dist_tag(&self, package: i64, tag: &str, version: i64) -> Result<(), StoreError> {
         self.with(|state| {
             tag_version(state, package, tag, version);
             Ok(())
@@ -924,15 +1101,16 @@ impl PackageStore for Packages {
         })
     }
 
-    async fn delete_version(&self, version: i64) -> Result<(), StoreError> {
+    async fn delete_version(&self, version: i64, now: DateTime<Utc>) -> Result<(), StoreError> {
         self.with(|state| {
             let at = state
                 .versions
                 .iter()
                 .position(|v| v.id == version)
                 .ok_or(StoreError::NotFound)?;
-            state.versions.remove(at);
+            let gone = state.versions.remove(at);
             state.dist_tags.retain(|tag| tag.version_id != version);
+            state.reclaim.enqueue(&gone.tarball_path, false, now);
             Ok(())
         })
     }
@@ -941,6 +1119,31 @@ impl PackageStore for Packages {
     /// that stored it could never be asserted against.
     async fn record_download(&self, _version: i64) -> Result<(), StoreError> {
         self.with(|_| Ok(()))
+    }
+}
+
+struct NugetFeed(Arc<Mutex<State>>);
+
+#[async_trait]
+impl NugetFeedRead for NugetFeed {
+    async fn search(&self, query: &FeedQuery<'_>) -> Result<FeedPage, StoreError> {
+        with(&self.0, PortId::Search, |state| {
+            let candidates = state
+                .packages
+                .iter()
+                .filter(|p| p.repository_id == query.repository)
+                .map(|p| {
+                    let versions = state
+                        .versions
+                        .iter()
+                        .filter(|v| v.package_id == p.id)
+                        .cloned()
+                        .collect();
+                    (p.clone(), versions, 0)
+                })
+                .collect();
+            Ok(query.page(candidates))
+        })
     }
 }
 
@@ -1176,11 +1379,7 @@ struct Permissions(Arc<Mutex<State>>);
 
 #[async_trait]
 impl PermissionStore for Permissions {
-    async fn rights(
-        &self,
-        user_id: i64,
-        repository_id: i64,
-    ) -> Result<Option<Rights>, StoreError> {
+    async fn rights(&self, user_id: i64, repository_id: i64) -> Result<Option<Rights>, StoreError> {
         with(&self.0, PortId::Permissions, |state| {
             Ok(state
                 .grants
@@ -1235,9 +1434,9 @@ impl PermissionStore for Permissions {
 
     async fn revoke(&self, user_id: i64, repository_id: i64) -> Result<(), StoreError> {
         with(&self.0, PortId::Permissions, |state| {
-            state
-                .grants
-                .retain(|grant| !(grant.user_id == user_id && grant.repository_id == repository_id));
+            state.grants.retain(|grant| {
+                !(grant.user_id == user_id && grant.repository_id == repository_id)
+            });
             Ok(())
         })
     }
@@ -1365,9 +1564,57 @@ impl ProxyCacheStore for ProxyCache {
             Ok(())
         })
     }
+
+    async fn quarantine(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        reason: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        let key = format!("{kind}/{key}");
+        let entry = NewEntry {
+            repository_id: repo,
+            kind: "quarantine",
+            cache_key: &key,
+            status: 502,
+            storage_path: None,
+            content_type: Some(reason),
+            etag: None,
+            digest: Some(announced),
+            size: 0,
+            ttl_secs: None,
+        };
+        self.upsert(&entry, now).await
+    }
+
+    async fn quarantined(
+        &self,
+        repo: RepoId,
+        kind: &str,
+        key: &str,
+        announced: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
+        let key = format!("{kind}/{key}");
+        with(&self.0, PortId::ProxyCache, |state| {
+            let at = Self::at(state, repo, "quarantine", &key)
+                .filter(|&at| state.cache[at].digest.as_deref() == Some(announced));
+            if let Some(at) = at {
+                state.cache[at].last_used_at = now;
+            }
+            Ok(at.is_some())
+        })
+    }
 }
 
 struct Oci(Arc<Mutex<State>>);
+
+fn after(now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
+    now + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX)
+}
 
 #[async_trait]
 impl OciStore for Oci {
@@ -1380,6 +1627,7 @@ impl OciStore for Oci {
                 .map(|row| Blob {
                     size: row.size,
                     content_type: row.content_type.clone(),
+                    key: row.key.clone(),
                 }))
         })
     }
@@ -1400,6 +1648,7 @@ impl OciStore for Oci {
                 .map(|row| Manifest {
                     content_type: row.content_type.clone(),
                     size: row.size,
+                    key: row.key.clone(),
                 }))
         })
     }
@@ -1434,12 +1683,33 @@ impl OciStore for Oci {
         })
     }
 
-    async fn put_manifest(&self, m: NewManifest<'_>) -> Result<(), StoreError> {
+    async fn put_manifest(&self, m: NewManifest<'_>, now: DateTime<Utc>) -> Result<(), StoreError> {
         with(&self.0, PortId::Oci, |state| {
+            let mut pins = vec![m.pin.clone()];
+            pins.extend(m.blobs.iter().map(|(_, pin)| pin.clone()));
+            state.reclaim.live_pins(&pins)?;
+            let unknown = m.blobs.iter().any(|(digest, _)| {
+                !state
+                    .oci_blobs
+                    .iter()
+                    .any(|row| row.repository_id == m.repository && row.digest == *digest)
+            });
+            if unknown {
+                return Err(StoreError::NotFound);
+            }
+            state.reclaim.spend(&pins);
+            let previous = state
+                .oci_manifests
+                .iter()
+                .find(|row| {
+                    row.repository_id == m.repository && row.name == m.name && row.digest == m.digest
+                })
+                .map(|row| row.key.clone());
+            if let Some(previous) = previous.filter(|k| *k != m.pin.physical_key) {
+                state.reclaim.enqueue(&previous, false, now);
+            }
             state.oci_manifests.retain(|row| {
-                !(row.repository_id == m.repository
-                    && row.name == m.name
-                    && row.digest == m.digest)
+                !(row.repository_id == m.repository && row.name == m.name && row.digest == m.digest)
             });
             state.oci_manifests.push(ManifestRow {
                 repository_id: m.repository,
@@ -1447,16 +1717,25 @@ impl OciStore for Oci {
                 digest: m.digest.to_string(),
                 content_type: m.content_type.to_string(),
                 size: m.size,
+                key: m.pin.physical_key.clone(),
             });
             state.oci_links.retain(|row| {
                 !(row.repository_id == m.repository && row.manifest_digest == m.digest)
             });
-            for blob in m.blobs {
-                state.oci_links.push(LinkRow {
-                    repository_id: m.repository,
-                    manifest_digest: m.digest.to_string(),
-                    blob_digest: blob.clone(),
+            let linked = m.blobs.iter().map(|(d, _)| d).chain(m.children.iter());
+            for blob in linked {
+                let present = state.oci_links.iter().any(|row| {
+                    row.repository_id == m.repository
+                        && row.manifest_digest == m.digest
+                        && row.blob_digest == *blob
                 });
+                if !present {
+                    state.oci_links.push(LinkRow {
+                        repository_id: m.repository,
+                        manifest_digest: m.digest.to_string(),
+                        blob_digest: blob.clone(),
+                    });
+                }
             }
             if let Some(tag) = m.tag {
                 state.oci_tags.retain(|row| {
@@ -1478,88 +1757,58 @@ impl OciStore for Oci {
         repository: i64,
         name: &str,
         digest: &str,
+        now: DateTime<Utc>,
     ) -> Result<Option<Orphaned>, StoreError> {
         with(&self.0, PortId::Oci, |state| {
-            let before = state.oci_manifests.len();
-            state.oci_manifests.retain(|row| {
-                !(row.repository_id == repository && row.name == name && row.digest == digest)
-            });
-            if state.oci_manifests.len() == before {
+            let Some(at) = state.oci_manifests.iter().position(|row| {
+                row.repository_id == repository && row.name == name && row.digest == digest
+            }) else {
                 return Ok(None);
-            }
+            };
+            let gone = state.oci_manifests.remove(at);
+            let mut released = vec![gone.key];
             state.oci_tags.retain(|row| {
                 !(row.repository_id == repository
                     && row.name == name
                     && row.manifest_digest == digest)
             });
-            let linked: Vec<String> = state
-                .oci_links
+            let still_listed = state
+                .oci_manifests
                 .iter()
-                .filter(|row| row.repository_id == repository && row.manifest_digest == digest)
-                .map(|row| row.blob_digest.clone())
-                .collect();
-            state
-                .oci_links
-                .retain(|row| !(row.repository_id == repository && row.manifest_digest == digest));
-
+                .any(|row| row.repository_id == repository && row.digest == digest);
             let mut blob_digests = Vec::new();
-            for blob in linked {
-                let still = state
+            if !still_listed {
+                let linked: Vec<String> = state
                     .oci_links
                     .iter()
-                    .any(|row| row.repository_id == repository && row.blob_digest == blob);
-                if !still {
-                    state
+                    .filter(|row| row.repository_id == repository && row.manifest_digest == digest)
+                    .map(|row| row.blob_digest.clone())
+                    .collect();
+                state.oci_links.retain(|row| {
+                    !(row.repository_id == repository && row.manifest_digest == digest)
+                });
+                for blob in linked {
+                    let still = state
+                        .oci_links
+                        .iter()
+                        .any(|row| row.repository_id == repository && row.blob_digest == blob);
+                    if still {
+                        continue;
+                    }
+                    if let Some(at) = state
                         .oci_blobs
-                        .retain(|row| !(row.repository_id == repository && row.digest == blob));
-                    blob_digests.push(blob);
+                        .iter()
+                        .position(|row| row.repository_id == repository && row.digest == blob)
+                    {
+                        released.push(state.oci_blobs.remove(at).key);
+                        blob_digests.push(blob);
+                    }
                 }
             }
-            Ok(Some(Orphaned { blob_digests }))
-        })
-    }
-
-    async fn start_upload(
-        &self,
-        id: &str,
-        repository: i64,
-        _name: &str,
-    ) -> Result<(), StoreError> {
-        with(&self.0, PortId::Oci, |state| {
-            state.oci_uploads.push(UploadRow {
-                id: id.to_string(),
-                repository_id: repository,
-            });
-            Ok(())
-        })
-    }
-
-    async fn upload_owner(&self, id: &str) -> Result<Option<i64>, StoreError> {
-        with(&self.0, PortId::Oci, |state| {
-            Ok(state
-                .oci_uploads
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| row.repository_id))
-        })
-    }
-
-    async fn complete_upload(&self, id: &str, blob: NewBlob<'_>) -> Result<(), StoreError> {
-        with(&self.0, PortId::Oci, |state| {
-            let known = state
-                .oci_blobs
-                .iter()
-                .any(|row| row.repository_id == blob.repository && row.digest == blob.digest);
-            if !known {
-                state.oci_blobs.push(BlobRow {
-                    repository_id: blob.repository,
-                    digest: blob.digest.to_string(),
-                    size: blob.size,
-                    content_type: Some(blob.content_type.to_string()),
-                });
+            for key in &released {
+                state.reclaim.enqueue(key, false, now);
             }
-            state.oci_uploads.retain(|row| row.id != id);
-            Ok(())
+            Ok(Some(Orphaned { blob_digests }))
         })
     }
 
@@ -1573,15 +1822,225 @@ impl OciStore for Oci {
         })
     }
 
-    async fn delete_blob(&self, repository: i64, digest: &str) -> Result<bool, StoreError> {
+    async fn delete_blob(
+        &self,
+        repository: i64,
+        digest: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
         with(&self.0, PortId::Oci, |state| {
-            let before = state.oci_blobs.len();
-            state
+            let listed = state
+                .oci_links
+                .iter()
+                .any(|row| row.repository_id == repository && row.blob_digest == digest);
+            if listed {
+                return Err(StoreError::Conflict);
+            }
+            let Some(at) = state
                 .oci_blobs
-                .retain(|row| !(row.repository_id == repository && row.digest == digest));
-            Ok(state.oci_blobs.len() != before)
+                .iter()
+                .position(|row| row.repository_id == repository && row.digest == digest)
+            else {
+                return Ok(false);
+            };
+            let gone = state.oci_blobs.remove(at);
+            state.reclaim.enqueue(&gone.key, false, now);
+            Ok(true)
         })
     }
+
+    async fn start_upload(
+        &self,
+        id: &str,
+        repository: i64,
+        _name: &str,
+        prefix: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            if state.oci_uploads.iter().any(|row| row.id == id) {
+                return Err(StoreError::Conflict);
+            }
+            state.oci_uploads.push(UploadRow {
+                id: id.to_string(),
+                repository_id: repository,
+                prefix: Some(prefix.to_string()),
+                received: Some(0),
+                segments: 0,
+                touched: now,
+                lease: None,
+            });
+            Ok(())
+        })
+    }
+
+    async fn upload(&self, id: &str) -> Result<Option<UploadSession>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            Ok(state.oci_uploads.iter().find(|row| row.id == id).and_then(|row| {
+                Some(UploadSession {
+                    repository: row.repository_id,
+                    prefix: row.prefix.clone()?,
+                    received: row.received?,
+                    segments: row.segments,
+                })
+            }))
+        })
+    }
+
+    async fn claim_segment(
+        &self,
+        id: &str,
+        segment: &Segment,
+        max_segments: u32,
+        now: DateTime<Utc>,
+    ) -> Result<SegmentClaim, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let Some(row) = state.oci_uploads.iter_mut().find(|row| row.id == id) else {
+                return Ok(SegmentClaim::Lost);
+            };
+            let completing = row.lease.as_ref().is_some_and(|(_, until)| *until > now);
+            if completing || row.received != Some(segment.start) {
+                return Ok(SegmentClaim::Lost);
+            }
+            if row.segments >= max_segments {
+                return Ok(SegmentClaim::TooManySegments);
+            }
+            row.received = Some(segment.start + segment.len);
+            row.segments += 1;
+            row.touched = now;
+            state.oci_segments.push((id.to_string(), segment.clone()));
+            Ok(SegmentClaim::Won)
+        })
+    }
+
+    async fn segments(&self, id: &str) -> Result<Vec<Segment>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let mut segments: Vec<Segment> = state
+                .oci_segments
+                .iter()
+                .filter(|(upload, _)| upload == id)
+                .map(|(_, s)| s.clone())
+                .collect();
+            segments.sort_by_key(|s| s.start);
+            Ok(segments)
+        })
+    }
+
+    async fn begin_complete(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+    ) -> Result<BeginComplete, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let Some(row) = state
+                .oci_uploads
+                .iter_mut()
+                .find(|row| row.id == id && row.received.is_some())
+            else {
+                return Ok(BeginComplete::Unknown);
+            };
+            if row.lease.as_ref().is_some_and(|(_, until)| *until > now) {
+                return Ok(BeginComplete::Held);
+            }
+            let token = uuid::Uuid::new_v4().to_string();
+            row.lease = Some((token.clone(), after(now, ttl)));
+            row.touched = now;
+            Ok(BeginComplete::Lease(LeaseToken(token)))
+        })
+    }
+
+    async fn release_complete(&self, id: &str, lease: &LeaseToken) -> Result<(), StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            if let Some(row) = state.oci_uploads.iter_mut().find(|row| {
+                row.id == id && row.lease.as_ref().is_some_and(|(t, _)| *t == lease.0)
+            }) {
+                row.lease = None;
+            }
+            Ok(())
+        })
+    }
+
+    async fn finish_upload(
+        &self,
+        id: &str,
+        lease: &LeaseToken,
+        pin: &PinToken,
+        blob: NewBlob<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Finished, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let held = state.oci_uploads.iter().any(|row| {
+                row.id == id && row.lease.as_ref().is_some_and(|(t, _)| *t == lease.0)
+            });
+            if !held {
+                return Ok(Finished::LeaseLost);
+            }
+            state.reclaim.live_pins(std::slice::from_ref(pin))?;
+            state.reclaim.spend(std::slice::from_ref(pin));
+            let existing = state
+                .oci_blobs
+                .iter()
+                .find(|row| row.repository_id == blob.repository && row.digest == blob.digest)
+                .map(|row| row.key.clone());
+            let recorded = match existing {
+                Some(key) => {
+                    if key != pin.physical_key {
+                        state.reclaim.enqueue(&pin.physical_key, false, now);
+                    }
+                    key
+                }
+                None => {
+                    state.oci_blobs.push(BlobRow {
+                        repository_id: blob.repository,
+                        digest: blob.digest.to_string(),
+                        size: blob.size,
+                        content_type: Some(blob.content_type.to_string()),
+                        key: pin.physical_key.clone(),
+                    });
+                    pin.physical_key.clone()
+                }
+            };
+            state.oci_segments.retain(|(upload, _)| upload != id);
+            state.oci_uploads.retain(|row| row.id != id);
+            Ok(Finished::Recorded(recorded))
+        })
+    }
+
+    async fn reap_uploads(
+        &self,
+        idle: Duration,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u64, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let cut = cutoff(idle, now);
+            let mut dead: Vec<(String, String)> = state
+                .oci_uploads
+                .iter()
+                .filter(|row| {
+                    row.received.is_none()
+                        || (row.touched <= cut
+                            && row.lease.as_ref().is_none_or(|(_, until)| *until <= now))
+                })
+                .map(|row| (row.id.clone(), upload_prefix(row)))
+                .collect();
+            dead.sort();
+            dead.truncate(limit as usize);
+            for (id, prefix) in &dead {
+                state.oci_segments.retain(|(upload, _)| upload != id);
+                state.oci_uploads.retain(|row| row.id != *id);
+                state.reclaim.enqueue(prefix, true, now);
+            }
+            Ok(dead.len() as u64)
+        })
+    }
+}
+
+fn upload_prefix(row: &UploadRow) -> String {
+    row.prefix
+        .clone()
+        .unwrap_or_else(|| format!("oci/_uploads/{}", row.id))
 }
 
 struct Audit(Arc<Mutex<State>>);
@@ -1647,11 +2106,7 @@ impl AuditStore for Audit {
         })
     }
 
-    async fn of_target(
-        &self,
-        action: &str,
-        target: &str,
-    ) -> Result<Vec<AuditEntry>, StoreError> {
+    async fn of_target(&self, action: &str, target: &str) -> Result<Vec<AuditEntry>, StoreError> {
         with(&self.0, PortId::Audit, |state| {
             let matching: Vec<AuditEntry> = state
                 .audit
@@ -1668,11 +2123,7 @@ struct Dependencies(Arc<Mutex<State>>);
 
 #[async_trait]
 impl DependencyStore for Dependencies {
-    async fn record(
-        &self,
-        dep: &NewDependency<'_>,
-        _now: DateTime<Utc>,
-    ) -> Result<(), StoreError> {
+    async fn record(&self, dep: &NewDependency<'_>, _now: DateTime<Utc>) -> Result<(), StoreError> {
         with(&self.0, PortId::Dependencies, |state| {
             state.dependencies.push(DependencyRow {
                 version_id: dep.version,
@@ -1712,11 +2163,7 @@ impl DependencyStore for Dependencies {
                 .map(|repo| repo.id)
                 .collect();
             let mut found: Vec<Dependent> = Vec::new();
-            for row in state
-                .dependencies
-                .iter()
-                .filter(|r| r.name == name)
-            {
+            for row in state.dependencies.iter().filter(|r| r.name == name) {
                 let Some(version) = state.versions.iter().find(|v| v.id == row.version_id) else {
                     continue;
                 };
@@ -1984,11 +2431,7 @@ impl PolicyStore for Policy {
         })
     }
 
-    async fn delete_older_than(
-        &self,
-        days: u64,
-        now: DateTime<Utc>,
-    ) -> Result<u64, StoreError> {
+    async fn delete_older_than(&self, days: u64, now: DateTime<Utc>) -> Result<u64, StoreError> {
         with(&self.0, PortId::Policy, |state| {
             let cutoff = i64::try_from(days)
                 .ok()
@@ -2006,6 +2449,1558 @@ impl PolicyStore for Policy {
             let before = state.resolutions.len();
             state.resolutions.retain(|e| e.row.user_id != Some(user_id));
             Ok((before - state.resolutions.len()) as u64)
+        })
+    }
+}
+
+struct Pypi(Arc<Mutex<State>>);
+
+impl Pypi {
+    fn with<T>(
+        &self,
+        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        with(&self.0, PortId::Pypi, act)
+    }
+}
+
+fn pypi_file(state: &State, row: &PypiFile) -> PypiFile {
+    let mut file = row.clone();
+    if let Some(p) = state.packages.iter().find(|p| p.id == row.package_id) {
+        file.project = p.name.clone();
+    }
+    if let Some(v) = state.versions.iter().find(|v| v.id == row.version_id) {
+        file.version = v.version.clone();
+    }
+    file
+}
+
+fn pypi_release_versions(
+    state: &State,
+    repository: i64,
+    project: &str,
+    version: Option<&str>,
+) -> Vec<i64> {
+    let Some(package) = state
+        .packages
+        .iter()
+        .find(|p| p.repository_id == repository && p.name == project)
+    else {
+        return Vec::new();
+    };
+    state
+        .versions
+        .iter()
+        .filter(|v| v.package_id == package.id && version.is_none_or(|want| v.version == want))
+        .map(|v| v.id)
+        .collect()
+}
+
+fn pypi_purge(state: &mut State, versions: &[i64], now: DateTime<Utc>) -> Vec<String> {
+    let mut keys = Vec::new();
+    for &version in versions {
+        for f in state.pypi_files.iter().filter(|f| f.version_id == version) {
+            keys.push(f.key.clone());
+            keys.extend(f.metadata_key.clone());
+        }
+        if let Some(v) = state.versions.iter().find(|v| v.id == version) {
+            keys.push(v.tarball_path.clone());
+        }
+        state.pypi_files.retain(|f| f.version_id != version);
+        state.dist_tags.retain(|t| t.version_id != version);
+        state.versions.retain(|v| v.id != version);
+    }
+    keys.sort();
+    keys.dedup();
+    for key in &keys {
+        state.reclaim.enqueue(key, false, now);
+    }
+    keys
+}
+
+#[async_trait]
+impl PypiFileStore for Pypi {
+    async fn publish_file(&self, file: &NewPypiFile<'_>) -> Result<Published, StoreError> {
+        self.with(|state| {
+            let Some(artifact) = file.pins.first() else {
+                return Err(StoreError::Other("a file row needs its artifact's pin".into()));
+            };
+            state.reclaim.live_pins(file.pins)?;
+            if state
+                .pypi_files
+                .iter()
+                .any(|f| f.repository == file.repository && f.filename == file.filename)
+            {
+                return Err(StoreError::Conflict);
+            }
+            let package = match state
+                .packages
+                .iter()
+                .find(|p| p.repository_id == file.repository && p.name == file.project)
+            {
+                Some(p) => p.id,
+                None => {
+                    let id = state.id();
+                    state.packages.push(Package {
+                        id,
+                        repository_id: file.repository,
+                        name: file.project.to_string(),
+                        description: file.summary.map(str::to_string),
+                        readme: None,
+                        license: None,
+                        created_at: file.now,
+                        updated_at: file.now,
+                    });
+                    id
+                }
+            };
+            let existing = state
+                .versions
+                .iter()
+                .find(|v| v.package_id == package && v.version == file.version)
+                .map(|v| v.id);
+            let (version, version_created) = match existing {
+                Some(id) => (id, false),
+                None => {
+                    let id = state.id();
+                    let mut row = blank_version(file.version, file.metadata_json);
+                    row.id = id;
+                    row.package_id = package;
+                    row.checksum_sha256 = Some(file.sha256.to_string());
+                    row.size = file.size;
+                    row.tarball_path = artifact.physical_key.clone();
+                    row.published_at = file.now;
+                    state.versions.push(row);
+                    (id, true)
+                }
+            };
+            let row = PypiFile {
+                id: state.id(),
+                repository: file.repository,
+                package_id: package,
+                version_id: version,
+                project: file.project.to_string(),
+                version: file.version.to_string(),
+                filename: file.filename.to_string(),
+                packagetype: file.packagetype.to_string(),
+                sha256: file.sha256.to_string(),
+                size: file.size,
+                key: artifact.physical_key.clone(),
+                metadata_key: file.pins.get(1).map(|p| p.physical_key.clone()),
+                metadata_sha256: file.metadata_sha256.map(str::to_string),
+                requires_python: file.requires_python.map(str::to_string),
+                yanked: false,
+                yanked_reason: None,
+                uploaded_at: file.now,
+            };
+            state.pypi_files.push(row.clone());
+            state.reclaim.spend(file.pins);
+            Ok(Published {
+                version_created,
+                file: row,
+            })
+        })
+    }
+
+    async fn file_by_name(
+        &self,
+        repository: i64,
+        filename: &str,
+    ) -> Result<Option<PypiFile>, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .pypi_files
+                .iter()
+                .find(|f| f.repository == repository && f.filename == filename)
+                .map(|f| pypi_file(state, f)))
+        })
+    }
+
+    async fn project_files(
+        &self,
+        repository: i64,
+        project: &str,
+    ) -> Result<Vec<PypiFile>, StoreError> {
+        self.with(|state| {
+            let mut files: Vec<PypiFile> = state
+                .pypi_files
+                .iter()
+                .filter(|f| f.repository == repository)
+                .map(|f| pypi_file(state, f))
+                .filter(|f| f.project == project)
+                .collect();
+            files.sort_by_key(|f| f.id);
+            Ok(files)
+        })
+    }
+
+    async fn list_projects(&self, repository: i64) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let mut names: Vec<String> = state
+                .pypi_files
+                .iter()
+                .filter(|f| f.repository == repository)
+                .map(|f| pypi_file(state, f).project)
+                .collect();
+            names.sort();
+            names.dedup();
+            Ok(names)
+        })
+    }
+
+    async fn set_release_yanked(
+        &self,
+        repository: i64,
+        project: &str,
+        version: &str,
+        reason: Option<&str>,
+        yanked: bool,
+        _now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.with(|state| {
+            let Some(&id) = pypi_release_versions(state, repository, project, Some(version)).first()
+            else {
+                return Err(StoreError::NotFound);
+            };
+            if let Some(v) = state.versions.iter_mut().find(|v| v.id == id) {
+                v.yanked = yanked;
+            }
+            for f in state.pypi_files.iter_mut().filter(|f| f.version_id == id) {
+                f.yanked = yanked;
+                f.yanked_reason = if yanked { reason.map(str::to_string) } else { None };
+            }
+            Ok(())
+        })
+    }
+
+    async fn delete_release(
+        &self,
+        repository: i64,
+        project: &str,
+        version: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let versions = pypi_release_versions(state, repository, project, Some(version));
+            if versions.is_empty() {
+                return Err(StoreError::NotFound);
+            }
+            Ok(pypi_purge(state, &versions, now))
+        })
+    }
+
+    async fn delete_project_files(
+        &self,
+        repository: i64,
+        project: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let versions = pypi_release_versions(state, repository, project, None);
+            if versions.is_empty() {
+                return Err(StoreError::NotFound);
+            }
+            Ok(pypi_purge(state, &versions, now))
+        })
+    }
+}
+
+struct PinRow {
+    token: String,
+    physical_key: String,
+    repo_prefix: String,
+    until: DateTime<Utc>,
+}
+
+struct ClaimRow {
+    key: String,
+    token: String,
+    until: DateTime<Utc>,
+}
+
+struct CandidateRow {
+    key: String,
+    prefix: bool,
+    enqueued_at: DateTime<Utc>,
+}
+
+/// Port 22's tables: pins, claims, candidates, claimed generations, and the
+/// incarnations with their prefixes and retired marks.
+#[derive(Default)]
+struct ReclaimState {
+    incarnations: Vec<(i64, String)>,
+    prefixes: Vec<(String, String)>,
+    retired: Vec<String>,
+    pins: Vec<PinRow>,
+    claims: Vec<ClaimRow>,
+    candidates: Vec<CandidateRow>,
+    claimed: Vec<String>,
+}
+
+impl ReclaimState {
+    fn enqueue(&mut self, key: &str, prefix: bool, now: DateTime<Utc>) {
+        match self.candidates.iter_mut().find(|c| c.key == key) {
+            Some(existing) => existing.prefix |= prefix,
+            None => self.candidates.push(CandidateRow {
+                key: key.to_string(),
+                prefix,
+                enqueued_at: now,
+            }),
+        }
+    }
+
+    /// The compare-and-set a committing method runs first: every token
+    /// still names its pin, or the commit writes nothing.
+    fn live_pins(&self, tokens: &[PinToken]) -> Result<(), StoreError> {
+        let revoked: Vec<String> = tokens
+            .iter()
+            .filter(|t| {
+                !self
+                    .pins
+                    .iter()
+                    .any(|p| p.token == t.token && p.physical_key == t.physical_key)
+            })
+            .map(|t| t.physical_key.clone())
+            .collect();
+        if revoked.is_empty() {
+            Ok(())
+        } else {
+            Err(StoreError::Superseded(revoked))
+        }
+    }
+
+    fn spend(&mut self, tokens: &[PinToken]) {
+        self.pins
+            .retain(|p| !tokens.iter().any(|t| t.token == p.token));
+    }
+
+    fn revoke_under(&mut self, prefix: &str) {
+        self.pins
+            .retain(|p| p.repo_prefix != prefix && !layout::under(&p.physical_key, prefix));
+    }
+
+    fn retired_prefix(&self, prefix: &str) -> bool {
+        self.prefixes
+            .iter()
+            .any(|(p, i)| p == prefix && self.retired.contains(i))
+    }
+
+    fn live_prefix(&self, prefix: &str) -> bool {
+        self.prefixes
+            .iter()
+            .any(|(p, i)| p == prefix && !self.retired.contains(i))
+    }
+}
+
+fn cutoff(grace: Duration, now: DateTime<Utc>) -> DateTime<Utc> {
+    now - chrono::Duration::from_std(grace).unwrap_or(chrono::Duration::MAX)
+}
+
+/// What committed rows reference, the list the SQLite adapter's predicate
+/// yields: a key, and whether it covers everything under it.
+fn row_references(state: &State) -> Vec<(String, bool)> {
+    let mut refs: Vec<(String, bool)> = Vec::new();
+    refs.extend(
+        state
+            .versions
+            .iter()
+            .map(|v| (v.tarball_path.clone(), false)),
+    );
+    refs.extend(
+        state
+            .cache
+            .iter()
+            .filter_map(|e| e.storage_path.clone())
+            .map(|k| (k, false)),
+    );
+    refs.extend(state.oci_blobs.iter().map(|b| (b.key.clone(), false)));
+    refs.extend(state.oci_manifests.iter().map(|m| (m.key.clone(), false)));
+    refs.extend(state.oci_uploads.iter().map(|u| (upload_prefix(u), true)));
+    for f in &state.pypi_files {
+        refs.push((f.key.clone(), false));
+        refs.extend(f.metadata_key.clone().map(|k| (k, false)));
+    }
+    refs.extend(state.maven.keys().map(|k| (k.clone(), false)));
+    refs
+}
+
+fn references(state: &State, key: &str, prefix: bool) -> bool {
+    row_references(state).iter().any(|(k, covers)| {
+        k == key || (prefix && layout::under(k, key)) || (*covers && layout::under(key, k))
+    })
+}
+
+struct Reclaim(Arc<Mutex<State>>);
+
+impl Reclaim {
+    fn with<T>(
+        &self,
+        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        with(&self.0, PortId::Reclaim, act)
+    }
+}
+
+#[async_trait]
+impl ReclaimStore for Reclaim {
+    async fn pin(
+        &self,
+        repo_prefix: &str,
+        logical_keys: &[String],
+        until: DateTime<Utc>,
+    ) -> Result<Pinned, StoreError> {
+        self.with(|state| {
+            if !state.reclaim.live_prefix(repo_prefix) {
+                return Ok(Pinned::Retired);
+            }
+            let mut tokens = Vec::new();
+            for logical in logical_keys {
+                let stem = layout::physical_key(logical, "");
+                let reusable = row_references(state).into_iter().find(|(k, covers)| {
+                    !covers
+                        && k.strip_prefix(&stem).is_some_and(|g| !g.contains('/'))
+                        && !state.reclaim.claimed.contains(k)
+                });
+                let physical = match reusable {
+                    Some((k, _)) => k,
+                    None => {
+                        layout::physical_key(logical, &uuid::Uuid::new_v4().simple().to_string())
+                    }
+                };
+                let token = uuid::Uuid::new_v4().to_string();
+                state.reclaim.pins.push(PinRow {
+                    token: token.clone(),
+                    physical_key: physical.clone(),
+                    repo_prefix: repo_prefix.to_string(),
+                    until,
+                });
+                tokens.push(PinToken {
+                    token,
+                    logical_key: logical.clone(),
+                    physical_key: physical,
+                });
+            }
+            Ok(Pinned::Tokens(tokens))
+        })
+    }
+
+    async fn enqueue(
+        &self,
+        physical_keys: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.with(|state| {
+            for key in physical_keys {
+                state.reclaim.enqueue(key, false, now);
+            }
+            Ok(())
+        })
+    }
+
+    async fn enqueue_prefix(&self, prefix: &str, now: DateTime<Utc>) -> Result<(), StoreError> {
+        self.with(|state| {
+            state.reclaim.enqueue(prefix, true, now);
+            Ok(())
+        })
+    }
+
+    async fn due(
+        &self,
+        grace: Duration,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<Candidate>, StoreError> {
+        self.with(|state| {
+            let r = &state.reclaim;
+            let mut due: Vec<&CandidateRow> = r
+                .candidates
+                .iter()
+                .filter(|c| {
+                    c.enqueued_at <= cutoff(grace, now) || (c.prefix && r.retired_prefix(&c.key))
+                })
+                .filter(|c| !r.claims.iter().any(|k| k.key == c.key && k.until > now))
+                .collect();
+            due.sort_by(|a, b| (a.enqueued_at, &a.key).cmp(&(b.enqueued_at, &b.key)));
+            Ok(due
+                .into_iter()
+                .take(limit as usize)
+                .map(|c| Candidate {
+                    key: c.key.clone(),
+                    prefix: c.prefix,
+                })
+                .collect())
+        })
+    }
+
+    async fn claim(
+        &self,
+        key: &str,
+        grace: Duration,
+        now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Claim, StoreError> {
+        self.with(|state| {
+            let Some(candidate) = state.reclaim.candidates.iter().find(|c| c.key == key) else {
+                return Ok(Claim::NotDue);
+            };
+            let prefix = candidate.prefix;
+            let retired = prefix && state.reclaim.retired_prefix(key);
+            if prefix && !retired && state.reclaim.live_prefix(key) {
+                state.reclaim.candidates.retain(|c| c.key != key);
+                return Ok(Claim::Referenced);
+            }
+            if !retired && candidate.enqueued_at > cutoff(grace, now) {
+                return Ok(Claim::NotDue);
+            }
+            if state
+                .reclaim
+                .claims
+                .iter()
+                .any(|c| c.key == key && c.until > now)
+            {
+                return Ok(Claim::NotDue);
+            }
+            if references(state, key, prefix) {
+                state.reclaim.candidates.retain(|c| c.key != key);
+                return Ok(Claim::Referenced);
+            }
+            let protected = state.reclaim.pins.iter().any(|p| {
+                p.until > cutoff(grace, now)
+                    && (p.physical_key == key || (prefix && layout::under(&p.physical_key, key)))
+            });
+            if protected && !retired {
+                return Ok(Claim::Pinned);
+            }
+            if prefix {
+                state.reclaim.revoke_under(key);
+            } else {
+                state.reclaim.pins.retain(|p| p.physical_key != key);
+                if !state.reclaim.claimed.iter().any(|c| c == key) {
+                    state.reclaim.claimed.push(key.to_string());
+                }
+            }
+            let token = uuid::Uuid::new_v4().to_string();
+            state.reclaim.claims.retain(|c| c.key != key);
+            state.reclaim.claims.push(ClaimRow {
+                key: key.to_string(),
+                token: token.clone(),
+                until,
+            });
+            Ok(Claim::Claimed(ClaimToken(token)))
+        })
+    }
+
+    async fn renew(
+        &self,
+        token: &ClaimToken,
+        _now: DateTime<Utc>,
+        until: DateTime<Utc>,
+    ) -> Result<Renewal, StoreError> {
+        self.with(
+            |state| match state.reclaim.claims.iter_mut().find(|c| c.token == token.0) {
+                Some(claim) => {
+                    claim.until = until;
+                    Ok(Renewal::Renewed)
+                }
+                None => Ok(Renewal::Superseded),
+            },
+        )
+    }
+
+    async fn release(&self, token: &ClaimToken) -> Result<(), StoreError> {
+        self.with(|state| {
+            if let Some(at) = state.reclaim.claims.iter().position(|c| c.token == token.0) {
+                let claim = state.reclaim.claims.remove(at);
+                state.reclaim.candidates.retain(|c| c.key != claim.key);
+            }
+            Ok(())
+        })
+    }
+
+    async fn forget_claimed(&self, physical_key: &str) -> Result<(), StoreError> {
+        self.with(|state| {
+            state.reclaim.claimed.retain(|k| k != physical_key);
+            Ok(())
+        })
+    }
+
+    async fn forget_retired(&self, prefix: &str) -> Result<(), StoreError> {
+        self.with(|state| {
+            let r = &mut state.reclaim;
+            let Some(incarnation) = r
+                .prefixes
+                .iter()
+                .find(|(p, i)| p == prefix && r.retired.contains(i))
+                .map(|(_, i)| i.clone())
+            else {
+                return Ok(());
+            };
+            r.prefixes.retain(|(p, _)| p != prefix);
+            if !r.prefixes.iter().any(|(_, i)| *i == incarnation) {
+                r.retired.retain(|i| *i != incarnation);
+            }
+            Ok(())
+        })
+    }
+
+    async fn backlog(&self) -> Result<Backlog, StoreError> {
+        self.with(|state| {
+            let candidates = &state.reclaim.candidates;
+            Ok(Backlog {
+                candidates: candidates.len() as u64,
+                prefixes: candidates.iter().filter(|c| c.prefix).count() as u64,
+            })
+        })
+    }
+
+    async fn prune_pins(
+        &self,
+        grace: Duration,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u64, StoreError> {
+        self.with(|state| {
+            let cut = cutoff(grace, now);
+            let mut dead: Vec<(DateTime<Utc>, String)> = state
+                .reclaim
+                .pins
+                .iter()
+                .filter(|p| p.until <= cut)
+                .map(|p| (p.until, p.token.clone()))
+                .collect();
+            dead.sort();
+            dead.truncate(limit as usize);
+            state
+                .reclaim
+                .pins
+                .retain(|p| !dead.iter().any(|(_, t)| *t == p.token));
+            Ok(dead.len() as u64)
+        })
+    }
+}
+
+impl ReferencedKeys for Reclaim {
+    fn referenced(&self, grace: Duration, now: DateTime<Utc>) -> ReferencedStream {
+        let state = self.0.lock().unwrap();
+        let mut all: Vec<Referenced> = row_references(&state)
+            .into_iter()
+            .map(|(key, prefix)| Referenced { key, prefix })
+            .collect();
+        all.extend(
+            state
+                .reclaim
+                .pins
+                .iter()
+                .filter(|p| p.until > cutoff(grace, now))
+                .map(|p| Referenced {
+                    key: p.physical_key.clone(),
+                    prefix: false,
+                }),
+        );
+        all.sort();
+        Box::pin(futures_util::stream::iter(all.into_iter().map(Ok)))
+    }
+}
+
+/// Port 18's tables: values, the units under them, their files and
+/// declarations, the client documents and the counters.
+#[derive(Default)]
+struct MavenState {
+    values: Vec<MavenValue>,
+    units: Vec<MavenUnit>,
+    client: Vec<ClientMetadata>,
+    counters: Vec<(i64, String, Counter)>,
+}
+
+struct MavenValue {
+    id: i64,
+    repository: i64,
+    ga: String,
+    version: String,
+    versioned: bool,
+}
+
+struct MavenUnit {
+    value: i64,
+    unit: Unit,
+}
+
+impl MavenState {
+    fn value(&self, repository: i64, ga: &str, version: &str) -> Option<&MavenValue> {
+        self.values
+            .iter()
+            .find(|v| v.repository == repository && v.ga == ga && v.version == version)
+    }
+
+    fn unit_mut(&mut self, key: &UnitKey<'_>) -> Option<&mut Unit> {
+        let value = self.value(key.repository, key.ga, key.version)?.id;
+        self.units
+            .iter_mut()
+            .find(|u| u.value == value && u.unit.build == key.build)
+            .map(|u| &mut u.unit)
+    }
+
+    fn bump(&mut self, repository: i64, scopes: &[String], now: DateTime<Utc>) {
+        for scope in scopes {
+            match self
+                .counters
+                .iter_mut()
+                .find(|(r, s, _)| *r == repository && s == scope)
+            {
+                Some((_, _, counter)) => {
+                    counter.value += 1;
+                    counter.updated_at = Some(now);
+                }
+                None => self.counters.push((
+                    repository,
+                    scope.clone(),
+                    Counter {
+                        value: 1,
+                        updated_at: Some(now),
+                    },
+                )),
+            }
+        }
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.units
+            .iter()
+            .flat_map(|u| u.unit.files.iter().map(|f| &f.physical_key))
+    }
+}
+
+struct Maven(Arc<Mutex<State>>);
+
+impl Maven {
+    fn with<T>(
+        &self,
+        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        with(&self.0, PortId::Maven, act)
+    }
+}
+
+fn change_unit(state: &mut State, change: &UnitChange<'_>) -> Result<Changed, StoreError> {
+    state.reclaim.live_pins(change.pins)?;
+    let key = change.key;
+    let revision = match (change.revision, state.maven.unit_mut(&key)) {
+        (None, Some(_)) => return Err(StoreError::Conflict),
+        (Some(r), Some(unit)) if unit.revision != r => return Err(StoreError::Conflict),
+        (Some(_), None) => return Err(StoreError::Conflict),
+        (Some(r), Some(_)) => r + 1,
+        (None, None) => {
+            let value = match state.maven.value(key.repository, key.ga, key.version) {
+                Some(v) => v.id,
+                None => {
+                    let id = state.id();
+                    state.maven.values.push(MavenValue {
+                        id,
+                        repository: key.repository,
+                        ga: key.ga.to_string(),
+                        version: key.version.to_string(),
+                        versioned: false,
+                    });
+                    id
+                }
+            };
+            state.maven.units.push(MavenUnit {
+                value,
+                unit: Unit {
+                    version: key.version.to_string(),
+                    build: key.build.to_string(),
+                    revision: 0,
+                    depositor: change.depositor.to_string(),
+                    contested: false,
+                    refused: false,
+                    visible_at: None,
+                    created_at: change.now,
+                    files: Vec::new(),
+                    declarations: Vec::new(),
+                },
+            });
+            1
+        }
+    };
+    state.reclaim.spend(change.pins);
+    let unit = state.maven.unit_mut(&key).expect("the unit exists");
+    unit.revision = revision;
+    let mut released = Vec::new();
+    if let Some(file) = &change.file {
+        if let Some(old) = unit.files.iter().position(|f| f.filename == file.filename) {
+            let old = unit.files.remove(old);
+            unit.declarations.retain(|d| d.filename != file.filename);
+            if old.physical_key != file.physical_key {
+                released.push(old.physical_key);
+            }
+        }
+        unit.files.push(StoredFile {
+            filename: file.filename.to_string(),
+            physical_key: file.physical_key.to_string(),
+            size: file.size,
+            digests: file.digests.clone(),
+            depositor: file.depositor.to_string(),
+            created_at: change.now,
+        });
+        unit.files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    }
+    for d in change.declarations {
+        unit.declarations
+            .retain(|x| !(x.filename == d.filename && x.algorithm == d.algorithm));
+        unit.declarations.push(d.clone());
+    }
+    unit.declarations
+        .sort_by(|a, b| (&a.filename, a.algorithm.as_str()).cmp(&(&b.filename, b.algorithm.as_str())));
+    unit.contested |= change.contest;
+    if change.reveal && unit.visible_at.is_none() {
+        unit.visible_at = Some(change.now);
+    }
+    for key in &released {
+        state.reclaim.enqueue(key, false, change.now);
+    }
+    state.maven.bump(key.repository, change.scopes, change.now);
+    Ok(Changed { revision, released })
+}
+
+#[async_trait]
+impl MavenFileStore for Maven {
+    async fn unit(&self, key: &UnitKey<'_>) -> Result<Option<Unit>, StoreError> {
+        self.with(|state| Ok(state.maven.unit_mut(key).map(|u| u.clone())))
+    }
+
+    async fn change(&self, change: &UnitChange<'_>) -> Result<Changed, StoreError> {
+        self.with(|state| change_unit(state, change))
+    }
+
+    async fn refuse(
+        &self,
+        key: &UnitKey<'_>,
+        revision: i64,
+        scopes: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<Changed, StoreError> {
+        self.with(|state| {
+            let unit = state.maven.unit_mut(key).ok_or(StoreError::NotFound)?;
+            if unit.revision != revision {
+                return Err(StoreError::Conflict);
+            }
+            unit.revision += 1;
+            unit.refused = true;
+            unit.declarations.clear();
+            let released: Vec<String> =
+                unit.files.drain(..).map(|f| f.physical_key).collect();
+            let revision = unit.revision;
+            for k in &released {
+                state.reclaim.enqueue(k, false, now);
+            }
+            state.maven.bump(key.repository, scopes, now);
+            Ok(Changed { revision, released })
+        })
+    }
+
+    async fn artifact(&self, repository: i64, ga: &str) -> Result<Vec<UnitView>, StoreError> {
+        self.with(|state| {
+            let values: Vec<i64> = state
+                .maven
+                .values
+                .iter()
+                .filter(|v| v.repository == repository && v.ga == ga)
+                .map(|v| v.id)
+                .collect();
+            Ok(state
+                .maven
+                .units
+                .iter()
+                .filter(|u| values.contains(&u.value))
+                .map(|u| UnitView {
+                    version: u.unit.version.clone(),
+                    build: u.unit.build.clone(),
+                    visible_at: u.unit.visible_at,
+                    refused: u.unit.refused,
+                    files: u.unit.files.clone(),
+                })
+                .collect())
+        })
+    }
+
+    async fn counter(&self, repository: i64, scope: &str) -> Result<Counter, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .maven
+                .counters
+                .iter()
+                .find(|(r, s, _)| *r == repository && s == scope)
+                .map(|(_, _, c)| *c)
+                .unwrap_or_default())
+        })
+    }
+
+    async fn record_client_metadata(
+        &self,
+        metadata: &ClientMetadata,
+        scopes: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.with(|state| {
+            state
+                .maven
+                .client
+                .retain(|m| !(m.repository == metadata.repository && m.dir == metadata.dir));
+            state.maven.client.push(metadata.clone());
+            state.maven.bump(metadata.repository, scopes, now);
+            Ok(())
+        })
+    }
+
+    async fn client_metadata(
+        &self,
+        repository: i64,
+        dir: &str,
+    ) -> Result<Option<ClientMetadata>, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .maven
+                .client
+                .iter()
+                .find(|m| m.repository == repository && m.dir == dir)
+                .cloned())
+        })
+    }
+
+    async fn pending(
+        &self,
+        before: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<PendingUnit>, StoreError> {
+        self.with(|state| {
+            let mut pending: Vec<PendingUnit> = state
+                .maven
+                .units
+                .iter()
+                .filter(|u| {
+                    let unit = &u.unit;
+                    unit.visible_at.is_none()
+                        && !unit.refused
+                        && !unit.contested
+                        && unit.created_at < before
+                        && !unit.files.is_empty()
+                        && unit.declarations.iter().all(|d| unit.file(&d.filename).is_some())
+                })
+                .filter_map(|u| {
+                    let value = state.maven.values.iter().find(|v| v.id == u.value)?;
+                    Some(PendingUnit {
+                        repository: value.repository,
+                        ga: value.ga.clone(),
+                        version: value.version.clone(),
+                        build: u.unit.build.clone(),
+                        created_at: u.unit.created_at,
+                    })
+                })
+                .collect();
+            pending.sort_by_key(|p| p.created_at);
+            pending.truncate(limit as usize);
+            Ok(pending)
+        })
+    }
+
+    async fn unversioned(
+        &self,
+        after: Option<&Unversioned>,
+        limit: u32,
+    ) -> Result<Vec<Unversioned>, StoreError> {
+        let key = |r: i64, ga: &str, v: &str| (r, ga.to_string(), v.to_string());
+        let after = after.map(|a| key(a.repository, &a.ga, &a.version));
+        self.with(|state| {
+            let mut values: Vec<_> = state
+                .maven
+                .values
+                .iter()
+                .filter(|v| !v.versioned)
+                .filter(|v| after.as_ref().is_none_or(|a| key(v.repository, &v.ga, &v.version) > *a))
+                .collect();
+            values.sort_by_key(|v| key(v.repository, &v.ga, &v.version));
+            Ok(values
+                .into_iter()
+                .filter(|v| {
+                    state
+                        .maven
+                        .units
+                        .iter()
+                        .any(|u| u.value == v.id && u.unit.visible())
+                })
+                .take(limit as usize)
+                .map(|v| Unversioned {
+                    repository: v.repository,
+                    ga: v.ga.clone(),
+                    version: v.version.clone(),
+                })
+                .collect())
+        })
+    }
+
+    async fn mark_versioned(
+        &self,
+        repository: i64,
+        ga: &str,
+        version: &str,
+    ) -> Result<(), StoreError> {
+        self.with(|state| {
+            if let Some(v) = state
+                .maven
+                .values
+                .iter_mut()
+                .find(|v| v.repository == repository && v.ga == ga && v.version == version)
+            {
+                v.versioned = true;
+            }
+            Ok(())
+        })
+    }
+}
+
+/// Ports 19-21 in memory: the same state as every other fake, so a revoked
+/// token disappears from `Tokens` exactly as the SQLite cascade removes it.
+#[derive(Default)]
+struct SsoState {
+    links: Vec<(IdentityLink, Option<String>)>,
+    disabled_users: Vec<(i64, DisabledBy)>,
+    provenance: Vec<(String, IdentityKey)>,
+    outages: Vec<(Authority, Outage)>,
+    handoffs: Vec<HandoffRow>,
+    secrets: Vec<(String, Vec<u8>)>,
+}
+
+#[derive(Clone)]
+struct HandoffRow {
+    code_hash: String,
+    binding: String,
+    payload: String,
+    expires_at: DateTime<Utc>,
+    consumed: bool,
+}
+
+impl FakeDb {
+    pub fn identities(&self) -> Arc<dyn IdentityStore> {
+        Arc::new(Identities(self.0.clone()))
+    }
+
+    pub fn handoffs(&self) -> Arc<dyn LoginHandoffStore> {
+        Arc::new(Identities(self.0.clone()))
+    }
+
+    pub fn secrets(&self) -> Arc<dyn ServerSecretStore> {
+        Arc::new(Identities(self.0.clone()))
+    }
+}
+
+struct Identities(Arc<Mutex<State>>);
+
+fn revoke_where(state: &mut State, hit: impl Fn(&IdentityKey) -> bool) -> u64 {
+    let gone: Vec<String> = state
+        .sso
+        .provenance
+        .iter()
+        .filter(|(_, k)| hit(k))
+        .map(|(t, _)| t.clone())
+        .collect();
+    let before = state.tokens.len();
+    state.tokens.retain(|t| !gone.contains(&t.id));
+    state.sso.provenance.retain(|(t, _)| !gone.contains(t));
+    (before - state.tokens.len()) as u64
+}
+
+fn fake_grants(state: &mut State, user_id: i64, a: &Admission<'_>) {
+    for repo in a.managed {
+        state
+            .grants
+            .retain(|g| !(g.user_id == user_id && g.repository_id == *repo));
+        if let Some((_, rights)) = a.grants.iter().find(|(r, _)| r == repo) {
+            state.grants.push(Grant {
+                user_id,
+                repository_id: *repo,
+                rights: *rights,
+            });
+        }
+    }
+}
+
+fn fake_disable(state: &mut State, user_id: i64, by: DisabledBy) -> Result<(), StoreError> {
+    if !state.users.iter().any(|u| u.id == user_id) {
+        return Err(StoreError::NotFound);
+    }
+    match state
+        .sso
+        .disabled_users
+        .iter_mut()
+        .find(|(u, _)| *u == user_id)
+    {
+        Some((_, current)) if *current == DisabledBy::Admin => {}
+        Some((_, current)) => *current = by,
+        None => state.sso.disabled_users.push((user_id, by)),
+    }
+    let keys: Vec<IdentityKey> = state
+        .sso
+        .links
+        .iter()
+        .filter(|(l, _)| l.user_id == user_id)
+        .map(|(l, _)| l.key.clone())
+        .collect();
+    revoke_where(state, |k| keys.contains(k));
+    Ok(())
+}
+
+#[async_trait]
+impl IdentityStore for Identities {
+    async fn find(&self, key: &IdentityKey) -> Result<Option<IdentityLink>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            Ok(state
+                .sso
+                .links
+                .iter()
+                .find(|(l, _)| &l.key == key)
+                .map(|(l, _)| l.clone()))
+        })
+    }
+
+    async fn of_user(&self, user_id: i64) -> Result<Vec<IdentityLink>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            Ok(state
+                .sso
+                .links
+                .iter()
+                .filter(|(l, _)| l.user_id == user_id)
+                .map(|(l, _)| l.clone())
+                .collect())
+        })
+    }
+
+    async fn provision(
+        &self,
+        user: &NewUser<'_>,
+        a: &Admission<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<User, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            if state.users.iter().any(|u| u.username == user.username) {
+                return Err(StoreError::Conflict);
+            }
+            let id = state.id();
+            let created = User {
+                id,
+                username: user.username.to_string(),
+                email: user.email.map(str::to_string),
+                password_hash: user.password_hash.to_string(),
+                role: user.role.to_string(),
+                must_change_password: false,
+                created_at: now,
+                updated_at: now,
+            };
+            state.users.push(created.clone());
+            state.sso.links.push((
+                IdentityLink {
+                    key: a.key.clone(),
+                    user_id: id,
+                    email: a.email.map(str::to_string),
+                    provisioned: true,
+                    disabled: false,
+                    linked_at: now,
+                    last_login_at: now,
+                },
+                None,
+            ));
+            fake_grants(state, id, a);
+            Ok(created)
+        })
+    }
+
+    async fn admit(&self, a: &Admission<'_>, now: DateTime<Utc>) -> Result<User, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let Some((link, _)) = state
+                .sso
+                .links
+                .iter_mut()
+                .find(|(l, _)| &l.key == a.key && !l.disabled)
+            else {
+                return Err(StoreError::NotFound);
+            };
+            link.email = a.email.map(str::to_string);
+            link.last_login_at = now;
+            let (user_id, provisioned) = (link.user_id, link.provisioned);
+            state
+                .sso
+                .disabled_users
+                .retain(|(u, by)| !(*u == user_id && *by == DisabledBy::Denied));
+            let user = state
+                .users
+                .iter_mut()
+                .find(|u| u.id == user_id)
+                .ok_or(StoreError::NotFound)?;
+            if provisioned {
+                user.role = a.role.to_string();
+                user.updated_at = now;
+            }
+            let user = user.clone();
+            fake_grants(state, user_id, a);
+            Ok(user)
+        })
+    }
+
+    async fn attach(
+        &self,
+        user_id: i64,
+        key: &IdentityKey,
+        email: Option<&str>,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let role = state
+                .users
+                .iter()
+                .find(|u| u.id == user_id)
+                .map(|u| u.role.clone())
+                .ok_or(StoreError::NotFound)?;
+            if state.sso.links.iter().any(|(l, _)| &l.key == key) {
+                return Err(StoreError::Conflict);
+            }
+            state.sso.links.push((
+                IdentityLink {
+                    key: key.clone(),
+                    user_id,
+                    email: email.map(str::to_string),
+                    provisioned: false,
+                    disabled: false,
+                    linked_at: now,
+                    last_login_at: now,
+                },
+                Some(role),
+            ));
+            Ok(())
+        })
+    }
+
+    async fn detach(&self, user_id: i64, key: &IdentityKey) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let at = state
+                .sso
+                .links
+                .iter()
+                .position(|(l, _)| &l.key == key && l.user_id == user_id)
+                .ok_or(StoreError::NotFound)?;
+            let (_, before) = state.sso.links.remove(at);
+            revoke_where(state, |k| k == key);
+            if let (Some(role), Some(user)) =
+                (before, state.users.iter_mut().find(|u| u.id == user_id))
+            {
+                user.role = role;
+            }
+            Ok(())
+        })
+    }
+
+    async fn disable_link(&self, key: &IdentityKey) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let (link, _) = state
+                .sso
+                .links
+                .iter_mut()
+                .find(|(l, _)| &l.key == key)
+                .ok_or(StoreError::NotFound)?;
+            link.disabled = true;
+            revoke_where(state, |k| k == key);
+            Ok(())
+        })
+    }
+
+    async fn disable_user(
+        &self,
+        user_id: i64,
+        by: DisabledBy,
+        _now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            fake_disable(state, user_id, by)
+        })
+    }
+
+    async fn enable_user(&self, user_id: i64) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            state.sso.disabled_users.retain(|(u, _)| *u != user_id);
+            Ok(())
+        })
+    }
+
+    async fn deprovision(&self, key: &IdentityKey, _now: DateTime<Utc>) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let user_id = state
+                .sso
+                .links
+                .iter()
+                .find(|(l, _)| &l.key == key)
+                .map(|(l, _)| l.user_id)
+                .ok_or(StoreError::NotFound)?;
+            fake_disable(state, user_id, DisabledBy::Denied)
+        })
+    }
+
+    async fn revoke_authority(&self, authority: &Authority) -> Result<u64, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            for (l, _) in state.sso.links.iter_mut() {
+                if &l.key.authority == authority {
+                    l.disabled = true;
+                }
+            }
+            Ok(revoke_where(state, |k| &k.authority == authority))
+        })
+    }
+
+    async fn migrate_authority(&self, from: &Authority, to: &Authority) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            for (l, _) in state.sso.links.iter_mut() {
+                if &l.key.authority == from {
+                    l.key.authority = to.clone();
+                }
+            }
+            for (_, k) in state.sso.provenance.iter_mut() {
+                if &k.authority == from {
+                    k.authority = to.clone();
+                }
+            }
+            for (a, _) in state.sso.outages.iter_mut() {
+                if a == from {
+                    *a = to.clone();
+                }
+            }
+            Ok(())
+        })
+    }
+
+    async fn authorities(&self) -> Result<Vec<Authority>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let mut all: Vec<Authority> = state
+                .sso
+                .links
+                .iter()
+                .filter(|(l, _)| !l.disabled)
+                .map(|(l, _)| l.key.authority.clone())
+                .collect();
+            all.sort();
+            all.dedup();
+            Ok(all)
+        })
+    }
+
+    async fn issue_session(
+        &self,
+        token: &NewToken<'_>,
+        key: &IdentityKey,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let live = state
+                .sso
+                .links
+                .iter()
+                .any(|(l, _)| &l.key == key && l.user_id == token.user_id && !l.disabled);
+            let enabled = !state
+                .sso
+                .disabled_users
+                .iter()
+                .any(|(u, _)| *u == token.user_id);
+            if !live || !enabled {
+                return Err(StoreError::NotFound);
+            }
+            if state.tokens.iter().any(|t| t.id == token.id) {
+                return Err(StoreError::Conflict);
+            }
+            state.tokens.push(ApiToken {
+                id: token.id.to_string(),
+                user_id: token.user_id,
+                name: token.name.to_string(),
+                prefix: token.prefix.to_string(),
+                token_hash: token.token_hash.to_string(),
+                expires_at: token.expires_at,
+                last_used_at: None,
+                created_at: now,
+            });
+            state
+                .sso
+                .provenance
+                .push((token.id.to_string(), key.clone()));
+            Ok(())
+        })
+    }
+
+    async fn provenance(&self, token_id: &str) -> Result<Option<IdentityKey>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            Ok(state
+                .sso
+                .provenance
+                .iter()
+                .find(|(t, _)| t == token_id)
+                .map(|(_, k)| k.clone()))
+        })
+    }
+
+    async fn login_state(&self, user_id: i64) -> Result<LoginState, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let links = state
+                .sso
+                .links
+                .iter()
+                .filter(|(l, _)| l.user_id == user_id && !l.disabled)
+                .map(|(l, _)| LinkState {
+                    last_login: l.last_login_at,
+                    outages: state
+                        .sso
+                        .outages
+                        .iter()
+                        .filter(|(a, _)| a == &l.key.authority)
+                        .map(|(_, o)| *o)
+                        .collect(),
+                })
+                .collect();
+            Ok(LoginState {
+                disabled: state.sso.disabled_users.iter().any(|(u, _)| *u == user_id),
+                bootstrap: false,
+                links,
+            })
+        })
+    }
+
+    async fn record_probe(
+        &self,
+        authority: &Authority,
+        reachable: bool,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            let open = state
+                .sso
+                .outages
+                .iter_mut()
+                .find(|(a, o)| a == authority && o.end.is_none());
+            match (open, reachable) {
+                (Some((_, o)), true) => o.end = Some(now),
+                (None, false) => state.sso.outages.push((
+                    authority.clone(),
+                    Outage {
+                        start: now,
+                        end: None,
+                    },
+                )),
+                _ => {}
+            }
+            Ok(())
+        })
+    }
+
+    async fn outages(&self, authority: &Authority) -> Result<Vec<Outage>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            Ok(state
+                .sso
+                .outages
+                .iter()
+                .filter(|(a, _)| a == authority)
+                .map(|(_, o)| *o)
+                .collect())
+        })
+    }
+}
+
+#[async_trait]
+impl LoginHandoffStore for Identities {
+    async fn deposit(&self, h: &NewHandoff<'_>) -> Result<(), StoreError> {
+        with(&self.0, PortId::Handoffs, |state| {
+            if state
+                .sso
+                .handoffs
+                .iter()
+                .any(|r| r.code_hash == h.code_hash)
+            {
+                return Err(StoreError::Conflict);
+            }
+            state.sso.handoffs.push(HandoffRow {
+                code_hash: h.code_hash.to_string(),
+                binding: h.binding.to_string(),
+                payload: h.payload.to_string(),
+                expires_at: h.expires_at,
+                consumed: false,
+            });
+            Ok(())
+        })
+    }
+
+    async fn consume(
+        &self,
+        code_hash: &str,
+        binding: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Consumption, StoreError> {
+        with(&self.0, PortId::Handoffs, |state| {
+            let Some(row) = state
+                .sso
+                .handoffs
+                .iter_mut()
+                .find(|r| r.code_hash == code_hash)
+            else {
+                return Ok(Consumption::Unknown);
+            };
+            if row.consumed {
+                return Ok(Consumption::AlreadyConsumed);
+            }
+            row.consumed = true;
+            if row.expires_at < now {
+                return Ok(Consumption::Expired);
+            }
+            if row.binding != binding {
+                return Ok(Consumption::BindingMismatch);
+            }
+            Ok(Consumption::Consumed(row.payload.clone()))
+        })
+    }
+
+    async fn peek(
+        &self,
+        code_hash: &str,
+        binding: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Option<String>, StoreError> {
+        with(&self.0, PortId::Handoffs, |state| {
+            Ok(state
+                .sso
+                .handoffs
+                .iter()
+                .find(|r| {
+                    r.code_hash == code_hash
+                        && !r.consumed
+                        && r.binding == binding
+                        && r.expires_at >= now
+                })
+                .map(|r| r.payload.clone()))
+        })
+    }
+
+    async fn purge_expired(&self, now: DateTime<Utc>) -> Result<u64, StoreError> {
+        with(&self.0, PortId::Handoffs, |state| {
+            let before = state.sso.handoffs.len();
+            state.sso.handoffs.retain(|r| r.expires_at >= now);
+            Ok((before - state.sso.handoffs.len()) as u64)
+        })
+    }
+}
+
+#[async_trait]
+impl ServerSecretStore for Identities {
+    async fn get_or_init(&self, name: &str, candidate: &[u8]) -> Result<Vec<u8>, StoreError> {
+        with(&self.0, PortId::Identities, |state| {
+            if let Some((_, v)) = state.sso.secrets.iter().find(|(n, _)| n == name) {
+                return Ok(v.clone());
+            }
+            state
+                .sso
+                .secrets
+                .push((name.to_string(), candidate.to_vec()));
+            Ok(candidate.to_vec())
         })
     }
 }

@@ -4,15 +4,13 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
 
+use crate::app::reconcile::{Reconciled, Reconciler};
 use crate::config::CleanupConfig;
 use crate::ports::clock::Clock;
 use crate::ports::packages::PackageStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
-use crate::storage::StorageBackend;
-
-/// Abandoned `*.part-*` files older than this are reclaimed by the sweep.
-const STALE_PART_AGE: Duration = Duration::from_secs(3600);
+use crate::ports::reclaim::ReclaimStore;
 
 /// A retention bound in days, as the duration the ports take.
 fn retention(days: u64) -> Duration {
@@ -28,7 +26,6 @@ const SWEEP_LIMIT: u32 = 10_000;
 pub(crate) struct SweepStats {
     pub rows: u64,
     pub files: u64,
-    pub parts: u64,
 }
 
 #[derive(Debug, Default)]
@@ -36,6 +33,48 @@ pub(crate) struct CleanupStats {
     pub prereleases: Option<u64>,
     pub proxy: Option<SweepStats>,
     pub policy: Option<u64>,
+    pub reconciled: Vec<(&'static str, crate::app::reconcile::Item)>,
+}
+
+/// How often the registered reconcilers run: a Maven unit waits this long
+/// past its promotion window at most.
+const RECONCILE_EVERY: Duration = Duration::from_secs(60);
+
+/// The reconcilers the composition root registered, on their own period:
+/// they repair within minutes what the daily sweeps would leave for a day.
+pub async fn start_reconcile_task(reconcilers: Vec<Arc<dyn Reconciler>>, clock: Arc<dyn Clock>) {
+    if reconcilers.is_empty() {
+        return;
+    }
+    loop {
+        reconcile(&reconcilers, clock.now()).await;
+        tokio::time::sleep(RECONCILE_EVERY).await;
+    }
+}
+
+/// Every reconciler's pass, each item logged; a failed item never stops a
+/// pass, and a failed reconciler never stops the next one.
+pub(crate) async fn reconcile(
+    reconcilers: &[Arc<dyn Reconciler>],
+    now: DateTime<Utc>,
+) -> Vec<(&'static str, crate::app::reconcile::Item)> {
+    let mut all = Vec::new();
+    for r in reconcilers {
+        for item in r.pass(now).await {
+            match &item.outcome {
+                Reconciled::Repaired => info!(reconciler = r.name(), item = %item.name, "repaired"),
+                Reconciled::Clean => {}
+                Reconciled::Skipped(why) => {
+                    info!(reconciler = r.name(), item = %item.name, why = %why, "left as is")
+                }
+                Reconciled::Failed(why) => {
+                    warn!(reconciler = r.name(), item = %item.name, error = %why, "not repaired; next pass")
+                }
+            }
+            all.push((r.name(), item));
+        }
+    }
+    all
 }
 
 fn proxy_idle_days(config: &CleanupConfig) -> Option<u64> {
@@ -61,9 +100,10 @@ pub async fn start_cleanup_task(
     packages: Arc<dyn PackageStore>,
     cache: Arc<dyn ProxyCacheStore>,
     policy: Arc<dyn PolicyStore>,
-    storage: Arc<dyn StorageBackend>,
+    reclaim: Arc<dyn ReclaimStore>,
     clock: Arc<dyn Clock>,
     config: CleanupConfig,
+    reconcilers: Vec<Arc<dyn Reconciler>>,
 ) {
     if !sweeps_configured(&config) {
         info!("Cleanup task is disabled");
@@ -78,7 +118,8 @@ pub async fn start_cleanup_task(
             packages: packages.as_ref(),
             cache: cache.as_ref(),
             policy: policy.as_ref(),
-            storage: &storage,
+            reclaim: reclaim.as_ref(),
+            reconcilers: &reconcilers,
         };
         sweeps.run(&config, clock.now()).await;
         tokio::time::sleep(Duration::from_secs(86400)).await;
@@ -90,7 +131,8 @@ pub(crate) struct RunCleanup<'a> {
     pub packages: &'a dyn PackageStore,
     pub cache: &'a dyn ProxyCacheStore,
     pub policy: &'a dyn PolicyStore,
-    pub storage: &'a Arc<dyn StorageBackend>,
+    pub reclaim: &'a dyn ReclaimStore,
+    pub reconcilers: &'a [Arc<dyn Reconciler>],
 }
 
 impl RunCleanup<'_> {
@@ -99,14 +141,14 @@ impl RunCleanup<'_> {
         let mut stats = CleanupStats::default();
 
         if let Some(days) = config.prerelease_older_than_days.filter(|_| config.enabled) {
-            match sweep_prereleases(self.packages, self.storage, days, now).await {
+            match sweep_prereleases(self.packages, days, now).await {
                 Ok(deleted) => stats.prereleases = Some(deleted),
                 Err(e) => error!(error = %e, "Failed to clean up old pre-release versions"),
             }
         }
 
         if let Some(idle) = proxy_idle_days(config) {
-            match sweep_proxy_cache(self.cache, self.storage, idle, now).await {
+            match sweep_proxy_cache(self.cache, self.reclaim, idle, now).await {
                 Ok(sweep) => stats.proxy = Some(sweep),
                 Err(e) => error!(error = %e, "Failed to sweep the proxy cache"),
             }
@@ -121,16 +163,16 @@ impl RunCleanup<'_> {
                 Err(e) => error!(error = %e, "Failed to sweep the policy report"),
             }
         }
+
+        stats.reconciled = reconcile(self.reconcilers, now).await;
         stats
     }
 }
 
-/// Drop the pre-release versions past their retention, artifact first: the
-/// version row carries the only record of its path, so losing the row first
-/// would strand the file with nothing left pointing at it.
+/// Drop the pre-release versions past their retention. Each delete enqueues
+/// its artifact in its own transaction and deletes nothing (A1 C5bis N1).
 pub(crate) async fn sweep_prereleases(
     packages: &dyn PackageStore,
-    storage: &Arc<dyn StorageBackend>,
     older_than_days: u64,
     now: DateTime<Utc>,
 ) -> anyhow::Result<u64> {
@@ -144,15 +186,7 @@ pub(crate) async fn sweep_prereleases(
 
     info!(count = stale.len(), "Cleaning up old pre-release versions");
     for row in &stale {
-        if let Err(e) = storage.delete(&row.tarball_path).await {
-            warn!(
-                version_id = row.id,
-                path = %row.tarball_path,
-                error = %e,
-                "Failed to delete tarball for pre-release version"
-            );
-        }
-        packages.delete_version(row.id).await?;
+        packages.delete_version(row.id, now).await?;
         info!(
             package = %row.package,
             version = %row.version,
@@ -162,32 +196,28 @@ pub(crate) async fn sweep_prereleases(
     Ok(stale.len() as u64)
 }
 
-/// Evict expired negative entries and every row idle for `idle_days`, file
-/// first, then row; then reclaim abandoned part files.
+/// Evict expired negative entries and every row idle for `idle_days`: the
+/// row goes and its file is enqueued, never deleted here.
 pub(crate) async fn sweep_proxy_cache(
     cache: &dyn ProxyCacheStore,
-    storage: &Arc<dyn StorageBackend>,
+    reclaim: &dyn ReclaimStore,
     idle_days: u64,
     now: DateTime<Utc>,
 ) -> anyhow::Result<SweepStats> {
     let mut stats = SweepStats::default();
     for row in cache.evictable(retention(idle_days), now, SWEEP_LIMIT).await? {
+        cache.delete(row.id).await?;
         if let Some(path) = &row.storage_path {
-            match storage.delete(path).await {
+            match reclaim.enqueue(std::slice::from_ref(path), now).await {
                 Ok(()) => stats.files += 1,
-                Err(e) => warn!(path, error = %e, "Failed to delete an evicted cache file"),
+                Err(e) => warn!(path, error = %e, "Failed to enqueue an evicted cache file"),
             }
         }
-        cache.delete(row.id).await?;
         stats.rows += 1;
     }
-    stats.parts = storage
-        .remove_stale_parts("", STALE_PART_AGE)
-        .await?;
     info!(
         rows = stats.rows,
         files = stats.files,
-        parts = stats.parts,
         "Proxy cache sweep complete"
     );
     Ok(stats)
@@ -196,6 +226,7 @@ pub(crate) async fn sweep_proxy_cache(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::StorageBackend;
     use chrono::TimeZone;
 
     use crate::domain::{Format, NewEntry, RepoKind, RepoSpec, RuleVerdict, Verdict, Visibility};
@@ -219,6 +250,8 @@ mod tests {
         cache: Arc<dyn ProxyCacheStore>,
         policy: Arc<dyn PolicyStore>,
         storage: Arc<dyn StorageBackend>,
+        fakes: FakeDb,
+        reclaim: Arc<dyn ReclaimStore>,
         /// The seeded repositories: a hosted npm one, a hosted go one, and
         /// the npm proxy whose answers the cache rows belong to.
         npm: i64,
@@ -252,10 +285,12 @@ mod tests {
             ids.push(repos.create(&spec, now()).await.unwrap().id);
         }
         Fx {
-            storage: crate::storage::filesystem(tmp.path().join("storage")),
+            storage: crate::server::filesystem(tmp.path().join("storage")),
             packages: db.packages(),
             cache: db.proxy_cache(),
             policy: db.policy(),
+            reclaim: db.reclaim(),
+            fakes: db,
             _tmp: tmp,
             npm: ids[0],
             go: ids[1],
@@ -269,7 +304,8 @@ mod tests {
                 packages: self.packages.as_ref(),
                 cache: self.cache.as_ref(),
                 policy: self.policy.as_ref(),
-                storage: &self.storage,
+                reclaim: self.reclaim.as_ref(),
+                reconcilers: &[],
             }
         }
 
@@ -341,6 +377,8 @@ mod tests {
                     size: 6,
                     tarball_path: &tarball_path,
                     dist_tags: &["latest".to_string()],
+                    dependencies: &[],
+                    pins: &[],
                     now: at,
                 })
                 .await
@@ -417,7 +455,7 @@ mod tests {
         fx.publish(fx.go, "gomod", "v0.0.0-20200101000000-abcdef", days_ago(10))
             .await;
 
-        let deleted = sweep_prereleases(fx.packages.as_ref(), &fx.storage, 0, now())
+        let deleted = sweep_prereleases(fx.packages.as_ref(), 0, now())
             .await
             .unwrap();
 
@@ -428,8 +466,13 @@ mod tests {
             "the npm pre-release goes, and its dist-tag with it"
         );
         assert!(
-            !fx.storage.exists("npmpkg/1.0.0-beta.tgz").await.unwrap(),
-            "the artifact goes before the row that names it"
+            fx.storage.stat("npmpkg/1.0.0-beta.tgz").await.unwrap().is_some(),
+            "delete_version deletes nothing"
+        );
+        assert_eq!(
+            fx.fakes.candidates(),
+            vec!["npmpkg/1.0.0-beta.tgz".to_string()],
+            "its artifact is enqueued for reclamation"
         );
         assert_eq!(
             fx.left(fx.go, "gomod").await,
@@ -445,7 +488,7 @@ mod tests {
         let fx = fixture().await;
         fx.publish(fx.npm, "npmpkg", "1.0.0-beta", days_ago(29)).await;
 
-        let deleted = sweep_prereleases(fx.packages.as_ref(), &fx.storage, 30, now())
+        let deleted = sweep_prereleases(fx.packages.as_ref(), 30, now())
             .await
             .unwrap();
 
@@ -464,49 +507,24 @@ mod tests {
         fx.entry("npm-metadata", "fresh-negative", 404, Some(60), now())
             .await;
 
-        let stats = sweep_proxy_cache(fx.cache.as_ref(), &fx.storage, 30, now())
+        let stats = sweep_proxy_cache(fx.cache.as_ref(), fx.fakes.reclaim().as_ref(), 30, now())
             .await
             .unwrap();
 
         assert_eq!(
             stats,
-            SweepStats {
-                rows: 2,
-                files: 1,
-                parts: 0
-            }
+            SweepStats { rows: 2, files: 1 }
         );
         assert!(!fx.cached("npm-tarball", "idle").await);
         assert!(!fx.cached("npm-metadata", "gone").await);
         assert!(fx.cached("npm-metadata", "stale").await);
         assert!(fx.cached("npm-metadata", "fresh-negative").await);
-        assert!(!fx.storage.exists("_proxy_cache/p/npm-tarball/idle").await.unwrap());
-        assert!(fx.storage.exists("_proxy_cache/p/npm-metadata/stale").await.unwrap());
-    }
-
-    #[tokio::test]
-    async fn sweep_reclaims_abandoned_part_file() {
-        let fx = fixture().await;
-        fx.put("_proxy_cache/p/npm-tarball/ab/abc.part-old").await;
-        fx.put("_proxy_cache/p/npm-tarball/ab/abc.part-new").await;
-        fx.put("_proxy_cache/p/npm-tarball/ab/abc").await;
-        let old = fx.storage.resolve("_proxy_cache/p/npm-tarball/ab/abc.part-old").unwrap();
-        let two_hours_ago = std::time::SystemTime::now() - Duration::from_secs(7200);
-        std::fs::File::options()
-            .write(true)
-            .open(&old)
-            .unwrap()
-            .set_modified(two_hours_ago)
-            .unwrap();
-
-        let stats = sweep_proxy_cache(fx.cache.as_ref(), &fx.storage, 30, now())
-            .await
-            .unwrap();
-
-        assert_eq!(stats.parts, 1);
-        assert!(!old.exists(), "an hour-old part is reclaimed");
-        assert!(fx.storage.exists("_proxy_cache/p/npm-tarball/ab/abc.part-new").await.unwrap());
-        assert!(fx.storage.exists("_proxy_cache/p/npm-tarball/ab/abc").await.unwrap());
+        assert_eq!(
+            fx.fakes.candidates(),
+            vec!["_proxy_cache/p/npm-tarball/idle".to_string()],
+            "the evicted file is enqueued, not deleted"
+        );
+        assert!(fx.storage.stat("_proxy_cache/p/npm-metadata/stale").await.unwrap().is_some());
     }
 
     #[tokio::test]
@@ -590,5 +608,47 @@ mod tests {
         let stats = fx.sweeps().run(&off, now()).await;
         assert_eq!(stats.policy, None);
         assert_eq!(fx.policy_left().await.0.len(), 2);
+    }
+
+    struct Scripted(&'static str, Vec<Reconciled>);
+
+    #[async_trait::async_trait]
+    impl Reconciler for Scripted {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        async fn pass(&self, _now: DateTime<Utc>) -> Vec<crate::app::reconcile::Item> {
+            self.1
+                .iter()
+                .enumerate()
+                .map(|(i, outcome)| crate::app::reconcile::Item {
+                    name: format!("{}-{i}", self.0),
+                    outcome: outcome.clone(),
+                })
+                .collect()
+        }
+    }
+
+    /// `RunCleanup` knows no format: it runs whatever was registered, and a
+    /// failed item or reconciler stops neither the pass nor the next one.
+    #[tokio::test]
+    async fn every_registered_reconciler_runs_and_reports_every_item() {
+        let fx = fixture().await;
+        let reconcilers: Vec<Arc<dyn Reconciler>> = vec![
+            Arc::new(Scripted("a", vec![Reconciled::Failed("boom".into()), Reconciled::Repaired])),
+            Arc::new(Scripted("b", vec![Reconciled::Skipped("conflict".into())])),
+        ];
+        let sweeps = RunCleanup {
+            reconcilers: &reconcilers,
+            ..fx.sweeps()
+        };
+        let stats = sweeps.run(&CleanupConfig::default(), now()).await;
+        let names: Vec<(&str, String)> = stats
+            .reconciled
+            .iter()
+            .map(|(r, item)| (*r, item.name.clone()))
+            .collect();
+        assert_eq!(names, [("a", "a-0".to_string()), ("a", "a-1".to_string()), ("b", "b-0".to_string())]);
     }
 }

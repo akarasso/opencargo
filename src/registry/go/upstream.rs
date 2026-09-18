@@ -1,5 +1,7 @@
+use axum::http::HeaderMap;
+
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, MAX_METADATA_BYTES,
+    CacheKey, CachePolicy, ExpectedDigests, Transfer, Ttl, UpstreamStrategy, MAX_METADATA_BYTES,
 };
 use crate::registry::resolve::{ResolveError, Upstream};
 
@@ -110,6 +112,12 @@ impl UpstreamStrategy for GoUpstream {
                 key: format!("{module}/{version}"),
             },
         }
+    }
+
+    // The checksum database is not consulted; the ratchet lists go among
+    // the strategies at none().
+    fn expected_digests(&self, _a: &GoArtifact, _h: &HeaderMap) -> ExpectedDigests {
+        ExpectedDigests::none()
     }
 
     fn cache_policy(&self, a: &GoArtifact) -> CachePolicy {

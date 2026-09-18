@@ -1,3 +1,5 @@
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use base64::Engine;
@@ -189,7 +191,7 @@ async fn setup_with_webhooks(
 
     config.server.base_url = base_url.clone();
 
-    let state = server::build_state(&config)
+    let state = common::build_state(&mut config)
         .await
         .expect("failed to build app state");
     let router = server::build_router(state);
@@ -489,7 +491,28 @@ async fn test_webhook_on_oci_manifest_push() {
     .await;
 
     let client = reqwest::Client::new();
-    let manifest = br#"{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{"mediaType":"application/vnd.oci.image.config.v1+json","size":0,"digest":"sha256:0000000000000000000000000000000000000000000000000000000000000000"},"layers":[]}"#;
+    // A manifest may only list blobs the repository holds, so the config goes first.
+    let resp = client
+        .post(format!("{}/v2/oci-hosted/hookapp/blobs/uploads/", base_url))
+        .bearer_auth("test-token")
+        .send()
+        .await
+        .expect("start upload failed");
+    let location = resp.headers()["location"].to_str().unwrap().to_string();
+    let config = b"{}";
+    let config_digest = format!("sha256:{:x}", <sha2::Sha256 as sha2::Digest>::digest(config));
+    let resp = client
+        .put(format!("{}{}?digest={}", base_url, location, config_digest))
+        .bearer_auth("test-token")
+        .body(config.to_vec())
+        .send()
+        .await
+        .expect("complete upload failed");
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let manifest = format!(
+        r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","size":2,"digest":"{config_digest}"}},"layers":[]}}"#
+    );
+    let manifest = manifest.as_bytes();
 
     let resp = client
         .put(format!("{}/v2/oci-hosted/hookapp/manifests/v1.0", base_url))

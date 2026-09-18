@@ -58,7 +58,7 @@ pub fn validate_escaped_module(module: &str) -> AppResult<()> {
     if !escapes_well_formed(module) {
         return Err(invalid());
     }
-    crate::domain::validate_package_name("go", &module.replace('!', "")).map_err(|_| invalid())
+    crate::registry::rules::rules_of(crate::domain::Format::Go)?.validate(&module.replace('!', "")).map_err(|_| invalid())
 }
 
 /// The version is case-encoded like the module (`v1.0.0-RC1` arrives as
@@ -68,7 +68,7 @@ pub fn validate_escaped_version(version: &str) -> AppResult<()> {
     if !escapes_well_formed(version) {
         return Err(invalid());
     }
-    crate::domain::validate_version(&unescape(version)).map_err(|_| invalid())
+    crate::registry::rules::rules_of(crate::domain::Format::Go)?.validate_version(&unescape(version)).map_err(|_| invalid())
 }
 
 /// `v` + semver core with optional pre-release/build; pseudo-versions

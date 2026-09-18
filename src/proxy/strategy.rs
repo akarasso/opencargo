@@ -5,7 +5,10 @@ use crate::registry::resolve::{ResolveError, Upstream};
 /// The vocabulary a strategy answers in is registry semantics, not proxy
 /// machinery, so it lives in the domain; the hooks below are its only
 /// consumers in this module and re-exporting it keeps their spelling.
-pub use crate::domain::{CachePolicy, Classified, Transfer, Ttl, UrlSource};
+pub use crate::domain::{
+    CachePolicy, Classified, DigestAlgorithm, DigestSource, ExpectedDigests, RedirectRule,
+    Transfer, Ttl, UrlSource,
+};
 
 pub const DEFAULT_MAX_UPSTREAM_BYTES: u64 = 100 * 1024 * 1024;
 /// Index lines, version lists, tag lists: far below this in practice.
@@ -35,13 +38,17 @@ pub trait UpstreamStrategy: Send + Sync {
         self.cache_key(a)
     }
 
-    fn verify_headers(
-        &self,
-        _a: &Self::Artifact,
-        _h: &HeaderMap,
-        _body_sha256: &str,
-    ) -> Result<(), ResolveError> {
-        Ok(())
+    /// Every digest the body must match, from what the artifact already
+    /// knows and from the response headers. No default: a strategy with
+    /// nothing to verify says so with `ExpectedDigests::none()`.
+    fn expected_digests(&self, a: &Self::Artifact, headers: &HeaderMap) -> ExpectedDigests;
+
+    fn send_credentials(&self, _a: &Self::Artifact) -> bool {
+        true
+    }
+
+    fn final_url_must_match(&self, _a: &Self::Artifact) -> RedirectRule {
+        RedirectRule::Unrestricted
     }
 
     fn transfer(&self, _a: &Self::Artifact) -> Transfer {
@@ -54,10 +61,6 @@ pub trait UpstreamStrategy: Send + Sync {
 
     fn request_headers(&self, _a: &Self::Artifact) -> Vec<(HeaderName, HeaderValue)> {
         Vec::new()
-    }
-
-    fn expected_sha256(&self, _a: &Self::Artifact) -> Option<String> {
-        None
     }
 
     fn bearer_scope(&self, _a: &Self::Artifact) -> Option<String> {

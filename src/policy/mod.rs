@@ -125,6 +125,15 @@ pub enum Source {
     Go {
         digest: Option<String>,
     },
+    /// The page the file was listed on dates it (PEP 700 `upload-time`).
+    Pypi {
+        digest: Option<String>,
+        uploaded: Option<String>,
+    },
+    Nuget {
+        body: Cached,
+        published: Option<DateTime<Utc>>,
+    },
     Oci {
         body: Cached,
         served: Option<Cached>,

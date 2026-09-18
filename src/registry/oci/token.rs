@@ -12,9 +12,8 @@ use rand::Rng;
 use serde_json::json;
 use sha2::Sha256;
 
-use crate::auth::middleware::{
-    authenticate_basic, authenticate_bearer, basic_credentials, AuthFailure, AuthState, AuthUser,
-};
+use crate::app::authenticate::{Credential, Presented, Refusal, Transport};
+use crate::auth::middleware::{authorization_credential, client_source, AuthState, AuthUser};
 use crate::error::AppError;
 use crate::ports::signing::RegistryTokenSigner;
 pub use crate::ports::signing::Claims;
@@ -28,19 +27,25 @@ const TTL_SECS: i64 = 3600;
 const MAX_SCOPES: usize = 16;
 const MAX_SCOPE_LEN: usize = 256;
 
-/// Signs and verifies registry tokens with a key that lives for one process:
-/// a restart invalidates every outstanding token, which is fine for a
-/// one-hour credential the client re-requests on any 401.
+/// Signs and verifies registry tokens with the key `ServerSecretStore`
+/// holds under [`SIGNING_KEY`].
 #[derive(Clone)]
 pub struct TokenSigner {
-    key: [u8; 32],
+    key: Vec<u8>,
 }
+
+pub const SIGNING_KEY: &str = "registry_token_key";
 
 impl TokenSigner {
     pub fn random() -> Self {
-        let mut key = [0u8; 32];
-        rand::thread_rng().fill(&mut key);
-        Self { key }
+        Self { key: fresh_key() }
+    }
+
+    pub async fn from_store(
+        secrets: &dyn crate::ports::secrets::ServerSecretStore,
+    ) -> Result<Self, crate::error::StoreError> {
+        let key = secrets.get_or_init(SIGNING_KEY, &fresh_key()).await?;
+        Ok(Self { key })
     }
 
     fn mac(&self) -> Hmac<Sha256> {
@@ -65,19 +70,27 @@ impl RegistryTokenSigner for TokenSigner {
     }
 }
 
+fn fresh_key() -> Vec<u8> {
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill(&mut key);
+    key.to_vec()
+}
+
 /// `GET /v2/token?service=opencargo&scope=repository:{repo}/{name}:pull`.
 /// Basic credentials or an API token identify the caller; without any,
 /// an anonymous token is issued when `anonymous_read` allows it.
 pub async fn issue_token(
     State(state): State<AppState>,
     Query(params): Query<Vec<(String, String)>>,
-    headers: HeaderMap,
+    request: axum::extract::Request,
 ) -> Result<Response, Response> {
-    let user = caller(&state.auth, &headers).await?;
+    let source = client_source(&request, &state.auth.trusted_proxies);
+    let headers = request.headers();
+    let user = caller(&state.auth, headers, &source).await?;
     if user.is_none() && !state.auth.anonymous_read {
         return Err(unauthorized("authentication required"));
     }
-    let api_token_id = match user.as_ref().and(bearer_value(&headers)) {
+    let api_token_id = match user.as_ref().and(bearer_value(headers)) {
         Some(raw) if !raw.starts_with("ocr_") => {
             crate::auth::middleware::live_api_token(&state.auth, raw)
                 .await
@@ -107,7 +120,7 @@ pub async fn issue_token(
         scope = ?claims.scope,
         "registry token issued"
     );
-    let token = state.auth.registry_tokens.sign(&claims);
+    let token = state.registry_tokens.sign(&claims);
     Ok(Json(json!({
         "token": token,
         "access_token": token,
@@ -126,31 +139,31 @@ fn bearer_value(headers: &HeaderMap) -> Option<&str> {
 
 /// The user behind the `Authorization` header, `None` when there is none;
 /// credentials that are present but wrong are an error, never anonymous.
-async fn caller(auth: &AuthState, headers: &HeaderMap) -> Result<Option<AuthUser>, Response> {
-    let Some(value) = headers
+async fn caller(
+    auth: &AuthState,
+    headers: &HeaderMap,
+    source: &str,
+) -> Result<Option<AuthUser>, Response> {
+    let credential = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-    else {
-        return Ok(None);
+        .and_then(authorization_credential);
+    let presented: Vec<Presented> = match credential {
+        None => return Ok(None),
+        Some(Credential::Registry(_)) => return Err(unauthorized("invalid credentials")),
+        Some(credential) => vec![Presented {
+            transport: Transport::Authorization,
+            credential,
+        }],
     };
-    let outcome = if let Some((username, password)) = basic_credentials(value) {
-        authenticate_basic(auth, &username, &password).await
-    } else if let Some(token) = value.strip_prefix("Bearer ") {
-        authenticate_bearer(auth, token).await.map_err(|e| {
-            tracing::warn!(error = %e, "database error during token endpoint authentication");
-            AuthFailure::Unavailable
-        })
-    } else {
-        Ok(None)
-    };
-    match outcome {
-        Ok(Some(user)) => Ok(Some(user)),
-        Ok(None) => Err(unauthorized("invalid credentials")),
-        Err(AuthFailure::Throttled) => Err(AppError::TooManyRequests(
+    match auth.authenticate.run(&presented, None, source).await {
+        Ok(done) => Ok(done.and_then(|d| d.user)),
+        Err(Refusal::Invalid) => Err(unauthorized("invalid credentials")),
+        Err(Refusal::Throttled) => Err(AppError::TooManyRequests(
             "too many authentication attempts, try again later".to_string(),
         )
         .into_response()),
-        Err(AuthFailure::Unavailable) => Err(AppError::ServiceUnavailable(
+        Err(Refusal::Unavailable) => Err(AppError::ServiceUnavailable(
             "authentication temporarily unavailable, try again".to_string(),
         )
         .into_response()),
@@ -234,6 +247,35 @@ mod tests {
             ..claims(i64::MAX)
         });
         assert!(signer.verify(&admin).expect("valid").static_token);
+    }
+
+    /// Two signers over one secret store verify each other's tokens: the key
+    /// is the store's, not the process's.
+    #[tokio::test]
+    async fn the_signing_key_is_read_from_the_secret_store() {
+        use crate::ports::secrets::ServerSecretStore;
+
+        struct One(std::sync::Mutex<Option<Vec<u8>>>);
+
+        #[async_trait::async_trait]
+        impl ServerSecretStore for One {
+            async fn get_or_init(
+                &self,
+                name: &str,
+                candidate: &[u8],
+            ) -> Result<Vec<u8>, crate::error::StoreError> {
+                assert_eq!(name, SIGNING_KEY);
+                let mut held = self.0.lock().unwrap();
+                Ok(held.get_or_insert_with(|| candidate.to_vec()).clone())
+            }
+        }
+
+        let store = One(std::sync::Mutex::new(None));
+        let first = TokenSigner::from_store(&store).await.unwrap();
+        let second = TokenSigner::from_store(&store).await.unwrap();
+        let token = first.sign(&claims(i64::MAX));
+        assert!(second.verify(&token).is_some());
+        assert!(TokenSigner::random().verify(&token).is_none());
     }
 
     #[test]

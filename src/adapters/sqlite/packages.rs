@@ -16,6 +16,7 @@ use crate::adapters::sqlite::rows::{DistTagRow, PackageRow, VersionRow};
 use crate::domain::{DistTag, Package, Version};
 use crate::error::StoreError;
 use crate::ports::packages::{
+    ReleaseDependency,
     NameMatch, NewRelease, PackageStore, Promotion, PromotionAudit, Release, StalePrerelease,
 };
 
@@ -45,6 +46,7 @@ struct ReleaseSpec<'a> {
     readme: Option<&'a str>,
     values: VersionValues<'a>,
     dist_tags: &'a [String],
+    dependencies: &'a [ReleaseDependency<'a>],
     now: DateTime<Utc>,
 }
 
@@ -66,6 +68,7 @@ impl<'a> From<&'a NewRelease<'a>> for ReleaseSpec<'a> {
                 tarball_path: release.tarball_path,
             },
             dist_tags: release.dist_tags,
+            dependencies: release.dependencies,
             now: release.now,
         }
     }
@@ -89,6 +92,7 @@ impl<'a> From<&'a Promotion<'a>> for ReleaseSpec<'a> {
                 tarball_path: promotion.tarball_path,
             },
             dist_tags: promotion.dist_tags,
+            dependencies: &[],
             now: promotion.now,
         }
     }
@@ -201,6 +205,22 @@ async fn write_release(
     for tag in spec.dist_tags {
         tag_version(tx, package.id, tag, version.id).await?;
     }
+    for dep in spec.dependencies {
+        sqlx::query(
+            "INSERT INTO package_dependencies
+                 (package_id, version_id, dependency_name, dependency_version_req,
+                  dependency_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        )
+        .bind(package.id)
+        .bind(version.id)
+        .bind(dep.name)
+        .bind(dep.requirement)
+        .bind(dep.kind)
+        .bind(bind_ts(spec.now))
+        .execute(&mut **tx)
+        .await?;
+    }
     Ok((package, version))
 }
 
@@ -258,7 +278,15 @@ async fn write_audit(
 async fn purge_version(
     tx: &mut Transaction<'static, Sqlite>,
     version: i64,
+    now: DateTime<Utc>,
 ) -> Result<Result<(), StoreError>, sqlx::Error> {
+    let key: Option<String> = sqlx::query_scalar("SELECT tarball_path FROM versions WHERE id = ?1")
+        .bind(version)
+        .fetch_optional(&mut **tx)
+        .await?;
+    let Some(key) = key else {
+        return Ok(Err(StoreError::NotFound));
+    };
     for table in VERSION_DEPENDENTS {
         sqlx::query(&format!("DELETE FROM {table} WHERE version_id = ?1"))
             .bind(version)
@@ -272,6 +300,7 @@ async fn purge_version(
     if done.rows_affected() == 0 {
         return Ok(Err(StoreError::NotFound));
     }
+    super::reclaim::enqueue_keys(tx, &[key], now).await?;
     Ok(Ok(()))
 }
 
@@ -336,6 +365,18 @@ impl PackageStore for SqlitePackageStore {
         rows.into_iter().map(version_of).collect()
     }
 
+    async fn stamp(&self, package: i64) -> Result<String, StoreError> {
+        let stamp: Option<String> = sqlx::query_scalar(
+            "SELECT group_concat(id || ':' || yanked, ',')
+             FROM (SELECT id, yanked FROM versions WHERE package_id = ?1 ORDER BY id)",
+        )
+        .bind(package)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(stamp.unwrap_or_default())
+    }
+
     async fn version(
         &self,
         package: i64,
@@ -368,7 +409,11 @@ impl PackageStore for SqlitePackageStore {
         let (package, version) = immediate(&self.pool, |mut tx| {
             let spec = &spec;
             Box::pin(async move {
-                let landed = write_release(&mut tx, spec).await.map(Ok);
+                let landed = match super::reclaim::spend_pins(&mut tx, release.pins).await {
+                    Ok(Ok(())) => write_release(&mut tx, spec).await.map(Ok),
+                    Ok(Err(revoked)) => Ok(Err(StoreError::Superseded(revoked))),
+                    Err(e) => Err(e),
+                };
                 (tx, landed)
             })
         })
@@ -384,7 +429,11 @@ impl PackageStore for SqlitePackageStore {
         let version = immediate(&self.pool, |mut tx| {
             let spec = &spec;
             Box::pin(async move {
-                let landed = promote(&mut tx, spec, &promotion.audit).await.map(Ok);
+                let landed = match super::reclaim::spend_pins(&mut tx, promotion.pins).await {
+                    Ok(Ok(())) => promote(&mut tx, spec, &promotion.audit).await.map(Ok),
+                    Ok(Err(revoked)) => Ok(Err(StoreError::Superseded(revoked))),
+                    Err(e) => Err(e),
+                };
                 (tx, landed)
             })
         })
@@ -491,10 +540,10 @@ impl PackageStore for SqlitePackageStore {
         Ok(rows.into_iter().map(StalePrerelease::from).collect())
     }
 
-    async fn delete_version(&self, version: i64) -> Result<(), StoreError> {
+    async fn delete_version(&self, version: i64, now: DateTime<Utc>) -> Result<(), StoreError> {
         immediate(&self.pool, |mut tx| {
             Box::pin(async move {
-                let gone = purge_version(&mut tx, version).await;
+                let gone = purge_version(&mut tx, version, now).await;
                 (tx, gone)
             })
         })

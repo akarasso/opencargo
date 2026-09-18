@@ -66,6 +66,10 @@ export default function Sidebar() {
                 <Icon name="shield-check" />
                 <span>My access</span>
               </A>
+              <A class="nav-link" href="/account/sso" activeClass="active" onClick={close}>
+                <Icon name="log-in" />
+                <span>Single sign-on</span>
+              </A>
               <A
                 class="nav-link"
                 href={`/admin/users/${session.user()?.username}/tokens`}

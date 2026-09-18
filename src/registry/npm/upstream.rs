@@ -1,4 +1,8 @@
-use crate::proxy::strategy::{CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy};
+use axum::http::HeaderMap;
+
+use crate::proxy::strategy::{
+    CacheKey, CachePolicy, ExpectedDigests, Transfer, Ttl, UpstreamStrategy,
+};
 use crate::registry::resolve::{ResolveError, Upstream};
 
 #[derive(Debug)]
@@ -33,6 +37,12 @@ impl UpstreamStrategy for NpmUpstream {
                 key: format!("{name}/{filename}"),
             },
         }
+    }
+
+    // A tarball's integrity lives in the packument, which this strategy
+    // does not read; the ratchet lists npm among the strategies at none().
+    fn expected_digests(&self, _a: &NpmArtifact, _h: &HeaderMap) -> ExpectedDigests {
+        ExpectedDigests::none()
     }
 
     fn cache_policy(&self, a: &NpmArtifact) -> CachePolicy {

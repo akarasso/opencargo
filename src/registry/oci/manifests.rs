@@ -8,9 +8,7 @@ use axum::{
 };
 use tracing::info;
 
-use crate::app::oci::{
-    DeleteManifest, ManifestTarget, OciWriteError, PushedManifest, PutManifest,
-};
+use crate::app::oci::{DeleteManifest, ManifestTarget, OciWriteError, PushedManifest, PutManifest};
 use crate::app::publish_tail::{PreScan, Published};
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Repository};
@@ -21,7 +19,8 @@ use crate::registry::resolve::first_hit;
 use crate::server::AppState;
 
 use super::leaves::ManifestLeaf;
-use super::{is_digest, param, parse_digest, paths, refs, respond, sha256_digest, OciRef};
+use super::uploads::repo_prefix;
+use super::{is_digest, oci_error, param, parse_digest, refs, respond, sha256_digest, OciRef};
 
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
@@ -45,7 +44,7 @@ fn parse_reference(reference: &str) -> AppResult<String> {
     if is_digest(reference) {
         parse_digest(reference)
     } else {
-        crate::domain::validate_oci_tag(reference)?;
+        crate::registry::rules::rules_of(crate::domain::Format::Oci)?.validate_version(reference)?;
         Ok(reference.to_string())
     }
 }
@@ -120,7 +119,11 @@ pub async fn put_manifest(
         )));
     }
 
-    push_manifest(&state, &repo, &r, &reference, &digest, &content_type, &body).await?;
+    if let Some(refused) =
+        push_manifest(&state, &repo, &r, &reference, &digest, &content_type, &body).await?
+    {
+        return Ok(refused);
+    }
     // The "package" is the image name, the "version" the pushed reference;
     // OCI has no `versions` row, so no vulnerability scan applies.
     state
@@ -161,7 +164,8 @@ pub async fn put_manifest(
         .into_response())
 }
 
-/// The bytes, then the rows that claim them.
+/// The bytes, then the rows that claim them; `Some` is the refusal a client
+/// reads as its blobs being unknown.
 async fn push_manifest(
     state: &AppState,
     repo: &Repository,
@@ -170,20 +174,34 @@ async fn push_manifest(
     digest: &str,
     content_type: &str,
     body: &Bytes,
-) -> AppResult<()> {
-    PutManifest::new(state.oci.clone(), state.storage.clone())
-        .run(PushedManifest {
-            repository: repo.id,
-            name: &r.name,
-            digest,
-            content_type,
-            blobs: refs::extract_refs(body),
-            tag: (!is_digest(reference)).then_some(reference),
-            path: &paths::manifest_path(&r.image_name(), &r.name, digest),
-            body: body.clone(),
-        })
-        .await?;
-    Ok(())
+) -> AppResult<Option<Response>> {
+    let prefix = repo_prefix(state, repo).await?;
+    let (blobs, children) = refs::split_refs(body);
+    let pushed = PutManifest::new(state.oci.clone(), state.placer())
+        .run(
+            PushedManifest {
+                repository: repo.id,
+                repo_prefix: &prefix,
+                name: &r.name,
+                digest,
+                content_type,
+                blobs,
+                children,
+                tag: (!is_digest(reference)).then_some(reference),
+                body: body.clone(),
+            },
+            state.clock.now(),
+        )
+        .await;
+    match pushed {
+        Ok(()) => Ok(None),
+        Err(OciWriteError::BlobUnknown) => Ok(Some(oci_error(
+            StatusCode::BAD_REQUEST,
+            "MANIFEST_BLOB_UNKNOWN",
+            "the manifest references a blob this repository does not hold",
+        ))),
+        Err(err) => Err(err.into()),
+    }
 }
 
 pub async fn delete_manifest(
@@ -212,15 +230,14 @@ pub async fn delete_manifest(
                 r.name, reference, r.repo
             ))
         })?;
-    DeleteManifest::new(state.oci.clone(), state.storage.clone())
+    DeleteManifest::new(state.oci.clone())
         .run(
             ManifestTarget {
                 repository: repo.id,
                 name: &r.name,
                 digest: &digest,
-                path: &paths::manifest_path(&r.image_name(), &r.name, &digest),
             },
-            |blob| paths::blob_path(&repo.name, blob),
+            state.clock.now(),
         )
         .await
         .map_err(|err| match err {

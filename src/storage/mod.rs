@@ -1,27 +1,26 @@
-use std::path::PathBuf;
+//! The object storage port (S3 v5 §2): whole-object reads and atomic
+//! writes, listing, copies, and the bounds a caller derives liveness from.
+//! No operation names a filesystem path, a bucket or a URL.
+
 use std::pin::Pin;
-use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use chrono::{DateTime, Utc};
+use futures_util::Stream;
 use tokio::io::AsyncRead;
 
-mod filesystem;
-// The re-export is what makes clippy.toml's `opencargo::storage::FilesystemStorage`
-// resolve; naming the concrete backend is this module's job and nobody else's.
-#[allow(clippy::disallowed_types)]
-pub use filesystem::FilesystemStorage;
+pub mod keys;
 
-/// How a storage backend refuses: the port's own vocabulary, so nothing above
-/// it has to know which backend answered, and nothing in here has to know that
-/// HTTP exists.
+#[cfg(test)]
+pub mod contract;
+
+/// How a storage backend refuses: the port's own vocabulary.
 ///
-/// `InvalidPath` is not a variant for symmetry. "This key is not addressable"
-/// is a fact every backend has — the filesystem's traversal guard and
-/// `s3.md`'s `validate_key` are the same refusal over different key spaces —
-/// and it is the one that must keep its 400; folded into `Other` it would
-/// become a 500.
+/// `InvalidPath` is decided before any I/O and keeps its 400; `Unavailable`
+/// is every other fault and carries no text, the detail being logged by the
+/// adapter where it maps the fault; `Other` is an adapter invariant breach.
 #[derive(Debug, thiserror::Error)]
 pub enum StorageError {
     #[error("file not found")]
@@ -43,42 +42,124 @@ impl From<std::io::Error> for StorageError {
     }
 }
 
-#[async_trait]
-pub trait StorageBackend: Send + Sync {
-    async fn get(&self, path: &str) -> Result<Bytes, StorageError>;
-    async fn put(&self, path: &str, data: Bytes) -> Result<(), StorageError>;
-    /// Append bytes to a file (creating it if absent) and return the new total
-    /// size. Used by chunked uploads to avoid re-reading and rewriting the whole
-    /// blob on every chunk (turns an O(N²) accumulation into O(N)).
-    async fn append(&self, path: &str, data: Bytes) -> Result<u64, StorageError>;
-    async fn delete(&self, path: &str) -> Result<(), StorageError>;
-    /// Recursively delete everything under a path prefix (e.g. a repo's proxy
-    /// cache directory). A no-op if nothing exists at the prefix.
-    async fn delete_prefix(&self, prefix: &str) -> Result<(), StorageError>;
-    async fn exists(&self, path: &str) -> Result<bool, StorageError>;
-    async fn rename(&self, from: &str, to: &str) -> Result<(), StorageError>;
-    /// Open once and hand out the reader with its length, so a later rename of
-    /// the path leaves the reader on the old, complete inode.
-    async fn read_stream(
-        &self,
-        path: &str,
-    ) -> Result<(u64, Pin<Box<dyn AsyncRead + Send>>), StorageError>;
-    /// Remove every `*.part-*` file under `prefix` whose mtime is older than
-    /// `older_than`; returns how many were removed.
-    async fn remove_stale_parts(
-        &self,
-        prefix: &str,
-        older_than: Duration,
-    ) -> Result<u64, StorageError>;
-    /// Validate a key and give back the local name the backend writes it under.
-    /// Only the part uploader needs it, and only until `s3.md` replaces it with
-    /// `writer`/`reserve`/`commit`.
-    fn resolve(&self, path: &str) -> Result<PathBuf, StorageError>;
+/// A committed object as `list`, `head` and `stat` describe it. The key is
+/// logical: no backend prefix.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ObjectMeta {
+    pub key: String,
+    pub size: u64,
+    /// Never earlier than the instant the object became visible at `key`.
+    pub last_modified: DateTime<Utc>,
 }
 
-/// The one place the concrete backend is named outside its own module: the
-/// composition root asks for storage, not for a filesystem.
-#[allow(clippy::disallowed_types)]
-pub fn filesystem(base_path: impl Into<PathBuf>) -> Arc<dyn StorageBackend> {
-    Arc::new(FilesystemStorage::new(base_path))
+pub type ObjectBody = Pin<Box<dyn AsyncRead + Send>>;
+
+pub struct ReadStream {
+    pub total: u64,
+    pub body: ObjectBody,
+}
+
+pub type ObjectList = Pin<Box<dyn Stream<Item = Result<ObjectMeta, StorageError>> + Send>>;
+
+/// A streamed create-or-replace. Nothing is visible until `commit`, and a
+/// writer dropped before it leaves no object.
+#[async_trait]
+pub trait ObjectWriter: Send {
+    /// The only await that may queue on a backend-wide resource. No caller
+    /// wraps it, or `commit`, in a deadline.
+    async fn reserve(&mut self, next_len: usize) -> Result<(), StorageError>;
+
+    async fn write(&mut self, chunk: Bytes) -> Result<(), StorageError>;
+
+    /// Atomic and uncancellable; answers the committed size.
+    async fn commit(self: Box<Self>) -> Result<u64, StorageError>;
+}
+
+/// What a protocol adapter may advertise, and the backend's own bounds, from
+/// which leases and claims derive their length for liveness only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UploadPlan {
+    pub max_object_bytes: u64,
+    pub min_chunk_bytes: u64,
+    pub completion_bound: Duration,
+    pub delete_bound: Duration,
+    pub delete_batch: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CheckStep {
+    pub operation: &'static str,
+    pub outcome: Result<(), String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CheckReport {
+    pub steps: Vec<CheckStep>,
+}
+
+impl CheckReport {
+    pub fn ok(&self) -> bool {
+        self.steps.iter().all(|s| s.outcome.is_ok())
+    }
+}
+
+/// An opaque, declared name for a store: never an endpoint, bucket or path.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct StoreIdentity(pub String);
+
+#[async_trait]
+pub trait StorageBackend: Send + Sync {
+    async fn get(&self, key: &str) -> Result<Bytes, StorageError>;
+
+    /// `writer` + one reserved write + `commit`.
+    async fn put(&self, key: &str, data: Bytes) -> Result<(), StorageError> {
+        let mut writer = self.writer(key).await?;
+        writer.reserve(data.len()).await?;
+        writer.write(data).await?;
+        writer.commit().await?;
+        Ok(())
+    }
+
+    async fn writer(&self, key: &str) -> Result<Box<dyn ObjectWriter>, StorageError>;
+
+    /// The whole object; a mid-body failure is an error, never mixed bytes.
+    async fn read_stream(&self, key: &str) -> Result<ReadStream, StorageError>;
+
+    /// Server-side copy; `Ok` only once an uncached size check of `to` holds.
+    async fn copy_object(&self, from: &str, to: &str) -> Result<(), StorageError>;
+
+    /// A copy whose source need not survive; idempotent on the target.
+    async fn relocate(&self, from: &str, to: &str) -> Result<(), StorageError>;
+
+    /// Existence and size, possibly from a cache: only where a read path
+    /// heals a stale positive.
+    async fn head(&self, key: &str) -> Result<Option<ObjectMeta>, StorageError>;
+
+    /// Existence and size, never cached.
+    async fn stat(&self, key: &str) -> Result<Option<ObjectMeta>, StorageError>;
+
+    /// Absent is `Ok`.
+    async fn delete(&self, key: &str) -> Result<(), StorageError>;
+
+    /// All or an error, never a partial `Ok`.
+    async fn delete_batch(&self, keys: &[String]) -> Result<(), StorageError>;
+
+    /// Recursive and segment-wise: the key equal to `prefix` and everything
+    /// under `prefix/`, committed objects only, reserved segments excluded.
+    fn list(&self, prefix: &str) -> ObjectList;
+
+    /// Reclaims in-flight writer residue older than `older_than`.
+    async fn sweep_abandoned(
+        &self,
+        older_than: Duration,
+        now: DateTime<Utc>,
+    ) -> Result<u64, StorageError>;
+
+    async fn probe(&self) -> Result<(), StorageError>;
+
+    fn upload_plan(&self) -> UploadPlan;
+
+    async fn self_check(&self) -> CheckReport;
+
+    fn identity(&self) -> StoreIdentity;
 }

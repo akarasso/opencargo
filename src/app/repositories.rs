@@ -1,24 +1,27 @@
 //! Administering a repository: creating one, changing one, removing one.
 //!
-//! Each owns the order its writes happen in and what happens outside them —
-//! a proxy's cached files are dropped after the transaction that removes its
-//! row, and before the one that repoints it at a different upstream, because
-//! a store method touches nothing but the database and the cache rows are not
-//! keyed by the upstream they came from.
+//! Each owns the order its writes happen in and what happens outside them.
+//! A removal retires the repository's incarnation in one transaction and
+//! leaves its bytes to `ReclaimOrphans`; a proxy's cached files are dropped
+//! before the transaction that repoints it at a different upstream, because
+//! the cache rows are not keyed by the upstream they came from.
 
 use std::sync::Arc;
 
 use chrono::{DateTime, Utc};
 
 use crate::app::audit::{self, Actor};
-use crate::app::repo_spec::validate_spec;
+use crate::app::reclaim::ReclaimOrphans;
+use crate::app::repo_spec::{refuse_reserved, validate_spec};
 use crate::domain::{
-    Audience, DomainEvent, RepoConfig, RepoKind, RepoSpec, Repository, Visibility,
+    layout, Audience, DomainEvent, Format, RepoConfig, RepoKind, RepoSpec, Repository, Visibility,
 };
 use crate::error::{AppError, AppResult, StoreError};
 use crate::ports::audit::AuditStore;
 use crate::ports::events::Events;
+use crate::ports::reclaim::Candidate;
 use crate::ports::repositories::{RepoPatch, RepositoryStore};
+use crate::storage::StorageBackend;
 use crate::proxy::engine::ProxyEngine;
 use crate::proxy::purge::purge_repository;
 use crate::registry::load_repo;
@@ -54,6 +57,8 @@ pub struct CreateRepository {
     repos: Arc<dyn RepositoryStore>,
     audit: Arc<dyn AuditStore>,
     events: Arc<dyn Events>,
+    storage: Option<Arc<dyn StorageBackend>>,
+    reserved: &'static [&'static str],
 }
 
 impl CreateRepository {
@@ -66,7 +71,43 @@ impl CreateRepository {
             repos,
             audit,
             events,
+            storage: None,
+            reserved: &[],
         }
+    }
+
+    /// The path prefixes the protocol adapters mount, which no new
+    /// repository may take as its name.
+    pub fn reserving(mut self, names: &'static [&'static str]) -> Self {
+        self.reserved = names;
+        self
+    }
+
+    /// Refuse a name whose name-keyed prefixes still hold bytes: the only
+    /// place a name still matters, until the last legacy key is gone.
+    pub fn guarding(mut self, storage: Arc<dyn StorageBackend>) -> Self {
+        self.storage = Some(storage);
+        self
+    }
+
+    async fn legacy_bytes(&self, name: &str) -> AppResult<Option<String>> {
+        use futures_util::StreamExt;
+        let Some(storage) = &self.storage else {
+            return Ok(None);
+        };
+        let mut prefixes: Vec<String> = Format::ALL
+            .iter()
+            .flat_map(|f| layout::name_keyed_prefixes(f.as_str(), name))
+            .collect();
+        prefixes.sort();
+        prefixes.dedup();
+        for prefix in prefixes {
+            if let Some(first) = storage.list(&prefix).next().await {
+                first?;
+                return Ok(Some(prefix));
+            }
+        }
+        Ok(None)
     }
 
     pub async fn run(
@@ -81,7 +122,14 @@ impl CreateRepository {
                 spec.name
             )));
         }
+        refuse_reserved(spec.name, self.reserved)?;
         validate_spec(self.repos.as_ref(), spec, &[]).await?;
+        if let Some(prefix) = self.legacy_bytes(spec.name).await? {
+            return Err(AppError::Conflict(format!(
+                "repository '{}' was removed and its bytes under '{prefix}' are not reclaimed yet;                  run 'opencargo storage reclaim --prefix {prefix}' first",
+                spec.name
+            )));
+        }
 
         let repo = self.repos.create(spec, now).await?;
         recorded(
@@ -180,7 +228,7 @@ pub struct DeleteRepository {
     repos: Arc<dyn RepositoryStore>,
     audit: Arc<dyn AuditStore>,
     events: Arc<dyn Events>,
-    proxy: ProxyEngine,
+    reclaim: Arc<ReclaimOrphans>,
 }
 
 impl DeleteRepository {
@@ -188,33 +236,31 @@ impl DeleteRepository {
         repos: Arc<dyn RepositoryStore>,
         audit: Arc<dyn AuditStore>,
         events: Arc<dyn Events>,
-        proxy: ProxyEngine,
+        reclaim: Arc<ReclaimOrphans>,
     ) -> Self {
         Self {
             repos,
             audit,
             events,
-            proxy,
+            reclaim,
         }
     }
 
-    /// Refused while packages or a group membership remain. The cached files
-    /// go after the commit and outside it: a store method touches nothing but
-    /// the database, and a refused delete purges nothing. A group owns no
-    /// cache — its members keep theirs.
+    /// `RetireRepository`: a fast conflict read, then `retire`, which
+    /// re-checks both conflicts in its transaction, retires the incarnation
+    /// and enqueues its prefixes. The name is free from that commit. The
+    /// prefixes are then reclaimed at once, each claim re-checking; what a
+    /// pass leaves stays queued for the sweep.
     pub async fn run(&self, name: &str, by: &Actor<'_>, now: DateTime<Utc>) -> AppResult<()> {
-        let repo = load_repo(self.repos.as_ref(), name).await?;
+        load_repo(self.repos.as_ref(), name).await?;
         let holders = groups_containing(self.repos.as_ref(), name).await?;
         if !holders.is_empty() {
-            return Err(AppError::Conflict(format!(
-                "repository '{name}' is a member of group(s) {}; remove it from them first",
-                holders.join(", ")
-            )));
+            return Err(held(name, &holders));
         }
 
-        let kind = repo.kind()?;
-        self.repos
-            .delete_empty(name)
+        let prefixes = self
+            .repos
+            .retire(name, now)
             .await
             .map_err(|err| match err {
                 StoreError::Conflict => AppError::Conflict(format!(
@@ -223,13 +269,22 @@ impl DeleteRepository {
                 other => other.into(),
             })?;
 
-        if kind == RepoKind::Proxy {
-            purge_repository(&self.proxy, self.repos.as_ref(), &repo).await?;
-        }
+        let candidates: Vec<Candidate> = prefixes
+            .into_iter()
+            .map(|key| Candidate { key, prefix: true })
+            .collect();
+        self.reclaim.now(&candidates, now).await;
 
         recorded(&*self.audit, &*self.events, by, "repo.delete", name, now).await;
         Ok(())
     }
+}
+
+fn held(name: &str, holders: &[String]) -> AppError {
+    AppError::Conflict(format!(
+        "repository '{name}' is a member of group(s) {}; remove it from them first",
+        holders.join(", ")
+    ))
 }
 
 #[cfg(test)]
@@ -293,6 +348,23 @@ mod tests {
         assert!(matches!(refused, AppError::BadRequest(_)), "{refused:?}");
         assert!(db.repositories().all().await.unwrap().is_empty());
         assert!(db.audit_rows().is_empty());
+    }
+
+    /// A name an adapter mounts is refused before the write, whatever the
+    /// format; the same name is free where nothing reserves it.
+    #[tokio::test]
+    async fn a_reserved_name_is_refused_before_the_write() {
+        let db = FakeDb::new();
+        let refused = CreateRepository::new(db.repositories(), db.audit(), crate::server::event_bus())
+            .reserving(crate::server::RESERVED_NAMES)
+            .run(&spec("maven", &[]), &by(), Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(refused, AppError::BadRequest(ref m) if m.contains("reserved")), "{refused:?}");
+        assert!(db.repositories().all().await.unwrap().is_empty());
+        assert!(db.audit_rows().is_empty());
+        create(&db, &spec("maven", &[])).await.unwrap();
     }
 
     /// What a delete consults before it asks the store: the groups still

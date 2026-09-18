@@ -402,9 +402,9 @@ async fn oci_proxy_purge_removes_rows_and_files_and_leaves_oci_tables_untouched(
             .status(),
         StatusCode::OK
     );
-    let cache_dir = a.tmp.path().join("storage/_proxy_cache/oci-proxy");
     assert_eq!(cache_rows(&a).await.len(), 3);
-    assert!(cache_dir.is_dir());
+    let cached = cache_files(&a).await.len();
+    assert!(cached > 0);
     assert_eq!(oci_table_rows(&a).await, 0);
 
     let resp = reqwest::Client::new()
@@ -418,9 +418,10 @@ async fn oci_proxy_purge_removes_rows_and_files_and_leaves_oci_tables_untouched(
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "{:?}", resp.text().await);
     assert!(cache_rows(&a).await.is_empty());
-    assert!(
-        !cache_dir.exists(),
-        "purge removes the member's cache directory"
+    assert_eq!(
+        cache_files(&a).await.len(),
+        cached,
+        "purge enqueues the member's files and deletes none inline"
     );
     assert_eq!(oci_table_rows(&a).await, 0);
     assert_eq!(
@@ -754,23 +755,12 @@ fn basic(user: &str, pass: &str) -> ProxyOpts {
     }
 }
 
-fn cache_files(server: &TestServer) -> Vec<std::path::PathBuf> {
-    let mut out = Vec::new();
-    let mut stack = vec![server.tmp.path().join("storage/_proxy_cache")];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            } else {
-                out.push(path);
-            }
-        }
-    }
-    out
+async fn cache_files(server: &TestServer) -> Vec<String> {
+    common::stored_keys(server)
+        .await
+        .into_iter()
+        .filter(|k| k.starts_with("r/"))
+        .collect()
 }
 
 #[tokio::test]
@@ -1004,8 +994,10 @@ async fn blob_digest_mismatch_is_502_nothing_stored() {
     ))
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    assert!(cache_rows(&a).await.is_empty(), "no row");
-    assert!(cache_files(&a).is_empty(), "no file, no part left behind");
+    let rows = cache_rows(&a).await;
+    assert!(rows.iter().all(|row| row.0 == "quarantine"), "only the quarantine: {rows:?}");
+    assert_eq!(rows.len(), 1);
+    assert!(cache_files(&a).await.is_empty(), "no file, no part left behind");
 }
 
 #[tokio::test]
@@ -1093,7 +1085,7 @@ async fn head_blob_miss_forwards_head_without_download() {
         0,
         "never downloaded"
     );
-    assert!(cache_rows(&a).await.is_empty() && cache_files(&a).is_empty());
+    assert!(cache_rows(&a).await.is_empty() && cache_files(&a).await.is_empty());
 }
 
 /// Hub answers 401 after a token for an unknown or private image: a 404 to

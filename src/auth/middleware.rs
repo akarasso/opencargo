@@ -1,116 +1,111 @@
+use std::net::{IpAddr, SocketAddr};
+use std::sync::Arc;
+
 use axum::{
     body::Body,
-    extract::State,
-    http::{header, HeaderMap, Request, StatusCode},
+    extract::{ConnectInfo, State},
+    http::{header, HeaderMap, HeaderName, HeaderValue, Method, Request, StatusCode},
     middleware::Next,
     response::{IntoResponse, Response},
     Json,
 };
 use base64::Engine;
-use chrono::Utc;
 use serde_json::json;
-use std::sync::Arc;
 
-use super::rate_limit::RateLimiter;
-use super::tokens;
+use crate::app::authenticate::{Authenticate, Credential, Presented, Refusal, Transport};
 use crate::domain::ApiToken;
 use crate::error::StoreError;
-use crate::ports::tokens::TokenStore;
-use crate::ports::users::UserStore;
-use crate::ports::signing::RegistryTokenSigner;
-use crate::registry::oci::token;
 
-// ---------------------------------------------------------------------------
-// Auth state (passed via axum's State extractor)
-// ---------------------------------------------------------------------------
+pub use crate::app::authenticate::AuthUser;
+
+/// What a protocol adapter declares about the routes it owns: its
+/// challenge, its 401 body, its anonymous-read exemptions and the extra
+/// credential headers it reads. `src/auth` itself knows no route.
+pub trait RouteRules: Send + Sync {
+    fn owns(&self, path: &str) -> bool;
+
+    fn challenge(&self, _method: &Method, _path: &str) -> Option<HeaderValue> {
+        None
+    }
+
+    fn unauthorized(&self) -> Response {
+        unauthorized_response()
+    }
+
+    fn anonymous_exempt(&self, _method: &Method, _path: &str) -> bool {
+        false
+    }
+
+    fn accepts_registry_tokens(&self) -> bool {
+        false
+    }
+
+    fn extra_credentials(&self, _headers: &HeaderMap) -> Vec<Presented> {
+        Vec::new()
+    }
+
+    fn primary(&self, _method: &Method, _path: &str) -> Option<Transport> {
+        None
+    }
+}
 
 #[derive(Clone)]
 pub struct AuthState {
-    pub static_tokens: Vec<String>,
     pub anonymous_read: bool,
-    pub users: Arc<dyn UserStore>,
-    pub tokens: Arc<dyn TokenStore>,
-    /// Shared with `AppState.login_rate_limiter`; throttles Basic Auth attempts.
-    pub login_rate_limiter: Arc<RateLimiter>,
-    /// Names the token realm in every OCI challenge.
-    pub base_url: String,
-    pub registry_tokens: Arc<dyn RegistryTokenSigner>,
+    pub authenticate: Arc<Authenticate>,
+    pub routes: Vec<Arc<dyn RouteRules>>,
+    /// Peers whose `X-Forwarded-For` names the client; nobody by default.
+    pub trusted_proxies: Vec<IpAddr>,
 }
 
-// ---------------------------------------------------------------------------
-// Authenticated user, inserted into request extensions on success
-// ---------------------------------------------------------------------------
-
-#[derive(Clone, Debug)]
-pub struct AuthUser {
-    pub token: String,
-    pub user_id: Option<i64>,
-    pub username: String,
-    pub role: String,
-    /// When true, the user must change their password before doing anything
-    /// other than changing it (enforced in `auth_middleware`).
-    pub must_change_password: bool,
-    /// The API token's display name when one identified the caller.
-    pub token_name: Option<String>,
-}
-
-impl AuthUser {
-    fn from_user(user: crate::domain::User, token: &str, token_name: Option<String>) -> Self {
-        Self {
-            token: token.to_string(),
-            user_id: Some(user.id),
-            username: user.username,
-            role: user.role,
-            must_change_password: user.must_change_password,
-            token_name,
-        }
+impl AuthState {
+    fn route(&self, path: &str) -> Option<&dyn RouteRules> {
+        self.routes.iter().find(|r| r.owns(path)).map(|r| r.as_ref())
     }
 }
 
-/// Why credentials could not be checked, as opposed to being wrong.
-pub(crate) enum AuthFailure {
-    Throttled,
-    Unavailable,
-}
-
-impl IntoResponse for AuthFailure {
-    fn into_response(self) -> Response {
-        match self {
-            AuthFailure::Throttled => too_many_requests_response(),
-            AuthFailure::Unavailable => service_unavailable_response(),
-        }
-    }
-}
-
-enum Credentials {
-    Basic(String, String),
-    Registry(String),
-    Bearer(String),
-    None,
-}
-
-// ---------------------------------------------------------------------------
-// Middleware
-// ---------------------------------------------------------------------------
-
-/// Axum middleware for Bearer and Basic authentication.
-///
-/// Bearer values are static config tokens, DB-backed API tokens or registry
-/// tokens issued by `/v2/token`; Basic credentials are checked against the
-/// user's password. Every 401 under `/v2/` carries the Bearer challenge that
-/// points Docker clients at the token endpoint.
+/// Every request goes through [`Authenticate`]; a credential presented that
+/// does not verify is a 401 whatever its scheme, anonymous is reserved for a
+/// request that presented none.
 pub async fn auth_middleware(
     State(state): State<Arc<AuthState>>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Response {
-    let challenge = request
-        .uri()
-        .path()
-        .starts_with("/v2/")
-        .then(|| token::challenge(&state.base_url, request.method(), request.uri().path()))
-        .flatten();
-    let mut response = authenticate(&state, request, next).await;
+    let path = request.uri().path().to_string();
+    let method = request.method().clone();
+    let route = state.route(&path);
+    let challenge = route.and_then(|r| r.challenge(&method, &path));
+    let unauthorized = || route.map_or_else(unauthorized_response, |r| r.unauthorized());
+
+    let presented = match presented(request.headers(), route) {
+        Ok(presented) => presented,
+        Err(()) => return with_challenge(unauthorized(), challenge),
+    };
+    let source = client_source(&request, &state.trusted_proxies);
+    let primary = route.and_then(|r| r.primary(&method, &path));
+    let response = match state.authenticate.run(&presented, primary, &source).await {
+        Ok(Some(done)) => {
+            if let Some(claims) = done.claims {
+                request.extensions_mut().insert(claims);
+            }
+            match done.user {
+                Some(user) => run_as(user, request, next).await,
+                None => run_anonymous(&state, route, request, next).await,
+            }
+        }
+        Ok(None) if is_read(&method) && route.is_some_and(|r| r.anonymous_exempt(&method, &path)) => {
+            next.run(request).await
+        }
+        Ok(None) => run_anonymous(&state, route, request, next).await,
+        Err(Refusal::Invalid) => unauthorized(),
+        Err(Refusal::Throttled) => too_many_requests_response(),
+        Err(Refusal::Unavailable) => service_unavailable_response(),
+    };
+    with_challenge(response, challenge)
+}
+
+fn with_challenge(mut response: Response, challenge: Option<HeaderValue>) -> Response {
     if let Some(challenge) = challenge.filter(|_| response.status() == StatusCode::UNAUTHORIZED) {
         response
             .headers_mut()
@@ -119,52 +114,42 @@ pub async fn auth_middleware(
     response
 }
 
-async fn authenticate(state: &AuthState, request: Request<Body>, next: Next) -> Response {
-    let is_oci = is_oci_path(request.uri().path());
-    match credentials(request.headers()) {
-        Credentials::Basic(username, password) => {
-            match authenticate_basic(state, &username, &password).await {
-                Ok(Some(auth_user)) => run_as(auth_user, request, next).await,
-                Ok(None) => unauthorized_response(is_oci),
-                Err(failure) => failure.into_response(),
-            }
-        }
-        Credentials::Registry(_) if !request.uri().path().starts_with("/v2/") => {
-            unauthorized_response(false)
-        }
-        Credentials::Registry(raw) => run_registry_token(state, &raw, is_oci, request, next).await,
-        Credentials::Bearer(raw) => match authenticate_bearer(state, &raw).await {
-            Ok(Some(auth_user)) => run_as(auth_user, request, next).await,
-            Ok(None) => run_anonymous(state, request, next).await,
-            Err(e) => {
-                tracing::warn!(error = %e, "store error during bearer authentication");
-                service_unavailable_response()
-            }
-        },
-        Credentials::None if is_read(&request) && is_cargo_config_path(request.uri().path()) => {
-            next.run(request).await
-        }
-        Credentials::None => run_anonymous(state, request, next).await,
-    }
-}
-
-fn credentials(headers: &HeaderMap) -> Credentials {
-    let Some(value) = headers
+/// Every credential the request carries; `Err` for a registry token on a
+/// route that takes none. A scheme this server does not speak is no
+/// credential, as it always was.
+fn presented(headers: &HeaderMap, route: Option<&dyn RouteRules>) -> Result<Vec<Presented>, ()> {
+    let mut all = Vec::new();
+    let authorization = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-    else {
-        return Credentials::None;
-    };
-    if let Some(raw) = value.strip_prefix("Bearer ") {
-        if raw.starts_with(token::PREFIX) {
-            return Credentials::Registry(raw.to_string());
+        .and_then(authorization_credential);
+    if let Some(credential) = authorization {
+        if matches!(credential, Credential::Registry(_))
+            && !route.is_some_and(|r| r.accepts_registry_tokens())
+        {
+            return Err(());
         }
-        return Credentials::Bearer(raw.to_string());
+        all.push(Presented {
+            transport: Transport::Authorization,
+            credential,
+        });
     }
-    match basic_credentials(value) {
-        Some((username, password)) => Credentials::Basic(username, password),
-        None => Credentials::None,
+    if let Some(route) = route {
+        all.extend(route.extra_credentials(headers));
     }
+    Ok(all)
+}
+
+/// The credential of an `Authorization` value: Basic, a registry token, or
+/// any other Bearer. An unknown scheme is not a credential.
+pub(crate) fn authorization_credential(value: &str) -> Option<Credential> {
+    if let Some(raw) = value.strip_prefix("Bearer ") {
+        if raw.starts_with(crate::registry::oci::token::PREFIX) {
+            return Some(Credential::Registry(raw.to_string()));
+        }
+        return Some(Credential::Bearer(raw.to_string()));
+    }
+    basic_credentials(value).map(|(username, password)| Credential::Basic { username, password })
 }
 
 /// The `(username, password)` of a `Basic` header value, if it decodes.
@@ -177,77 +162,32 @@ pub(crate) fn basic_credentials(value: &str) -> Option<(String, String)> {
     Some((username.to_string(), password.to_string()))
 }
 
-/// Check a password, counting only failures against the login rate limiter
-/// so a burst of authenticated requests (a `docker push`) is never throttled.
-/// A DB failure says nothing about the credentials: it is reported as
-/// unavailable and not counted.
-pub(crate) async fn authenticate_basic(
-    state: &AuthState,
-    username: &str,
-    password: &str,
-) -> Result<Option<AuthUser>, AuthFailure> {
-    let rl_key = format!("basic:{username}");
-    if state.login_rate_limiter.is_limited(&rl_key) {
-        return Err(AuthFailure::Throttled);
-    }
-    let user = state.users.by_name(username).await.map_err(|e| {
-        tracing::warn!(error = %e, "store error during basic authentication");
-        AuthFailure::Unavailable
-    })?;
-    if let Some(user) = user {
-        let password_ok =
-            super::users::verify_password_async(password.to_string(), user.password_hash.clone())
-                .await
-                .unwrap_or(false);
-        if password_ok {
-            return Ok(Some(AuthUser::from_user(user, "", None)));
-        }
-    }
-    state.login_rate_limiter.record_failure(&rl_key);
-    Ok(None)
+const X_FORWARDED_FOR: HeaderName = HeaderName::from_static("x-forwarded-for");
+
+/// The peer address, or the address a configured trusted proxy forwarded;
+/// `X-Forwarded-For` from anyone else is ignored.
+pub fn client_source<B>(request: &Request<B>, trusted: &[IpAddr]) -> String {
+    let peer = request
+        .extensions()
+        .get::<ConnectInfo<SocketAddr>>()
+        .map(|c| c.0.ip());
+    source_of(peer, request.headers(), trusted)
 }
 
-/// A registry token names its user, or nobody: an anonymous token walks the
-/// anonymous path, one issued to a static config token is the same synthetic
-/// admin, and a named one is loaded like a DB token.
-async fn run_registry_token(
-    state: &AuthState,
-    raw: &str,
-    is_oci: bool,
-    mut request: Request<Body>,
-    next: Next,
-) -> Response {
-    let Some(claims) = state.registry_tokens.verify(raw) else {
-        return unauthorized_response(is_oci);
+pub(crate) fn source_of(peer: Option<IpAddr>, headers: &HeaderMap, trusted: &[IpAddr]) -> String {
+    let Some(peer) = peer else {
+        return "unknown".to_string();
     };
-    let mut token_name = None;
-    if let Some(id) = claims.api_token_id.as_deref() {
-        match live_api_token_by_id(state, id).await {
-            Ok(Some(api_token)) => token_name = Some(api_token.name),
-            Ok(None) => return unauthorized_response(is_oci),
-            Err(e) => {
-                tracing::warn!(error = %e, "store error during registry token authentication");
-                return service_unavailable_response();
-            }
-        }
+    if !trusted.contains(&peer) {
+        return peer.to_string();
     }
-    let subject = claims.sub.clone();
-    let static_token = claims.static_token;
-    request.extensions_mut().insert(claims);
-    if static_token {
-        return run_as(static_token_user(raw), request, next).await;
-    }
-    let Some(username) = subject else {
-        return run_anonymous(state, request, next).await;
-    };
-    match state.users.by_name(&username).await {
-        Ok(Some(user)) => run_as(AuthUser::from_user(user, raw, token_name), request, next).await,
-        Ok(None) => unauthorized_response(is_oci),
-        Err(e) => {
-            tracing::warn!(error = %e, "store error during registry token authentication");
-            service_unavailable_response()
-        }
-    }
+    headers
+        .get(X_FORWARDED_FOR)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.rsplit(',').next())
+        .and_then(|v| v.trim().parse::<IpAddr>().ok())
+        .unwrap_or(peer)
+        .to_string()
 }
 
 async fn run_as(auth_user: AuthUser, mut request: Request<Body>, next: Next) -> Response {
@@ -260,63 +200,33 @@ async fn run_as(auth_user: AuthUser, mut request: Request<Body>, next: Next) -> 
     next.run(request).await
 }
 
-async fn run_anonymous(state: &AuthState, request: Request<Body>, next: Next) -> Response {
-    if state.anonymous_read && is_read(&request) {
+async fn run_anonymous(
+    state: &AuthState,
+    route: Option<&dyn RouteRules>,
+    request: Request<Body>,
+    next: Next,
+) -> Response {
+    if state.anonymous_read && is_read(request.method()) {
         next.run(request).await
     } else {
-        unauthorized_response(is_oci_path(request.uri().path()))
+        route.map_or_else(unauthorized_response, |r| r.unauthorized())
     }
 }
 
-fn is_read(request: &Request<Body>) -> bool {
-    request.method() == axum::http::Method::GET || request.method() == axum::http::Method::HEAD
+fn is_read(method: &Method) -> bool {
+    method == Method::GET || method == Method::HEAD
 }
 
-fn is_oci_path(path: &str) -> bool {
-    path.starts_with("/v2/")
-}
-
-/// `/{repo}/index/config.json`: cargo reads it before it knows whether to send
-/// a token and learns to from `auth-required`, so a tokenless read passes the
-/// anonymous gate; the handler discloses only existence and format.
-fn is_cargo_config_path(path: &str) -> bool {
-    let mut segments = path.split('/');
-    matches!(
-        (
-            segments.next(),
-            segments.next(),
-            segments.next(),
-            segments.next(),
-            segments.next(),
-        ),
-        (Some(""), Some(repo), Some("index"), Some("config.json"), None) if !repo.is_empty()
+fn unauthorized_response() -> Response {
+    (
+        StatusCode::UNAUTHORIZED,
+        Json(json!({
+            "error": "Invalid or missing authentication token"
+        })),
     )
+        .into_response()
 }
 
-/// Build an unauthorized response; OCI requests get the distribution error
-/// body, and `auth_middleware` adds the Bearer challenge on top.
-fn unauthorized_response(is_oci: bool) -> Response {
-    if is_oci {
-        (
-            StatusCode::UNAUTHORIZED,
-            [("Docker-Distribution-Api-Version", "registry/2.0")],
-            Json(json!({
-                "errors": [{"code": "UNAUTHORIZED", "message": "authentication required"}]
-            })),
-        )
-            .into_response()
-    } else {
-        (
-            StatusCode::UNAUTHORIZED,
-            Json(json!({
-                "error": "Invalid or missing authentication token"
-            })),
-        )
-            .into_response()
-    }
-}
-
-/// 429 response for throttled authentication attempts.
 fn too_many_requests_response() -> Response {
     (
         StatusCode::TOO_MANY_REQUESTS,
@@ -325,8 +235,7 @@ fn too_many_requests_response() -> Response {
         .into_response()
 }
 
-/// 503 response for transient DB failures during authentication — retryable,
-/// unlike the 401 these used to be silently collapsed into.
+/// Retryable, unlike the 401 a store failure used to be collapsed into.
 fn service_unavailable_response() -> Response {
     (
         StatusCode::SERVICE_UNAVAILABLE,
@@ -336,19 +245,16 @@ fn service_unavailable_response() -> Response {
 }
 
 /// While `must_change_password` is set, allow only the password-change endpoint
-/// (`PUT .../password`) and `/-/whoami`; block everything else with 403. This
-/// makes the forced rotation real instead of cosmetic — a long-lived token can
-/// no longer be used indefinitely without changing the password.
+/// (`PUT .../password`) and `/-/whoami`.
 fn password_change_pending_block(
     auth_user: &AuthUser,
-    method: &axum::http::Method,
+    method: &Method,
     path: &str,
 ) -> Option<Response> {
     if !auth_user.must_change_password {
         return None;
     }
-    let allowed =
-        (method == axum::http::Method::PUT && path.ends_with("/password")) || path == "/-/whoami";
+    let allowed = (method == Method::PUT && path.ends_with("/password")) || path == "/-/whoami";
     if allowed {
         None
     } else {
@@ -362,220 +268,63 @@ fn password_change_pending_block(
     }
 }
 
-/// Resolve a Bearer token to an [`AuthUser`].
-///
-/// Static config tokens are checked first with a constant-time comparison
-/// (they map to a synthetic admin user, backwards compat), then DB-backed
-/// API tokens. Shared by the HTTP auth middleware and the WebSocket
-/// first-frame authentication (`api::ws`).
-///
-/// `Ok(None)` means the token was actually rejected (unknown, bad hash,
-/// expired); `Err` means the store could not answer and the caller must NOT
-/// treat the token as invalid.
+/// A Bearer value through [`Authenticate`], for the callers outside the
+/// middleware (the WebSocket's first frame). `Ok(None)` is a rejection,
+/// `Err` a store that could not answer.
 pub(crate) async fn authenticate_bearer(
     state: &AuthState,
     token: &str,
+    source: &str,
 ) -> Result<Option<AuthUser>, StoreError> {
-    let is_static = state.static_tokens.iter().any(|st| {
-        st.len() == token.len()
-            && st
-                .bytes()
-                .zip(token.bytes())
-                .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                == 0
-    });
-    if is_static {
-        return Ok(Some(static_token_user(token)));
-    }
-    try_stored_token_auth(state, token).await
-}
-
-/// The synthetic admin a static config token acts as; it has no row, so
-/// `user_id` is `None` and `username` is a fixed label.
-fn static_token_user(token: &str) -> AuthUser {
-    AuthUser {
-        token: token.to_string(),
-        user_id: None,
-        username: "static-token".to_string(),
-        role: "admin".to_string(),
-        must_change_password: false,
-        token_name: None,
+    let presented = [Presented {
+        transport: Transport::Authorization,
+        credential: Credential::Bearer(token.to_string()),
+    }];
+    match state.authenticate.run(&presented, None, source).await {
+        Ok(done) => Ok(done.and_then(|d| d.user)),
+        Err(Refusal::Unavailable) => Err(StoreError::Unavailable),
+        Err(Refusal::Invalid | Refusal::Throttled) => Ok(None),
     }
 }
 
-/// Attempt to authenticate via a stored API token.
-///
-/// Looks up the token by its prefix, verifies the hash, checks expiration,
-/// loads the user, and records the use. Store errors are propagated instead
-/// of being collapsed into a rejection (the historical "401 under load":
-/// SQLITE_BUSY looked like an invalid token).
-async fn try_stored_token_auth(
-    state: &AuthState,
-    raw_token: &str,
-) -> Result<Option<AuthUser>, StoreError> {
-    let Some(stored) = live_api_token(state, raw_token).await? else {
-        return Ok(None);
-    };
-    let Some(user) = state.users.by_id(stored.user_id).await? else {
-        return Ok(None);
-    };
-    let _ = state.tokens.touch(&stored.id, Utc::now()).await;
-    Ok(Some(AuthUser::from_user(
-        user,
-        raw_token,
-        Some(stored.name),
-    )))
-}
-
-/// The API token behind `raw_token`, if it exists, matches and is still live.
 pub(crate) async fn live_api_token(
     state: &AuthState,
     raw_token: &str,
 ) -> Result<Option<ApiToken>, StoreError> {
-    if raw_token.len() < 16 {
-        return Ok(None);
-    }
-    let Some(stored) = state.tokens.by_prefix(&raw_token[..16]).await? else {
-        return Ok(None);
-    };
-    if !tokens::verify_token(raw_token, &stored.token_hash) || !stored.is_live(Utc::now()) {
-        return Ok(None);
-    }
-    Ok(Some(stored))
-}
-
-/// The API token behind `id`, `None` when missing or expired: one lookup, so
-/// a registry-token request learns the name for free.
-pub(crate) async fn live_api_token_by_id(
-    state: &AuthState,
-    id: &str,
-) -> Result<Option<ApiToken>, StoreError> {
-    let stored = state.tokens.by_id(id).await?;
-    Ok(stored.filter(|token| token.is_live(Utc::now())))
+    state.authenticate.live_api_token(raw_token).await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ports::tokens::NewToken;
-    use crate::ports::users::NewUser;
-    use crate::testing::fakes::FakeDb;
-    use chrono::Duration;
+    use std::net::Ipv4Addr;
 
-    fn state(db: &FakeDb) -> AuthState {
-        AuthState {
-            static_tokens: Vec::new(),
-            anonymous_read: false,
-            users: db.users(),
-            tokens: db.tokens(),
-            login_rate_limiter: Arc::new(RateLimiter::new(5, 60)),
-            base_url: "http://localhost".to_string(),
-            registry_tokens: Arc::new(token::TokenSigner::random()),
-        }
-    }
-
-    /// Issues a token the way `POST /users/{u}/tokens` does, `expires_in_days`
-    /// included, and hands back its raw value.
-    async fn issue(db: &FakeDb, id: &str, expires_in_days: Option<i64>) -> String {
-        let now = Utc::now();
-        let user = db
-            .users()
-            .by_name("ci")
-            .await
-            .unwrap()
-            .expect("the fixture user exists");
-        let (raw, hash) = tokens::generate_token("trg_");
-        db.tokens()
-            .create(
-                &NewToken {
-                    id,
-                    user_id: user.id,
-                    name: "ci-runner",
-                    prefix: &raw[..16],
-                    token_hash: &hash,
-                    expires_at: expires_in_days.map(|days| now + Duration::days(days)),
-                },
-                now,
-            )
-            .await
-            .unwrap();
-        raw
-    }
-
-    async fn with_user() -> FakeDb {
-        let db = FakeDb::new();
-        db.users()
-            .create(
-                &NewUser {
-                    username: "ci",
-                    email: None,
-                    password_hash: "hash",
-                    role: "reader",
-                },
-                Utc::now(),
-            )
-            .await
-            .unwrap();
-        db
-    }
-
-    /// The expiry a caller asked for in days is enforced as an instant, not
-    /// as a string in one adapter's spelling.
-    #[tokio::test]
-    async fn a_token_is_accepted_before_its_expiry_and_rejected_after() {
-        let db = with_user().await;
-        let state = state(&db);
-
-        let live = issue(&db, "t-live", Some(30)).await;
-        let dead = issue(&db, "t-dead", Some(-1)).await;
-        let forever = issue(&db, "t-forever", None).await;
-
-        for raw in [&live, &forever] {
-            let user = authenticate_bearer(&state, raw)
-                .await
-                .unwrap()
-                .expect("a live token authenticates");
-            assert_eq!(
-                (user.username.as_str(), user.token_name.as_deref()),
-                ("ci", Some("ci-runner"))
-            );
-        }
-        assert!(
-            authenticate_bearer(&state, &dead).await.unwrap().is_none(),
-            "an expired token is rejected, not accepted"
+    #[test]
+    fn forwarded_for_is_ignored_without_a_trusted_proxy() {
+        let peer = IpAddr::V4(Ipv4Addr::new(10, 0, 0, 7));
+        let mut headers = HeaderMap::new();
+        headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("203.0.113.9"));
+        assert_eq!(source_of(Some(peer), &headers, &[]), "10.0.0.7");
+        assert_eq!(source_of(Some(peer), &headers, &[peer]), "203.0.113.9");
+        headers.insert(X_FORWARDED_FOR, HeaderValue::from_static("1.1.1.1, 203.0.113.9"));
+        assert_eq!(
+            source_of(Some(peer), &headers, &[peer]),
+            "203.0.113.9",
+            "the address the trusted proxy appended"
         );
+        assert_eq!(source_of(None, &headers, &[peer]), "unknown");
     }
 
-    #[tokio::test]
-    async fn authenticating_records_the_use_but_a_wrong_hash_does_not() {
-        let db = with_user().await;
-        let state = state(&db);
-        let raw = issue(&db, "t-live", None).await;
-
-        assert!(authenticate_bearer(&state, &raw).await.unwrap().is_some());
-        let stored = db.tokens().by_id("t-live").await.unwrap().unwrap();
-        assert!(stored.last_used_at.is_some(), "the use is recorded");
-
-        let forged = format!("{}ffff", &raw[..raw.len() - 4]);
-        assert!(authenticate_bearer(&state, &forged).await.unwrap().is_none());
-    }
-
-    #[tokio::test]
-    async fn live_api_token_by_id_returns_name_and_rejects_expired() {
-        let db = with_user().await;
-        let state = state(&db);
-        issue(&db, "t-live", None).await;
-        issue(&db, "t-dead", Some(-1)).await;
-
-        let live = live_api_token_by_id(&state, "t-live")
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(live.name, "ci-runner");
-        assert!(live_api_token_by_id(&state, "t-dead")
-            .await
-            .unwrap()
-            .is_none());
-        assert!(live_api_token_by_id(&state, "nope").await.unwrap().is_none());
+    #[test]
+    fn an_unreadable_or_foreign_scheme_is_no_credential() {
+        assert!(authorization_credential("Digest abc").is_none());
+        assert!(matches!(
+            authorization_credential("Bearer ocr_x.y"),
+            Some(Credential::Registry(_))
+        ));
+        assert!(matches!(
+            authorization_credential("Bearer trg_abc"),
+            Some(Credential::Bearer(_))
+        ));
     }
 }

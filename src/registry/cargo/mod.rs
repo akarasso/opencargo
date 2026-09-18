@@ -1,3 +1,4 @@
+pub mod auth_rules;
 pub mod download;
 pub mod index;
 pub mod leaves;

@@ -1,11 +1,14 @@
 pub mod audit;
+pub mod auth_sso;
 pub mod dashboard;
 pub mod deps;
+pub mod maven;
 pub mod me;
 pub mod permissions;
 pub mod policy;
 pub mod promote;
 pub mod repositories;
+pub mod storage;
 pub mod tokens;
 pub mod users;
 pub mod vulns;

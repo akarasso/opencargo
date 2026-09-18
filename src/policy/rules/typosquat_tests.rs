@@ -3,9 +3,9 @@ use crate::policy::{Actor, Facts};
 
 /// Ceilings set from the measured residual over the shipped lists: 67,
 /// 101 and 5 once digit, separator and short-head substitutions read as
-/// family markers (82, 138 and 5 before).
-const HOLDOUT_FP_MAX: [(Format, usize); 3] =
-    [(Format::Npm, 75), (Format::Cargo, 110), (Format::Go, 10)];
+/// family markers (82, 138 and 5 before); PyPI measured 160.
+const HOLDOUT_FP_MAX: [(Format, usize); 4] =
+    [(Format::Npm, 75), (Format::Cargo, 110), (Format::Go, 10), (Format::Pypi, 175)];
 
 fn lists(top: &str, known: &str) -> Lists {
     Lists::parse(top, known)
@@ -251,9 +251,11 @@ fn list_text(format: Format, tier: &str) -> &'static str {
         (Format::Npm, "top") => include_str!("../lists/npm.txt"),
         (Format::Cargo, "top") => include_str!("../lists/crates.txt"),
         (Format::Go, "top") => include_str!("../lists/go.txt"),
+        (Format::Pypi, "top") => include_str!("../lists/pypi.txt"),
         (Format::Npm, _) => include_str!("../lists/holdout/npm.txt"),
         (Format::Cargo, _) => include_str!("../lists/holdout/crates.txt"),
         (Format::Go, _) => include_str!("../lists/holdout/go.txt"),
+        (Format::Pypi, _) => include_str!("../lists/holdout/pypi.txt"),
         _ => unreachable!(),
     }
 }
@@ -291,7 +293,7 @@ fn typosquat_holdout_false_positive_rate() {
 
 #[test]
 fn known_list_suppresses_siblings() {
-    for format in [Format::Npm, Format::Cargo, Format::Go] {
+    for format in [Format::Npm, Format::Cargo, Format::Go, Format::Pypi] {
         let lists = shipped(format).unwrap();
         let without_known = Lists::parse(list_text(format, "top"), "");
         let siblings = lists
@@ -337,4 +339,14 @@ fn oci_not_applicable() {
         Typosquat.evaluate(&cfg, &npm, Utc::now()).unwrap().verdict,
         Verdict::WouldBlock
     );
+}
+
+#[test]
+fn pypi_names_compare_as_pep_503_spells_them() {
+    let pypi = shipped(Format::Pypi).unwrap();
+    for spelling in ["requests", "Requests", "python.dateutil", "Python_DateUtil"] {
+        assert_eq!(check(pypi, Format::Pypi, spelling).0, Verdict::Pass, "{spelling}");
+    }
+    assert_eq!(check(pypi, Format::Pypi, "reqeusts").0, Verdict::WouldBlock);
+    assert_eq!(check(pypi, Format::Pypi, "Reqeusts").0, Verdict::WouldBlock, "normalized first");
 }

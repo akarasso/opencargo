@@ -4,7 +4,8 @@
 # 20 000 known names that pass untouched plus the 20 001-40 000 holdout the
 # false-positive test measures. Every name is normalised the way
 # policy::distance::normalize does it: lowercase, `_` -> `-`, Go major
-# suffixes stripped, then deduplicated and sorted.
+# suffixes stripped, PyPI runs of `-_.` one `-` (PEP 503), then deduplicated
+# and sorted. `--only <eco>` regenerates one ecosystem.
 set -euo pipefail
 
 OUT=${OUT:-src/policy/lists}
@@ -14,12 +15,15 @@ DATE=$(date -u +%Y-%m-%d)
 TOP_NPM=5000
 TOP_CRATES=5000
 TOP_GO=2000
+TOP_PYPI=5000
 KNOWN=20000
 
 normalize() {
   local eco=$1
   tr 'A-Z_' 'a-z-' | if [ "$eco" = go ]; then
     sed -E -e 's#/v([2-9]|[1-9][0-9]+)$##' -e 's#^(gopkg\.in/.*)\.v[0-9]+$#\1#'
+  elif [ "$eco" = pypi ]; then
+    sed -E 's#[-.]+#-#g'
   else
     cat
   fi
@@ -34,9 +38,9 @@ write() {
 }
 
 eco_pages() {
-  local registry=$1 first=$2 last=$3 page
+  local registry=$1 first=$2 last=$3 sort=${4:-dependent_packages_count} page
   for page in $(seq "$first" "$last"); do
-    curl -sSf -A "$UA" "$ECO/$registry/packages?per_page=1000&page=$page&sort=dependent_packages_count&order=desc" \
+    curl -sSf -A "$UA" "$ECO/$registry/packages?per_page=1000&page=$page&sort=$sort&order=desc" \
       | jq -r '.[].name'
   done
 }
@@ -62,6 +66,11 @@ top_go() {
     | write "$OUT/go.txt" "ecosyste.ms proxy.golang.org by dependents, first $TOP_GO after major suffixes" "$TOP_GO"
 }
 
+top_pypi() {
+  eco_pages pypi.org 1 $((TOP_PYPI / 1000)) downloads | normalize pypi \
+    | write "$OUT/pypi.txt" "ecosyste.ms pypi.org by downloads, first $TOP_PYPI" "$TOP_PYPI"
+}
+
 known() {
   local eco=$1 registry=$2 pages=$((KNOWN / 1000)) all
   all=$(eco_pages "$registry" 1 $((pages * 2)) | normalize "$eco" | awk '!seen[$0]++')
@@ -71,12 +80,19 @@ known() {
 }
 
 mkdir -p "$OUT/known" "$OUT/holdout"
-if [ "${1:-}" = --known ]; then
+if [ "${1:-}" = --only ]; then
+  case ${2:-} in
+    pypi) top_pypi; known pypi pypi.org ;;
+    *) echo "usage: $0 [--known | --only pypi]" >&2; exit 2 ;;
+  esac
+elif [ "${1:-}" = --known ]; then
   known npm npmjs.org
   known crates crates.io
   known go proxy.golang.org
+  known pypi pypi.org
 else
   top_npm
   top_go
   top_crates
+  top_pypi
 fi

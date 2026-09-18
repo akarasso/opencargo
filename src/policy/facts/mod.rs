@@ -3,7 +3,6 @@ mod oci;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
-use tokio::time::timeout;
 use tracing::debug;
 
 use crate::proxy::engine::Cached;
@@ -75,6 +74,21 @@ pub(crate) async fn gather(shared: &Shared, cfg: &PolicyConfig, p: Pending) -> R
             facts.date_source = source;
             (digest, version, at)
         }
+        Source::Pypi { digest, uploaded } => {
+            let at = uploaded.as_deref().and_then(parse_time);
+            facts.date_source = match (&cfg.min_release_age, at) {
+                (None, _) => "none",
+                (Some(_), Some(_)) => "page",
+                (Some(_), None) => "failed",
+            };
+            let at = cfg.min_release_age.as_ref().and(at);
+            (digest, version, at)
+        }
+        Source::Nuget { body, published } => {
+            facts.install_scripts = nuget_install_assets(&shared.proxy, &body).await;
+            facts.date_source = if published.is_some() { "registration" } else { "none" };
+            (body.entry.digest.clone(), version, published)
+        }
         Source::Oci {
             body,
             served,
@@ -142,20 +156,33 @@ pub(crate) async fn fetch_missing<S: UpstreamStrategy>(
     if !cfg.fetch_missing_facts {
         return (None, "not-fetched");
     }
-    match timeout(
-        shared.tuning.gather_timeout,
-        shared.proxy.observe(s, up, member, a),
-    )
-    .await
-    {
-        Err(_) => (None, "timeout"),
-        Ok(Ok(Outcome::Found(cached))) => (Some(cached), "fetch"),
-        Ok(Ok(Outcome::NotFound)) => (None, "not-found"),
-        Ok(Err(e)) => {
+    let observed = shared
+        .proxy
+        .observe_within(s, up, member, a, shared.tuning.gather_timeout)
+        .await;
+    match observed {
+        Ok(None) => (None, "timeout"),
+        Ok(Some(Outcome::Found(cached))) => (Some(cached), "fetch"),
+        Ok(Some(Outcome::NotFound)) => (None, "not-found"),
+        Err(e) => {
             debug!(artifact = ?a, error = %e, "fact fetch failed");
             (None, "failed")
         }
     }
+}
+
+/// Whether a served `.nupkg` carries assets NuGet runs or imports on
+/// install, read from its bytes through the storage port, never a path.
+pub(crate) async fn nuget_install_assets(
+    proxy: &crate::proxy::ProxyEngine,
+    body: &Cached,
+) -> Option<bool> {
+    let bytes = proxy.bytes(body).await.ok()?;
+    tokio::task::spawn_blocking(move || crate::registry::nuget::nuspec::entries(&bytes).ok())
+        .await
+        .ok()
+        .flatten()
+        .map(|entries| crate::registry::nuget::nuspec::executes_on_install(&entries))
 }
 
 pub(crate) async fn read_json(shared: &Shared, cached: &Cached) -> Option<Value> {
@@ -313,6 +340,14 @@ mod tests {
             ),
             (Format::Go, Source::Go { digest: None }, None),
             (
+                Format::Pypi,
+                Source::Pypi {
+                    digest: Some("dd".into()),
+                    uploaded: None,
+                },
+                Some("dd"),
+            ),
+            (
                 Format::Oci,
                 Source::Oci {
                     body: cached("cc"),
@@ -336,6 +371,73 @@ mod tests {
             assert_eq!(r.requested_repo, "requested");
         }
         assert!(fx.hits().is_empty(), "no rule on, no request");
+    }
+
+    /// NuGet 3.4: the package is read through the storage port, which here
+    /// has no filesystem behind it at all.
+    #[tokio::test]
+    async fn nuget_install_assets_verdicts() {
+        use crate::policy::rules::install_scripts::InstallScripts;
+        use crate::policy::rules::Rule;
+        use crate::domain::Verdict;
+        use crate::policy::{Actor, Facts};
+        use crate::storage::StorageBackend;
+        use crate::testing::storage::MemStorage;
+        use std::io::Write as _;
+
+        fn package(extra: Option<&str>) -> bytes::Bytes {
+            let mut out = std::io::Cursor::new(Vec::new());
+            let mut zip = zip::ZipWriter::new(&mut out);
+            let options = zip::write::SimpleFileOptions::default();
+            zip.start_file("lib/net8.0/a.dll", options).unwrap();
+            zip.write_all(b"MZ").unwrap();
+            if let Some(path) = extra {
+                zip.start_file(path, options).unwrap();
+                zip.write_all(b"x").unwrap();
+            }
+            zip.finish().unwrap();
+            bytes::Bytes::from(out.into_inner())
+        }
+
+        let fx = Fx::new().await;
+        let mem = MemStorage::new();
+        let engine = fx.engine_over(
+            std::sync::Arc::new(mem.clone()),
+            crate::proxy::Timeouts::from_connect_secs(1),
+        );
+        let cfg = PolicyConfig {
+            install_scripts: true,
+            ..Default::default()
+        };
+        for (extra, expected, verdict) in [
+            (Some("tools/install.ps1"), Some(true), Verdict::WouldBlock),
+            (Some("buildTransitive/a.targets"), Some(true), Verdict::WouldBlock),
+            (None, Some(false), Verdict::Pass),
+        ] {
+            mem.put("r/i/_proxy/nuget-nupkg/a", package(extra)).await.unwrap();
+            let mut body = cached("aa");
+            body.entry.storage_path = Some("r/i/_proxy/nuget-nupkg/a".into());
+            let fact = nuget_install_assets(&engine, &body).await;
+            assert_eq!(fact, expected, "{extra:?}");
+            let r = Resolution {
+                requested_repo: "r".into(),
+                member_repo: "m".into(),
+                format: Format::Nuget,
+                name: "a".into(),
+                version: Some("1.0.0".into()),
+                digest: None,
+                actor: Actor::of(None),
+                published_at: None,
+                facts: Facts {
+                    install_scripts: fact,
+                    date_source: "none",
+                },
+            };
+            assert_eq!(InstallScripts.evaluate(&cfg, &r, Utc::now()).unwrap().verdict, verdict);
+        }
+        let mut missing = cached("aa");
+        missing.entry.storage_path = Some("gone".into());
+        assert_eq!(nuget_install_assets(&engine, &missing).await, None, "unread is unknown");
     }
 
     #[tokio::test]

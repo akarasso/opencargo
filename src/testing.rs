@@ -13,6 +13,10 @@
 #[path = "../tests/common/fakes.rs"]
 pub mod fakes;
 
+#[cfg(test)]
+#[path = "../tests/common/fake_idp.rs"]
+pub mod fake_idp;
+
 /// The proxy-engine fixture: a temp database, a fake upstream and a storage
 /// root. It lives here rather than under `src/proxy/` because four other
 /// modules build their engine and their pool out of it, and because the proxy
@@ -24,3 +28,19 @@ pub mod fixture;
 /// holds ports instead of the whole application state.
 #[cfg(test)]
 pub mod resolver;
+
+/// An in-memory storage backend with a delete log and injected faults.
+#[cfg(test)]
+pub mod storage;
+
+/// An in-process S3 endpoint with injectable faults, for the S3 adapter.
+#[cfg(test)]
+pub mod fake_s3;
+
+/// The multipart ledger in memory.
+#[cfg(test)]
+pub mod ledger;
+
+/// A TCP relay that resets or stalls a matching connection.
+#[cfg(test)]
+pub mod relay;

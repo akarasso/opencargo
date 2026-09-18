@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use sha2::Digest;
 use tracing::info;
 
-use crate::app::publish::{Artifact, PublishVersion};
+use crate::app::publish::Artifact;
 use crate::app::releases::Yank;
 use crate::app::publish_tail::Published;
 use crate::auth::middleware::AuthUser;
@@ -66,8 +66,8 @@ pub async fn publish_crate(
     let user = require_user(auth_user)?;
     let repo = load_hosted(&state, &repo_name, &user).await?;
     let (meta, crate_data) = parse_publish_body(&body)?;
-    crate::domain::validate_package_name("cargo", &meta.name)?;
-    crate::domain::validate_version(&meta.vers)?;
+    crate::registry::rules::rules_of(crate::domain::Format::Cargo)?.validate(&meta.name)?;
+    crate::registry::rules::rules_of(crate::domain::Format::Cargo)?.validate_version(&meta.vers)?;
 
     let sha256_hex = checksum(&crate_data).await?;
     let metadata_json = serde_json::to_string(&meta)?;
@@ -81,12 +81,9 @@ pub async fn publish_crate(
     // the stored artifact of the version it is about to be refused for.
     refuse_duplicate(&state, repo.id, &meta).await?;
 
-    let storage_path = format!(
-        "cargo/{repo_name}/{}/{}-{}.crate",
-        meta.name, meta.name, meta.vers
-    );
+    let filename = format!("{}-{}.crate", meta.name, meta.vers);
     let size = crate_data.len() as i64;
-    let landed = PublishVersion::new(state.packages.clone(), state.storage.clone())
+    let landed = state.publish_version()
         .run(
             Artifact {
                 repository: repo.id,
@@ -100,7 +97,7 @@ pub async fn publish_crate(
                 checksum_sha1: None,
                 checksum_sha256: Some(&sha256_hex),
                 integrity: None,
-                storage_path: &storage_path,
+                filename: &filename,
                 dist_tags: &[],
                 bytes: crate_data,
             },

@@ -2,7 +2,7 @@ import { For, Show, createSignal } from 'solid-js';
 import Icon from '../../components/Icon.tsx';
 import { RequireAdmin } from '../../components/guards.tsx';
 import { LoadError, TableSkeleton } from '../../components/bits.tsx';
-import { fetchHealthReady, fetchMetrics } from '../../core/api.ts';
+import { fetchHealthReady, fetchMetrics, fetchStorageStatus } from '../../core/api.ts';
 import { createLiveResource } from '../../core/stores/live.ts';
 import { parsePrometheusMetrics } from '../../core/prometheus.ts';
 
@@ -18,6 +18,7 @@ function SystemInner() {
   // No WS event carries health/metrics changes — poll while the tab is visible.
   const [health, refetchHealth] = createLiveResource(fetchHealthReady, [], { debounce: 500, pollMs: 15_000 });
   const [metricsRaw, refetchMetrics] = createLiveResource(fetchMetrics, [], { debounce: 500, pollMs: 15_000 });
+  const [storage, refetchStorage] = createLiveResource(fetchStorageStatus, [], { debounce: 500, pollMs: 15_000 });
   const [filter, setFilter] = createSignal('');
 
   const metrics = () => {
@@ -44,6 +45,7 @@ function SystemInner() {
             onClick={() => {
               void refetchHealth();
               void refetchMetrics();
+              void refetchStorage();
             }}
           >
             <Icon name="refresh" size={14} />
@@ -53,7 +55,7 @@ function SystemInner() {
       </div>
 
       <div class="stagger">
-        <section class="stats-grid section" style={{ 'grid-template-columns': 'repeat(2, minmax(0, 1fr))' }}>
+        <section class="stats-grid section" style={{ 'grid-template-columns': 'repeat(3, minmax(0, 1fr))' }}>
           <div class="stat" style={{ '--stat-tint': health()?.status === 'ok' ? 'var(--ok)' : 'var(--danger)' }}>
             <div class="stat-head">
               <span class="stat-label">Database</span>
@@ -65,6 +67,27 @@ function SystemInner() {
               </Show>
             </div>
             <div class="stat-foot">SQLite · embedded</div>
+          </div>
+          <div class="stat" style={{ '--stat-tint': storage()?.ready ? 'var(--ok)' : 'var(--danger)' }}>
+            <div class="stat-head">
+              <span class="stat-label">Storage</span>
+              <Icon name="database" size={16} />
+            </div>
+            <div class="stat-value" style={{ 'font-size': '1.3rem' }}>
+              <Show when={storage()} fallback={<span class="dim">checking…</span>}>
+                {(s) => <>{s().ready ? 'Healthy' : 'Unavailable'}</>}
+              </Show>
+            </div>
+            <div class="stat-foot">
+              <Show when={storage()} fallback={<>—</>}>
+                {(s) => (
+                  <>
+                    {s().backend === 's3' ? 'S3' : 'Filesystem'} · {s().identity} · {s().multipart_in_flight} uploads open ·{' '}
+                    {s().reclaim_candidates} awaiting reclamation
+                  </>
+                )}
+              </Show>
+            </div>
           </div>
           <div class="stat" style={{ '--stat-tint': 'var(--steel)' }}>
             <div class="stat-head">
@@ -78,6 +101,9 @@ function SystemInner() {
           </div>
         </section>
 
+        <Show when={storage.error}>
+          <LoadError what="storage status" />
+        </Show>
         <Show when={metricsRaw.error}>
           <LoadError what="metrics" />
         </Show>

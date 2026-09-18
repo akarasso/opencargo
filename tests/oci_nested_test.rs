@@ -160,37 +160,36 @@ async fn push_pull_team_app_and_org_team_app_on_every_route() {
     every_route_roundtrip(&client, &server.base_url, "org/team/app").await;
 }
 
+/// Manifest keys carry the image, blob keys only the digest, and both lie
+/// under the repository's incarnation rather than its name.
 #[tokio::test]
-async fn manifest_path_unchanged_for_single_segment_names() {
+async fn manifest_keys_carry_the_image_and_blob_keys_do_not() {
     let server = setup().await;
     let client = reqwest::Client::new();
-    let storage = server.tmp.path().join("storage");
 
-    for (name, dir) in [
-        ("myapp", "myapp/manifests/myapp"),
-        ("team/app", "team/app/manifests/team/app"),
-    ] {
+    for name in ["myapp", "team/app"] {
         let image = format!("{REPO}/{name}");
         let (manifest, resp) = push_image(&client, &server.base_url, &image, "v1").await;
         assert_eq!(resp.status(), StatusCode::CREATED);
-        let hex = sha256_digest(&manifest)
-            .trim_start_matches("sha256:")
-            .to_string();
-        let manifest_file = storage.join(format!("oci/{REPO}/{dir}/sha256/{hex}"));
-        assert!(
-            manifest_file.is_file(),
-            "{name}: expected {manifest_file:?}"
-        );
-        assert_eq!(std::fs::read(&manifest_file).unwrap(), manifest);
-
+        let hex = sha256_digest(&manifest).trim_start_matches("sha256:").to_string();
         let layer_hex = sha256_digest(format!("layer-of-{image}").as_bytes())
             .trim_start_matches("sha256:")
             .to_string();
-        let blob_file = storage.join(format!("oci/{REPO}/_blobs/sha256/{layer_hex}"));
-        assert!(
-            blob_file.is_file(),
-            "{name}: blobs never carry the image name"
-        );
+
+        let files = common::stored_keys(&server).await;
+        let manifest_file = files
+            .iter()
+            .find(|f| f.contains(&format!("/{name}/{hex}/manifest~")))
+            .unwrap_or_else(|| panic!("{name}: no manifest key in {files:?}"));
+        assert!(manifest_file.starts_with("r/"), "{manifest_file}");
+        let stored = common::storage_of(&server).await.get(manifest_file).await.unwrap();
+        assert_eq!(stored.as_ref(), manifest.as_slice());
+        let blob_file = files
+            .iter()
+            .find(|f| f.contains(&format!("/_blobs/{layer_hex}/blob~")))
+            .unwrap_or_else(|| panic!("{name}: no blob key in {files:?}"));
+        assert!(!blob_file.contains(name), "blobs never carry the image name");
+        assert!(!files.iter().any(|f| f.contains(REPO)), "no key names the repository");
     }
 }
 

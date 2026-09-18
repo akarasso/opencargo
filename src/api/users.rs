@@ -118,6 +118,14 @@ pub async fn update_user(
     let caller = require_auth(&request)?;
     require_admin_or_self(&caller, &username)?;
     let body: UpdateUserRequest = read_json(request).await?;
+    if body.role.is_some() {
+        let user = load_user(&state, &username).await?;
+        if !state.identities.of_user(user.id).await?.is_empty() {
+            return Err(AppError::Conflict(
+                "the role of an account linked to SSO follows its provider's rules".into(),
+            ));
+        }
+    }
 
     let user = UpdateUser::new(state.users.clone(), state.audit.clone(), state.events.clone())
         .run(
@@ -161,7 +169,7 @@ pub async fn change_password(
     require_admin_or_self(&caller, &username)?;
     let body: ChangePasswordRequest = read_json(request).await?;
 
-    ChangePassword::new(state.users.clone())
+    ChangePassword::new(state.users.clone(), state.auth.authenticate.clone())
         .run(
             &username,
             body.current_password.as_deref(),

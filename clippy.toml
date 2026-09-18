@@ -36,7 +36,7 @@ disallowed-types = [
   # Step 2a. A backstop only: the lint sees field types, `use` items and type
   # positions, never `FilesystemStorage::new(..)` in expression position, so
   # scripts/boundary.sh's concrete-fs row (== 0) is the real check.
-  { path = "opencargo::storage::FilesystemStorage", reason = "storage is reached through Arc<dyn StorageBackend>; the concrete backend is named in src/storage/ alone" },
+  { path = "opencargo::adapters::fs::FilesystemStorage", reason = "storage is reached through Arc<dyn StorageBackend>; the concrete backend is named by the composition root alone" },
 ]
 
 # Step 8e. The greps of 4.2 stay alongside: they catch a spelling nobody

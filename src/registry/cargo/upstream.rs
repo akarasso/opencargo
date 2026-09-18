@@ -1,8 +1,8 @@
-use axum::http::{header, HeaderName, HeaderValue};
+use axum::http::{header, HeaderMap, HeaderName, HeaderValue};
 
 use crate::proxy::strategy::{
-    CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
-    MAX_METADATA_BYTES,
+    CacheKey, CachePolicy, DigestAlgorithm, DigestSource, ExpectedDigests, Transfer, Ttl,
+    UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES, MAX_METADATA_BYTES,
 };
 use crate::registry::resolve::{ResolveError, Upstream};
 
@@ -131,10 +131,16 @@ impl UpstreamStrategy for CargoUpstream {
         }
     }
 
-    fn expected_sha256(&self, a: &CargoArtifact) -> Option<String> {
+    /// The index's checksum for a crate; the index and API documents carry
+    /// nothing to verify against.
+    fn expected_digests(&self, a: &CargoArtifact, _h: &HeaderMap) -> ExpectedDigests {
         match a {
-            CargoArtifact::Crate { cksum, .. } => Some(cksum.clone()),
-            _ => None,
+            CargoArtifact::Crate { cksum, .. } => ExpectedDigests::none().with(
+                DigestAlgorithm::Sha256,
+                cksum,
+                DigestSource::Known,
+            ),
+            _ => ExpectedDigests::none(),
         }
     }
 }
@@ -336,9 +342,13 @@ mod tests {
         assert_eq!(s.cache_policy(&c), CachePolicy::Immutable);
         assert_eq!(s.transfer(&c), Transfer::Streamed);
         assert_eq!(
-            s.expected_sha256(&c).as_deref(),
+            s.expected_digests(&c, &HeaderMap::new())
+                .known(DigestAlgorithm::Sha256),
             Some("ab".repeat(32).as_str())
         );
+        assert!(s
+            .expected_digests(&CargoArtifact::Config, &HeaderMap::new())
+            .is_empty());
     }
 
     #[test]

@@ -19,7 +19,9 @@
 //! `UpdateUser` and `DeleteUser` are `users`, with the self-service password
 //! change beside them; `IssueToken` and `RevokeToken` are `tokens`;
 //! `SetPermission` is `permissions`, with its withdrawal; `CreateWebhook` is
-//! `webhooks`; `ScanVersion` is `scan`. `events` and `audit` are not use
+//! `webhooks`; `ScanVersion` is `scan`; `Authenticate` is `authenticate`,
+//! behind the auth middleware, npm login, the token endpoint and the
+//! password change. `events` and `audit` are not use
 //! cases but the two tails every one of them ends with: which audience an
 //! event has, and what the trail records.
 //!
@@ -35,22 +37,31 @@
 //! - `ReportTotals`: one delegation to the memoized snapshot the policy
 //!   engine holds over `PolicyStore` (`policy/mod.rs`), which is parse, call
 //!   one port, encode;
-//! - `Authenticate`: the auth middleware, which is a tower layer and cannot
-//!   be anything else;
 //! - `AuthorizeRepoAction`: a pure domain function over one grant lookup
 //!   (`domain::allows`), applied by the format modules as their write gate.
 
 pub mod audit;
+pub mod authenticate;
 pub mod events;
+pub mod maven;
+pub mod nuget;
+pub mod login_gate;
 pub mod oci;
 pub mod permissions;
+pub mod place;
 pub mod promote;
+pub mod pypi;
 pub mod publish;
 pub mod publish_tail;
+pub mod reclaim;
+pub mod reconcile;
 pub mod releases;
 pub mod repo_spec;
 pub mod repositories;
 pub mod scan;
+pub mod storage_ops;
+pub mod sso;
+pub mod sweep_storage;
 pub mod tokens;
 pub mod users;
 pub mod webhooks;

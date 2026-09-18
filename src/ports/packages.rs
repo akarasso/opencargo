@@ -12,6 +12,7 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
 use crate::domain::{DistTag, Package, Version};
+use crate::ports::reclaim::PinToken;
 use crate::error::StoreError;
 
 /// How a package name is matched. Cargo's names are unique regardless of
@@ -45,7 +46,20 @@ pub struct NewRelease<'a> {
     pub tarball_path: &'a str,
     /// The tags that point at this version once it exists.
     pub dist_tags: &'a [String],
+    /// Edges out of this version, written in the same transaction so a
+    /// visible version never lacks them.
+    pub dependencies: &'a [ReleaseDependency<'a>],
+    /// The pins of the keys the row references, spent by compare-and-set in
+    /// the transaction; a revoked one makes the publish write nothing.
+    pub pins: &'a [PinToken],
     pub now: DateTime<Utc>,
+}
+
+/// One dependency edge of a release, recorded with its version row.
+pub struct ReleaseDependency<'a> {
+    pub name: &'a str,
+    pub requirement: &'a str,
+    pub kind: &'a str,
 }
 
 /// What a publish landed: both rows, as stored.
@@ -68,9 +82,8 @@ pub struct PromotionAudit<'a> {
 
 /// A version already published elsewhere, arriving in another repository.
 ///
-/// The blob is the caller's business and is copied *before* this runs: a
-/// gigabyte-long copy inside the transaction would hold SQLite's single
-/// writer for its whole duration.
+/// The blob is placed *before* this runs: a gigabyte-long copy inside the
+/// transaction would hold SQLite's single writer for its whole duration.
 pub struct Promotion<'a> {
     pub source: &'a Version,
     pub target_repository: i64,
@@ -80,6 +93,8 @@ pub struct Promotion<'a> {
     pub tarball_path: &'a str,
     /// The tags the source version holds, which the promoted one inherits.
     pub dist_tags: &'a [String],
+    /// As for a publish: spent in the transaction, all or none.
+    pub pins: &'a [PinToken],
     pub audit: PromotionAudit<'a>,
     pub now: DateTime<Utc>,
 }
@@ -120,6 +135,13 @@ pub trait PackageStore: Send + Sync {
     async fn version(&self, package: i64, version: &str)
         -> Result<Option<Version>, StoreError>;
 
+    /// The package's version stamp (A1 C5), opaque: every publish, yank,
+    /// unyank and delete of one of its versions moves it, nothing else does,
+    /// and equal stamps mean the same version rows in the same listing
+    /// state, so a reader validates what it derived from them without
+    /// reading them again.
+    async fn stamp(&self, package: i64) -> Result<String, StoreError>;
+
     async fn dist_tags(&self, package: i64) -> Result<Vec<DistTag>, StoreError>;
 
     /// The package upsert, the version row and this version's dist-tags, in
@@ -127,7 +149,7 @@ pub trait PackageStore: Send + Sync {
     ///
     /// `Conflict` when that `package@version` is already there, including
     /// when two callers race for it: the unique constraint is the arbiter,
-    /// not a preceding read.
+    /// not a preceding read. `Superseded` when a pin was revoked.
     async fn publish_version(&self, release: &NewRelease<'_>) -> Result<Release, StoreError>;
 
     /// The package upsert in the target repository, the version row, its
@@ -176,10 +198,9 @@ pub trait PackageStore: Send + Sync {
     /// it is gone. None of those four foreign keys cascades, so the deletion
     /// is this method's to perform and not the schema's.
     ///
-    /// The artifact is deliberately not part of it: the caller deletes the
-    /// blob *before* calling, because the version row holds the only record
-    /// of its path, and no store method is allowed to touch storage.
-    async fn delete_version(&self, version: i64) -> Result<(), StoreError>;
+    /// The artifact's key is enqueued for reclamation in the same
+    /// transaction; nothing is deleted from storage (A1 C5bis N1).
+    async fn delete_version(&self, version: i64, now: DateTime<Utc>) -> Result<(), StoreError>;
 
     /// One more download of a version, as a counter rather than a row per
     /// download. Best-effort at every call site: a served artifact is not

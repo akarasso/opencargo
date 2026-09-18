@@ -141,6 +141,53 @@ union of its members, `@latest` with the highest semver, and `.info`/`.mod`/
 `410`: `404` (negative-cached; an empty `@v/list` for a known module is
 `200`); upstream down: `502`. The checksum database is not proxied.
 
+## NuGet (v3)
+
+```
+GET    /{repo}/v3/index.json                                  Service index
+PUT    /{repo}/v3/package                                     Push (multipart, first file = .nupkg); also /api/v2/package
+DELETE /{repo}/v3/package/{id}/{version}                      Unlist
+POST   /{repo}/v3/package/{id}/{version}                      Relist
+GET    /{repo}/v3/flatcontainer/{id}/index.json               Every version, listed or not
+GET    /{repo}/v3/flatcontainer/{id}/{version}/{id}.{version}.nupkg
+GET    /{repo}/v3/flatcontainer/{id}/{version}/{id}.nuspec
+GET    /{repo}/v3/registration/{id}/index.json                Pages inlined up to 128 versions
+GET    /{repo}/v3/registration/{id}/{version}.json
+GET    /{repo}/v3/registration/{id}/page/{lower}/{upper}.json
+GET    /{repo}/v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=
+```
+
+Point `dotnet` at `{base_url}/{repo}/v3/index.json`. Ids are case-insensitive and
+versions normalized as NuGet does (`1.0`, `1.0.0.0`, `01.0.0` and `1.0.0+meta` are one
+version): a second push of any spelling is `409`, an invalid package `400`, a package over
+250 MiB `413`; concurrent pushes share a 512 MiB spool, and one that waits more than 30 s for
+its share is `503`. A push takes an API token as `X-NuGet-ApiKey` (`dotnet nuget push -k`) or as
+the Basic password of `packageSourceCredentials`; every credential presented is verified, one
+invalid is `401`, and when the key and the Basic credential name different users the key wins
+on push and delete. A key that is neither an API token (`trg_` prefix) nor a static token is not a credential: Azure
+Artifacts' convention `-k az` beside Basic credentials pushes with the Basic credential alone,
+while a `trg_` key that fails verification is still `401`. The service index is read before the
+push, so a private repository needs `packageSourceCredentials` even when `-k` is given.
+
+Delete is an unlist: the version leaves search and stays restorable by exact version. A 401
+carries `WWW-Authenticate: Basic`, and an anonymous caller on a group with a member it cannot
+read gets a 401 whatever the package, so `dotnet restore` asks for credentials instead of
+reporting NU1101; an authenticated caller sees the group as if that member were absent.
+A hosted push stores the `.nupkg` and nothing else: the `.nuspec` is read out of it at push,
+kept with the version row and served from there, never stored as a file of its own.
+
+A `proxy` takes a v3 service index as `upstream` (`https://api.nuget.org/v3/index.json`). Its
+documents are rendered with this server's URLs, except `catalogEntry.@id`. A `.nupkg` is
+verified against the sha512 of its registration entry, else of its catalog leaf; a republish
+under a new hash is fetched again. Resources on another origin than the upstream's receive no
+credentials, and any redirect off the origin asked is refused (`502`). A `group` merges
+versions and registrations by version, the first member winning, and search hits by id. A
+member down never makes a `404`: the other members and verified cache answer, else `502`.
+A merged flat index or registration is kept in memory: while the hosted members' versions do
+not change, and for at most 60 s when a proxy member contributed to it. A publish, unlist or
+relist shows at once; a new upstream version may take up to that long. Storage or database
+unavailable is `503`.
+
 ## Administration
 
 ```

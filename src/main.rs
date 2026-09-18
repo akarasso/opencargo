@@ -40,6 +40,88 @@ enum Commands {
     },
     /// Run database migrations
     Migrate,
+    /// Operate on the artifact store; the server must be stopped for
+    /// `migrate` and `reclaim`
+    Storage {
+        #[command(subcommand)]
+        command: StorageCommand,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum StorageCommand {
+    /// Probe the store and exercise every operation on its reserved tree
+    Check,
+    /// List keys rows reference with no object, and with --orphans the
+    /// objects nothing references
+    Verify {
+        #[arg(long)]
+        orphans: bool,
+    },
+    /// Copy every object into the store another config file declares
+    Migrate {
+        #[arg(long)]
+        to: PathBuf,
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Run one reclamation pass, or empty a prefix no repository names
+    Reclaim {
+        #[arg(long)]
+        prefix: Option<String>,
+    },
+}
+
+async fn storage(cfg: &config::Config, command: StorageCommand) -> anyhow::Result<()> {
+    let now = chrono::Utc::now();
+    match command {
+        StorageCommand::Check => {
+            let report = server::storage_check(cfg).await?;
+            for step in &report.steps {
+                match &step.outcome {
+                    Ok(()) => println!("ok    {}", step.operation),
+                    Err(e) => println!("FAIL  {}: {e}", step.operation),
+                }
+            }
+            if !report.ok() {
+                anyhow::bail!("storage check failed");
+            }
+        }
+        StorageCommand::Verify { orphans } => {
+            let report = server::storage_verify(cfg, orphans, now).await?;
+            for key in &report.missing {
+                println!("missing  {key}");
+            }
+            for key in &report.orphans {
+                println!("orphan   {key}");
+            }
+            println!(
+                "{} objects, {} missing, {} orphans",
+                report.objects,
+                report.missing.len(),
+                report.orphans.len()
+            );
+            if !report.missing.is_empty() {
+                anyhow::bail!("rows reference missing objects");
+            }
+        }
+        StorageCommand::Migrate { to, dry_run } => {
+            let target = config::load_config(Some(&to))?;
+            let report = server::storage_migrate(cfg, &target, dry_run).await?;
+            println!(
+                "{} {} objects ({} bytes), {} already there",
+                if dry_run { "would copy" } else { "copied" },
+                report.copied,
+                report.bytes,
+                report.skipped
+            );
+        }
+        StorageCommand::Reclaim { prefix } => {
+            let report = server::storage_reclaim(cfg, prefix.as_deref(), now).await?;
+            println!("{report:?}");
+        }
+    }
+    Ok(())
 }
 
 #[tokio::main]
@@ -56,6 +138,9 @@ async fn main() -> anyhow::Result<()> {
     let mut cfg = config::load_config(cli.config.as_deref())?;
     if let Some(base_url) = cli.base_url {
         cfg.server.base_url = base_url.trim_end_matches('/').to_string();
+    }
+    if let Some(bind) = &cli.bind {
+        cfg.server.bind = bind.clone();
     }
     if let Some(osv_base_url) = cli.osv_base_url {
         cfg.vuln_scan.osv_base_url = osv_base_url.trim_end_matches('/').to_string();
@@ -74,6 +159,10 @@ async fn main() -> anyhow::Result<()> {
             }
 
             let app_state = server::build_state(&cfg).await?;
+            let probe_every = config::parse_chrono_duration(&cfg.auth.sso.probe_interval)?
+                .to_std()
+                .unwrap_or(std::time::Duration::from_secs(60));
+            tokio::spawn(server::start_sso_probe(app_state.sso.clone(), probe_every));
 
             // Spawn the periodic cleanup/GC task before the router consumes
             // app_state: the pre-release sweep needs cleanup.enabled, the proxy
@@ -82,9 +171,21 @@ async fn main() -> anyhow::Result<()> {
                 app_state.packages.clone(),
                 app_state.cache.clone(),
                 app_state.policy_store.clone(),
-                app_state.storage.clone(),
+                app_state.reclaim.clone(),
                 app_state.clock.clone(),
                 cfg.cleanup.clone(),
+                app_state.reconcilers(),
+            ));
+            tokio::spawn(opencargo::telemetry::cleanup::start_reconcile_task(
+                app_state.reconcilers(),
+                app_state.clock.clone(),
+            ));
+
+            tokio::spawn(opencargo::app::sweep_storage::start_storage_sweep(
+                opencargo::app::sweep_storage::SweepStorage::new(app_state.storage.clone())
+                    .reclaiming(app_state.reclaim_orphans())
+                    .reaping_uploads(app_state.oci.clone()),
+                app_state.clock.clone(),
             ));
 
             let router = server::build_router(app_state);
@@ -114,26 +215,27 @@ async fn main() -> anyhow::Result<()> {
                     .serve(
                         router
                             .map_request(server::decode_percent_encoded_slashes)
-                            .into_make_service(),
+                            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
                     )
                     .await?;
             } else {
                 let app = router
                     .map_request(server::decode_percent_encoded_slashes)
-                    .into_make_service();
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
                 let listener = tokio::net::TcpListener::bind(bind).await?;
                 info!("Listening on {}", listener.local_addr()?);
                 axum::serve(listener, app).await?;
             }
         }
         Commands::ValidateConfig { path } => {
-            let _cfg = config::load_config(Some(&path))?;
+            config::load_config(Some(&path))?.validate()?;
             println!("Config is valid.");
         }
         Commands::Migrate => {
             server::run_migrations(&cfg).await?;
             println!("Migrations applied successfully.");
         }
+        Commands::Storage { command } => storage(&cfg, command).await?,
     }
 
     Ok(())

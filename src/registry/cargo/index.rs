@@ -66,7 +66,7 @@ pub async fn get_index_entry(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response<Body>> {
     let (repo_name, name) = index_params(&params)?;
-    crate::domain::validate_package_name("cargo", name)?;
+    crate::registry::rules::rules_of(crate::domain::Format::Cargo)?.validate(name)?;
     if index_prefix(uri.path()) != Some(compute_prefix(name)) {
         return Err(AppError::NotFound(format!("crate not found: {name}")));
     }

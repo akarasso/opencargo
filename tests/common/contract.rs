@@ -33,6 +33,7 @@ pub struct Handles {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub deps: Arc<dyn DependencyStore>,
     _keep: Box<dyn Any + Send>,
 }
 
@@ -43,6 +44,7 @@ pub struct Ports {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub deps: Arc<dyn DependencyStore>,
 }
 
 impl Handles {
@@ -52,6 +54,7 @@ impl Handles {
             repos: ports.repos,
             packages: ports.packages,
             search: ports.search,
+            deps: ports.deps,
             _keep: keep,
         }
     }
@@ -407,6 +410,8 @@ macro_rules! package_contract {
                     size: 4,
                     tarball_path: "npm/r/p/p.tgz",
                     dist_tags: tags,
+                    dependencies: &[],
+                    pins: &[],
                     now: at(9),
                 }
             }
@@ -452,6 +457,83 @@ macro_rules! package_contract {
                     .unwrap();
                 assert_eq!(landed.package.created_at, at(9).trunc_subsecs(0));
                 assert_eq!(landed.version.published_at, at(9).trunc_subsecs(0));
+            }
+
+            /// The edges of a release are written with its version row, so
+            /// a visible version never lacks them; a refused one writes none.
+            #[tokio::test]
+            async fn a_release_lands_with_its_dependencies_or_not_at_all() {
+                use ::opencargo::ports::packages::ReleaseDependency;
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let edges = [
+                    ReleaseDependency { name: "a", requirement: "^1", kind: "net8.0" },
+                    ReleaseDependency { name: "b", requirement: "", kind: "any" },
+                ];
+                let mut with = release(repo.id, "left-pad", "1.0.0", &[]);
+                with.dependencies = &edges;
+                let landed = handles.packages.publish_version(&with).await.unwrap();
+                let recorded = handles.deps.of_version(landed.version.id).await.unwrap();
+                assert_eq!(
+                    recorded
+                        .iter()
+                        .map(|d| (d.name.as_str(), d.requirement.as_str(), d.kind.as_str()))
+                        .collect::<Vec<_>>(),
+                    [("a", "^1", "net8.0"), ("b", "", "any")]
+                );
+
+                let refused = handles.packages.publish_version(&with).await.unwrap_err();
+                assert!(matches!(refused, StoreError::Conflict), "{refused:?}");
+                assert_eq!(handles.deps.of_version(landed.version.id).await.unwrap().len(), 2);
+                assert!(
+                    handles.deps.dependents("a", false).await.unwrap().len() == 1,
+                    "the refused publish recorded no second edge"
+                );
+            }
+
+            /// A1 C5: each publish, yank, unyank and delete moves the stamp,
+            /// nothing else does, and a stamp is a function of the versions'
+            /// state, so a validated reader never sees a stale state as current.
+            #[tokio::test]
+            async fn the_version_stamp_moves_with_the_four_operations_only() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let first = handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "1.0.0", &[]))
+                    .await
+                    .unwrap();
+                let package = first.package.id;
+                let stamp = || handles.packages.stamp(package);
+                let one = stamp().await.unwrap();
+                let second = handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "2.0.0", &[]))
+                    .await
+                    .unwrap();
+                let two = stamp().await.unwrap();
+                assert_ne!(two, one, "publish");
+                handles.packages.set_yanked(first.version.id, true).await.unwrap();
+                let yanked = stamp().await.unwrap();
+                assert_ne!(yanked, two, "yank");
+                handles.packages.set_yanked(first.version.id, false).await.unwrap();
+                let unyanked = stamp().await.unwrap();
+                assert_ne!(unyanked, yanked, "unyank");
+                assert_eq!(unyanked, two, "the same state, the same stamp");
+                handles.packages.set_metadata(second.version.id, "{\"x\":1}").await.unwrap();
+                handles.packages.record_download(second.version.id).await.unwrap();
+                assert_eq!(stamp().await.unwrap(), two, "nothing else moves it");
+                handles.packages.delete_version(second.version.id, at(10)).await.unwrap();
+                let deleted = stamp().await.unwrap();
+                assert_ne!(deleted, two, "delete");
+                handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "2.0.0", &[]))
+                    .await
+                    .unwrap();
+                let republished = stamp().await.unwrap();
+                assert_ne!(republished, deleted, "republish");
+                assert_ne!(republished, two, "a republished version is a new row");
             }
 
             #[tokio::test]
@@ -588,8 +670,10 @@ macro_rules! package_contract {
                     .search(SearchScope::Repo(repo.id), None, 20)
                     .await
                     .unwrap();
-                let mut names: Vec<&str> =
-                    browsed.iter().map(|package| package.name.as_str()).collect();
+                let mut names: Vec<&str> = browsed
+                    .iter()
+                    .map(|package| package.name.as_str())
+                    .collect();
                 names.sort();
                 assert_eq!(
                     names,
@@ -640,7 +724,11 @@ macro_rules! package_contract {
                     .unwrap();
 
                 assert!(matches!(
-                    handles.repos.delete_empty("npm-hosted").await.unwrap_err(),
+                    handles
+                        .repos
+                        .retire("npm-hosted", at(10))
+                        .await
+                        .unwrap_err(),
                     StoreError::Conflict
                 ));
                 assert_eq!(
@@ -655,10 +743,14 @@ macro_rules! package_contract {
                 let handles = $open().await;
                 hosted(&handles, "npm-hosted", Visibility::Public).await;
 
-                handles.repos.delete_empty("npm-hosted").await.unwrap();
+                handles.repos.retire("npm-hosted", at(10)).await.unwrap();
                 assert!(handles.repos.by_name("npm-hosted").await.unwrap().is_none());
                 assert!(matches!(
-                    handles.repos.delete_empty("npm-hosted").await.unwrap_err(),
+                    handles
+                        .repos
+                        .retire("npm-hosted", at(10))
+                        .await
+                        .unwrap_err(),
                     StoreError::NotFound
                 ));
             }
@@ -689,6 +781,7 @@ macro_rules! package_contract {
                         metadata_json: "{}",
                         tarball_path: "npm/npm-prod/left-pad/p.tgz",
                         dist_tags: &tags,
+                        pins: &[],
                         audit: PromotionAudit {
                             user_id: None,
                             username: "alex",
@@ -726,6 +819,7 @@ macro_rules! package_contract {
                             metadata_json: "{}",
                             tarball_path: "npm/npm-prod/left-pad/p.tgz",
                             dist_tags: &[],
+                            pins: &[],
                             audit: PromotionAudit {
                                 user_id: None,
                                 username: "alex",
@@ -818,7 +912,10 @@ macro_rules! package_contract {
                     .unwrap();
                 store.record_download(landed.version.id).await.unwrap();
 
-                store.delete_version(landed.version.id).await.unwrap();
+                store
+                    .delete_version(landed.version.id, at(10))
+                    .await
+                    .unwrap();
 
                 assert!(store
                     .version(landed.package.id, "1.0.0")
@@ -826,11 +923,7 @@ macro_rules! package_contract {
                     .unwrap()
                     .is_none());
                 assert!(
-                    store
-                        .dist_tags(landed.package.id)
-                        .await
-                        .unwrap()
-                        .is_empty(),
+                    store.dist_tags(landed.package.id).await.unwrap().is_empty(),
                     "the tag that pointed at it goes with it"
                 );
                 assert_eq!(
@@ -845,7 +938,10 @@ macro_rules! package_contract {
                     "a sibling version is untouched"
                 );
                 assert!(matches!(
-                    store.delete_version(landed.version.id).await.unwrap_err(),
+                    store
+                        .delete_version(landed.version.id, at(10))
+                        .await
+                        .unwrap_err(),
                     StoreError::NotFound
                 ));
             }
@@ -994,7 +1090,10 @@ macro_rules! proxy_cache_contract {
                     .unwrap()
                     .is_none());
 
-                store.upsert(&entry("lodash", 200, Some(3600)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, Some(3600)), at(9))
+                    .await
+                    .unwrap();
                 let row = read(store, "lodash", at(9)).await;
 
                 assert_eq!((row.status, row.size), (200, 42));
@@ -1018,22 +1117,39 @@ macro_rules! proxy_cache_contract {
             async fn an_entry_is_stale_at_exactly_its_expiry() {
                 let handles = $open().await;
                 let store = &handles.cache;
-                store.upsert(&entry("lodash", 200, Some(3600)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, Some(3600)), at(9))
+                    .await
+                    .unwrap();
                 let expires = at(9) + TimeDelta::seconds(3600);
 
-                assert!(read(store, "lodash", expires - TimeDelta::seconds(1)).await.fresh);
+                assert!(
+                    read(store, "lodash", expires - TimeDelta::seconds(1))
+                        .await
+                        .fresh
+                );
                 assert!(!read(store, "lodash", expires).await.fresh);
-                assert!(!read(store, "lodash", expires + TimeDelta::seconds(1)).await.fresh);
+                assert!(
+                    !read(store, "lodash", expires + TimeDelta::seconds(1))
+                        .await
+                        .fresh
+                );
             }
 
             #[tokio::test]
             async fn an_immutable_answer_never_expires_and_upserts_in_place() {
                 let handles = $open().await;
                 let store = &handles.cache;
-                store.upsert(&entry("lodash", 200, Some(60)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, Some(60)), at(9))
+                    .await
+                    .unwrap();
                 let first = read(store, "lodash", at(9)).await;
 
-                store.upsert(&entry("lodash", 200, None), at(11)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, None), at(11))
+                    .await
+                    .unwrap();
                 let again = read(store, "lodash", at(23)).await;
 
                 assert_eq!(again.id, first.id, "one key is one row");
@@ -1045,12 +1161,18 @@ macro_rules! proxy_cache_contract {
             async fn a_touch_moves_the_use_and_only_a_revalidation_moves_the_expiry() {
                 let handles = $open().await;
                 let store = &handles.cache;
-                store.upsert(&entry("lodash", 200, Some(3600)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("lodash", 200, Some(3600)), at(9))
+                    .await
+                    .unwrap();
                 let row = read(store, "lodash", at(9)).await;
 
                 store.touch(row.id, None, at(10)).await.unwrap();
                 let touched = read(store, "lodash", at(10)).await;
-                assert_eq!(touched.last_used_at.trunc_subsecs(0), at(10).trunc_subsecs(0));
+                assert_eq!(
+                    touched.last_used_at.trunc_subsecs(0),
+                    at(10).trunc_subsecs(0)
+                );
                 assert_eq!(touched.expires_at, row.expires_at, "a hit is not a refresh");
 
                 store
@@ -1073,10 +1195,22 @@ macro_rules! proxy_cache_contract {
                 let handles = $open().await;
                 let store = &handles.cache;
                 let day = Duration::from_secs(86_400);
-                store.upsert(&entry("idle", 200, None), at(9)).await.unwrap();
-                store.upsert(&entry("gone", 404, Some(60)), at(9)).await.unwrap();
-                store.upsert(&entry("stale", 200, Some(60)), at(9)).await.unwrap();
-                store.upsert(&entry("fresh-negative", 404, Some(3600)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("idle", 200, None), at(9))
+                    .await
+                    .unwrap();
+                store
+                    .upsert(&entry("gone", 404, Some(60)), at(9))
+                    .await
+                    .unwrap();
+                store
+                    .upsert(&entry("stale", 200, Some(60)), at(9))
+                    .await
+                    .unwrap();
+                store
+                    .upsert(&entry("fresh-negative", 404, Some(3600)), at(9))
+                    .await
+                    .unwrap();
 
                 let now = at(9) + TimeDelta::seconds(1800);
                 let soon: Vec<String> = store
@@ -1104,16 +1238,30 @@ macro_rules! proxy_cache_contract {
             async fn forgetting_is_by_row_or_by_repository() {
                 let handles = $open().await;
                 let store = &handles.cache;
-                store.upsert(&entry("a", 200, Some(60)), at(9)).await.unwrap();
-                store.upsert(&entry("b", 200, Some(60)), at(9)).await.unwrap();
+                store
+                    .upsert(&entry("a", 200, Some(60)), at(9))
+                    .await
+                    .unwrap();
+                store
+                    .upsert(&entry("b", 200, Some(60)), at(9))
+                    .await
+                    .unwrap();
                 let a = read(store, "a", at(9)).await;
 
                 store.delete(a.id).await.unwrap();
-                assert!(store.entry(REPO, "npm-metadata", "a", at(9)).await.unwrap().is_none());
+                assert!(store
+                    .entry(REPO, "npm-metadata", "a", at(9))
+                    .await
+                    .unwrap()
+                    .is_none());
                 store.delete(a.id).await.unwrap();
 
                 assert_eq!(store.delete_for_repo(REPO).await.unwrap(), 1);
-                assert!(store.entry(REPO, "npm-metadata", "b", at(9)).await.unwrap().is_none());
+                assert!(store
+                    .entry(REPO, "npm-metadata", "b", at(9))
+                    .await
+                    .unwrap()
+                    .is_none());
                 assert_eq!(store.delete_for_repo(REPO).await.unwrap(), 0);
             }
         }
@@ -1131,9 +1279,12 @@ pub struct TailHandles {
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
     pub oci: Arc<dyn OciStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
     /// The repository an image's rows hang off; `OciStore` keys on it and
     /// carries no release of its own.
     pub repository: i64,
+    /// Its incarnation prefix, the root of every key its pins name.
+    pub prefix: String,
     /// A published version both the graph and the scan record hang off: the
     /// schema declares those foreign keys, so the suite states what it needs
     /// through `PackageStore` rather than writing orphan rows.
@@ -1155,7 +1306,9 @@ pub struct TailPorts {
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
     pub oci: Arc<dyn OciStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
     pub repository: i64,
+    pub prefix: String,
     pub release: Release,
 }
 
@@ -1167,7 +1320,9 @@ impl TailHandles {
             deps: ports.deps,
             vulns: ports.vulns,
             oci: ports.oci,
+            reclaim: ports.reclaim,
             repository: ports.repository,
+            prefix: ports.prefix,
             release: ports.release,
             _keep: keep,
         }
@@ -1193,7 +1348,12 @@ macro_rules! cascade_contract {
             use ::opencargo::domain::{RuleVerdict, ScanResult, Verdict, VulnDetail};
             use ::opencargo::ports::audit::NewAuditEntry;
             use ::opencargo::ports::deps::NewDependency;
-            use ::opencargo::ports::oci::{NewManifest, Orphaned};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::oci::{
+                BeginComplete, Finished, LeaseToken, NewBlob, NewManifest, Orphaned, Segment,
+                SegmentClaim,
+            };
+            use ::opencargo::ports::reclaim::{PinToken, Pinned};
             use ::opencargo::ports::policy::{NewResolution, ReportFilter};
 
             fn at(hour: u32) -> DateTime<Utc> {
@@ -1210,7 +1370,11 @@ macro_rules! cascade_contract {
             }
 
             fn verdicts() -> Vec<RuleVerdict> {
-                vec![RuleVerdict::new("typosquat", Verdict::WouldBlock, "looks like left-pad")]
+                vec![RuleVerdict::new(
+                    "typosquat",
+                    Verdict::WouldBlock,
+                    "looks like left-pad",
+                )]
             }
 
             /// Two callers spelled the same and identified differently: the
@@ -1279,10 +1443,7 @@ macro_rules! cascade_contract {
                 let verdicts = verdicts();
                 handles
                     .policy
-                    .insert_batch(
-                        &[resolution(&verdicts, 7), resolution(&verdicts, 8)],
-                        at(9),
-                    )
+                    .insert_batch(&[resolution(&verdicts, 7), resolution(&verdicts, 8)], at(9))
                     .await
                     .unwrap();
 
@@ -1311,7 +1472,10 @@ macro_rules! cascade_contract {
                 let verdicts = verdicts();
                 handles
                     .policy
-                    .insert_batch(&[resolution(&verdicts, 7)], at(9) - ::chrono::Duration::days(100))
+                    .insert_batch(
+                        &[resolution(&verdicts, 7)],
+                        at(9) - ::chrono::Duration::days(100),
+                    )
                     .await
                     .unwrap();
                 handles
@@ -1320,12 +1484,23 @@ macro_rules! cascade_contract {
                     .await
                     .unwrap();
 
-                assert_eq!(handles.policy.delete_older_than(30, at(9)).await.unwrap(), 1);
                 assert_eq!(
-                    handles.policy.resolutions(&window(), 1, 10).await.unwrap().len(),
+                    handles.policy.delete_older_than(30, at(9)).await.unwrap(),
                     1
                 );
-                assert_eq!(handles.policy.delete_older_than(30, at(9)).await.unwrap(), 0);
+                assert_eq!(
+                    handles
+                        .policy
+                        .resolutions(&window(), 1, 10)
+                        .await
+                        .unwrap()
+                        .len(),
+                    1
+                );
+                assert_eq!(
+                    handles.policy.delete_older_than(30, at(9)).await.unwrap(),
+                    0
+                );
             }
 
             /// The trail is read back newest first, under the caller's clock,
@@ -1359,7 +1534,10 @@ macro_rules! cascade_contract {
                     vec!["user.delete", "user.create"],
                     "newest first"
                 );
-                assert_eq!(listed[0].created_at.trunc_subsecs(0), at(10).trunc_subsecs(0));
+                assert_eq!(
+                    listed[0].created_at.trunc_subsecs(0),
+                    at(10).trunc_subsecs(0)
+                );
                 assert_eq!(listed[0].username.as_deref(), Some("ci"));
                 assert_eq!(handles.audit.recent(2, 1).await.unwrap().len(), 1);
 
@@ -1392,20 +1570,43 @@ macro_rules! cascade_contract {
                     }],
                 };
 
-                assert!(handles.vulns.latest(handles.release.version).await.unwrap().is_none());
-                handles.vulns.record(handles.release.version, &result, at(9)).await.unwrap();
+                assert!(handles
+                    .vulns
+                    .latest(handles.release.version)
+                    .await
+                    .unwrap()
+                    .is_none());
+                handles
+                    .vulns
+                    .record(handles.release.version, &result, at(9))
+                    .await
+                    .unwrap();
 
-                let stored = handles.vulns.latest(handles.release.version).await.unwrap().unwrap();
+                let stored = handles
+                    .vulns
+                    .latest(handles.release.version)
+                    .await
+                    .unwrap()
+                    .unwrap();
                 assert_eq!(stored.scanned_at.trunc_subsecs(0), at(9).trunc_subsecs(0));
                 assert_eq!((stored.total_deps, stored.vulnerable_deps), (3, 1));
                 assert_eq!(stored.status, "warning");
                 assert_eq!(
-                    stored.details.as_ref().and_then(|d| d.get(0)).and_then(|d| d["vuln_id"].as_str()),
+                    stored
+                        .details
+                        .as_ref()
+                        .and_then(|d| d.get(0))
+                        .and_then(|d| d["vuln_id"].as_str()),
                     Some("GHSA-x")
                 );
 
                 handles.vulns.forget(handles.release.version).await.unwrap();
-                assert!(handles.vulns.latest(handles.release.version).await.unwrap().is_none());
+                assert!(handles
+                    .vulns
+                    .latest(handles.release.version)
+                    .await
+                    .unwrap()
+                    .is_none());
                 handles.vulns.forget(handles.release.version).await.unwrap();
             }
 
@@ -1413,10 +1614,9 @@ macro_rules! cascade_contract {
             #[tokio::test]
             async fn a_versions_edges_come_back_in_the_order_they_were_recorded() {
                 let handles = $open().await;
-                for (name, requirement, kind) in [
-                    ("left-pad", "^1.0.0", "runtime"),
-                    ("tape", "^5.0.0", "dev"),
-                ] {
+                for (name, requirement, kind) in
+                    [("left-pad", "^1.0.0", "runtime"), ("tape", "^5.0.0", "dev")]
+                {
                     handles
                         .deps
                         .record(
@@ -1433,136 +1633,329 @@ macro_rules! cascade_contract {
                         .unwrap();
                 }
 
-                let edges = handles.deps.of_version(handles.release.version).await.unwrap();
+                let edges = handles
+                    .deps
+                    .of_version(handles.release.version)
+                    .await
+                    .unwrap();
                 assert_eq!(
                     edges
                         .iter()
                         .map(|d| (d.name.as_str(), d.requirement.as_str(), d.kind.as_str()))
                         .collect::<Vec<_>>(),
-                    vec![
-                        ("left-pad", "^1.0.0", "runtime"),
-                        ("tape", "^5.0.0", "dev"),
-                    ]
+                    vec![("left-pad", "^1.0.0", "runtime"), ("tape", "^5.0.0", "dev"),]
                 );
-                assert!(handles.deps.of_version(handles.release.version + 1).await.unwrap().is_empty());
+                assert!(handles
+                    .deps
+                    .of_version(handles.release.version + 1)
+                    .await
+                    .unwrap()
+                    .is_empty());
             }
 
-            fn manifest<'a>(
-                repository: i64,
-                digest: &'a str,
-                blobs: &'a [String],
-                tag: Option<&'a str>,
-            ) -> NewManifest<'a> {
-                NewManifest {
-                    repository,
-                    name: "app",
-                    digest,
-                    content_type: "application/vnd.oci.image.manifest.v1+json",
-                    size: 2,
-                    blobs,
-                    tag,
+            const LEASE: ::std::time::Duration = ::std::time::Duration::from_secs(60);
+
+            async fn pins(handles: &TailHandles, keys: &[&str]) -> Vec<PinToken> {
+                let keys: Vec<String> = keys.iter().map(|k| format!("{}/{k}", handles.prefix)).collect();
+                match handles.reclaim.pin(&handles.prefix, &keys, at(23)).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("the repository is live"),
                 }
+            }
+
+            fn new_blob(repository: i64, digest: &str) -> NewBlob<'_> {
+                NewBlob {
+                    repository,
+                    digest,
+                    size: 5,
+                    content_type: "application/octet-stream",
+                }
+            }
+
+            async fn session(handles: &TailHandles, id: &str) -> LeaseToken {
+                let prefix = format!("{}/_uploads/{id}", handles.prefix);
+                handles.oci.start_upload(id, handles.repository, "app", &prefix, at(8)).await.unwrap();
+                match handles.oci.begin_complete(id, at(8), LEASE).await.unwrap() {
+                    BeginComplete::Lease(lease) => lease,
+                    other => panic!("a fresh session is free: {other:?}"),
+                }
+            }
+
+            /// A blob as a completed upload records it: its row names the
+            /// pinned key.
+            async fn blob(handles: &TailHandles, digest: &str) -> String {
+                let lease = session(handles, digest).await;
+                let pin = pins(handles, &[digest]).await.remove(0);
+                let finished = handles
+                    .oci
+                    .finish_upload(digest, &lease, &pin, new_blob(handles.repository, digest), at(8))
+                    .await
+                    .unwrap();
+                assert_eq!(finished, Finished::Recorded(pin.physical_key.clone()));
+                pin.physical_key
+            }
+
+            async fn put(handles: &TailHandles, digest: &str, blobs: &[String], tag: Option<&str>) -> Result<String, StoreError> {
+                let mut keys = vec![digest];
+                keys.extend(blobs.iter().map(String::as_str));
+                let mut tokens = pins(handles, &keys).await;
+                let pin = tokens.remove(0);
+                let pinned: Vec<(String, PinToken)> = blobs.iter().cloned().zip(tokens).collect();
+                handles
+                    .oci
+                    .put_manifest(
+                        NewManifest {
+                            repository: handles.repository,
+                            name: "app",
+                            digest,
+                            content_type: "application/vnd.oci.image.manifest.v1+json",
+                            size: 2,
+                            pin: &pin,
+                            blobs: &pinned,
+                            children: &[],
+                            tag,
+                        },
+                        at(9),
+                    )
+                    .await
+                    .map(|()| pin.physical_key)
+            }
+
+            async fn queued(handles: &TailHandles) -> Vec<String> {
+                let mut keys: Vec<String> = handles
+                    .reclaim
+                    .due(::std::time::Duration::ZERO, at(23), 100)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.key)
+                    .collect();
+                keys.sort();
+                keys
             }
 
             /// The orphan set is the point of the method: a layer another
             /// manifest still lists is not in it, and a layer nothing lists
-            /// any more is — reported, never deleted from storage, because
-            /// the store may not touch a file.
+            /// any more is — its key enqueued with the manifest's, in the
+            /// same transaction, and nothing deleted (M2).
             #[tokio::test]
-            async fn a_manifest_delete_reports_only_the_layers_it_orphaned() {
+            async fn a_manifest_delete_enqueues_only_the_layers_it_orphaned() {
                 let handles = $open().await;
                 let repo = handles.repository;
                 let (shared, only) = ("sha256:cc".to_string(), "sha256:bb".to_string());
-                handles
-                    .oci
-                    .put_manifest(manifest(repo, "sha256:aa", &[only.clone(), shared.clone()], Some("v1")))
-                    .await
-                    .unwrap();
-                handles
-                    .oci
-                    .put_manifest(manifest(repo, "sha256:dd", std::slice::from_ref(&shared), Some("v2")))
-                    .await
-                    .unwrap();
+                let only_key = blob(&handles, &only).await;
+                blob(&handles, &shared).await;
+                let manifest_key = put(&handles, "sha256:aa", &[only.clone(), shared.clone()], Some("v1")).await.unwrap();
+                put(&handles, "sha256:dd", std::slice::from_ref(&shared), Some("v2")).await.unwrap();
+                assert!(queued(&handles).await.is_empty());
 
                 let orphaned = handles
                     .oci
-                    .delete_manifest(repo, "app", "sha256:aa")
+                    .delete_manifest(repo, "app", "sha256:aa", at(10))
                     .await
                     .unwrap()
                     .expect("the manifest was there");
 
-                assert_eq!(orphaned, Orphaned { blob_digests: vec![only] });
+                assert_eq!(orphaned, Orphaned { blob_digests: vec![only.clone()] });
+                let mut want = vec![manifest_key, only_key];
+                want.sort();
+                assert_eq!(queued(&handles).await, want);
                 assert!(handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().is_none());
+                assert!(handles.oci.blob(repo, &only).await.unwrap().is_none());
                 assert!(handles.oci.digest_for_ref(repo, "app", "v1").await.unwrap().is_none());
                 assert_eq!(handles.oci.blob_references(repo, &shared).await.unwrap(), 1);
-                assert_eq!(handles.oci.tags(repo, "app").await.unwrap(), vec!["v2".to_string()]);
+                assert_eq!(
+                    handles.oci.tags(repo, "app").await.unwrap(),
+                    vec!["v2".to_string()]
+                );
             }
 
-            /// Nothing to delete is `None`, not an empty orphan set: the
-            /// layer above turns one into a 404 and the other into a 202.
+            /// Nothing to delete is `None`, not an empty orphan set, and it
+            /// enqueues nothing.
             #[tokio::test]
             async fn deleting_an_unknown_manifest_reports_nothing() {
                 let handles = $open().await;
                 assert!(handles
                     .oci
-                    .delete_manifest(handles.repository, "app", "sha256:aa")
+                    .delete_manifest(handles.repository, "app", "sha256:aa", at(10))
                     .await
                     .unwrap()
                     .is_none());
+                assert!(queued(&handles).await.is_empty());
             }
 
             /// A re-push replaces the link rows wholesale, so a layer the new
-            /// manifest no longer lists stops being referenced — otherwise a
-            /// dropped layer would be undeletable for ever.
+            /// manifest no longer lists stops being referenced.
             #[tokio::test]
             async fn a_re_push_replaces_the_layers_and_moves_the_tag() {
                 let handles = $open().await;
                 let repo = handles.repository;
                 let (old, new) = ("sha256:bb".to_string(), "sha256:cc".to_string());
-                handles
-                    .oci
-                    .put_manifest(manifest(repo, "sha256:aa", std::slice::from_ref(&old), Some("v1")))
-                    .await
-                    .unwrap();
-                handles
-                    .oci
-                    .put_manifest(manifest(repo, "sha256:aa", std::slice::from_ref(&new), Some("v1")))
-                    .await
-                    .unwrap();
+                blob(&handles, &old).await;
+                blob(&handles, &new).await;
+                put(&handles, "sha256:aa", std::slice::from_ref(&old), Some("v1")).await.unwrap();
+                put(&handles, "sha256:aa", std::slice::from_ref(&new), Some("v1")).await.unwrap();
 
                 assert_eq!(handles.oci.blob_references(repo, &old).await.unwrap(), 0);
                 assert_eq!(handles.oci.blob_references(repo, &new).await.unwrap(), 1);
-                assert_eq!(handles.oci.tags(repo, "app").await.unwrap(), vec!["v1".to_string()]);
+                assert_eq!(
+                    handles.oci.tags(repo, "app").await.unwrap(),
+                    vec!["v1".to_string()]
+                );
             }
 
-            /// The ledger is what tells a chunk which repository it belongs
-            /// to, and a completed upload closes it in the same breath as it
-            /// records the blob.
+            /// A pin is not proof of existence: a manifest listing a blob
+            /// with no row writes nothing (N4), and neither does one whose
+            /// pin was revoked (M1).
             #[tokio::test]
-            async fn an_upload_is_owned_until_it_completes() {
+            async fn put_manifest_with_an_unknown_blob_or_a_revoked_pin_writes_nothing() {
                 let handles = $open().await;
                 let repo = handles.repository;
-                handles.oci.start_upload("u1", repo, "app").await.unwrap();
-                assert_eq!(handles.oci.upload_owner("u1").await.unwrap(), Some(repo));
+                let unknown = put(&handles, "sha256:aa", &["sha256:bb".to_string()], Some("v1")).await;
+                assert!(matches!(unknown, Err(StoreError::NotFound)), "{unknown:?}");
+                assert!(handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().is_none());
 
-                handles
+                let pin = pins(&handles, &["sha256:aa"]).await.remove(0);
+                handles.reclaim.enqueue(std::slice::from_ref(&pin.physical_key), at(1)).await.unwrap();
+                let late = at(23) + ::chrono::Duration::days(2);
+                handles.reclaim.claim(&pin.physical_key, ::std::time::Duration::from_secs(1), late, late).await.unwrap();
+                let revoked = handles
                     .oci
-                    .complete_upload(
-                        "u1",
-                        ::opencargo::ports::oci::NewBlob {
+                    .put_manifest(
+                        NewManifest {
                             repository: repo,
-                            digest: "sha256:bb",
-                            size: 5,
-                            content_type: "application/octet-stream",
+                            name: "app",
+                            digest: "sha256:aa",
+                            content_type: "application/json",
+                            size: 2,
+                            pin: &pin,
+                            blobs: &[],
+                            children: &[],
+                            tag: Some("v1"),
                         },
+                        at(9),
                     )
-                    .await
-                    .unwrap();
+                    .await;
+                assert!(matches!(revoked, Err(StoreError::Superseded(ref k)) if *k == vec![pin.physical_key.clone()]), "{revoked:?}");
+                assert!(handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().is_none());
+                assert!(handles.oci.digest_for_ref(repo, "app", "v1").await.unwrap().is_none());
+            }
 
-                assert!(handles.oci.upload_owner("u1").await.unwrap().is_none());
-                assert_eq!(handles.oci.blob(repo, "sha256:bb").await.unwrap().unwrap().size, 5);
-                assert!(handles.oci.delete_blob(repo, "sha256:bb").await.unwrap());
-                assert!(!handles.oci.delete_blob(repo, "sha256:bb").await.unwrap());
+            /// Chunks claim their offset by compare-and-set: one winner per
+            /// offset, none while a completion holds the lease, and a cap.
+            #[tokio::test]
+            async fn a_segment_offset_has_one_winner() {
+                let handles = $open().await;
+                let prefix = format!("{}/_uploads/u1", handles.prefix);
+                handles.oci.start_upload("u1", handles.repository, "app", &prefix, at(8)).await.unwrap();
+                let seg = |start: u64, n: &str| Segment { start, len: 3, key: format!("{prefix}/{start:020}-{n}") };
+                assert_eq!(handles.oci.claim_segment("u1", &seg(0, "a"), 2, at(8)).await.unwrap(), SegmentClaim::Won);
+                assert_eq!(handles.oci.claim_segment("u1", &seg(0, "b"), 2, at(8)).await.unwrap(), SegmentClaim::Lost);
+                assert_eq!(handles.oci.claim_segment("u1", &seg(3, "c"), 2, at(8)).await.unwrap(), SegmentClaim::Won);
+                assert_eq!(handles.oci.claim_segment("u1", &seg(6, "d"), 2, at(8)).await.unwrap(), SegmentClaim::TooManySegments);
+                assert_eq!(handles.oci.claim_segment("nope", &seg(0, "e"), 2, at(8)).await.unwrap(), SegmentClaim::Lost);
+                let session = handles.oci.upload("u1").await.unwrap().unwrap();
+                assert_eq!((session.received, session.segments, session.prefix.as_str()), (6, 2, prefix.as_str()));
+                assert_eq!(handles.oci.segments("u1").await.unwrap(), vec![seg(0, "a"), seg(3, "c")]);
+
+                let BeginComplete::Lease(_) = handles.oci.begin_complete("u1", at(9), LEASE).await.unwrap() else {
+                    panic!("free");
+                };
+                assert_eq!(handles.oci.claim_segment("u1", &seg(6, "f"), 9, at(9)).await.unwrap(), SegmentClaim::Lost);
+            }
+
+            /// The lease is dated: held while live, taken over once expired
+            /// with a fresh token, released only by its own token.
+            #[tokio::test]
+            async fn completion_claim_survives_a_crash() {
+                let handles = $open().await;
+                let first = session(&handles, "u1").await;
+                assert_eq!(handles.oci.begin_complete("u1", at(8), LEASE).await.unwrap(), BeginComplete::Held);
+                let BeginComplete::Lease(second) = handles.oci.begin_complete("u1", at(9), LEASE).await.unwrap() else {
+                    panic!("an expired lease is taken over");
+                };
+                assert_ne!(first, second);
+                handles.oci.release_complete("u1", &first).await.unwrap();
+                assert_eq!(handles.oci.begin_complete("u1", at(9), LEASE).await.unwrap(), BeginComplete::Held);
+                handles.oci.release_complete("u1", &second).await.unwrap();
+                assert!(matches!(handles.oci.begin_complete("u1", at(9), LEASE).await.unwrap(), BeginComplete::Lease(_)));
+                assert_eq!(handles.oci.begin_complete("nope", at(9), LEASE).await.unwrap(), BeginComplete::Unknown);
+            }
+
+            /// `Superseded(Lease)` and `Superseded(Pin)`: either writes
+            /// nothing, the session and its row untouched.
+            #[tokio::test]
+            async fn finish_upload_with_a_lost_lease_or_a_revoked_pin_writes_nothing() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                let stale = session(&handles, "u1").await;
+                let BeginComplete::Lease(live) = handles.oci.begin_complete("u1", at(10), LEASE).await.unwrap() else {
+                    panic!("expired");
+                };
+                let pin = pins(&handles, &["sha256:bb"]).await.remove(0);
+                let lost = handles.oci.finish_upload("u1", &stale, &pin, new_blob(repo, "sha256:bb"), at(10)).await.unwrap();
+                assert_eq!(lost, Finished::LeaseLost);
+                assert!(handles.oci.blob(repo, "sha256:bb").await.unwrap().is_none());
+
+                handles.reclaim.enqueue(std::slice::from_ref(&pin.physical_key), at(1)).await.unwrap();
+                let late = at(23) + ::chrono::Duration::days(2);
+                handles.reclaim.claim(&pin.physical_key, ::std::time::Duration::from_secs(1), late, late).await.unwrap();
+                let revoked = handles.oci.finish_upload("u1", &live, &pin, new_blob(repo, "sha256:bb"), at(10)).await;
+                assert!(matches!(revoked, Err(StoreError::Superseded(_))), "{revoked:?}");
+                assert!(handles.oci.blob(repo, "sha256:bb").await.unwrap().is_none());
+                assert!(handles.oci.upload("u1").await.unwrap().is_some());
+            }
+
+            /// Two completions of one digest: the second keeps the recorded
+            /// key and its own generation is enqueued (N9). The session goes
+            /// with its segments either way.
+            #[tokio::test]
+            async fn a_second_completion_keeps_the_recorded_key_and_enqueues_its_own() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                let first = blob(&handles, "sha256:bb").await;
+                let lease = session(&handles, "u2").await;
+                let fresh = pins(&handles, &["other"]).await.remove(0);
+                let finished = handles.oci.finish_upload("u2", &lease, &fresh, new_blob(repo, "sha256:bb"), at(9)).await.unwrap();
+                assert_eq!(finished, Finished::Recorded(first.clone()));
+                assert_eq!(handles.oci.blob(repo, "sha256:bb").await.unwrap().unwrap().key, first);
+                assert_eq!(queued(&handles).await, vec![fresh.physical_key]);
+                assert!(handles.oci.upload("u2").await.unwrap().is_none());
+            }
+
+            /// A listed blob refuses deletion; an unlisted one goes and its
+            /// key is enqueued.
+            #[tokio::test]
+            async fn a_blob_delete_enqueues_its_key() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                let key = blob(&handles, "sha256:bb").await;
+                put(&handles, "sha256:aa", &["sha256:bb".to_string()], None).await.unwrap();
+                assert!(matches!(handles.oci.delete_blob(repo, "sha256:bb", at(10)).await, Err(StoreError::Conflict)));
+                let manifest_key = handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().unwrap().key;
+                handles.oci.delete_manifest(repo, "app", "sha256:aa", at(10)).await.unwrap();
+                assert_eq!(queued(&handles).await.len(), 2);
+                let loose = blob(&handles, "sha256:cc").await;
+                assert!(handles.oci.delete_blob(repo, "sha256:cc", at(10)).await.unwrap());
+                assert!(!handles.oci.delete_blob(repo, "sha256:cc", at(10)).await.unwrap());
+                let mut want = vec![key, manifest_key, loose];
+                want.sort();
+                assert_eq!(queued(&handles).await, want);
+            }
+
+            /// Idle sessions without a live lease are reaped, their rows gone
+            /// and their prefixes enqueued; a completing one stays.
+            #[tokio::test]
+            async fn idle_sessions_are_reaped_and_their_prefixes_enqueued() {
+                let handles = $open().await;
+                let prefix = format!("{}/_uploads/idle", handles.prefix);
+                handles.oci.start_upload("idle", handles.repository, "app", &prefix, at(1)).await.unwrap();
+                session(&handles, "busy").await;
+                let idle = ::std::time::Duration::from_secs(1800);
+                assert_eq!(handles.oci.reap_uploads(idle, at(8), 10).await.unwrap(), 1);
+                assert!(handles.oci.upload("idle").await.unwrap().is_none());
+                assert!(handles.oci.upload("busy").await.unwrap().is_some());
+                assert_eq!(queued(&handles).await, vec![prefix]);
             }
         }
     };
@@ -1570,3 +1963,1625 @@ macro_rules! cascade_contract {
 
 #[allow(unused_imports)]
 pub(crate) use cascade_contract;
+
+/// What `reclaim_contract!` needs of an adapter: port 22, port 23, and the
+/// ports whose rows reference keys or whose methods enqueue.
+pub struct ReclaimHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub packages: Arc<dyn PackageStore>,
+    pub oci: Arc<dyn OciStore>,
+    pub maven: Arc<dyn opencargo::ports::maven::MavenFileStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+    pub referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+    _keep: Box<dyn Any + Send>,
+}
+
+/// The referencing ports of `ReclaimHandles`.
+pub struct Referencing {
+    pub packages: Arc<dyn PackageStore>,
+    pub oci: Arc<dyn OciStore>,
+    pub maven: Arc<dyn opencargo::ports::maven::MavenFileStore>,
+}
+
+impl ReclaimHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        referencing: Referencing,
+        reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+        referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            packages: referencing.packages,
+            oci: referencing.oci,
+            maven: referencing.maven,
+            reclaim,
+            referenced,
+            _keep: keep,
+        }
+    }
+}
+
+/// `reclaim_contract!(name, opener)`: port 22 and port 23 answer alike on
+/// every adapter, and agree with each other.
+#[allow(unused_macros)]
+macro_rules! reclaim_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, TimeZone, Utc};
+            use ::futures_util::TryStreamExt;
+            use ::opencargo::domain::{layout, Format, RepoKind, RepoSpec, Repository, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::packages::{NameMatch, NewRelease};
+            use ::opencargo::ports::reclaim::{Claim, PinToken, Pinned, Renewal};
+            use ::std::time::Duration;
+
+            const GRACE: Duration = Duration::from_secs(3600);
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 18, hour, 0, 0).unwrap()
+            }
+
+            async fn repo(h: &ReclaimHandles, name: &str) -> (Repository, String) {
+                let repo = h
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            name,
+                            kind: RepoKind::Hosted,
+                            format: Format::Npm,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                let incarnation = h.repos.incarnation(repo.id).await.unwrap().unwrap();
+                (repo, layout::incarnation_prefix(&incarnation))
+            }
+
+            async fn pin(
+                h: &ReclaimHandles,
+                prefix: &str,
+                keys: &[&str],
+                until: u32,
+            ) -> Vec<PinToken> {
+                let keys: Vec<String> = keys.iter().map(|k| k.to_string()).collect();
+                match h.reclaim.pin(prefix, &keys, at(until)).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("{prefix} is live"),
+                }
+            }
+
+            async fn publish(h: &ReclaimHandles, repo: i64, version: &str, key: &str) -> i64 {
+                h.packages
+                    .publish_version(&NewRelease {
+                        repository: repo,
+                        package: "p",
+                        match_name: NameMatch::Exact,
+                        description: None,
+                        readme: None,
+                        version,
+                        metadata_json: "{}",
+                        checksum_sha1: None,
+                        checksum_sha256: None,
+                        integrity: None,
+                        size: 1,
+                        tarball_path: key,
+                        dist_tags: &[],
+                        dependencies: &[],
+                        pins: &[],
+                        now: at(2),
+                    })
+                    .await
+                    .unwrap()
+                    .version
+                    .id
+            }
+
+            async fn listed(h: &ReclaimHandles, now: u32) -> Vec<String> {
+                h.referenced
+                    .referenced(GRACE, at(now))
+                    .map_ok(|r| r.key)
+                    .try_collect()
+                    .await
+                    .unwrap()
+            }
+
+            async fn claim(h: &ReclaimHandles, key: &str, now: u32) -> Claim {
+                h.reclaim
+                    .claim(key, GRACE, at(now), at(now + 1))
+                    .await
+                    .unwrap()
+            }
+
+            #[tokio::test]
+            async fn claim_revokes_every_pin_on_its_key() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let first = pin(&h, &prefix, &["r/x"], 2).await;
+                let key = first[0].physical_key.clone();
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&key), at(1))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    claim(&h, &key, 2).await,
+                    Claim::Pinned,
+                    "a live pin protects"
+                );
+                assert!(
+                    matches!(claim(&h, &key, 5).await, Claim::Claimed(_)),
+                    "expired past the grace"
+                );
+                assert!(!listed(&h, 5).await.contains(&key));
+            }
+
+            #[tokio::test]
+            async fn an_expired_pin_within_the_grace_still_protects() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &["r/x"], 4).await;
+                let key = tokens[0].physical_key.clone();
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&key), at(1))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    claim(&h, &key, 4).await,
+                    Claim::Pinned,
+                    "expired at the instant, inside the grace"
+                );
+                assert!(
+                    listed(&h, 4).await.contains(&key),
+                    "protecting pins are listed"
+                );
+            }
+
+            #[tokio::test]
+            async fn claimed_generation_is_never_pinned_again() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let first = pin(&h, &prefix, &["r/x"], 2).await;
+                let key = first[0].physical_key.clone();
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&key), at(1))
+                    .await
+                    .unwrap();
+                assert!(matches!(claim(&h, &key, 5).await, Claim::Claimed(_)));
+                publish(&h, r.id, "1.0.0", &key).await;
+                let again = pin(&h, &prefix, &["r/x"], 9).await;
+                assert_ne!(
+                    again[0].physical_key, key,
+                    "a claimed generation is never reused"
+                );
+            }
+
+            #[tokio::test]
+            async fn pin_reuses_only_a_referenced_never_claimed_generation() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let fresh = pin(&h, &prefix, &["r/x"], 2).await;
+                let other = pin(&h, &prefix, &["r/x"], 2).await;
+                assert_ne!(
+                    fresh[0].physical_key, other[0].physical_key,
+                    "unreferenced: fresh each time"
+                );
+                publish(&h, r.id, "1.0.0", &fresh[0].physical_key).await;
+                let reused = pin(&h, &prefix, &["r/x"], 2).await;
+                assert_eq!(reused[0].physical_key, fresh[0].physical_key);
+                let batch = pin(&h, &prefix, &["r/x", "r/y"], 2).await;
+                assert_eq!(batch.len(), 2, "one transaction, one token per key");
+                assert!(batch[1].physical_key.starts_with("r/y~"));
+            }
+
+            #[tokio::test]
+            async fn pin_under_retired_incarnation_is_refused() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let (_, sibling) = repo(&h, "r2").await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                let keys = vec!["k".to_string()];
+                assert_eq!(
+                    h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(),
+                    Pinned::Retired
+                );
+                assert!(matches!(
+                    h.reclaim.pin(&sibling, &keys, at(3)).await.unwrap(),
+                    Pinned::Tokens(_)
+                ));
+                let string_sibling = format!("{prefix}x");
+                assert_eq!(
+                    h.reclaim.pin(&string_sibling, &keys, at(3)).await.unwrap(),
+                    Pinned::Retired,
+                    "an unknown prefix is never live, whatever it starts with"
+                );
+            }
+
+            #[tokio::test]
+            async fn retire_revokes_pins_and_enqueues_its_prefixes() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &[&format!("{prefix}/p/f")], 9).await;
+                let prefixes = h.repos.retire("r", at(2)).await.unwrap();
+                assert!(prefixes.contains(&prefix));
+                assert!(prefixes.contains(&"npm/r".to_string()));
+                assert!(
+                    !listed(&h, 2).await.contains(&tokens[0].physical_key),
+                    "the pin taken before retire is revoked"
+                );
+                let due = h.reclaim.due(GRACE, at(2), 10).await.unwrap();
+                assert!(
+                    due.iter().any(|c| c.key == prefix && c.prefix),
+                    "claimable without the grace"
+                );
+                assert!(matches!(claim(&h, &prefix, 2).await, Claim::Claimed(_)));
+            }
+
+            #[tokio::test]
+            async fn retire_rechecks_conflicts_in_the_transaction() {
+                let h = $open().await;
+                let (r, _) = repo(&h, "r").await;
+                let v = publish(&h, r.id, "1.0.0", "npm/r/p/p.tgz").await;
+                assert!(matches!(
+                    h.repos.retire("r", at(2)).await,
+                    Err(StoreError::Conflict)
+                ));
+                assert!(
+                    h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty(),
+                    "a refusal enqueues nothing"
+                );
+                h.packages.delete_version(v, at(3)).await.unwrap();
+                h.repos
+                    .create(
+                        &RepoSpec {
+                            name: "g",
+                            kind: RepoKind::Group,
+                            format: Format::Npm,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &["r".to_string()],
+                        },
+                        at(3),
+                    )
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    h.repos.retire("r", at(4)).await,
+                    Err(StoreError::Conflict)
+                ));
+            }
+
+            #[tokio::test]
+            async fn a_retired_group_enqueues_nothing() {
+                let h = $open().await;
+                h.repos
+                    .create(
+                        &RepoSpec {
+                            name: "g",
+                            kind: RepoKind::Group,
+                            format: Format::Npm,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                assert!(h.repos.retire("g", at(2)).await.unwrap().is_empty());
+                assert!(h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_recreated_name_takes_its_legacy_prefix_out_of_the_queue() {
+                let h = $open().await;
+                repo(&h, "r").await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                repo(&h, "r").await;
+                assert_eq!(
+                    claim(&h, "npm/r", 9).await,
+                    Claim::NotDue,
+                    "the candidate went with the recreation"
+                );
+                h.reclaim.enqueue_prefix("npm/r", at(3)).await.unwrap();
+                assert_eq!(
+                    claim(&h, "npm/r", 9).await,
+                    Claim::Referenced,
+                    "a live incarnation's prefix is never claimed"
+                );
+            }
+
+            #[tokio::test]
+            async fn recreation_refused_while_its_legacy_prefix_is_claimed() {
+                let h = $open().await;
+                repo(&h, "r").await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                assert!(matches!(claim(&h, "npm/r", 2).await, Claim::Claimed(_)));
+                let spec = RepoSpec {
+                    name: "r",
+                    kind: RepoKind::Hosted,
+                    format: Format::Npm,
+                    visibility: Visibility::Public,
+                    upstream: None,
+                    members: &[],
+                };
+                assert!(matches!(
+                    h.repos.create(&spec, at(2)).await,
+                    Err(StoreError::Conflict)
+                ));
+            }
+
+            #[tokio::test]
+            async fn delete_version_enqueues_and_deletes_nothing() {
+                let h = $open().await;
+                let (r, _) = repo(&h, "r").await;
+                let v = publish(&h, r.id, "1.0.0", "npm/r/p/p.tgz").await;
+                assert_eq!(
+                    claim(&h, "npm/r/p/p.tgz", 9).await,
+                    Claim::NotDue,
+                    "nothing queued yet"
+                );
+                h.packages.delete_version(v, at(3)).await.unwrap();
+                assert!(matches!(
+                    h.packages.delete_version(v, at(3)).await,
+                    Err(StoreError::NotFound)
+                ));
+                let due = h.reclaim.due(GRACE, at(5), 10).await.unwrap();
+                assert_eq!(due.len(), 1);
+                assert_eq!(due[0].key, "npm/r/p/p.tgz");
+                assert!(matches!(
+                    claim(&h, "npm/r/p/p.tgz", 5).await,
+                    Claim::Claimed(_)
+                ));
+            }
+
+            #[tokio::test]
+            async fn a_referenced_key_is_listed_and_never_claimed() {
+                let h = $open().await;
+                let (r, _) = repo(&h, "r").await;
+                publish(&h, r.id, "1.0.0", "npm/r/p/a.tgz").await;
+                h.reclaim
+                    .enqueue(&["npm/r/p/a.tgz".to_string()], at(1))
+                    .await
+                    .unwrap();
+                h.reclaim
+                    .enqueue(&["npm/r/p/a.tgz".to_string()], at(1))
+                    .await
+                    .unwrap();
+                assert!(listed(&h, 5).await.contains(&"npm/r/p/a.tgz".to_string()));
+                assert_eq!(claim(&h, "npm/r/p/a.tgz", 5).await, Claim::Referenced);
+                assert!(
+                    h.reclaim.due(GRACE, at(5), 10).await.unwrap().is_empty(),
+                    "Referenced drops the candidate"
+                );
+            }
+
+            /// NuGet 2.5: the `.nupkg` of an unlisted version stays referenced,
+            /// because an unlist keeps it restorable by exact version.
+            #[tokio::test]
+            async fn an_unlisted_nupkg_is_referenced_and_listed() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "nuget").await;
+                let key = format!("{prefix}/my.lib/ab/my.lib.1.0.0.nupkg~g1");
+                let id = publish(&h, r.id, "1.0.0", &key).await;
+                h.packages.set_yanked(id, true).await.unwrap();
+                h.reclaim.enqueue(std::slice::from_ref(&key), at(1)).await.unwrap();
+                assert!(listed(&h, 5).await.contains(&key));
+                assert_eq!(claim(&h, &key, 5).await, Claim::Referenced);
+            }
+
+            #[tokio::test]
+            async fn segments_of_a_slow_session_are_never_claimable() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let session = layout::upload_prefix(&prefix, "u1");
+                h.oci.start_upload("u1", r.id, "app", &session, at(1)).await.unwrap();
+                let segment = layout::segment_key(&session, 0, "n");
+                h.reclaim.enqueue(std::slice::from_ref(&segment), at(1)).await.unwrap();
+                assert_eq!(claim(&h, &segment, 20).await, Claim::Referenced);
+                let refs: Vec<_> = h.referenced.referenced(GRACE, at(20)).try_collect().await.unwrap();
+                assert!(refs.iter().any(|r| r.key == session && r.prefix));
+            }
+
+            #[tokio::test]
+            async fn renew_after_takeover_is_superseded() {
+                let h = $open().await;
+                h.reclaim.enqueue(&["k".to_string()], at(1)).await.unwrap();
+                let Claim::Claimed(first) = claim(&h, "k", 3).await else {
+                    panic!("due")
+                };
+                assert_eq!(
+                    claim(&h, "k", 3).await,
+                    Claim::NotDue,
+                    "a live claim is exclusive"
+                );
+                let Claim::Claimed(second) = claim(&h, "k", 6).await else {
+                    panic!("an expired claim is taken over")
+                };
+                assert_eq!(
+                    h.reclaim.renew(&first, at(6), at(7)).await.unwrap(),
+                    Renewal::Superseded
+                );
+                assert_eq!(
+                    h.reclaim.renew(&second, at(6), at(7)).await.unwrap(),
+                    Renewal::Renewed
+                );
+                h.reclaim.release(&first).await.unwrap();
+                assert_eq!(
+                    claim(&h, "k", 6).await,
+                    Claim::NotDue,
+                    "a stale release is a no-op"
+                );
+                h.reclaim.release(&second).await.unwrap();
+                assert!(h.reclaim.due(GRACE, at(9), 10).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn crashed_placer_pins_are_pruned_past_the_grace_and_bounded() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                pin(&h, &prefix, &["a", "b", "c"], 2).await;
+                let live = pin(&h, &prefix, &["d"], 9).await;
+                assert_eq!(h.reclaim.prune_pins(GRACE, at(2), 10).await.unwrap(), 0);
+                assert_eq!(
+                    h.reclaim.prune_pins(GRACE, at(4), 2).await.unwrap(),
+                    2,
+                    "bounded"
+                );
+                assert_eq!(h.reclaim.prune_pins(GRACE, at(4), 10).await.unwrap(), 1);
+                assert_eq!(listed(&h, 4).await, vec![live[0].physical_key.clone()]);
+            }
+
+            fn release_with<'a>(
+                repo: i64,
+                version: &'a str,
+                pins: &'a [PinToken],
+            ) -> NewRelease<'a> {
+                NewRelease {
+                    repository: repo,
+                    package: "p",
+                    match_name: NameMatch::Exact,
+                    description: None,
+                    readme: None,
+                    version,
+                    metadata_json: "{}",
+                    checksum_sha1: None,
+                    checksum_sha256: None,
+                    integrity: None,
+                    size: 1,
+                    tarball_path: &pins[0].physical_key,
+                    dist_tags: &[],
+                    dependencies: &[],
+                    pins,
+                    now: at(2),
+                }
+            }
+
+            #[tokio::test]
+            async fn commit_with_revoked_pin_is_superseded() {
+                use ::opencargo::ports::packages::{Promotion, PromotionAudit};
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &["r/x"], 2).await;
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&tokens[0].physical_key), at(1))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    claim(&h, &tokens[0].physical_key, 5).await,
+                    Claim::Claimed(_)
+                ));
+                let refused = h
+                    .packages
+                    .publish_version(&release_with(r.id, "1.0.0", &tokens))
+                    .await;
+                match &refused {
+                    Err(StoreError::Superseded(keys)) => {
+                        assert_eq!(keys, &vec![tokens[0].physical_key.clone()])
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert!(
+                    h.packages
+                        .package(r.id, "p", NameMatch::Exact)
+                        .await
+                        .unwrap()
+                        .is_none(),
+                    "nothing written"
+                );
+
+                let live = pin(&h, &prefix, &["r/y"], 9).await;
+                let landed = h
+                    .packages
+                    .publish_version(&release_with(r.id, "1.0.0", &live))
+                    .await
+                    .unwrap();
+                let (target, target_prefix) = repo(&h, "t").await;
+                let revoked = pin(&h, &target_prefix, &["t/x"], 2).await;
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&revoked[0].physical_key), at(1))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    claim(&h, &revoked[0].physical_key, 5).await,
+                    Claim::Claimed(_)
+                ));
+                let promoted = h
+                    .packages
+                    .promote_metadata(&Promotion {
+                        source: &landed.version,
+                        target_repository: target.id,
+                        package: "p",
+                        description: None,
+                        metadata_json: "{}",
+                        tarball_path: &revoked[0].physical_key,
+                        dist_tags: &[],
+                        pins: &revoked,
+                        audit: PromotionAudit {
+                            user_id: None,
+                            username: "u",
+                            target: "p@1.0.0",
+                            repository: "t",
+                            details_json: "{}",
+                        },
+                        now: at(6),
+                    })
+                    .await;
+                assert!(
+                    matches!(promoted, Err(StoreError::Superseded(_))),
+                    "{promoted:?}"
+                );
+                assert!(h
+                    .packages
+                    .package(target.id, "p", NameMatch::Exact)
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+
+            #[tokio::test]
+            async fn a_spent_pin_is_gone_and_a_row_references_its_key() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &["r/x"], 9).await;
+                h.packages
+                    .publish_version(&release_with(r.id, "1.0.0", &tokens))
+                    .await
+                    .unwrap();
+                let again = h
+                    .packages
+                    .publish_version(&release_with(r.id, "1.0.1", &tokens))
+                    .await;
+                assert!(
+                    matches!(again, Err(StoreError::Superseded(_))),
+                    "a token is spent once"
+                );
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&tokens[0].physical_key), at(1))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    claim(&h, &tokens[0].physical_key, 5).await,
+                    Claim::Referenced
+                );
+            }
+
+            #[tokio::test]
+            async fn commit_after_retire_is_superseded_not_fk_error() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &[&format!("{prefix}/p/f")], 9).await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                let refused = h
+                    .packages
+                    .publish_version(&release_with(r.id, "1.0.0", &tokens))
+                    .await;
+                assert!(
+                    matches!(refused, Err(StoreError::Superseded(_))),
+                    "{refused:?}"
+                );
+            }
+
+            #[tokio::test]
+            async fn maven_keys_agree_between_ports_18_and_23() {
+                use ::opencargo::ports::maven::{Digests, NewFile, UnitChange, UnitKey};
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &[&format!("{prefix}/g/a/x/a-1.jar")], 2).await;
+                let key = UnitKey { repository: r.id, ga: "g:a", version: "1", build: "" };
+                let digests = Digests::default();
+                h.maven
+                    .change(&UnitChange {
+                        key,
+                        revision: None,
+                        depositor: "alice",
+                        file: Some(NewFile {
+                            filename: "a-1.jar",
+                            physical_key: &tokens[0].physical_key,
+                            size: 1,
+                            digests: &digests,
+                            depositor: "alice",
+                        }),
+                        declarations: &[],
+                        contest: false,
+                        reveal: false,
+                        scopes: &[],
+                        pins: &tokens,
+                        now: at(2),
+                    })
+                    .await
+                    .unwrap();
+                let physical = tokens[0].physical_key.clone();
+                assert!(listed(&h, 10).await.contains(&physical));
+                h.reclaim.enqueue(std::slice::from_ref(&physical), at(1)).await.unwrap();
+                assert_eq!(claim(&h, &physical, 10).await, Claim::Referenced);
+
+                let released = h.maven.refuse(&key, 1, &[], at(11)).await.unwrap().released;
+                assert_eq!(released, vec![physical.clone()]);
+                assert!(!listed(&h, 13).await.contains(&physical));
+                assert!(matches!(claim(&h, &physical, 13).await, Claim::Claimed(_)));
+            }
+
+            #[tokio::test]
+            async fn forgetting_a_retired_prefix_keeps_the_rest_retired() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                h.reclaim.forget_retired("npm/r").await.unwrap();
+                let keys = vec!["k".to_string()];
+                assert_eq!(
+                    h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(),
+                    Pinned::Retired
+                );
+            }
+
+            #[tokio::test]
+            async fn backlog_counts_candidates_and_prefixes() {
+                let h = $open().await;
+                assert_eq!(h.reclaim.backlog().await.unwrap(), ::opencargo::ports::reclaim::Backlog::default());
+                h.reclaim.enqueue(&["a".to_string(), "b".to_string(), "a".to_string()], at(1)).await.unwrap();
+                h.reclaim.enqueue_prefix("p", at(1)).await.unwrap();
+                let backlog = h.reclaim.backlog().await.unwrap();
+                assert_eq!((backlog.candidates, backlog.prefixes), (3, 1));
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use reclaim_contract;
+
+/// What `pypi_contract!` needs: port 15 and the ports its rows answer to.
+pub struct PypiHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub pypi: Arc<dyn opencargo::ports::pypi::PypiFileStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+    pub referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+    _keep: Box<dyn Any + Send>,
+}
+
+impl PypiHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        pypi: Arc<dyn opencargo::ports::pypi::PypiFileStore>,
+        reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+        referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            pypi,
+            reclaim,
+            referenced,
+            _keep: keep,
+        }
+    }
+}
+
+/// `pypi_contract!(name, opener)`: port 15 answers alike on every adapter,
+/// and the keys its rows reference are the ones port 22 refuses to claim and
+/// port 23 lists.
+#[allow(unused_macros)]
+macro_rules! pypi_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, TimeZone, Utc};
+            use ::futures_util::TryStreamExt;
+            use ::opencargo::domain::{layout, Format, RepoKind, RepoSpec, Repository, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::pypi::{NewPypiFile, Published};
+            use ::opencargo::ports::reclaim::{Claim, PinToken, Pinned};
+            use ::std::time::Duration;
+
+            const GRACE: Duration = Duration::from_secs(3600);
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 18, hour, 0, 0).unwrap()
+            }
+
+            async fn repo(h: &PypiHandles, name: &str) -> (Repository, String) {
+                let repo = h
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            name,
+                            kind: RepoKind::Hosted,
+                            format: Format::Pypi,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                let incarnation = h.repos.incarnation(repo.id).await.unwrap().unwrap();
+                (repo, layout::incarnation_prefix(&incarnation))
+            }
+
+            async fn pins(h: &PypiHandles, prefix: &str, filename: &str, metadata: bool) -> Vec<PinToken> {
+                let mut keys = vec![format!("{prefix}/demo/ab/{filename}")];
+                if metadata {
+                    keys.push(format!("{prefix}/demo/cd/{filename}.metadata"));
+                }
+                match h.reclaim.pin(prefix, &keys, at(9)).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("{prefix} is live"),
+                }
+            }
+
+            fn file<'a>(repo: i64, version: &'a str, filename: &'a str, pins: &'a [PinToken]) -> NewPypiFile<'a> {
+                NewPypiFile {
+                    repository: repo,
+                    project: "demo",
+                    summary: Some("a demo"),
+                    version,
+                    metadata_json: "{}",
+                    filename,
+                    packagetype: "bdist_wheel",
+                    sha256: "ab",
+                    size: 3,
+                    metadata_sha256: (pins.len() > 1).then_some("cd"),
+                    requires_python: Some(">=3.8"),
+                    pins,
+                    now: at(2),
+                }
+            }
+
+            async fn publish(h: &PypiHandles, repo: i64, prefix: &str, version: &str, filename: &str) -> Published {
+                let tokens = pins(h, prefix, filename, true).await;
+                h.pypi.publish_file(&file(repo, version, filename, &tokens)).await.unwrap()
+            }
+
+            async fn listed(h: &PypiHandles) -> Vec<String> {
+                h.referenced
+                    .referenced(GRACE, at(5))
+                    .map_ok(|r| r.key)
+                    .try_collect()
+                    .await
+                    .unwrap()
+            }
+
+            #[tokio::test]
+            async fn a_file_lands_its_release_and_records_the_keys_it_was_given() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let tokens = pins(&h, &prefix, "demo-1.0-py3-none-any.whl", true).await;
+                let first = h
+                    .pypi
+                    .publish_file(&file(r.id, "1", "demo-1.0-py3-none-any.whl", &tokens))
+                    .await
+                    .unwrap();
+                assert!(first.version_created);
+                assert_eq!(first.file.key, tokens[0].physical_key);
+                assert_eq!(first.file.metadata_key.as_deref(), Some(tokens[1].physical_key.as_str()));
+                assert_eq!(first.file.uploaded_at, at(2), "the caller's clock, read back as given");
+                assert_eq!((first.file.project.as_str(), first.file.version.as_str()), ("demo", "1"));
+                let second = publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await;
+                assert!(!second.version_created, "one release, two files");
+                assert_eq!(second.file.version_id, first.file.version_id);
+                let files = h.pypi.project_files(r.id, "demo").await.unwrap();
+                assert_eq!(
+                    files.iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(),
+                    ["demo-1.0-py3-none-any.whl", "demo-1.0.tar.gz"]
+                );
+                assert_eq!(h.pypi.list_projects(r.id).await.unwrap(), ["demo"]);
+                let found = h.pypi.file_by_name(r.id, "demo-1.0.tar.gz").await.unwrap().unwrap();
+                assert_eq!(found, second.file);
+                assert!(h.pypi.file_by_name(r.id, "nope-1.0.tar.gz").await.unwrap().is_none());
+            }
+
+            #[tokio::test]
+            async fn a_second_file_of_one_name_is_a_conflict_that_writes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await;
+                let tokens = pins(&h, &prefix, "demo-1.0.tar.gz", false).await;
+                let refused = h.pypi.publish_file(&file(r.id, "2", "demo-1.0.tar.gz", &tokens)).await;
+                assert!(matches!(refused, Err(StoreError::Conflict)), "{refused:?}");
+                let files = h.pypi.project_files(r.id, "demo").await.unwrap();
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].version, "1", "the refused file created no release");
+            }
+
+            #[tokio::test]
+            async fn two_concurrent_publishes_of_one_filename_yield_one_conflict() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let a = pins(&h, &prefix, "demo-1.0.tar.gz", false).await;
+                let b = pins(&h, &prefix, "demo-1.0.tar.gz", false).await;
+                let (fa, fb) = (file(r.id, "1", "demo-1.0.tar.gz", &a), file(r.id, "1", "demo-1.0.tar.gz", &b));
+                let (x, y) = ::tokio::join!(h.pypi.publish_file(&fa), h.pypi.publish_file(&fb));
+                let outcomes = [x, y];
+                assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1);
+                assert_eq!(
+                    outcomes.iter().filter(|o| matches!(o, Err(StoreError::Conflict))).count(),
+                    1,
+                    "{outcomes:?}"
+                );
+            }
+
+            #[tokio::test]
+            async fn a_revoked_pin_is_superseded_and_writes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let keys = [format!("{prefix}/demo/ab/w.whl"), format!("{prefix}/demo/cd/w.whl.metadata")];
+                let Pinned::Tokens(tokens) = h.reclaim.pin(&prefix, &keys, at(2)).await.unwrap() else {
+                    panic!("{prefix} is live")
+                };
+                h.reclaim.enqueue(std::slice::from_ref(&tokens[1].physical_key), at(1)).await.unwrap();
+                assert!(matches!(
+                    h.reclaim.claim(&tokens[1].physical_key, GRACE, at(5), at(6)).await.unwrap(),
+                    Claim::Claimed(_)
+                ));
+                let refused = h
+                    .pypi
+                    .publish_file(&file(r.id, "1", "demo-1.0-py3-none-any.whl", &tokens))
+                    .await;
+                match refused {
+                    Err(StoreError::Superseded(keys)) => assert_eq!(keys, vec![tokens[1].physical_key.clone()]),
+                    other => panic!("{other:?}"),
+                }
+                assert!(h.pypi.project_files(r.id, "demo").await.unwrap().is_empty());
+                assert!(h.pypi.list_projects(r.id).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_yank_moves_the_release_and_every_file_together() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await;
+                publish(&h, r.id, &prefix, "1", "demo-1.0-py3-none-any.whl").await;
+                publish(&h, r.id, &prefix, "2", "demo-2.0.tar.gz").await;
+                h.pypi.set_release_yanked(r.id, "demo", "1", Some("broken"), true, at(3)).await.unwrap();
+                let files = h.pypi.project_files(r.id, "demo").await.unwrap();
+                for f in &files {
+                    let yanked = f.version == "1";
+                    assert_eq!(f.yanked, yanked, "{}", f.filename);
+                    assert_eq!(f.yanked_reason.as_deref(), yanked.then_some("broken"));
+                }
+                h.pypi.set_release_yanked(r.id, "demo", "1", None, false, at(4)).await.unwrap();
+                assert!(h
+                    .pypi
+                    .project_files(r.id, "demo")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|f| !f.yanked && f.yanked_reason.is_none()));
+                assert!(matches!(
+                    h.pypi.set_release_yanked(r.id, "demo", "9", None, true, at(4)).await,
+                    Err(StoreError::NotFound)
+                ));
+            }
+
+            #[tokio::test]
+            async fn a_key_this_port_references_metadata_included_is_referenced_for_claim_and_listed() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let landed = publish(&h, r.id, &prefix, "1", "demo-1.0-py3-none-any.whl").await.file;
+                let metadata = landed.metadata_key.clone().unwrap();
+                let listing = listed(&h).await;
+                for key in [&landed.key, &metadata] {
+                    assert!(listing.contains(key), "{key} listed");
+                    h.reclaim.enqueue(std::slice::from_ref(key), at(1)).await.unwrap();
+                    assert_eq!(
+                        h.reclaim.claim(key, GRACE, at(5), at(6)).await.unwrap(),
+                        Claim::Referenced,
+                        "{key}"
+                    );
+                }
+            }
+
+            #[tokio::test]
+            async fn deleting_a_release_enqueues_every_key_it_held_and_deletes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let wheel = publish(&h, r.id, &prefix, "1", "demo-1.0-py3-none-any.whl").await.file;
+                let sdist = publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await.file;
+                let kept = publish(&h, r.id, &prefix, "2", "demo-2.0.tar.gz").await.file;
+                let mut want = vec![
+                    wheel.key.clone(),
+                    wheel.metadata_key.clone().unwrap(),
+                    sdist.key.clone(),
+                    sdist.metadata_key.clone().unwrap(),
+                ];
+                want.sort();
+                let released = h.pypi.delete_release(r.id, "demo", "1", at(3)).await.unwrap();
+                assert_eq!(released, want);
+                assert!(matches!(
+                    h.pypi.delete_release(r.id, "demo", "1", at(3)).await,
+                    Err(StoreError::NotFound)
+                ));
+                let mut due: Vec<String> =
+                    h.reclaim.due(GRACE, at(5), 50).await.unwrap().into_iter().map(|c| c.key).collect();
+                due.sort();
+                assert_eq!(due, want, "enqueued in the delete's own transaction");
+                for key in &want {
+                    assert!(
+                        matches!(h.reclaim.claim(key, GRACE, at(5), at(6)).await.unwrap(), Claim::Claimed(_)),
+                        "{key}"
+                    );
+                }
+                assert_eq!(h.pypi.project_files(r.id, "demo").await.unwrap(), vec![kept.clone()]);
+                let rest = h.pypi.delete_project_files(r.id, "demo", at(3)).await.unwrap();
+                assert!(rest.contains(&kept.key) && rest.contains(kept.metadata_key.as_ref().unwrap()));
+                assert!(h.pypi.list_projects(r.id).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_repository_holding_files_refuses_to_retire() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await;
+                assert!(matches!(h.repos.retire("py", at(3)).await, Err(StoreError::Conflict)));
+                assert_eq!(h.pypi.list_projects(r.id).await.unwrap(), ["demo"]);
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use pypi_contract;
+
+/// What `maven_contract!` needs of an adapter: port 18, and the ports it
+/// fences with and contributes to.
+pub struct MavenHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub maven: Arc<dyn opencargo::ports::maven::MavenFileStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+    pub referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+    _keep: Box<dyn Any + Send>,
+}
+
+impl MavenHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        maven: Arc<dyn opencargo::ports::maven::MavenFileStore>,
+        reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+        referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            maven,
+            reclaim,
+            referenced,
+            _keep: keep,
+        }
+    }
+}
+
+/// `maven_contract!(name, opener)`: port 18 answers alike on every adapter.
+#[allow(unused_macros)]
+macro_rules! maven_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, TimeZone, Utc};
+            use ::futures_util::TryStreamExt;
+            use ::opencargo::domain::{layout, Format, RepoKind, RepoSpec, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::maven::{
+                ClientMetadata, Declaration, Digests, NewFile, SumAlgorithm, UnitChange, UnitKey,
+            };
+            use ::opencargo::ports::reclaim::{Claim, PinToken, Pinned};
+            use ::std::time::Duration;
+
+            const GRACE: Duration = Duration::from_secs(3600);
+            const GA: &str = "org.example:lib";
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 18, hour, 0, 0).unwrap()
+            }
+
+            fn digests(seed: &str) -> Digests {
+                Digests {
+                    sha1: format!("{seed}1"),
+                    md5: format!("{seed}5"),
+                    sha256: format!("{seed}256"),
+                    sha512: format!("{seed}512"),
+                }
+            }
+
+            async fn repo(h: &MavenHandles) -> (i64, String) {
+                let repo = h
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            name: "m",
+                            kind: RepoKind::Hosted,
+                            format: Format::Maven,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                let incarnation = h.repos.incarnation(repo.id).await.unwrap().unwrap();
+                (repo.id, layout::incarnation_prefix(&incarnation))
+            }
+
+            async fn pin(h: &MavenHandles, prefix: &str, logical: &str, until: u32) -> Vec<PinToken> {
+                match h.reclaim.pin(prefix, &[logical.to_string()], at(until)).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("{prefix} is live"),
+                }
+            }
+
+            fn key(repository: i64, version: &str) -> UnitKey<'_> {
+                UnitKey {
+                    repository,
+                    ga: GA,
+                    version,
+                    build: "",
+                }
+            }
+
+            fn scopes() -> Vec<String> {
+                vec![GA.to_string()]
+            }
+
+            struct Deposit<'a> {
+                repository: i64,
+                version: &'a str,
+                revision: Option<i64>,
+                filename: &'a str,
+                pins: &'a [PinToken],
+                digests: &'a Digests,
+                declarations: &'a [Declaration],
+                contest: bool,
+                reveal: bool,
+                scopes: &'a [String],
+                now: u32,
+            }
+
+            async fn deposit(h: &MavenHandles, d: Deposit<'_>) -> Result<::opencargo::ports::maven::Changed, StoreError> {
+                h.maven
+                    .change(&UnitChange {
+                        key: key(d.repository, d.version),
+                        revision: d.revision,
+                        depositor: "alice",
+                        file: d.pins.first().map(|p| NewFile {
+                            filename: d.filename,
+                            physical_key: &p.physical_key,
+                            size: 3,
+                            digests: d.digests,
+                            depositor: "alice",
+                        }),
+                        declarations: d.declarations,
+                        contest: d.contest,
+                        reveal: d.reveal,
+                        scopes: d.scopes,
+                        pins: d.pins,
+                        now: at(d.now),
+                    })
+                    .await
+            }
+
+            fn plain<'a>(
+                repository: i64,
+                revision: Option<i64>,
+                pins: &'a [PinToken],
+                digests: &'a Digests,
+                scopes: &'a [String],
+            ) -> Deposit<'a> {
+                Deposit {
+                    repository,
+                    version: "1.0",
+                    revision,
+                    filename: "lib-1.0.jar",
+                    pins,
+                    digests,
+                    declarations: &[],
+                    contest: false,
+                    reveal: false,
+                    scopes,
+                    now: 2,
+                }
+            }
+
+            async fn due(h: &MavenHandles) -> Vec<String> {
+                h.reclaim
+                    .due(Duration::ZERO, at(20), 100)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.key)
+                    .collect()
+            }
+
+            #[tokio::test]
+            async fn a_unit_round_trips_with_its_files_declarations_and_depositor() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let pins = pin(&h, &prefix, &format!("{prefix}/a"), 9).await;
+                let d = digests("a");
+                let declared = [Declaration {
+                    filename: "lib-1.0.pom".to_string(),
+                    algorithm: SumAlgorithm::Sha1,
+                    value: "ff".to_string(),
+                }];
+                let s = scopes();
+                let changed = deposit(&h, Deposit { declarations: &declared, ..plain(r, None, &pins, &d, &s) })
+                    .await
+                    .unwrap();
+                assert_eq!(changed.revision, 1);
+                assert!(changed.released.is_empty());
+                let unit = h.maven.unit(&key(r, "1.0")).await.unwrap().unwrap();
+                assert_eq!(unit.revision, 1);
+                assert_eq!(unit.depositor, "alice");
+                assert!(!unit.contested && !unit.refused && unit.visible_at.is_none());
+                assert_eq!(unit.created_at, at(2));
+                let file = unit.file("lib-1.0.jar").unwrap();
+                assert_eq!(file.physical_key, pins[0].physical_key);
+                assert_eq!(file.digests, d);
+                assert_eq!(file.size, 3);
+                assert_eq!(unit.declarations, declared.to_vec());
+                assert!(h.maven.unit(&key(r, "2.0")).await.unwrap().is_none());
+            }
+
+            #[tokio::test]
+            async fn replacing_a_file_releases_its_key_and_its_declarations() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let first = pin(&h, &prefix, &format!("{prefix}/a"), 9).await;
+                let (d1, d2) = (digests("a"), digests("b"));
+                let s = scopes();
+                let declared = [Declaration {
+                    filename: "lib-1.0.jar".to_string(),
+                    algorithm: SumAlgorithm::Md5,
+                    value: "a5".to_string(),
+                }];
+                deposit(&h, Deposit { declarations: &declared, ..plain(r, None, &first, &d1, &s) })
+                    .await
+                    .unwrap();
+                let second = pin(&h, &prefix, &format!("{prefix}/b"), 9).await;
+                let changed = deposit(&h, plain(r, Some(1), &second, &d2, &s)).await.unwrap();
+                assert_eq!(changed.released, vec![first[0].physical_key.clone()]);
+                assert!(due(&h).await.contains(&first[0].physical_key), "enqueued, not deleted");
+                let unit = h.maven.unit(&key(r, "1.0")).await.unwrap().unwrap();
+                assert_eq!(unit.files.len(), 1);
+                assert_eq!(unit.files[0].physical_key, second[0].physical_key);
+                assert!(unit.declarations.is_empty(), "the old bytes' declarations went with them");
+            }
+
+            #[tokio::test]
+            async fn a_revoked_pin_is_superseded_and_writes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let pins = pin(&h, &prefix, &format!("{prefix}/a"), 2).await;
+                h.reclaim.enqueue(&[pins[0].physical_key.clone()], at(1)).await.unwrap();
+                let claim = h.reclaim.claim(&pins[0].physical_key, GRACE, at(5), at(6)).await.unwrap();
+                assert!(matches!(claim, Claim::Claimed(_)), "{claim:?}");
+                let d = digests("a");
+                let s = scopes();
+                let refused = deposit(&h, plain(r, None, &pins, &d, &s)).await;
+                assert!(
+                    matches!(&refused, Err(StoreError::Superseded(keys)) if keys == &vec![pins[0].physical_key.clone()]),
+                    "{refused:?}"
+                );
+                assert!(h.maven.unit(&key(r, "1.0")).await.unwrap().is_none());
+                assert_eq!(h.maven.counter(r, GA).await.unwrap().value, 0);
+            }
+
+            #[tokio::test]
+            async fn a_referenced_key_is_referenced_for_claim_and_listed() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let pins = pin(&h, &prefix, &format!("{prefix}/a"), 2).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, plain(r, None, &pins, &d, &s)).await.unwrap();
+                let physical = pins[0].physical_key.clone();
+                let listed: Vec<String> = h
+                    .referenced
+                    .referenced(GRACE, at(10))
+                    .map_ok(|k| k.key)
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert!(listed.contains(&physical), "{listed:?}");
+                h.reclaim.enqueue(std::slice::from_ref(&physical), at(1)).await.unwrap();
+                assert_eq!(
+                    h.reclaim.claim(&physical, GRACE, at(10), at(11)).await.unwrap(),
+                    Claim::Referenced
+                );
+            }
+
+            #[tokio::test]
+            async fn a_stale_revision_or_a_second_creation_is_a_conflict() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, plain(r, None, &[], &d, &s)).await.unwrap();
+                let again = deposit(&h, plain(r, None, &[], &d, &s)).await;
+                assert!(matches!(again, Err(StoreError::Conflict)), "{again:?}");
+                deposit(&h, plain(r, Some(1), &[], &d, &s)).await.unwrap();
+                let stale = deposit(&h, plain(r, Some(1), &[], &d, &s)).await;
+                assert!(matches!(stale, Err(StoreError::Conflict)), "{stale:?}");
+
+                let fresh = |v: &'static str| {
+                    let h = &h;
+                    let d = &d;
+                    let s = &s;
+                    async move {
+                        deposit(h, Deposit { version: v, ..plain(r, None, &[], d, s) }).await
+                    }
+                };
+                let (a, b) = tokio::join!(fresh("2.0"), fresh("2.0"));
+                let conflicts = [&a, &b].iter().filter(|x| matches!(x, Err(StoreError::Conflict))).count();
+                let oks = [&a, &b].iter().filter(|x| x.is_ok()).count();
+                assert_eq!((oks, conflicts), (1, 1), "{a:?} {b:?}");
+            }
+
+            #[tokio::test]
+            async fn the_contest_and_visibility_marks_stick() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, Deposit { contest: true, ..plain(r, None, &[], &d, &s) }).await.unwrap();
+                deposit(&h, Deposit { reveal: true, now: 3, ..plain(r, Some(1), &[], &d, &s) })
+                    .await
+                    .unwrap();
+                deposit(&h, Deposit { reveal: true, now: 4, ..plain(r, Some(2), &[], &d, &s) })
+                    .await
+                    .unwrap();
+                let unit = h.maven.unit(&key(r, "1.0")).await.unwrap().unwrap();
+                assert!(unit.contested, "nothing clears the mark");
+                assert_eq!(unit.visible_at, Some(at(3)), "revealed once");
+                assert!(unit.visible());
+            }
+
+            #[tokio::test]
+            async fn every_change_moves_the_counters_it_names_and_no_other() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let d = digests("a");
+                let both = vec![GA.to_string(), format!("{GA}@1.0")];
+                deposit(&h, plain(r, None, &[], &d, &both)).await.unwrap();
+                let one = scopes();
+                deposit(&h, Deposit { now: 5, ..plain(r, Some(1), &[], &d, &one) }).await.unwrap();
+                let ga = h.maven.counter(r, GA).await.unwrap();
+                assert_eq!((ga.value, ga.updated_at), (2, Some(at(5))));
+                assert_eq!(h.maven.counter(r, &format!("{GA}@1.0")).await.unwrap().value, 1);
+                assert_eq!(h.maven.counter(r, "other").await.unwrap().value, 0);
+                h.maven.refuse(&key(r, "1.0"), 2, &one, at(6)).await.unwrap();
+                assert_eq!(h.maven.counter(r, GA).await.unwrap().value, 3);
+            }
+
+            #[tokio::test]
+            async fn refusing_releases_every_key_and_keeps_the_unit_refused() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let pins = pin(&h, &prefix, &format!("{prefix}/a"), 9).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, plain(r, None, &pins, &d, &s)).await.unwrap();
+                let stale = h.maven.refuse(&key(r, "1.0"), 7, &s, at(3)).await;
+                assert!(matches!(stale, Err(StoreError::Conflict)), "{stale:?}");
+                let changed = h.maven.refuse(&key(r, "1.0"), 1, &s, at(3)).await.unwrap();
+                assert_eq!(changed.released, vec![pins[0].physical_key.clone()]);
+                assert!(due(&h).await.contains(&pins[0].physical_key));
+                let unit = h.maven.unit(&key(r, "1.0")).await.unwrap().unwrap();
+                assert!(unit.refused && unit.files.is_empty() && !unit.visible());
+                let views = h.maven.artifact(r, GA).await.unwrap();
+                assert!(views.iter().all(|v| v.refused));
+            }
+
+            #[tokio::test]
+            async fn a_repository_holding_maven_values_is_not_retired() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, plain(r, None, &[], &d, &s)).await.unwrap();
+                let refused = h.repos.retire("m", at(3)).await;
+                assert!(matches!(refused, Err(StoreError::Conflict)), "{refused:?}");
+                assert!(h.repos.by_name("m").await.unwrap().is_some());
+            }
+
+            #[tokio::test]
+            async fn pending_and_unversioned_list_what_the_reconciler_needs() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let d = digests("a");
+                let s = scopes();
+                let waiting = [Declaration {
+                    filename: "lib-sources.jar".to_string(),
+                    algorithm: SumAlgorithm::Sha1,
+                    value: d.sha1.clone(),
+                }];
+                for (i, version) in ["0.1", "0.2", "0.3", "1.0"].into_iter().enumerate() {
+                    let pins = pin(&h, &prefix, &format!("{prefix}/{i}"), 9).await;
+                    let files: &[PinToken] = if version == "0.3" { &[] } else { &pins };
+                    let declarations: &[Declaration] = if version == "0.2" { &waiting } else { &[] };
+                    deposit(&h, Deposit { version, contest: version == "0.1", declarations, ..plain(r, None, files, &d, &s) })
+                        .await
+                        .unwrap();
+                }
+                deposit(&h, Deposit { version: "2.0", now: 4, reveal: true, ..plain(r, None, &[], &d, &s) })
+                    .await
+                    .unwrap();
+                deposit(&h, Deposit { version: "3.0", now: 4, reveal: true, ..plain(r, None, &[], &d, &s) })
+                    .await
+                    .unwrap();
+                let pending = h.maven.pending(at(3), 1).await.unwrap();
+                assert_eq!(pending.len(), 1, "contested, waiting and empty units are not offered");
+                assert_eq!((pending[0].ga.as_str(), pending[0].version.as_str()), (GA, "1.0"));
+                assert!(h.maven.pending(at(2), 10).await.unwrap().is_empty(), "created at 2, not before");
+                let first = h.maven.unversioned(None, 1).await.unwrap();
+                assert_eq!(first.len(), 1);
+                assert_eq!(first[0].version, "2.0");
+                let next = h.maven.unversioned(Some(&first[0]), 10).await.unwrap();
+                assert_eq!(next.len(), 1);
+                assert_eq!(next[0].version, "3.0", "paged past the cursor");
+                h.maven.mark_versioned(r, GA, "2.0").await.unwrap();
+                h.maven.mark_versioned(r, GA, "3.0").await.unwrap();
+                assert!(h.maven.unversioned(None, 10).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_client_document_round_trips_and_moves_its_counters() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let doc = ClientMetadata {
+                    repository: r,
+                    dir: "org/example/lib".to_string(),
+                    digests: digests("m"),
+                    release: Some("1.0".to_string()),
+                    latest: None,
+                    plugins: vec![("ex".to_string(), "ex-maven-plugin".to_string(), "Ex".to_string())],
+                };
+                let s = scopes();
+                h.maven.record_client_metadata(&doc, &s, at(3)).await.unwrap();
+                assert_eq!(h.maven.client_metadata(r, "org/example/lib").await.unwrap(), Some(doc.clone()));
+                let newer = ClientMetadata { release: None, ..doc };
+                h.maven.record_client_metadata(&newer, &s, at(4)).await.unwrap();
+                assert_eq!(h.maven.client_metadata(r, "org/example/lib").await.unwrap(), Some(newer));
+                assert!(h.maven.client_metadata(r, "org/example").await.unwrap().is_none());
+                assert_eq!(h.maven.counter(r, GA).await.unwrap().value, 2);
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use maven_contract;
+
+/// What `NugetFeedRead` (port 17) owes, beside the `PackageStore` it reads.
+pub struct FeedHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub packages: Arc<dyn PackageStore>,
+    pub feed: Arc<dyn opencargo::ports::nuget::NugetFeedRead>,
+    _keep: Box<dyn Any + Send>,
+}
+
+impl FeedHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        packages: Arc<dyn PackageStore>,
+        feed: Arc<dyn opencargo::ports::nuget::NugetFeedRead>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            packages,
+            feed,
+            _keep: keep,
+        }
+    }
+}
+
+/// `nuget_feed_contract!(name, opener)`: port 17 filters before it cuts the
+/// window, counts exactly, never returns an unlisted version, and holds a
+/// consistent window while publishes land; `PackageStore` gives two
+/// concurrent publishes of one normalized version one row and one
+/// `Conflict`.
+#[allow(unused_macros)]
+macro_rules! nuget_feed_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::Utc;
+            use ::opencargo::domain::{Format, RepoKind, RepoSpec, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::nuget::FeedQuery;
+            use ::opencargo::ports::packages::{NameMatch, NewRelease};
+
+            async fn repo(h: &FeedHandles) -> i64 {
+                h.repos
+                    .create(
+                        &RepoSpec {
+                            name: "nuget-hosted",
+                            kind: RepoKind::Hosted,
+                            format: Format::Nuget,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        Utc::now(),
+                    )
+                    .await
+                    .unwrap()
+                    .id
+            }
+
+            async fn publish(
+                h: &FeedHandles,
+                repository: i64,
+                package: &str,
+                version: &str,
+                facts: &str,
+            ) -> Result<i64, StoreError> {
+                h.packages
+                    .publish_version(&NewRelease {
+                        repository,
+                        package,
+                        match_name: NameMatch::Exact,
+                        description: Some("a nuget package"),
+                        readme: None,
+                        version,
+                        metadata_json: facts,
+                        checksum_sha1: None,
+                        checksum_sha256: None,
+                        integrity: None,
+                        size: 1,
+                        tarball_path: "k",
+                        dist_tags: &[],
+                        dependencies: &[],
+                        pins: &[],
+                        now: Utc::now(),
+                    })
+                    .await
+                    .map(|r| r.version.id)
+            }
+
+            fn query(repository: i64) -> FeedQuery<'static> {
+                FeedQuery {
+                    repository,
+                    take: 20,
+                    ..FeedQuery::default()
+                }
+            }
+
+            #[tokio::test]
+            async fn filters_apply_before_the_window_and_the_total_is_exact() {
+                let h = $open().await;
+                let r = repo(&h).await;
+                publish(&h, r, "a.pre", "1.0.0-beta", r#"{"prerelease":true}"#).await.unwrap();
+                publish(&h, r, "b.stable", "1.0.0", "{}").await.unwrap();
+                publish(&h, r, "c.pre", "2.0.0-rc", r#"{"prerelease":true}"#).await.unwrap();
+                publish(&h, r, "d.stable", "1.0.0", r#"{"packageTypes":["dotnettool"]}"#)
+                    .await
+                    .unwrap();
+                publish(&h, r, "e.semver2", "1.0.0-rc.1", r#"{"prerelease":true,"semver2":true}"#)
+                    .await
+                    .unwrap();
+
+                let stable = h.feed.search(&FeedQuery { take: 1, ..query(r) }).await.unwrap();
+                assert_eq!(stable.total, 2);
+                assert_eq!(stable.hits.len(), 1);
+                assert_eq!(stable.hits[0].package.name, "b.stable");
+                let second = h.feed.search(&FeedQuery { skip: 1, take: 1, ..query(r) }).await.unwrap();
+                assert_eq!(second.hits[0].package.name, "d.stable");
+
+                let pre = h.feed.search(&FeedQuery { prerelease: true, ..query(r) }).await.unwrap();
+                assert_eq!(pre.total, 4, "semver2 still filtered");
+                let all = h
+                    .feed
+                    .search(&FeedQuery { prerelease: true, semver2: true, ..query(r) })
+                    .await
+                    .unwrap();
+                assert_eq!(all.total, 5);
+                let tools = h
+                    .feed
+                    .search(&FeedQuery { package_type: Some("DotnetTool"), ..query(r) })
+                    .await
+                    .unwrap();
+                assert_eq!(tools.total, 1);
+                let text = h
+                    .feed
+                    .search(&FeedQuery { text: Some("STABLE"), ..query(r) })
+                    .await
+                    .unwrap();
+                assert_eq!(text.total, 2);
+            }
+
+            #[tokio::test]
+            async fn an_unlisted_version_is_never_returned() {
+                let h = $open().await;
+                let r = repo(&h).await;
+                let old = publish(&h, r, "lib", "1.0.0", "{}").await.unwrap();
+                publish(&h, r, "lib", "2.0.0", "{}").await.unwrap();
+                let only = publish(&h, r, "solo", "1.0.0", "{}").await.unwrap();
+                h.packages.set_yanked(old, true).await.unwrap();
+                h.packages.set_yanked(only, true).await.unwrap();
+
+                let page = h.feed.search(&query(r)).await.unwrap();
+                assert_eq!(page.total, 1, "a package with nothing listed is not a hit");
+                let versions: Vec<&str> =
+                    page.hits[0].versions.iter().map(|v| v.version.as_str()).collect();
+                assert_eq!(versions, ["2.0.0"]);
+            }
+
+            #[tokio::test]
+            async fn two_spellings_of_one_version_race_to_one_row() {
+                let h = $open().await;
+                let r = repo(&h).await;
+                let (a, b) = tokio::join!(
+                    publish(&h, r, "race", "1.0.0", "{}"),
+                    publish(&h, r, "race", "1.0.0", "{}")
+                );
+                let conflicts = [&a, &b]
+                    .iter()
+                    .filter(|x| matches!(x, Err(StoreError::Conflict)))
+                    .count();
+                assert_eq!(conflicts, 1, "{a:?} {b:?}");
+                assert!([&a, &b].iter().any(|x| x.is_ok()));
+                let page = h.feed.search(&query(r)).await.unwrap();
+                assert_eq!(page.hits[0].versions.len(), 1);
+            }
+
+            #[tokio::test]
+            async fn the_window_holds_while_publishes_land() {
+                let h = $open().await;
+                let r = repo(&h).await;
+                let writer = async {
+                    for i in 0..20 {
+                        publish(&h, r, &format!("p{i:02}"), "1.0.0", "{}").await.unwrap();
+                    }
+                };
+                let reader = async {
+                    let mut last = 0;
+                    for _ in 0..20 {
+                        let page = h.feed.search(&FeedQuery { take: 5, ..query(r) }).await.unwrap();
+                        assert!(page.total >= last, "the total never goes back");
+                        assert_eq!(page.hits.len() as u64, page.total.min(5));
+                        let names: Vec<&str> =
+                            page.hits.iter().map(|h| h.package.name.as_str()).collect();
+                        let mut sorted = names.clone();
+                        sorted.sort();
+                        assert_eq!(names, sorted);
+                        last = page.total;
+                        tokio::task::yield_now().await;
+                    }
+                };
+                tokio::join!(writer, reader);
+                assert_eq!(h.feed.search(&query(r)).await.unwrap().total, 20);
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use nuget_feed_contract;
