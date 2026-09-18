@@ -197,7 +197,7 @@ fn build_index_line(
         "features": meta.get("features").cloned().unwrap_or(json!({})),
         "yanked": version.yanked,
     });
-    for key in ["features2", "links"] {
+    for key in ["v", "features2", "links", "rust_version"] {
         if let Some(v) = meta.get(key) {
             line[key] = v.clone();
         }

@@ -237,7 +237,7 @@ mod tests {
         assert_eq!(p.len(), 1);
         assert_eq!(p[0].target_repo, "npm");
         let kinds: Vec<_> = g.iter().map(|g| g.kind).collect();
-        assert_eq!(kinds, [GapKind::UnsupportedFormat, GapKind::UnsupportedFormat, GapKind::NoTarget]);
+        assert_eq!(kinds, [GapKind::UnsupportedFormat, GapKind::NoTarget, GapKind::UnsupportedFormat]);
     }
 
     #[test]

@@ -42,8 +42,7 @@ impl Digests {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "lowercase")]
 pub enum Origin {
-    /// A file in a repository manager: `{endpoint}/{repo}/{path}` in the
-    /// adapter's own URL grammar.
+    /// A file in a repository manager, at `{endpoint}{repo}/{path}`.
     Asset { endpoint: String, repo: String, path: String },
     /// An npm registry endpoint: its packument, then the version's tarball.
     Npm { registry: String, package: String },
@@ -436,7 +435,8 @@ pub trait ImportJournal: Send + Sync {
 
     async fn items(&self) -> Result<Vec<Journaled>, JournalError>;
 
-    async fn gaps(&self) -> Result<Vec<Gap>, JournalError>;
+    /// Every stored gap once, with how many times its fact was recorded.
+    async fn gaps(&self) -> Result<Vec<(Gap, u64)>, JournalError>;
 
     async fn pending(&self) -> Result<u64, JournalError>;
 }

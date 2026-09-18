@@ -560,12 +560,15 @@ impl ImportJournal for SqliteImportJournal {
         rows.iter().map(journaled).collect()
     }
 
-    async fn gaps(&self) -> Result<Vec<Gap>, JournalError> {
-        let rows = sqlx::query("SELECT kind, source_ref, detail FROM gap ORDER BY kind, source_ref, detail")
-            .fetch_all(&self.pool)
-            .await
-            .map_err(io)?;
-        rows.iter().map(gap_of).collect()
+    async fn gaps(&self) -> Result<Vec<(Gap, u64)>, JournalError> {
+        let rows = sqlx::query(
+            "SELECT kind, source_ref, detail, sum(count) AS n FROM gap
+             GROUP BY kind, source_ref, detail ORDER BY kind, source_ref, detail",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(io)?;
+        rows.iter().map(|r| Ok((gap_of(r)?, r.get::<i64, _>("n") as u64))).collect()
     }
 
     async fn pending(&self) -> Result<u64, JournalError> {
@@ -711,7 +714,7 @@ mod tests {
         j.record("s1", true, &[], &[g("x")], &None, true).await.unwrap();
         j.record("s2", true, &[], &[g("y"), g("y")], &None, true).await.unwrap();
         j.record("s1", true, &[], &[], &None, true).await.unwrap();
-        assert_eq!(j.gaps().await.unwrap(), vec![g("y")]);
+        assert_eq!(j.gaps().await.unwrap(), vec![(g("y"), 2)]);
     }
 
     #[tokio::test]

@@ -146,6 +146,44 @@ fn short(name: &str) -> &str {
     name.split_once('/').map_or(name, |(_, n)| n)
 }
 
+/// The full packument of `p`, its tarballs under `{base}/{name}/-/`.
+pub fn packument(base: &str, p: &Pkg) -> Value {
+    let mut versions = serde_json::Map::new();
+    let mut time = serde_json::Map::new();
+    for v in &p.versions {
+        let mut url = format!("{base}/{}/-/{}-{}.tgz", p.name, short(&p.name), v.version);
+        if let Some(q) = &v.tarball_query {
+            url = format!("{url}?{q}");
+        }
+        versions.insert(
+            v.version.clone(),
+            json!({
+                "name": p.name,
+                "version": v.version,
+                "description": p.description,
+                "dependencies": v.deps,
+                "license": "MIT",
+                "dist": { "shasum": v.shasum.clone().unwrap_or_else(|| sha1_hex(&v.tarball)), "tarball": url }
+            }),
+        );
+        time.insert(v.version.clone(), json!(v.time.clone().unwrap_or_else(|| "2026-01-01T00:00:00.000Z".into())));
+    }
+    let tags: serde_json::Map<String, Value> = p.dist_tags.iter().map(|(t, v)| (t.clone(), json!(v))).collect();
+    let mut doc = json!({ "name": p.name, "dist-tags": tags, "versions": versions, "time": time });
+    if let Some(d) = &p.description {
+        doc["description"] = json!(d);
+    }
+    if let Some(r) = &p.readme {
+        doc["readme"] = json!(r);
+    }
+    doc
+}
+
+/// The tarball `file` of `p`, as its packument names it.
+pub fn tarball_of(p: &Pkg, file: &str) -> Option<Vec<u8>> {
+    p.versions.iter().find(|v| format!("{}-{}.tgz", short(&p.name), v.version) == file).map(|v| v.tarball.clone())
+}
+
 impl Inner {
     fn packument(&self, name: &str) -> Option<Value> {
         let base = self.base.lock().unwrap().clone();
@@ -157,36 +195,7 @@ impl Inner {
             }
         }
         let pkgs = self.pkgs.lock().unwrap();
-        let p = pkgs.get(name)?;
-        let mut versions = serde_json::Map::new();
-        let mut time = serde_json::Map::new();
-        for v in &p.versions {
-            let mut url = format!("{base}/{}/-/{}-{}.tgz", p.name, short(&p.name), v.version);
-            if let Some(q) = &v.tarball_query {
-                url = format!("{url}?{q}");
-            }
-            versions.insert(
-                v.version.clone(),
-                json!({
-                    "name": p.name,
-                    "version": v.version,
-                    "description": p.description,
-                    "dependencies": v.deps,
-                    "license": "MIT",
-                    "dist": { "shasum": v.shasum.clone().unwrap_or_else(|| sha1_hex(&v.tarball)), "tarball": url }
-                }),
-            );
-            time.insert(v.version.clone(), json!(v.time.clone().unwrap_or_else(|| "2026-01-01T00:00:00.000Z".into())));
-        }
-        let tags: serde_json::Map<String, Value> = p.dist_tags.iter().map(|(t, v)| (t.clone(), json!(v))).collect();
-        let mut doc = json!({ "name": p.name, "dist-tags": tags, "versions": versions, "time": time });
-        if let Some(d) = &p.description {
-            doc["description"] = json!(d);
-        }
-        if let Some(r) = &p.readme {
-            doc["readme"] = json!(r);
-        }
-        Some(doc)
+        Some(packument(&base, pkgs.get(name)?))
     }
 
     fn names(&self) -> Vec<String> {
@@ -196,9 +205,7 @@ impl Inner {
     }
 
     fn tarball(&self, name: &str, file: &str) -> Option<Vec<u8>> {
-        let pkgs = self.pkgs.lock().unwrap();
-        let p = pkgs.get(name)?;
-        p.versions.iter().find(|v| format!("{}-{}.tgz", short(&p.name), v.version) == file).map(|v| v.tarball.clone())
+        tarball_of(self.pkgs.lock().unwrap().get(name)?, file)
     }
 }
 

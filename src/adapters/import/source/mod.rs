@@ -5,9 +5,40 @@ use chrono::{DateTime, Utc};
 use reqwest::Url;
 use serde_json::Value;
 
-use crate::ports::import::{Coord, Digests, Item, Origin, PkgExtra, SourceFormat, VersionExtra};
+use crate::adapters::import::http::{FetchError, Gate, Req};
+use crate::domain::import::glob_match;
+use crate::ports::import::{
+    Coord, Digests, Item, Origin, PkgExtra, SourceError, SourceFilter, SourceFormat, VersionExtra,
+};
 
+pub mod artifactory;
+pub mod nexus;
 pub mod verdaccio;
+
+/// `--source-repo` names or globs; none selects every repository.
+pub fn repo_selected(f: &SourceFilter, name: &str) -> bool {
+    f.source_repos.is_empty() || f.source_repos.iter().any(|g| glob_match(g, name))
+}
+
+/// A source's sparse cargo index, read for its lines' `cksum` and `yanked`.
+pub struct CargoIndex<'a> {
+    pub gate: &'a Gate,
+    pub base: Url,
+}
+
+impl CargoIndex<'_> {
+    /// The index file of `name`, `None` when the source serves no index.
+    pub async fn lines(&self, name: &str) -> Result<Option<String>, SourceError> {
+        let path = crate::adapters::import::sink::cargo::index_path(name);
+        let url = self.base.join(&path).map_err(|e| SourceError::Refused(e.to_string()))?;
+        match self.gate.bytes(&Req::get(url), 64 << 20).await {
+            Ok(b) => Ok(Some(String::from_utf8_lossy(&b).to_string())),
+            Err(FetchError::NotFound(_)) => Ok(None),
+            Err(FetchError::Auth(m)) => Err(SourceError::Auth(m)),
+            Err(e) => Err(e.into()),
+        }
+    }
+}
 
 /// Every version of a full packument, as items whose bytes are fetched off
 /// `registry` again at copy time.

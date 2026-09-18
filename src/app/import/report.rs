@@ -67,7 +67,7 @@ fn target_of(it: &Journaled) -> String {
 pub fn build(
     header: Option<&RunHeader>,
     items: &[Journaled],
-    stored: &[Gap],
+    stored: &[(Gap, u64)],
     allow_incomplete: bool,
     collapse: usize,
 ) -> Report {
@@ -79,8 +79,8 @@ pub fn build(
             *rows.entry((g.kind, g.source_ref, g.detail)).or_insert(0) += 1;
         }
     }
-    for g in stored {
-        *rows.entry((g.kind, g.source_ref.clone(), g.detail.clone())).or_insert(0) += 1;
+    for (g, n) in stored {
+        *rows.entry((g.kind, g.source_ref.clone(), g.detail.clone())).or_insert(0) += n;
     }
     let code = exit_code(rows.keys().map(|(k, _, _)| *k), allow_incomplete);
     let mut by_fact: BTreeMap<(GapKind, String), Vec<(String, u64)>> = BTreeMap::new();
@@ -222,7 +222,7 @@ mod tests {
             item("a", ItemStatus::Failed, Some("checksum mismatch"), None),
             item("c", ItemStatus::Skipped, None, Some("SkippedUnverifiable: go exposes no checksum")),
         ];
-        let stored = vec![Gap::new(GapKind::NoTarget, "z", "no --map"), Gap::new(GapKind::NoTarget, "y", "no --map")];
+        let stored = vec![(Gap::new(GapKind::NoTarget, "z", "no --map"), 1), (Gap::new(GapKind::NoTarget, "y", "no --map"), 1)];
         let one = build(None, &items, &stored, false, 20);
         let mut reversed = items.clone();
         reversed.reverse();
@@ -253,8 +253,8 @@ mod tests {
 
     #[test]
     fn collapse_threshold_aggregates_rows() {
-        let stored: Vec<Gap> =
-            (0..25).map(|i| Gap::new(GapKind::UnsupportedFormat, format!("r/{i}"), "raw")).collect();
+        let stored: Vec<(Gap, u64)> =
+            (0..25).map(|i| (Gap::new(GapKind::UnsupportedFormat, format!("r/{i}"), "raw"), 1)).collect();
         let r = build(None, &[], &stored, false, 20);
         assert_eq!(r.gaps.len(), 1);
         assert_eq!(r.gaps[0].source_ref, "25 coordinates");

@@ -12,7 +12,11 @@ use clap::{Args, Subcommand, ValueEnum};
 use serde::{Deserialize, Serialize};
 
 use super::http::{admin_url, Credential, Gate, GateConfig, HostSet, Secret};
+use super::sink::cargo::CargoSink;
+use super::sink::go::GoSink;
 use super::sink::npm::NpmSink;
+use super::source::artifactory::Artifactory;
+use super::source::nexus::Nexus;
 use super::source::verdaccio::Verdaccio;
 use super::target::{HttpTargetAdmin, LaneConfig, TargetLane};
 use crate::adapters::sqlite::import_journal::SqliteImportJournal;
@@ -41,12 +45,16 @@ pub enum Import {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum SourceKind {
+    Nexus,
+    Artifactory,
     Verdaccio,
 }
 
 impl SourceKind {
     fn as_str(self) -> &'static str {
         match self {
+            SourceKind::Nexus => "nexus",
+            SourceKind::Artifactory => "artifactory",
             SourceKind::Verdaccio => "verdaccio",
         }
     }
@@ -323,9 +331,13 @@ fn compose(
     };
     let source: Arc<dyn Source> = match a.source {
         SourceKind::Verdaccio => Arc::new(Verdaccio::new(gate.clone()).with_page(a.page_size)),
+        SourceKind::Nexus => Arc::new(Nexus::new(gate.clone())),
+        SourceKind::Artifactory => Arc::new(Artifactory::new(gate.clone()).with_page(a.page_size.min(1000))),
     };
     let mut sinks: HashMap<Format, Arc<dyn Sink>> = HashMap::new();
     sinks.insert(Format::Npm, Arc::new(NpmSink::new(gate.clone(), lane.clone(), parse_size(&a.max_npm_body)?)));
+    sinks.insert(Format::Cargo, Arc::new(CargoSink::new(gate.clone(), lane.clone())));
+    sinks.insert(Format::Go, Arc::new(GoSink::new(gate.clone(), lane.clone())));
     let mut maps = Vec::new();
     for m in &a.maps {
         maps.push(PlanRules::parse_map(m)?);

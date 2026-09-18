@@ -1,6 +1,7 @@
 //! In-process fakes of the registries `opencargo import` reads, shaped like
 //! their real APIs, recording every request they answer.
 
+pub mod manager;
 pub mod target;
 pub mod verdaccio;
 

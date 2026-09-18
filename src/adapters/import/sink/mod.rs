@@ -4,6 +4,8 @@
 
 use reqwest::Url;
 
+pub mod cargo;
+pub mod go;
 pub mod npm;
 
 /// `{base}{name}` with a scoped npm name's `/` kept in one path segment.
