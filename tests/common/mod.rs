@@ -135,7 +135,7 @@ async fn spawn_in(tmp: TempDir, opts: SpawnOpts) -> TestServer {
     }
     let app = server::build_router(state)
         .map_request(server::decode_percent_encoded_slashes)
-        .into_make_service();
+        .into_make_service_with_connect_info::<std::net::SocketAddr>();
 
     let handle = tokio::spawn(async move {
         axum::serve(listener, app).await.ok();

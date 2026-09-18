@@ -586,12 +586,10 @@ async fn test_revoke_token() {
         .await
         .expect("whoami request failed after revoke");
 
-    // With anonymous_read=true, a GET with an invalid token still passes through
-    // as anonymous, returning "anonymous" for whoami.
-    let whoami: Value = resp.json().await.expect("invalid json");
     assert_eq!(
-        whoami["username"], "anonymous",
-        "revoked token should not authenticate; should fall back to anonymous"
+        resp.status(),
+        StatusCode::UNAUTHORIZED,
+        "a presented credential that does not verify is 401, never anonymous (A1 C7)"
     );
 }
 

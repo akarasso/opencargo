@@ -633,3 +633,70 @@ async fn pnpm_publish_without_auth_fails_inner(pnpm: &str) {
         "pnpm publish without auth should have failed but succeeded.\nstdout:\n{stdout}\nstderr:\n{stderr}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A1 C7: a stale token is refused even where anonymous reads would pass.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn stale_bearer_on_public_repo_is_401_with_real_pnpm() {
+    let Some(pnpm) = client_bin("PNPM_BIN") else {
+        return;
+    };
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(120),
+        stale_bearer_inner(&pnpm),
+    )
+    .await;
+    assert!(result.is_ok(), "test timed out after 120s");
+}
+
+async fn stale_bearer_inner(pnpm: &str) {
+    let (_base_url, port, _handle, _server_tmp) = setup().await;
+    let tmp = TempDir::new().expect("failed to create work temp dir");
+    let fake_home = tmp.path().join("home");
+    std::fs::create_dir_all(&fake_home).unwrap();
+
+    let pkg_dir = tmp.path().join("pkg");
+    std::fs::create_dir_all(&pkg_dir).unwrap();
+    std::fs::write(
+        pkg_dir.join("package.json"),
+        serde_json::json!({"name": "@test/stale", "version": "1.0.0", "main": "index.js"})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(pkg_dir.join("index.js"), "module.exports = 1;").unwrap();
+    std::fs::write(
+        pkg_dir.join(".npmrc"),
+        format!(
+            "@test:registry=http://127.0.0.1:{port}/npm-private/\n\
+             //127.0.0.1:{port}/npm-private/:_authToken=test-token\n"
+        ),
+    )
+    .unwrap();
+    let (ok, stdout, stderr) =
+        run_in_home(pnpm, &["publish", "--no-git-checks"], &pkg_dir, &fake_home).await;
+    assert!(ok, "pnpm publish failed.\nstdout:\n{stdout}\nstderr:\n{stderr}");
+
+    let consumer = tmp.path().join("consumer");
+    std::fs::create_dir_all(&consumer).unwrap();
+    std::fs::write(
+        consumer.join("package.json"),
+        serde_json::json!({"name": "c", "version": "1.0.0", "dependencies": {"@test/stale": "1.0.0"}})
+            .to_string(),
+    )
+    .unwrap();
+    std::fs::write(
+        consumer.join(".npmrc"),
+        format!(
+            "@test:registry=http://127.0.0.1:{port}/npm-private/\n\
+             //127.0.0.1:{port}/npm-private/:_authToken=trg_revokedrevokedrevokedrevoked00\n"
+        ),
+    )
+    .unwrap();
+    let (ok, stdout, stderr) =
+        run_in_home(pnpm, &["install", "--no-lockfile"], &consumer, &fake_home).await;
+    assert!(!ok, "a stale token must not install anonymously.\nstdout:\n{stdout}");
+    let out = format!("{stdout}\n{stderr}");
+    assert!(out.contains("401"), "pnpm reports the 401:\n{out}");
+}

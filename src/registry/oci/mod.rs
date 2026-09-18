@@ -1,3 +1,4 @@
+pub mod auth_rules;
 pub mod blobs;
 pub mod leaves;
 pub mod manifests;

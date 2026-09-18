@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+- A credential that does not verify is refused with 401 on every route,
+  including an invalid or revoked Bearer on a public repository, which used
+  to fall back to anonymous. A request with no credential is still anonymous.
+- An API token is accepted as the Basic password on every format and is
+  never throttled by its account's password lockout. Password failures are
+  counted per account across Basic, `npm login` and the password change;
+  token failures are counted per client address. `auth.trusted_proxies`
+  names the proxies whose `X-Forwarded-For` is believed.
+
 ## [0.1.0-rc.1] - 2026-09-17
 
 First tagged release candidate.

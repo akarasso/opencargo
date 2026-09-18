@@ -143,7 +143,7 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
                 // reconnect and re-authenticate at its current level.
                 if ticks.is_multiple_of(REVALIDATE_EVERY) {
                     if let Some(ref token) = identity.token {
-                        let violation = match authenticate_bearer(&state.auth, token).await {
+                        let violation = match authenticate_bearer(&state.auth, token, "ws").await {
                             Ok(None) => Some((CLOSE_UNAUTHORIZED, "token no longer valid")),
                             // Transient DB failure: keep the previously
                             // validated identity instead of dropping the
@@ -211,7 +211,7 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<WsIden
         .map(|t| t.to_string());
 
     match token {
-        Some(t) => match authenticate_bearer(&state.auth, &t).await {
+        Some(t) => match authenticate_bearer(&state.auth, &t, "ws").await {
             Ok(Some(AuthUser {
                 must_change_password: true,
                 ..

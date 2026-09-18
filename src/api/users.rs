@@ -161,7 +161,7 @@ pub async fn change_password(
     require_admin_or_self(&caller, &username)?;
     let body: ChangePasswordRequest = read_json(request).await?;
 
-    ChangePassword::new(state.users.clone())
+    ChangePassword::new(state.users.clone(), state.auth.authenticate.clone())
         .run(
             &username,
             body.current_password.as_deref(),

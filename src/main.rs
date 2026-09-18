@@ -114,13 +114,13 @@ async fn main() -> anyhow::Result<()> {
                     .serve(
                         router
                             .map_request(server::decode_percent_encoded_slashes)
-                            .into_make_service(),
+                            .into_make_service_with_connect_info::<std::net::SocketAddr>(),
                     )
                     .await?;
             } else {
                 let app = router
                     .map_request(server::decode_percent_encoded_slashes)
-                    .into_make_service();
+                    .into_make_service_with_connect_info::<std::net::SocketAddr>();
                 let listener = tokio::net::TcpListener::bind(bind).await?;
                 info!("Listening on {}", listener.local_addr()?);
                 axum::serve(listener, app).await?;

@@ -12,9 +12,8 @@ use rand::Rng;
 use serde_json::json;
 use sha2::Sha256;
 
-use crate::auth::middleware::{
-    authenticate_basic, authenticate_bearer, basic_credentials, AuthFailure, AuthState, AuthUser,
-};
+use crate::app::authenticate::{Credential, Presented, Refusal, Transport};
+use crate::auth::middleware::{authorization_credential, client_source, AuthState, AuthUser};
 use crate::error::AppError;
 use crate::ports::signing::RegistryTokenSigner;
 pub use crate::ports::signing::Claims;
@@ -71,13 +70,15 @@ impl RegistryTokenSigner for TokenSigner {
 pub async fn issue_token(
     State(state): State<AppState>,
     Query(params): Query<Vec<(String, String)>>,
-    headers: HeaderMap,
+    request: axum::extract::Request,
 ) -> Result<Response, Response> {
-    let user = caller(&state.auth, &headers).await?;
+    let source = client_source(&request, &state.auth.trusted_proxies);
+    let headers = request.headers();
+    let user = caller(&state.auth, headers, &source).await?;
     if user.is_none() && !state.auth.anonymous_read {
         return Err(unauthorized("authentication required"));
     }
-    let api_token_id = match user.as_ref().and(bearer_value(&headers)) {
+    let api_token_id = match user.as_ref().and(bearer_value(headers)) {
         Some(raw) if !raw.starts_with("ocr_") => {
             crate::auth::middleware::live_api_token(&state.auth, raw)
                 .await
@@ -107,7 +108,7 @@ pub async fn issue_token(
         scope = ?claims.scope,
         "registry token issued"
     );
-    let token = state.auth.registry_tokens.sign(&claims);
+    let token = state.registry_tokens.sign(&claims);
     Ok(Json(json!({
         "token": token,
         "access_token": token,
@@ -126,31 +127,31 @@ fn bearer_value(headers: &HeaderMap) -> Option<&str> {
 
 /// The user behind the `Authorization` header, `None` when there is none;
 /// credentials that are present but wrong are an error, never anonymous.
-async fn caller(auth: &AuthState, headers: &HeaderMap) -> Result<Option<AuthUser>, Response> {
-    let Some(value) = headers
+async fn caller(
+    auth: &AuthState,
+    headers: &HeaderMap,
+    source: &str,
+) -> Result<Option<AuthUser>, Response> {
+    let credential = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-    else {
-        return Ok(None);
+        .and_then(authorization_credential);
+    let presented: Vec<Presented> = match credential {
+        None => return Ok(None),
+        Some(Credential::Registry(_)) => return Err(unauthorized("invalid credentials")),
+        Some(credential) => vec![Presented {
+            transport: Transport::Authorization,
+            credential,
+        }],
     };
-    let outcome = if let Some((username, password)) = basic_credentials(value) {
-        authenticate_basic(auth, &username, &password).await
-    } else if let Some(token) = value.strip_prefix("Bearer ") {
-        authenticate_bearer(auth, token).await.map_err(|e| {
-            tracing::warn!(error = %e, "database error during token endpoint authentication");
-            AuthFailure::Unavailable
-        })
-    } else {
-        Ok(None)
-    };
-    match outcome {
-        Ok(Some(user)) => Ok(Some(user)),
-        Ok(None) => Err(unauthorized("invalid credentials")),
-        Err(AuthFailure::Throttled) => Err(AppError::TooManyRequests(
+    match auth.authenticate.run(&presented, None, source).await {
+        Ok(done) => Ok(done.and_then(|d| d.user)),
+        Err(Refusal::Invalid) => Err(unauthorized("invalid credentials")),
+        Err(Refusal::Throttled) => Err(AppError::TooManyRequests(
             "too many authentication attempts, try again later".to_string(),
         )
         .into_response()),
-        Err(AuthFailure::Unavailable) => Err(AppError::ServiceUnavailable(
+        Err(Refusal::Unavailable) => Err(AppError::ServiceUnavailable(
             "authentication temporarily unavailable, try again".to_string(),
         )
         .into_response()),

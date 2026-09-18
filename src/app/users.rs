@@ -10,6 +10,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 
 use crate::app::audit::{self, Actor};
+use crate::app::authenticate::{Authenticate, Refusal};
 use crate::auth::users as passwords;
 use crate::domain::{Audience, DomainEvent, User};
 use crate::error::{AppError, AppResult};
@@ -238,13 +239,19 @@ impl DeleteUser {
 /// Changing one's own password, which is neither an administrative action nor
 /// something the trail records: the caller proves they know the current one
 /// unless an operator is acting for them.
+/// The current password goes through [`Authenticate`], so a throttled
+/// account answers 429 here as it does on Basic and npm login.
 pub struct ChangePassword {
     users: Arc<dyn UserStore>,
+    authenticate: Arc<Authenticate>,
 }
 
 impl ChangePassword {
-    pub fn new(users: Arc<dyn UserStore>) -> Self {
-        Self { users }
+    pub fn new(users: Arc<dyn UserStore>, authenticate: Arc<Authenticate>) -> Self {
+        Self {
+            users,
+            authenticate,
+        }
     }
 
     pub async fn run(
@@ -260,13 +267,23 @@ impl ChangePassword {
             let current = current.ok_or_else(|| {
                 AppError::BadRequest("current_password is required".to_string())
             })?;
-            let ok = passwords::verify_password_async(current.to_string(), user.password_hash)
-                .await
-                .map_err(|e| AppError::Internal(format!("failed to verify password: {e}")))?;
-            if !ok {
-                return Err(AppError::Unauthorized(
-                    "invalid current password".to_string(),
-                ));
+            match self.authenticate.password(&user.username, current).await {
+                Ok(_) => {}
+                Err(Refusal::Invalid) => {
+                    return Err(AppError::Unauthorized(
+                        "invalid current password".to_string(),
+                    ))
+                }
+                Err(Refusal::Throttled) => {
+                    return Err(AppError::TooManyRequests(
+                        "too many authentication attempts, try again later".to_string(),
+                    ))
+                }
+                Err(Refusal::Unavailable) => {
+                    return Err(AppError::ServiceUnavailable(
+                        "authentication temporarily unavailable, try again".to_string(),
+                    ))
+                }
             }
         }
 

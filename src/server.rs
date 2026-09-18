@@ -20,7 +20,9 @@ use tracing::{info, warn};
 use crate::adapters::sqlite::SqliteStores;
 use crate::app::events::Announce;
 use crate::app::publish_tail::{PublishGate, PublishTail};
+use crate::app::authenticate::{Authenticate, AuthenticateDeps, OpenGate, Refusal};
 use crate::auth::middleware::{auth_middleware, AuthState};
+use crate::ports::signing::RegistryTokenSigner;
 use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
@@ -71,7 +73,7 @@ pub struct AppState {
     pub upstream_auth: Arc<HashMap<String, UpstreamCreds>>,
     pub base_url: String,
     pub metrics_handle: PrometheusHandle,
-    pub login_rate_limiter: Arc<RateLimiter>,
+    pub registry_tokens: Arc<dyn RegistryTokenSigner>,
     pub publish_rate_limiter: Arc<RateLimiter>,
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
@@ -171,12 +173,11 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let storage = crate::storage::filesystem(&config.server.storage_path);
 
-    // Shared between AuthState (Basic Auth throttling) and AppState (npm login).
-    let login_rate_limiter = Arc::new(RateLimiter::new(5, 60));
-
     let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 
-    let auth = auth_state(config, &users, &tokens, &login_rate_limiter);
+    let registry_tokens: Arc<dyn RegistryTokenSigner> =
+        Arc::new(crate::registry::oci::token::TokenSigner::random());
+    let auth = auth_state(config, &users, &tokens, &registry_tokens);
 
     ensure_admin_user(users.as_ref(), config).await?;
 
@@ -212,7 +213,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         upstream_auth,
         base_url: config.server.base_url.clone(),
         metrics_handle,
-        login_rate_limiter,
+        registry_tokens,
         publish_rate_limiter: Arc::new(RateLimiter::new(30, 60)),
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
@@ -238,22 +239,35 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     })
 }
 
-/// What the auth middleware needs, which is two stores and the login
-/// throttle it shares with the npm login route.
+/// The one `Authenticate` and what the protocol adapters declare about
+/// their routes.
 fn auth_state(
     config: &Config,
     users: &Arc<dyn UserStore>,
     tokens: &Arc<dyn TokenStore>,
-    login_rate_limiter: &Arc<RateLimiter>,
+    signer: &Arc<dyn RegistryTokenSigner>,
 ) -> Arc<AuthState> {
-    Arc::new(AuthState {
+    let authenticate = Authenticate::new(AuthenticateDeps {
         static_tokens: config.auth.static_tokens.clone(),
-        anonymous_read: config.auth.anonymous_read,
+        token_prefix: config.auth.token_prefix.clone(),
         users: users.clone(),
         tokens: tokens.clone(),
-        login_rate_limiter: login_rate_limiter.clone(),
-        base_url: config.server.base_url.clone(),
-        registry_tokens: Arc::new(crate::registry::oci::token::TokenSigner::random()),
+        signer: signer.clone(),
+        login_limiter: Arc::new(RateLimiter::new(5, 60)),
+        token_limiter: Arc::new(RateLimiter::new(30, 60)),
+        gate: Arc::new(OpenGate),
+        clock: Arc::new(crate::adapters::system::SystemClock),
+    });
+    Arc::new(AuthState {
+        anonymous_read: config.auth.anonymous_read,
+        authenticate: Arc::new(authenticate),
+        routes: vec![
+            Arc::new(crate::registry::oci::auth_rules::OciRouteRules {
+                base_url: config.server.base_url.clone(),
+            }),
+            Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
+        ],
+        trusted_proxies: config.auth.trusted_proxies.clone(),
     })
 }
 
@@ -768,16 +782,6 @@ async fn npm_login(
     Path(_username): Path<String>,
     body: Bytes,
 ) -> impl IntoResponse {
-    // Rate limit: 5 attempts per minute per username
-    let rate_key = format!("npm_login:{}", _username);
-    if !state.login_rate_limiter.check(&rate_key) {
-        return (
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(json!({"error": "too many login attempts, try again later"})),
-        )
-            .into_response();
-    }
-
     let login: NpmLoginBody = match serde_json::from_slice(&body) {
         Ok(b) => b,
         Err(_) => {
@@ -789,10 +793,23 @@ async fn npm_login(
         }
     };
 
-    // Look up the user
-    let user = match state.users.by_name(&login.name).await {
-        Ok(Some(u)) => u,
-        _ => {
+    let user = match state.auth.authenticate.password(&login.name, &login.password).await {
+        Ok(user) => user,
+        Err(Refusal::Throttled) => {
+            return (
+                StatusCode::TOO_MANY_REQUESTS,
+                Json(json!({"error": "too many login attempts, try again later"})),
+            )
+                .into_response();
+        }
+        Err(Refusal::Unavailable) => {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error": "authentication temporarily unavailable, try again"})),
+            )
+                .into_response();
+        }
+        Err(Refusal::Invalid) => {
             return (
                 StatusCode::UNAUTHORIZED,
                 Json(json!({"error": "invalid credentials"})),
@@ -800,26 +817,17 @@ async fn npm_login(
                 .into_response();
         }
     };
-
-    // Verify password
-    let password_ok = crate::auth::users::verify_password_async(
-        login.password.clone(),
-        user.password_hash.clone(),
-    )
-    .await
-    .unwrap_or(false);
-
-    if !password_ok {
+    let Some(user_id) = user.user_id else {
         return (
             StatusCode::UNAUTHORIZED,
             Json(json!({"error": "invalid credentials"})),
         )
             .into_response();
-    }
+    };
 
     let must_change = user.must_change_password;
 
-    let Ok(raw_token) = issue_login_token(&state, user.id).await else {
+    let Ok(raw_token) = issue_login_token(&state, user_id).await else {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": "failed to create token"})),

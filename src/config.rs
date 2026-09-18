@@ -130,6 +130,8 @@ pub struct AuthConfig {
     pub token_prefix: String,
     pub static_tokens: Vec<String>,
     pub admin: AdminConfig,
+    /// Peers whose `X-Forwarded-For` names the client for the token limiter.
+    pub trusted_proxies: Vec<std::net::IpAddr>,
 }
 
 impl Default for AuthConfig {
@@ -139,6 +141,7 @@ impl Default for AuthConfig {
             token_prefix: "trg_".to_string(),
             static_tokens: Vec::new(),
             admin: AdminConfig::default(),
+            trusted_proxies: Vec::new(),
         }
     }
 }
