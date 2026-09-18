@@ -75,7 +75,7 @@ pub async fn set_permission(
     };
 
     let user = load_user(&state, &username).await?;
-    let repo = load_repository(&state, &repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
 
     let rights = Rights {
         read: body.can_read.unwrap_or(true),
@@ -113,7 +113,7 @@ pub async fn delete_permission(
     require_admin(&caller)?;
 
     let user = load_user(&state, &username).await?;
-    let repo = load_repository(&state, &repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
 
     state.permissions.revoke(user.id, repo.id).await?;
 
@@ -130,17 +130,6 @@ async fn load_user(state: &AppState, username: &str) -> AppResult<User> {
         .by_name(username)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))
-}
-
-/// The last pool read left in this module: `RepositoryStore` does not exist
-/// yet, and step 7's first commit is what closes it.
-async fn load_repository(
-    state: &AppState,
-    name: &str,
-) -> AppResult<crate::domain::Repository> {
-    crate::db::get_repository_by_name(&state.db, name)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))
 }
 
 /// Notify open sessions that a user's effective rights changed so they can

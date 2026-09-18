@@ -12,8 +12,8 @@ declare_row() { local IFS=$'\x1f'; rows+=("$*"); }
 # Bounds are measured occurrences at 6c9747a, never lines: `\bdb::` is 232 occurrences over 231
 # lines, so a max fed by a line count licenses one free violation. A raise is an edit to this
 # block, in the commit that needs it, with the reason on the line -- never a silent bump.
-declare_row db-calls       max  47 '\bdb::'                  plain src '*.rs' src/db src/adapters # 159 -> 47: the proxy cache, users, tokens, permissions, packages, repositories and search are ports
-declare_row pool-field     max  64 '\.db\b'                  strip src '*.rs' src/db src/adapters # 209 -> 64: the engine, the authz gates, publish, promote and the repo CRUD hold stores, not the pool. strip: `"...opencargo.db"` is a filename, not a pool
+declare_row db-calls       max  46 '\bdb::'                  plain src '*.rs' src/db src/adapters # 159 -> 46: the proxy cache, users, tokens, permissions, packages, repositories and search are ports
+declare_row pool-field     max  63 '\.db\b'                  strip src '*.rs' src/db src/adapters # 209 -> 63: the engine, the authz gates, publish, promote and the repo CRUD hold stores, not the pool. strip: `"...opencargo.db"` is a filename, not a pool
 declare_row stray-sql      max  81 'sqlx::query'             plain src '*.rs' src/db src/adapters # 96 -> 81: 0 in src/proxy/ and src/auth/; the cache sweep, npm search and the repo delete count go through ports. covers _as and _scalar
 declare_row pool-leak      max  47 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 70 -> 47: 0 in src/proxy/ (7a's Cx.proxy precondition), AuthState holds a UserStore and a TokenStore, and the packument, the seed and the repo validator take ports
 declare_row context-bypass max  25 'cx\.state\b'             plain src '*.rs'                     # word boundary: `cx.state` is also passed whole
