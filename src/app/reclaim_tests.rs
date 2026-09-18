@@ -194,3 +194,17 @@ async fn recreation_refused_while_legacy_prefix_non_empty() {
     );
     fx.hosted("r").await;
 }
+
+#[tokio::test]
+async fn a_recreated_name_never_inherits_a_queued_legacy_prefix() {
+    let fx = Fx::new();
+    fx.hosted("r").await;
+    let retired = fx.store.repositories().retire("r", Utc::now()).await.unwrap();
+    assert!(retired.contains(&"npm/r".to_string()), "queued, the immediate reclaim never ran");
+
+    fx.hosted("r").await;
+    fx.put("npm/r/p/live.tgz").await;
+    fx.reclaimer(false).run(later(3)).await;
+    assert!(fx.storage.contains("npm/r/p/live.tgz"), "the new incarnation's legacy prefix is live");
+    assert!(!fx.store.candidates().contains(&"npm/r".to_string()));
+}

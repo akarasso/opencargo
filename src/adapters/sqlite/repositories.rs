@@ -56,7 +56,20 @@ async fn insert(
     tx: &mut Tx,
     spec: &RepoSpec<'_>,
     now: DateTime<Utc>,
-) -> Result<RepositoryRow, sqlx::Error> {
+) -> Result<Result<RepositoryRow, StoreError>, sqlx::Error> {
+    let legacy_prefixes = layout::name_keyed_prefixes(spec.format.as_str(), spec.name);
+    for prefix in &legacy_prefixes {
+        let claimed: bool = sqlx::query_scalar(
+            "SELECT EXISTS (SELECT 1 FROM reclaim_claims WHERE key = ?1 AND until > ?2)",
+        )
+        .bind(prefix)
+        .bind(bind_ts(now))
+        .fetch_one(&mut **tx)
+        .await?;
+        if claimed {
+            return Ok(Err(StoreError::Conflict));
+        }
+    }
     let row: RepositoryRow = sqlx::query_as(&format!(
         "INSERT INTO repositories
              (name, repo_type, format, visibility, upstream_url, config_json,
@@ -79,9 +92,17 @@ async fn insert(
         .execute(&mut **tx)
         .await?;
     let own = std::iter::once((layout::incarnation_prefix(&incarnation), 0));
-    let legacy = layout::name_keyed_prefixes(spec.format.as_str(), spec.name)
-        .into_iter()
-        .map(|p| (p, 1));
+    for prefix in &legacy_prefixes {
+        sqlx::query("DELETE FROM reclaim_candidates WHERE key = ?1 AND prefix = 1")
+            .bind(prefix)
+            .execute(&mut **tx)
+            .await?;
+        sqlx::query("DELETE FROM reclaim_claims WHERE key = ?1")
+            .bind(prefix)
+            .execute(&mut **tx)
+            .await?;
+    }
+    let legacy = legacy_prefixes.into_iter().map(|p| (p, 1));
     for (prefix, legacy) in own.chain(legacy) {
         sqlx::query(
             "INSERT INTO storage_prefixes (prefix, incarnation, legacy) VALUES (?1, ?2, ?3)
@@ -94,7 +115,7 @@ async fn insert(
         .execute(&mut **tx)
         .await?;
     }
-    Ok(row)
+    Ok(Ok(row))
 }
 
 /// The groups listing `name` as a member, read inside the transaction.
@@ -226,7 +247,7 @@ impl RepositoryStore for SqliteRepositoryStore {
     ) -> Result<Repository, StoreError> {
         let row = immediate(&self.pool, |mut tx| {
             Box::pin(async move {
-                let row = insert(&mut tx, spec, now).await.map(Ok);
+                let row = insert(&mut tx, spec, now).await;
                 (tx, row)
             })
         })
@@ -301,7 +322,9 @@ impl RepositoryStore for SqliteRepositoryStore {
                         .fetch_one(&mut *tx)
                         .await?;
                         if !present {
-                            insert(&mut tx, spec, now).await?;
+                            if let Err(err) = insert(&mut tx, spec, now).await? {
+                                return Ok(Err(err));
+                            }
                         }
                         Ok(Ok(()))
                     }

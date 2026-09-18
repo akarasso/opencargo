@@ -1827,6 +1827,34 @@ macro_rules! reclaim_contract {
             }
 
             #[tokio::test]
+            async fn a_recreated_name_takes_its_legacy_prefix_out_of_the_queue() {
+                let h = $open().await;
+                repo(&h, "r").await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                repo(&h, "r").await;
+                assert_eq!(claim(&h, "npm/r", 9).await, Claim::NotDue, "the candidate went with the recreation");
+                h.reclaim.enqueue_prefix("npm/r", at(3)).await.unwrap();
+                assert_eq!(claim(&h, "npm/r", 9).await, Claim::Referenced, "a live incarnation's prefix is never claimed");
+            }
+
+            #[tokio::test]
+            async fn recreation_refused_while_its_legacy_prefix_is_claimed() {
+                let h = $open().await;
+                repo(&h, "r").await;
+                h.repos.retire("r", at(2)).await.unwrap();
+                assert!(matches!(claim(&h, "npm/r", 2).await, Claim::Claimed(_)));
+                let spec = RepoSpec {
+                    name: "r",
+                    kind: RepoKind::Hosted,
+                    format: Format::Npm,
+                    visibility: Visibility::Public,
+                    upstream: None,
+                    members: &[],
+                };
+                assert!(matches!(h.repos.create(&spec, at(2)).await, Err(StoreError::Conflict)));
+            }
+
+            #[tokio::test]
             async fn delete_version_enqueues_and_deletes_nothing() {
                 let h = $open().await;
                 let (r, _) = repo(&h, "r").await;

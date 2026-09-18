@@ -212,6 +212,13 @@ async fn claim_one(
         return Ok(Ok(Claim::NotDue));
     };
     let retired = prefix == 1 && is_retired_prefix(tx, key).await?;
+    if prefix == 1 && !retired && is_live_prefix(tx, key).await? {
+        sqlx::query("DELETE FROM reclaim_candidates WHERE key = ?1")
+            .bind(key)
+            .execute(&mut **tx)
+            .await?;
+        return Ok(Ok(Claim::Referenced));
+    }
     if !retired && enqueued_at > bind_ts(cutoff(grace, now)) {
         return Ok(Ok(Claim::NotDue));
     }
@@ -280,6 +287,19 @@ async fn claim_one(
     .execute(&mut **tx)
     .await?;
     Ok(Ok(Claim::Claimed(ClaimToken(token))))
+}
+
+async fn is_live_prefix(tx: &mut Tx, prefix: &str) -> Result<bool, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT EXISTS (
+             SELECT 1 FROM storage_prefixes
+             WHERE prefix = ?1
+               AND incarnation NOT IN (SELECT incarnation FROM retired_incarnations)
+         )",
+    )
+    .bind(prefix)
+    .fetch_one(&mut **tx)
+    .await
 }
 
 async fn is_retired_prefix(tx: &mut Tx, prefix: &str) -> Result<bool, sqlx::Error> {

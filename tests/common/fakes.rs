@@ -486,8 +486,13 @@ impl Repositories {
         state.repositories.push(stored.clone());
         let incarnation = uuid::Uuid::new_v4().simple().to_string();
         state.reclaim.incarnations.push((stored.id, incarnation.clone()));
+        let legacy = layout::name_keyed_prefixes(spec.format.as_str(), spec.name);
+        for prefix in &legacy {
+            state.reclaim.candidates.retain(|c| !(c.prefix && c.key == *prefix));
+            state.reclaim.claims.retain(|c| c.key != *prefix);
+        }
         let own = std::iter::once(layout::incarnation_prefix(&incarnation));
-        for prefix in own.chain(layout::name_keyed_prefixes(spec.format.as_str(), spec.name)) {
+        for prefix in own.chain(legacy) {
             state.reclaim.prefixes.retain(|(p, _)| *p != prefix);
             state.reclaim.prefixes.push((prefix, incarnation.clone()));
         }
@@ -529,6 +534,12 @@ impl RepositoryStore for Repositories {
     ) -> Result<Repository, StoreError> {
         self.with(|state| {
             if found(state, spec.name).is_some() {
+                return Err(StoreError::Conflict);
+            }
+            let claimed = layout::name_keyed_prefixes(spec.format.as_str(), spec.name)
+                .iter()
+                .any(|p| state.reclaim.claims.iter().any(|c| c.key == *p && c.until > now));
+            if claimed {
                 return Err(StoreError::Conflict);
             }
             Ok(Self::insert(state, spec, now))
@@ -2349,6 +2360,10 @@ impl ReclaimStore for Reclaim {
             };
             let prefix = candidate.prefix;
             let retired = prefix && state.reclaim.retired_prefix(key);
+            if prefix && !retired && state.reclaim.live_prefix(key) {
+                state.reclaim.candidates.retain(|c| c.key != key);
+                return Ok(Claim::Referenced);
+            }
             if !retired && candidate.enqueued_at > cutoff(grace, now) {
                 return Ok(Claim::NotDue);
             }
