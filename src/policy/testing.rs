@@ -1,6 +1,8 @@
+use chrono::DateTime;
 use serde_json::{json, Value};
 
 use super::*;
+use crate::domain::Visibility;
 use crate::proxy::engine::fixture::{timeouts, Fx};
 
 pub fn repo(id: i64, name: &str, format: Format) -> Repository {
@@ -9,11 +11,11 @@ pub fn repo(id: i64, name: &str, format: Format) -> Repository {
         name: name.into(),
         repo_type: "proxy".into(),
         format: format.as_str().into(),
-        visibility: "public".into(),
+        visibility: Visibility::Public,
         upstream_url: Some("http://127.0.0.1:1/".into()),
-        config_json: None,
-        created_at: String::new(),
-        updated_at: String::new(),
+        config: None,
+        created_at: DateTime::UNIX_EPOCH,
+        updated_at: DateTime::UNIX_EPOCH,
     }
 }
 

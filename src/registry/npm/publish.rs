@@ -15,8 +15,7 @@ use sqlx::SqlitePool;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
-use crate::db::{Package, Repository, Version};
+use crate::domain::{Format, Package, Repository, Version};
 use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;
 use crate::registry::publish::{finalize_publish, publish_gate, PreScan};
@@ -89,7 +88,7 @@ pub async fn publish_package(
 
     let repo_name = super::param(&params, "repo")?;
     let package_name = extract_package_name(&params);
-    crate::registry::validate_package_name("npm", &package_name)?;
+    crate::domain::validate_package_name("npm", &package_name)?;
     if body.name != package_name {
         return Err(AppError::BadRequest(format!(
             "package name in body ('{}') does not match URL ('{}')",
@@ -134,7 +133,7 @@ async fn plan_versions(
     let existing = crate::db::get_package(&state.db, repo.id, package_name).await?;
     let mut steps = Vec::with_capacity(body.versions.len());
     for (version_str, version_meta) in &body.versions {
-        crate::registry::validate_version(version_str)?;
+        crate::domain::validate_version(version_str)?;
 
         // A publish carries a tarball attachment; `npm deprecate` does not.
         let attachment = find_attachment_key(&body.attachments, package_name, version_str)

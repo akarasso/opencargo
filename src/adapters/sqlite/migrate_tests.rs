@@ -8,7 +8,7 @@ use sqlx::SqlitePool;
 use tempfile::TempDir;
 
 use super::*;
-use crate::db::kinds::{Format, RepoKind};
+use crate::domain::{Format, RepoKind};
 
 /// A database of the 001-012 vintage, the shape `data/db/opencargo.db` is in:
 /// `oci_manifest_blobs` present, `proxy_cache_entries` and the policy tables

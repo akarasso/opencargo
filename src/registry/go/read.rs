@@ -9,7 +9,7 @@ use axum::{
 use serde_json::Value;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::Repository;
+use crate::domain::Repository;
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::{collect, first_hit, Collected, Cx, UrlRepo};
 use crate::server::AppState;

@@ -9,7 +9,7 @@ use tokio::task::JoinSet;
 use tokio::time::MissedTickBehavior;
 use tracing::error;
 
-use crate::db::kinds::Format;
+use crate::domain::Format;
 use crate::events::{EventBus, Visibility};
 
 use super::rules::osv_severity;

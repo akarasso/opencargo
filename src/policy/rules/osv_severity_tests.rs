@@ -1,5 +1,5 @@
 use super::*;
-use crate::db::kinds::Format;
+use crate::domain::Format;
 use crate::policy::testing::{scanner, FakeOsv};
 use crate::policy::{Actor, Facts};
 

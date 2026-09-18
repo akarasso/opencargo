@@ -11,7 +11,7 @@ use tracing::info;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::can_admin;
-use crate::db::kinds::RepoKind;
+use crate::domain::{RepoKind, Visibility};
 use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;
 use crate::server::AppState;
@@ -280,7 +280,7 @@ async fn promote_impl(
     // anonymous/authenticated subscribers (admins get it via audit.entry).
     let from_is_public = matches!(
         crate::db::get_repository_by_name(&state.db, &body.from).await,
-        Ok(Some(ref r)) if r.visibility == "public"
+        Ok(Some(ref r)) if r.visibility == Visibility::Public
     );
     let mut event_payload = json!({
         "package": name,

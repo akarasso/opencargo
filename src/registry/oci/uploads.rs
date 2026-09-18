@@ -10,8 +10,7 @@ use serde::Deserialize;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
-use crate::db::Repository;
+use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 

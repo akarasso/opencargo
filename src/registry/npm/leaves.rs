@@ -1,6 +1,6 @@
 use serde_json::Value;
 
-use crate::db::kinds::Format;
+use crate::domain::Format;
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, Source};
 use crate::proxy::Payload;

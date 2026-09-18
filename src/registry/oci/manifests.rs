@@ -10,9 +10,8 @@ use sqlx::SqlitePool;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
 use crate::db::oci::OciTag;
-use crate::db::Repository;
+use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::first_hit;
 use crate::server::AppState;
@@ -48,7 +47,7 @@ fn parse_reference(reference: &str) -> AppResult<String> {
     if is_digest(reference) {
         parse_digest(reference)
     } else {
-        crate::registry::validate_oci_tag(reference)?;
+        crate::domain::validate_oci_tag(reference)?;
         Ok(reference.to_string())
     }
 }

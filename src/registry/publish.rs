@@ -1,6 +1,6 @@
 use tracing::warn;
 
-use crate::db::kinds::Format;
+use crate::domain::Format;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::telemetry::vulns::ScanResult;

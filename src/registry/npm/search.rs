@@ -10,10 +10,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::middleware::AuthUser;
-use crate::db::Package;
+use crate::db::PackageRow;
+use crate::domain::Package;
 use crate::error::AppResult;
 use crate::registry::resolve::collect;
 use crate::server::AppState;
+use crate::wire::wire_ts;
 
 use super::cx;
 use super::leaves::SearchLeaf;
@@ -97,7 +99,7 @@ pub async fn search_in_repo(
                 "name": pkg.name,
                 "description": pkg.description,
                 "version": latest.map(|v| v.version.as_str()).unwrap_or("0.0.0"),
-                "date": latest.map(|v| v.published_at.as_str()).unwrap_or(""),
+                "date": latest.map(|v| wire_ts(v.published_at)).unwrap_or_default(),
             },
         }));
     }
@@ -117,7 +119,7 @@ async fn find_packages(
             .map(|word| format!("\"{}\"", word.replace('"', "")))
             .collect::<Vec<_>>()
             .join(" ");
-        let fts = sqlx::query_as::<_, Package>(
+        let fts = sqlx::query_as::<_, PackageRow>(
             "SELECT p.* FROM packages p \
              JOIN packages_fts fts ON p.id = fts.rowid \
              WHERE p.repository_id = ?1 AND packages_fts MATCH ?2 \
@@ -129,18 +131,27 @@ async fn find_packages(
         .bind(limit)
         .fetch_all(&state.db)
         .await;
-        if let Ok(packages) = fts {
-            return Ok(packages);
+        if let Ok(rows) = fts {
+            return hydrate(rows);
         }
     }
     let pattern = format!("%{text}%");
-    Ok(sqlx::query_as::<_, Package>(
-        "SELECT * FROM packages WHERE repository_id = ?1 \
-         AND (name LIKE ?2 OR description LIKE ?2) LIMIT ?3",
+    hydrate(
+        sqlx::query_as::<_, PackageRow>(
+            "SELECT * FROM packages WHERE repository_id = ?1 \
+             AND (name LIKE ?2 OR description LIKE ?2) LIMIT ?3",
+        )
+        .bind(repo_id)
+        .bind(&pattern)
+        .bind(limit)
+        .fetch_all(&state.db)
+        .await?,
     )
-    .bind(repo_id)
-    .bind(&pattern)
-    .bind(limit)
-    .fetch_all(&state.db)
-    .await?)
+}
+
+fn hydrate(rows: Vec<PackageRow>) -> AppResult<Vec<Package>> {
+    Ok(rows
+        .into_iter()
+        .map(Package::try_from)
+        .collect::<Result<_, _>>()?)
 }

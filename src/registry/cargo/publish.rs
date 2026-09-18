@@ -13,8 +13,7 @@ use sha2::Digest;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
-use crate::db::{Package, Repository};
+use crate::domain::{Format, Package, Repository};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 
@@ -54,8 +53,8 @@ pub async fn publish_crate(
     let user = require_user(auth_user)?;
     let repo = load_hosted(&state, &repo_name, &user).await?;
     let (meta, crate_data) = parse_publish_body(&body)?;
-    crate::registry::validate_package_name("cargo", &meta.name)?;
-    crate::registry::validate_version(&meta.vers)?;
+    crate::domain::validate_package_name("cargo", &meta.name)?;
+    crate::domain::validate_version(&meta.vers)?;
 
     let sha256_hex = {
         let data = crate_data.clone();

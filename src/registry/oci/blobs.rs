@@ -7,7 +7,7 @@ use axum::{
 };
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
+use crate::domain::Format;
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::first_hit;
 use crate::server::AppState;

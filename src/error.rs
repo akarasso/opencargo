@@ -210,16 +210,22 @@ mod tests {
         );
     }
 
+    /// The name validators answer with `DomainError` now; this pins the
+    /// status and the body bytes they reach a client as, which is the whole
+    /// of what the `AppError::BadRequest` they used to build guaranteed.
     #[tokio::test]
     async fn invalid_name_serves_what_validate_package_name_serves_today() {
-        let legacy = crate::registry::validate_package_name("npm", "Bad Name").unwrap_err();
-        let message = legacy.to_string();
-        assert_eq!(message, "invalid npm package name: 'Bad Name'");
+        let refusal = crate::domain::validate_package_name("npm", "Bad Name").unwrap_err();
+        assert_eq!(refusal.to_string(), "invalid npm package name: 'Bad Name'");
+        assert!(matches!(refusal, DomainError::InvalidName(_)));
 
-        let (legacy_status, legacy_body) = served(legacy).await;
-        let (status, body) = served(DomainError::InvalidName(message).into()).await;
-        assert_eq!(status, StatusCode::BAD_REQUEST);
-        assert_eq!((status, body), (legacy_status, legacy_body));
+        assert_eq!(
+            served(refusal.into()).await,
+            (
+                StatusCode::BAD_REQUEST,
+                "invalid npm package name: 'Bad Name'".to_string()
+            )
+        );
     }
 
     #[tokio::test]

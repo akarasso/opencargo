@@ -4,8 +4,7 @@ use std::pin::Pin;
 
 use tracing::warn;
 
-use crate::db::kinds::RepoKind;
-use crate::db::Repository;
+use crate::domain::{RepoKind, Repository};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::{CacheRepo, MAX_GROUP_DEPTH};
 use crate::server::AppState;

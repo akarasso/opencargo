@@ -3,9 +3,10 @@ use std::collections::HashMap;
 use serde_json::{json, Value};
 use sqlx::SqlitePool;
 
-use crate::db::Version;
+use crate::domain::Version;
 use crate::error::AppResult;
 use crate::registry::resolve::{CacheRepo, Outcome};
+use crate::wire::wire_ts;
 
 /// A packument before the handler rewrites its tarball URLs.
 pub struct Packument {
@@ -29,14 +30,14 @@ pub async fn hosted_packument(
 
     let mut versions_map: HashMap<String, Value> = HashMap::new();
     let mut time_map: HashMap<String, String> = HashMap::new();
-    time_map.insert("created".to_string(), package.created_at.clone());
-    time_map.insert("modified".to_string(), package.updated_at.clone());
+    time_map.insert("created".to_string(), wire_ts(package.created_at));
+    time_map.insert("modified".to_string(), wire_ts(package.updated_at));
     for v in &versions {
         let mut meta: Value = serde_json::from_str(&v.metadata_json).unwrap_or(json!({}));
         if abbreviated {
             strip_to_abbreviated(&mut meta);
         }
-        time_map.insert(v.version.clone(), v.published_at.clone());
+        time_map.insert(v.version.clone(), wire_ts(v.published_at));
         versions_map.insert(v.version.clone(), meta);
     }
 

@@ -139,7 +139,7 @@ mod tests {
         let r = Resolution {
             requested_repo: "r".into(),
             member_repo: "m".into(),
-            format: crate::db::kinds::Format::Npm,
+            format: crate::domain::Format::Npm,
             name: "lodash".into(),
             version: Some("1.0.0".into()),
             digest: None,

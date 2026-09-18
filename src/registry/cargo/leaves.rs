@@ -1,6 +1,6 @@
 use serde_json::{json, Value};
 
-use crate::db::kinds::Format;
+use crate::domain::Format;
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, Source};
 use crate::proxy::{Payload, ProxyEngine};
@@ -167,7 +167,7 @@ fn checksum_of(lines: &[String], version: &str) -> Option<String> {
         .and_then(|l| line_field(l, "cksum"))
 }
 
-fn build_index_line(crate_name: &str, version: &crate::db::Version) -> AppResult<String> {
+fn build_index_line(crate_name: &str, version: &crate::domain::Version) -> AppResult<String> {
     let meta: Value = serde_json::from_str(&version.metadata_json).unwrap_or(json!({}));
     let deps: Vec<Value> = meta
         .get("deps")
@@ -180,7 +180,7 @@ fn build_index_line(crate_name: &str, version: &crate::db::Version) -> AppResult
         "deps": deps,
         "cksum": version.checksum_sha256.clone().unwrap_or_default(),
         "features": meta.get("features").cloned().unwrap_or(json!({})),
-        "yanked": version.yanked != 0,
+        "yanked": version.yanked,
     });
     for key in ["features2", "links"] {
         if let Some(v) = meta.get(key) {
@@ -219,8 +219,8 @@ fn index_dep(dep: &Value) -> Value {
 mod tests {
     use super::*;
 
-    fn version(metadata_json: &str) -> crate::db::Version {
-        crate::db::Version {
+    fn version(metadata_json: &str) -> crate::domain::Version {
+        crate::domain::Version {
             id: 1,
             package_id: 1,
             version: "0.1.0".into(),
@@ -230,8 +230,8 @@ mod tests {
             integrity: None,
             size: 1,
             tarball_path: String::new(),
-            published_at: String::new(),
-            yanked: 0,
+            published_at: chrono::DateTime::UNIX_EPOCH,
+            yanked: false,
         }
     }
 

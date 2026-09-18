@@ -8,11 +8,12 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::{require_admin, require_auth};
-use crate::db::kinds::{validate_spec, Format, RepoKind, RepoSpec};
-use crate::db::Repository;
+use crate::db::kinds::{validate_spec, RepoSpec};
+use crate::domain::{Format, RepoConfig, RepoKind, Repository, Visibility};
 use crate::error::{AppError, AppResult};
 use crate::proxy::purge::purge_repository;
 use crate::server::AppState;
+use crate::wire::{wire_config, wire_ts};
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -63,7 +64,7 @@ pub async fn create_repository(
             body.format
         )));
     }
-    validate_visibility(&body.visibility)?;
+    let visibility: Visibility = body.visibility.parse()?;
 
     if crate::db::get_repository_by_name(&state.db, &body.name)
         .await?
@@ -90,9 +91,9 @@ pub async fn create_repository(
         &body.name,
         kind,
         format,
-        &body.visibility,
+        visibility,
         spec.upstream,
-        spec.config_json().as_deref(),
+        spec.config().as_ref(),
     )
     .await?;
 
@@ -140,9 +141,11 @@ pub async fn update_repository(
     let body: UpdateRepositoryRequest = read_json(request).await?;
 
     let repo = load_repo(&state, &name).await?;
-    if let Some(ref vis) = body.visibility {
-        validate_visibility(vis)?;
-    }
+    let visibility = body
+        .visibility
+        .as_deref()
+        .map(str::parse::<Visibility>)
+        .transpose()?;
 
     let upstream_patch = non_empty(body.upstream.as_deref());
     let members = body.members.clone().unwrap_or_else(|| repo.members());
@@ -158,16 +161,16 @@ pub async fn update_repository(
         purge_repository(&state, &repo).await?;
     }
 
-    let config_json = body
+    let config = body
         .members
         .is_some()
-        .then(|| json!({ "members": members }).to_string());
+        .then(|| RepoConfig::of_members(&members));
     crate::db::update_repository(
         &state.db,
         &name,
-        body.visibility.as_deref(),
+        visibility,
         upstream_patch,
-        config_json.as_deref(),
+        config.as_ref(),
     )
     .await?;
 
@@ -260,15 +263,6 @@ async fn load_repo(state: &AppState, name: &str) -> AppResult<Repository> {
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))
 }
 
-fn validate_visibility(visibility: &str) -> AppResult<()> {
-    if matches!(visibility, "public" | "private") {
-        return Ok(());
-    }
-    Err(AppError::BadRequest(format!(
-        "invalid visibility: {visibility}"
-    )))
-}
-
 /// An empty upstream string is treated as absent, as the UI sends it.
 fn non_empty(upstream: Option<&str>) -> Option<&str> {
     upstream.filter(|u| !u.is_empty())
@@ -294,9 +288,9 @@ fn repo_json(repo: &Repository) -> Value {
         "format": repo.format,
         "visibility": repo.visibility,
         "upstream": repo.upstream_url,
-        "config": repo.config_json,
-        "created_at": repo.created_at,
-        "updated_at": repo.updated_at,
+        "config": wire_config(repo.config.as_ref()),
+        "created_at": wire_ts(repo.created_at),
+        "updated_at": wire_ts(repo.updated_at),
     })
 }
 

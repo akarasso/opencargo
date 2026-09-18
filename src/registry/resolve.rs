@@ -5,8 +5,7 @@ use std::pin::Pin;
 use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::RepoKind;
-use crate::db::Repository;
+use crate::domain::{RepoKind, Repository};
 use crate::error::{AppError, AppResult};
 use crate::proxy::auth::{default_token_realms, UpstreamAuth};
 use crate::server::AppState;
@@ -232,7 +231,7 @@ async fn walk_members<'a, L: Leaf + 'a>(
 mod tests {
     use super::*;
     use crate::config::{Config, DatabaseConfig, RepositoryConfig, ServerConfig, Visibility};
-    use crate::db::kinds::Format;
+    use crate::domain::Format;
 
     struct Script;
 

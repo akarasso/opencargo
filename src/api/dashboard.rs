@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
 use crate::server::AppState;
+use crate::wire::wire_stored_ts;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -258,7 +259,7 @@ pub async fn dashboard_stats(
         .map(|(package_name, version, published_at)| RecentVersionResponse {
             package_name,
             version,
-            published_at,
+            published_at: wire_stored_ts(&published_at),
         })
         .collect();
 
@@ -453,7 +454,7 @@ pub async fn list_packages(
             latest_version: latest,
             description: description.unwrap_or_default(),
             downloads,
-            published_at: updated_at,
+            published_at: wire_stored_ts(&updated_at),
         });
     }
 
@@ -515,7 +516,7 @@ pub async fn package_detail(
         .map(|(version, size, published_at)| VersionResponse {
             version,
             size_display: format_size(size),
-            published_at,
+            published_at: wire_stored_ts(&published_at),
         })
         .collect();
 

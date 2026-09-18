@@ -233,7 +233,7 @@ pub(crate) async fn go_published_at(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::kinds::Format;
+    use crate::domain::Format;
     use crate::db::proxy_cache::CacheEntry;
     use crate::policy::testing::{engine_over, fast, pending, repo};
     use crate::proxy::engine::fixture::Fx;

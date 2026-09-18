@@ -23,8 +23,7 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
-use crate::db::Repository;
+use crate::domain::{Format, Repository};
 use crate::events::EventBus;
 use crate::proxy::engine::Cached;
 use crate::proxy::ProxyEngine;

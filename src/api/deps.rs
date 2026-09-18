@@ -27,20 +27,20 @@ async fn find_package_by_name(
     db: &sqlx::SqlitePool,
     name: &str,
     public_only: bool,
-) -> Result<Option<(crate::db::Package, Vec<crate::db::Version>)>, sqlx::Error> {
+) -> AppResult<Option<(crate::domain::Package, Vec<crate::domain::Version>)>> {
     let vis = if public_only {
         " AND repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
     } else {
         ""
     };
-    let package: Option<crate::db::Package> = sqlx::query_as(&format!(
+    let row: Option<crate::db::PackageRow> = sqlx::query_as(&format!(
         "SELECT * FROM packages WHERE name = ?1{vis} LIMIT 1",
     ))
     .bind(name)
     .fetch_optional(db)
     .await?;
 
-    match package {
+    match row.map(crate::domain::Package::try_from).transpose()? {
         Some(pkg) => {
             let versions = crate::db::get_versions(db, pkg.id).await?;
             Ok(Some((pkg, versions)))

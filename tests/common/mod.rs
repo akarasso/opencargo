@@ -2,6 +2,7 @@
 
 pub mod fake_osv;
 pub mod fake_upstream;
+pub mod fakes;
 pub mod upstream_tap;
 
 use std::collections::HashMap;

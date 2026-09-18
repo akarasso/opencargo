@@ -12,8 +12,7 @@ use serde_json::json;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
-use crate::db::Repository;
+use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 
@@ -42,8 +41,8 @@ pub async fn publish_module(
     let repo_name = param(&params, "repo")?;
     let module_name = param(&params, "module")?;
     let version_str = param(&params, "version")?;
-    crate::registry::validate_package_name("go", module_name)?;
-    crate::registry::validate_version(version_str)?;
+    crate::domain::validate_package_name("go", module_name)?;
+    crate::domain::validate_version(version_str)?;
 
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;

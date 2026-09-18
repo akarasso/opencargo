@@ -16,8 +16,8 @@ pub async fn download_crate(
     Path((repo_name, name, version)): Path<(String, String, String)>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response> {
-    crate::registry::validate_package_name("cargo", &name)?;
-    crate::registry::validate_version(&version)?;
+    crate::domain::validate_package_name("cargo", &name)?;
+    crate::domain::validate_version(&version)?;
     let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
     crate::registry::ensure_can_read(&state.db, &repo, auth).await?;

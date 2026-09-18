@@ -1,8 +1,7 @@
 use bytes::Bytes;
 use serde_json::Value;
 
-use crate::db::kinds::Format;
-use crate::db::{Package, Version};
+use crate::domain::{Format, Package, Version};
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, Source};
 use crate::proxy::Payload;
@@ -18,7 +17,7 @@ async fn hosted_package(
     member: CacheRepo<'_>,
     module: &str,
 ) -> AppResult<Option<Package>> {
-    Ok(crate::db::get_package(&cx.state.db, member.0.id, &unescape(module)).await?)
+    crate::db::get_package(&cx.state.db, member.0.id, &unescape(module)).await
 }
 
 async fn hosted_versions(

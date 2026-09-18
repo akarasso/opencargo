@@ -10,7 +10,7 @@ pub mod upstream;
 use std::collections::HashMap;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::Repository;
+use crate::domain::Repository;
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::{Cx, UrlRepo};
 use crate::server::AppState;

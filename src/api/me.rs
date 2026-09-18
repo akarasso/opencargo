@@ -16,6 +16,7 @@ use axum::{extract::State, response::IntoResponse, Json};
 use serde_json::json;
 
 use crate::auth::middleware::AuthUser;
+use crate::domain::Visibility;
 use crate::error::AppResult;
 use crate::server::AppState;
 
@@ -29,7 +30,7 @@ pub async fn my_permissions(
         // Anonymous caller (only reachable when anonymous_read is on).
         let permissions: Vec<serde_json::Value> = repos
             .iter()
-            .filter(|r| r.visibility == "public")
+            .filter(|r| r.visibility == Visibility::Public)
             .map(|r| {
                 json!({
                     "repository": r.name,
@@ -76,7 +77,7 @@ pub async fn my_permissions(
 
         // Skip repos the caller cannot even read: their existence stays hidden
         // unless the repo is public.
-        if !can_read && repo.visibility != "public" {
+        if !can_read && repo.visibility != Visibility::Public {
             continue;
         }
 

@@ -1,8 +1,11 @@
+use chrono::{DateTime, NaiveDateTime, Utc};
 use sqlx::SqlitePool;
 use tracing::info;
 
-// Re-export serde_json for convenience in this module
-use serde_json;
+use crate::domain::{
+    DistTag, DomainError, Format, Package, RepoConfig, RepoKind, Repository, Version, Visibility,
+};
+use crate::error::AppResult;
 
 pub mod kinds;
 pub mod oci;
@@ -11,9 +14,15 @@ pub mod proxy_cache;
 // ---------------------------------------------------------------------------
 // Row types
 // ---------------------------------------------------------------------------
+//
+// One per domain type, holding the SQLite encoding of every column the domain
+// states as a value: a text timestamp, a text visibility, a `config_json`
+// document, an integer `yanked`. Decoding them is the only place a stored
+// timestamp is parsed, and a column the schema was supposed to constrain
+// coming back unreadable is a `CorruptColumn`, never a silent fallback.
 
 #[derive(Debug, Clone, sqlx::FromRow)]
-pub struct Repository {
+pub struct RepositoryRow {
     pub id: i64,
     pub name: String,
     pub repo_type: String,
@@ -26,7 +35,7 @@ pub struct Repository {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-pub struct Package {
+pub struct PackageRow {
     pub id: i64,
     pub repository_id: i64,
     pub name: String,
@@ -38,7 +47,7 @@ pub struct Package {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-pub struct Version {
+pub struct VersionRow {
     pub id: i64,
     pub package_id: i64,
     pub version: String,
@@ -53,11 +62,111 @@ pub struct Version {
 }
 
 #[derive(Debug, sqlx::FromRow)]
-pub struct DistTag {
+pub struct DistTagRow {
     pub id: i64,
     pub package_id: i64,
     pub tag: String,
     pub version_id: i64,
+}
+
+fn corrupt(subject: &str, column: &'static str, value: &str) -> DomainError {
+    DomainError::CorruptColumn {
+        repo: subject.to_string(),
+        column,
+        value: value.to_string(),
+    }
+}
+
+/// A stored timestamp back as a value. `bind_ts`'s inverse, and tolerant of
+/// the RFC 3339 a hand-written row or another dialect may carry.
+pub fn parse_ts(stored: &str) -> Option<DateTime<Utc>> {
+    NaiveDateTime::parse_from_str(stored, TS_FORMAT)
+        .map(|naive| naive.and_utc())
+        .ok()
+        .or_else(|| {
+            DateTime::parse_from_rfc3339(stored)
+                .map(|at| at.with_timezone(&Utc))
+                .ok()
+        })
+}
+
+/// The adapter's stored timestamp: UTC, second precision. Two live predicates
+/// compare these strings lexicographically against `datetime('now')`, and
+/// `'T'` sorts above `' '`, so an RFC 3339 write would mis-evaluate every
+/// legacy row.
+const TS_FORMAT: &str = "%Y-%m-%d %H:%M:%S";
+
+fn ts(subject: &str, column: &'static str, stored: &str) -> Result<DateTime<Utc>, DomainError> {
+    parse_ts(stored).ok_or_else(|| corrupt(subject, column, stored))
+}
+
+impl TryFrom<RepositoryRow> for Repository {
+    type Error = DomainError;
+
+    fn try_from(row: RepositoryRow) -> Result<Self, DomainError> {
+        Ok(Repository {
+            visibility: row
+                .visibility
+                .parse()
+                .map_err(|_| corrupt(&row.name, "visibility", &row.visibility))?,
+            created_at: ts(&row.name, "created_at", &row.created_at)?,
+            updated_at: ts(&row.name, "updated_at", &row.updated_at)?,
+            config: row.config_json.as_deref().map(RepoConfig::from_json),
+            id: row.id,
+            name: row.name,
+            repo_type: row.repo_type,
+            format: row.format,
+            upstream_url: row.upstream_url,
+        })
+    }
+}
+
+impl TryFrom<PackageRow> for Package {
+    type Error = DomainError;
+
+    fn try_from(row: PackageRow) -> Result<Self, DomainError> {
+        Ok(Package {
+            created_at: ts(&row.name, "created_at", &row.created_at)?,
+            updated_at: ts(&row.name, "updated_at", &row.updated_at)?,
+            id: row.id,
+            repository_id: row.repository_id,
+            name: row.name,
+            description: row.description,
+            readme: row.readme,
+            license: row.license,
+        })
+    }
+}
+
+impl TryFrom<VersionRow> for Version {
+    type Error = DomainError;
+
+    fn try_from(row: VersionRow) -> Result<Self, DomainError> {
+        Ok(Version {
+            published_at: ts(&row.version, "published_at", &row.published_at)?,
+            yanked: row.yanked != 0,
+            id: row.id,
+            package_id: row.package_id,
+            version: row.version,
+            metadata_json: row.metadata_json,
+            checksum_sha1: row.checksum_sha1,
+            checksum_sha256: row.checksum_sha256,
+            integrity: row.integrity,
+            size: row.size,
+            tarball_path: row.tarball_path,
+        })
+    }
+}
+
+impl From<DistTagRow> for DistTag {
+    fn from(row: DistTagRow) -> Self {
+        DistTag {
+            id: row.id,
+            package_id: row.package_id,
+            tag: row.tag,
+            version_id: row.version_id,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -121,11 +230,6 @@ pub async fn init_repositories(
             .await
             .map_err(|e| anyhow::anyhow!("repository {}: {e}", repo.name))?;
 
-        let visibility = match repo.visibility {
-            crate::config::Visibility::Public => "public",
-            crate::config::Visibility::Private => "private",
-        };
-
         sqlx::query(
             "INSERT OR IGNORE INTO repositories (name, repo_type, format, visibility, upstream_url, config_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
@@ -133,9 +237,9 @@ pub async fn init_repositories(
         .bind(&repo.name)
         .bind(repo.repo_type.as_str())
         .bind(repo.format.as_str())
-        .bind(visibility)
+        .bind(repo.visibility.as_str())
         .bind(repo.upstream.as_deref())
-        .bind(spec.config_json())
+        .bind(spec.config().map(|c| c.to_json()))
         .execute(pool)
         .await?;
     }
@@ -148,28 +252,23 @@ pub async fn init_repositories(
 // Query functions
 // ---------------------------------------------------------------------------
 
-pub async fn get_repository_by_name(
-    pool: &SqlitePool,
-    name: &str,
-) -> Result<Option<Repository>, sqlx::Error> {
-    sqlx::query_as::<_, Repository>("SELECT * FROM repositories WHERE name = ?1")
-        .bind(name)
-        .fetch_optional(pool)
-        .await
+pub async fn get_repository_by_name(pool: &SqlitePool, name: &str) -> AppResult<Option<Repository>> {
+    let row: Option<RepositoryRow> =
+        sqlx::query_as("SELECT * FROM repositories WHERE name = ?1")
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(Repository::try_from).transpose()?)
 }
 
-pub async fn get_package(
-    pool: &SqlitePool,
-    repo_id: i64,
-    name: &str,
-) -> Result<Option<Package>, sqlx::Error> {
-    sqlx::query_as::<_, Package>(
-        "SELECT * FROM packages WHERE repository_id = ?1 AND name = ?2",
-    )
-    .bind(repo_id)
-    .bind(name)
-    .fetch_optional(pool)
-    .await
+pub async fn get_package(pool: &SqlitePool, repo_id: i64, name: &str) -> AppResult<Option<Package>> {
+    let row: Option<PackageRow> =
+        sqlx::query_as("SELECT * FROM packages WHERE repository_id = ?1 AND name = ?2")
+            .bind(repo_id)
+            .bind(name)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(Package::try_from).transpose()?)
 }
 
 /// Case-insensitive lookup for ecosystems whose names are unique regardless
@@ -178,15 +277,16 @@ pub async fn get_package_nocase(
     pool: &SqlitePool,
     repo_id: i64,
     name: &str,
-) -> Result<Option<Package>, sqlx::Error> {
-    sqlx::query_as::<_, Package>(
+) -> AppResult<Option<Package>> {
+    let row: Option<PackageRow> = sqlx::query_as(
         "SELECT * FROM packages WHERE repository_id = ?1 AND name = ?2 COLLATE NOCASE
          ORDER BY id LIMIT 1",
     )
     .bind(repo_id)
     .bind(name)
     .fetch_optional(pool)
-    .await
+    .await?;
+    Ok(row.map(Package::try_from).transpose()?)
 }
 
 pub async fn create_package(
@@ -255,28 +355,30 @@ pub async fn create_version(
     Ok(result.last_insert_rowid())
 }
 
-pub async fn get_versions(
-    pool: &SqlitePool,
-    package_id: i64,
-) -> Result<Vec<Version>, sqlx::Error> {
-    sqlx::query_as::<_, Version>("SELECT * FROM versions WHERE package_id = ?1 ORDER BY id")
-        .bind(package_id)
-        .fetch_all(pool)
-        .await
+pub async fn get_versions(pool: &SqlitePool, package_id: i64) -> AppResult<Vec<Version>> {
+    let rows: Vec<VersionRow> =
+        sqlx::query_as("SELECT * FROM versions WHERE package_id = ?1 ORDER BY id")
+            .bind(package_id)
+            .fetch_all(pool)
+            .await?;
+    Ok(rows
+        .into_iter()
+        .map(Version::try_from)
+        .collect::<Result<_, _>>()?)
 }
 
 pub async fn get_version(
     pool: &SqlitePool,
     package_id: i64,
     version: &str,
-) -> Result<Option<Version>, sqlx::Error> {
-    sqlx::query_as::<_, Version>(
-        "SELECT * FROM versions WHERE package_id = ?1 AND version = ?2",
-    )
-    .bind(package_id)
-    .bind(version)
-    .fetch_optional(pool)
-    .await
+) -> AppResult<Option<Version>> {
+    let row: Option<VersionRow> =
+        sqlx::query_as("SELECT * FROM versions WHERE package_id = ?1 AND version = ?2")
+            .bind(package_id)
+            .bind(version)
+            .fetch_optional(pool)
+            .await?;
+    Ok(row.map(Version::try_from).transpose()?)
 }
 
 /// Replace the stored metadata JSON of a version (used by `npm deprecate`).
@@ -316,10 +418,11 @@ pub async fn get_dist_tags(
     pool: &SqlitePool,
     package_id: i64,
 ) -> Result<Vec<DistTag>, sqlx::Error> {
-    sqlx::query_as::<_, DistTag>("SELECT * FROM dist_tags WHERE package_id = ?1")
+    let rows: Vec<DistTagRow> = sqlx::query_as("SELECT * FROM dist_tags WHERE package_id = ?1")
         .bind(package_id)
         .fetch_all(pool)
-        .await
+        .await?;
+    Ok(rows.into_iter().map(DistTag::from).collect())
 }
 
 pub async fn record_download(
@@ -349,19 +452,6 @@ pub async fn set_yanked(
         .execute(pool)
         .await?;
     Ok(())
-}
-
-/// Return the list of member repository names for a group repo.
-pub fn parse_group_members(config_json: Option<&str>) -> Vec<String> {
-    config_json
-        .and_then(|json_str| serde_json::from_str::<serde_json::Value>(json_str).ok())
-        .and_then(|v| v.get("members")?.as_array().cloned())
-        .map(|arr| {
-            arr.into_iter()
-                .filter_map(|v| v.as_str().map(String::from))
-                .collect()
-        })
-        .unwrap_or_default()
 }
 
 // ---------------------------------------------------------------------------
@@ -804,20 +894,24 @@ pub async fn delete_vulnerability_scans(
 // Repository CRUD
 // ---------------------------------------------------------------------------
 
-pub async fn get_all_repositories(pool: &SqlitePool) -> Result<Vec<Repository>, sqlx::Error> {
-    sqlx::query_as::<_, Repository>("SELECT * FROM repositories ORDER BY name")
+pub async fn get_all_repositories(pool: &SqlitePool) -> AppResult<Vec<Repository>> {
+    let rows: Vec<RepositoryRow> = sqlx::query_as("SELECT * FROM repositories ORDER BY name")
         .fetch_all(pool)
-        .await
+        .await?;
+    Ok(rows
+        .into_iter()
+        .map(Repository::try_from)
+        .collect::<Result<_, _>>()?)
 }
 
 pub async fn create_repository(
     pool: &SqlitePool,
     name: &str,
-    kind: kinds::RepoKind,
-    format: kinds::Format,
-    visibility: &str,
+    kind: RepoKind,
+    format: Format,
+    visibility: Visibility,
     upstream_url: Option<&str>,
-    config_json: Option<&str>,
+    config: Option<&RepoConfig>,
 ) -> Result<i64, sqlx::Error> {
     let result = sqlx::query(
         "INSERT INTO repositories (name, repo_type, format, visibility, upstream_url, config_json)
@@ -826,9 +920,9 @@ pub async fn create_repository(
     .bind(name)
     .bind(kind.as_str())
     .bind(format.as_str())
-    .bind(visibility)
+    .bind(visibility.as_str())
     .bind(upstream_url)
-    .bind(config_json)
+    .bind(config.map(RepoConfig::to_json))
     .execute(pool)
     .await?;
 
@@ -838,15 +932,15 @@ pub async fn create_repository(
 pub async fn update_repository(
     pool: &SqlitePool,
     name: &str,
-    visibility: Option<&str>,
+    visibility: Option<Visibility>,
     upstream_url: Option<&str>,
-    config_json: Option<&str>,
+    config: Option<&RepoConfig>,
 ) -> Result<(), sqlx::Error> {
     if let Some(vis) = visibility {
         sqlx::query(
             "UPDATE repositories SET visibility = ?1, updated_at = datetime('now') WHERE name = ?2",
         )
-        .bind(vis)
+        .bind(vis.as_str())
         .bind(name)
         .execute(pool)
         .await?;
@@ -860,11 +954,11 @@ pub async fn update_repository(
         .execute(pool)
         .await?;
     }
-    if let Some(cfg) = config_json {
+    if let Some(cfg) = config {
         sqlx::query(
             "UPDATE repositories SET config_json = ?1, updated_at = datetime('now') WHERE name = ?2",
         )
-        .bind(cfg)
+        .bind(cfg.to_json())
         .bind(name)
         .execute(pool)
         .await?;
@@ -1124,5 +1218,84 @@ pub(crate) mod testing {
         crate::server::migrate(&pool).await.unwrap();
         crate::server::migrate(&pool).await.unwrap();
         (tmp, pool)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn repository_row() -> RepositoryRow {
+        RepositoryRow {
+            id: 1,
+            name: "npm-hosted".to_string(),
+            repo_type: "hosted".to_string(),
+            format: "npm".to_string(),
+            visibility: "private".to_string(),
+            upstream_url: None,
+            config_json: None,
+            created_at: "2026-09-17 10:02:03".to_string(),
+            updated_at: "2026-09-17 10:02:03".to_string(),
+        }
+    }
+
+    #[test]
+    fn a_row_decodes_every_column_the_domain_states_as_a_value() {
+        let repo = Repository::try_from(repository_row()).unwrap();
+        assert_eq!(repo.visibility, Visibility::Private);
+        assert_eq!(repo.created_at.to_rfc3339(), "2026-09-17T10:02:03+00:00");
+        assert_eq!(repo.config, None);
+
+        let version = Version::try_from(VersionRow {
+            id: 1,
+            package_id: 1,
+            version: "1.0.0".to_string(),
+            metadata_json: "{}".to_string(),
+            checksum_sha1: None,
+            checksum_sha256: None,
+            integrity: None,
+            size: 1,
+            tarball_path: String::new(),
+            published_at: "2026-09-17 10:02:03".to_string(),
+            yanked: 1,
+        })
+        .unwrap();
+        assert!(version.yanked);
+        assert_eq!(
+            version.published_at.to_rfc3339(),
+            "2026-09-17T10:02:03+00:00"
+        );
+    }
+
+    /// The stored format is the adapter's, but a row written by hand or by a
+    /// backend that keeps offsets still decodes rather than being refused.
+    #[test]
+    fn rfc_3339_is_read_back_too() {
+        let mut row = repository_row();
+        row.created_at = "2026-09-17T12:02:03+02:00".to_string();
+        let repo = Repository::try_from(row).unwrap();
+        assert_eq!(repo.created_at.to_rfc3339(), "2026-09-17T10:02:03+00:00");
+    }
+
+    /// A column the schema was supposed to constrain coming back unreadable
+    /// is an error naming the column, never a fallback: the `go` `Time` field
+    /// used to echo whatever it could not parse.
+    #[test]
+    fn an_unreadable_column_names_itself() {
+        for (column, corrupt) in [
+            ("visibility", "sometimes" as &str),
+            ("created_at", "17/09/2026"),
+        ] {
+            let mut row = repository_row();
+            match column {
+                "visibility" => row.visibility = corrupt.to_string(),
+                _ => row.created_at = corrupt.to_string(),
+            }
+            let err = Repository::try_from(row).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                format!("repository 'npm-hosted' has a corrupt {column} column: '{corrupt}'")
+            );
+        }
     }
 }

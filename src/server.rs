@@ -779,7 +779,7 @@ mod tests {
     fn proxy(name: &str) -> RepositoryConfig {
         RepositoryConfig {
             name: name.to_string(),
-            repo_type: crate::db::kinds::RepoKind::Proxy,
+            repo_type: crate::domain::RepoKind::Proxy,
             upstream: Some("https://registry.npmjs.org".to_string()),
             ..Default::default()
         }

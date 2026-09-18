@@ -1,104 +1,12 @@
 use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
-use std::str::FromStr;
 
-use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 
-use crate::db::Repository;
+use crate::domain::{Format, RepoConfig, RepoKind, Repository};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::MAX_GROUP_DEPTH;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum RepoKind {
-    #[default]
-    Hosted,
-    Proxy,
-    Group,
-}
-
-impl RepoKind {
-    pub const ALL: [RepoKind; 3] = [RepoKind::Hosted, RepoKind::Proxy, RepoKind::Group];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            RepoKind::Hosted => "hosted",
-            RepoKind::Proxy => "proxy",
-            RepoKind::Group => "group",
-        }
-    }
-}
-
-impl FromStr for RepoKind {
-    type Err = AppError;
-
-    fn from_str(s: &str) -> Result<Self, AppError> {
-        RepoKind::ALL
-            .into_iter()
-            .find(|kind| kind.as_str() == s)
-            .ok_or_else(|| AppError::BadRequest(format!("invalid repository type: {s}")))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum Format {
-    #[default]
-    Npm,
-    Cargo,
-    Oci,
-    Go,
-    Pypi,
-}
-
-impl Format {
-    pub const ALL: [Format; 5] = [
-        Format::Npm,
-        Format::Cargo,
-        Format::Oci,
-        Format::Go,
-        Format::Pypi,
-    ];
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Format::Npm => "npm",
-            Format::Cargo => "cargo",
-            Format::Oci => "oci",
-            Format::Go => "go",
-            Format::Pypi => "pypi",
-        }
-    }
-
-    pub const fn osv_ecosystem(self) -> Option<&'static str> {
-        match self {
-            Format::Npm => Some("npm"),
-            Format::Cargo => Some("crates.io"),
-            Format::Go => Some("Go"),
-            Format::Oci | Format::Pypi => None,
-        }
-    }
-
-    pub const fn supports_kind(self, kind: RepoKind) -> bool {
-        !matches!(
-            (self, kind),
-            (Format::Pypi, RepoKind::Proxy | RepoKind::Group)
-        )
-    }
-}
-
-impl FromStr for Format {
-    type Err = AppError;
-
-    fn from_str(s: &str) -> Result<Self, AppError> {
-        Format::ALL
-            .into_iter()
-            .find(|format| format.as_str() == s)
-            .ok_or_else(|| AppError::BadRequest(format!("invalid repository format: {s}")))
-    }
-}
 
 pub struct RepoSpec<'a> {
     pub name: &'a str,
@@ -118,10 +26,9 @@ pub struct Pending<'a> {
 }
 
 impl RepoSpec<'_> {
-    /// The `config_json` column: the member list for a group, nothing otherwise.
-    pub fn config_json(&self) -> Option<String> {
-        (self.kind == RepoKind::Group)
-            .then(|| serde_json::json!({ "members": self.members }).to_string())
+    /// The `config` document: the member list for a group, nothing otherwise.
+    pub fn config(&self) -> Option<RepoConfig> {
+        (self.kind == RepoKind::Group).then(|| RepoConfig::of_members(self.members))
     }
 
     fn refuse_upstream(&self) -> AppResult<()> {
@@ -327,105 +234,9 @@ pub async fn check_repository_names(pool: &SqlitePool) -> anyhow::Result<()> {
     )
 }
 
-impl Repository {
-    pub fn kind(&self) -> AppResult<RepoKind> {
-        self.repo_type
-            .parse()
-            .map_err(|_| self.corrupt_column("repo_type", &self.repo_type))
-    }
-
-    pub fn fmt(&self) -> AppResult<Format> {
-        self.format
-            .parse()
-            .map_err(|_| self.corrupt_column("format", &self.format))
-    }
-
-    pub fn members(&self) -> Vec<String> {
-        super::parse_group_members(self.config_json.as_deref())
-    }
-
-    fn corrupt_column(&self, column: &str, value: &str) -> AppError {
-        AppError::Internal(format!(
-            "repository '{}' has a corrupt {column} column: '{value}'",
-            self.name
-        ))
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn repository(repo_type: &str, format: &str) -> Repository {
-        Repository {
-            id: 1,
-            name: "r".to_string(),
-            repo_type: repo_type.to_string(),
-            format: format.to_string(),
-            visibility: "public".to_string(),
-            upstream_url: None,
-            config_json: Some(r#"{"members":["a","b"]}"#.to_string()),
-            created_at: String::new(),
-            updated_at: String::new(),
-        }
-    }
-
-    /// That these values are the ones the `repo_type` and `format` CHECKs admit
-    /// is asserted by the SQLite adapter against a migrated database
-    /// (`adapters/sqlite/migrate_tests.rs`): the dialect is the adapter's to
-    /// know, and reading a migration file from here would only prove that two
-    /// texts agree.
-    #[test]
-    fn values_round_trip_and_predicates_hold() {
-        for kind in RepoKind::ALL {
-            assert_eq!(kind.as_str().parse::<RepoKind>().unwrap(), kind);
-        }
-
-        for format in Format::ALL {
-            assert_eq!(format.as_str().parse::<Format>().unwrap(), format);
-            for kind in RepoKind::ALL {
-                let expected = format != Format::Pypi || kind == RepoKind::Hosted;
-                assert_eq!(format.supports_kind(kind), expected, "{format:?}/{kind:?}");
-            }
-        }
-        assert_eq!(Format::Cargo.osv_ecosystem(), Some("crates.io"));
-        assert_eq!(Format::Oci.osv_ecosystem(), None);
-
-        let repo = repository("group", "cargo");
-        assert_eq!(repo.kind().unwrap(), RepoKind::Group);
-        assert_eq!(repo.fmt().unwrap(), Format::Cargo);
-        assert_eq!(repo.members(), vec!["a".to_string(), "b".to_string()]);
-
-        assert!(matches!(
-            "mirror".parse::<RepoKind>(),
-            Err(AppError::BadRequest(_))
-        ));
-        assert!(matches!(
-            repository("mirror", "npm").kind(),
-            Err(AppError::Internal(_))
-        ));
-        assert!(matches!(
-            repository("hosted", "deb").fmt(),
-            Err(AppError::Internal(_))
-        ));
-    }
-
-    /// `corrupt_column` and `DomainError::CorruptColumn` build the same
-    /// sentence, so moving these two methods into the domain cannot change an
-    /// HTTP body.
-    #[test]
-    fn corrupt_column_message_matches_the_domain_error() {
-        let repo = repository("mirror", "npm");
-        assert_eq!(
-            repo.kind().unwrap_err().to_string(),
-            crate::domain::DomainError::CorruptColumn {
-                repo: repo.name.clone(),
-                column: "repo_type",
-                value: repo.repo_type.clone(),
-            }
-            .to_string()
-        );
-    }
 
     #[tokio::test]
     async fn check_repository_names_refuses_pre_upgrade_slash() {

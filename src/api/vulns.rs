@@ -20,25 +20,27 @@ use crate::server::AppState;
 async fn find_package_by_name(
     db: &sqlx::SqlitePool,
     name: &str,
-) -> Result<Option<crate::db::Package>, sqlx::Error> {
-    sqlx::query_as::<_, crate::db::Package>(
-        "SELECT * FROM packages WHERE name = ?1 LIMIT 1",
-    )
-    .bind(name)
-    .fetch_optional(db)
-    .await
+) -> AppResult<Option<crate::domain::Package>> {
+    let row: Option<crate::db::PackageRow> =
+        sqlx::query_as("SELECT * FROM packages WHERE name = ?1 LIMIT 1")
+            .bind(name)
+            .fetch_optional(db)
+            .await?;
+    Ok(row.map(TryInto::try_into).transpose()?)
 }
 
 /// Load the repository hosting a package.
 async fn load_repository(
     db: &sqlx::SqlitePool,
     repository_id: i64,
-) -> AppResult<crate::db::Repository> {
-    sqlx::query_as("SELECT * FROM repositories WHERE id = ?1")
-        .bind(repository_id)
-        .fetch_one(db)
-        .await
-        .map_err(|_| AppError::Internal("failed to fetch repository".to_string()))
+) -> AppResult<crate::domain::Repository> {
+    let row: crate::db::RepositoryRow =
+        sqlx::query_as("SELECT * FROM repositories WHERE id = ?1")
+            .bind(repository_id)
+            .fetch_one(db)
+            .await
+            .map_err(|_| AppError::Internal("failed to fetch repository".to_string()))?;
+    Ok(row.try_into()?)
 }
 
 /// Read-access gate shared by the vulns read and rescan paths. A package whose
@@ -46,7 +48,7 @@ async fn load_repository(
 /// that does not exist, so the denial maps to the same 404 as the name lookup.
 async fn ensure_readable_or_not_found(
     db: &sqlx::SqlitePool,
-    repo: &crate::db::Repository,
+    repo: &crate::domain::Repository,
     auth_user: Option<&AuthUser>,
     name: &str,
 ) -> AppResult<()> {

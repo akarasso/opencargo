@@ -1,7 +1,7 @@
 use chrono::{DateTime, Utc};
 
 use super::{PolicyConfig, Rule};
-use crate::db::kinds::Format;
+use crate::domain::Format;
 use crate::policy::{Resolution, RuleVerdict, Verdict};
 
 /// npm only: the fact was gathered from the packument by the recorder.

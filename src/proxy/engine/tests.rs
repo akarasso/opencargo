@@ -5,7 +5,7 @@ use tokio::io::AsyncReadExt;
 
 use super::fixture::*;
 use super::*;
-use crate::db::Repository;
+use crate::domain::{Repository, Visibility};
 use crate::proxy::strategy::{CacheKey, Transfer, UrlSource};
 
 fn found(o: AppResult<Outcome<Cached>>) -> Cached {
@@ -22,11 +22,11 @@ fn prefix_keys_do_not_collide() {
         name: "p".into(),
         repo_type: "proxy".into(),
         format: "go".into(),
-        visibility: "public".into(),
+        visibility: Visibility::Public,
         upstream_url: None,
-        config_json: None,
-        created_at: String::new(),
-        updated_at: String::new(),
+        config: None,
+        created_at: chrono::DateTime::UNIX_EPOCH,
+        updated_at: chrono::DateTime::UNIX_EPOCH,
     };
     let short = cache_path(
         CacheRepo(&repo),

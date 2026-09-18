@@ -8,7 +8,7 @@ use axum::response::{IntoResponse, Response};
 use sqlx::SqlitePool;
 
 use super::*;
-use crate::db::Repository;
+use crate::domain::Repository;
 use crate::proxy::strategy::{
     CacheKey, CachePolicy, Transfer, Ttl, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
 };

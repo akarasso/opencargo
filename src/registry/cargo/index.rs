@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::kinds::Format;
+use crate::domain::{Format, Visibility};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::{collect, Cx, UrlRepo};
 use crate::server::AppState;
@@ -43,7 +43,7 @@ pub async fn config_json(
     Ok(Json(config_body(
         &cx.state.base_url,
         cx.url,
-        repo.visibility != "public",
+        repo.visibility != Visibility::Public,
     )))
 }
 
@@ -69,7 +69,7 @@ pub async fn get_index_entry(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response<Body>> {
     let (repo_name, name) = index_params(&params)?;
-    crate::registry::validate_package_name("cargo", name)?;
+    crate::domain::validate_package_name("cargo", name)?;
     if index_prefix(uri.path()) != Some(compute_prefix(name)) {
         return Err(AppError::NotFound(format!("crate not found: {name}")));
     }
