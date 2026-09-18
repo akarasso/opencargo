@@ -14,6 +14,7 @@ use chrono::{DateTime, Utc};
 use futures_util::{StreamExt, TryStreamExt};
 use tracing::{info, warn};
 
+use crate::app::mark::HighWaterMark;
 use crate::domain::layout;
 use crate::error::StoreError;
 use crate::ports::reclaim::{Candidate, Claim, ClaimToken, ReclaimStore, Renewal};
@@ -50,6 +51,8 @@ pub struct ReclaimReport {
     pub failed: u64,
     /// Objects older than the grace that nothing references.
     pub scan_orphans: u64,
+    /// The high-water mark refused the batch: nothing was deleted.
+    pub refused: bool,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -64,6 +67,7 @@ pub struct ReclaimOrphans {
     store: Arc<dyn ReclaimStore>,
     referenced: Arc<dyn ReferencedKeys>,
     storage: Arc<dyn StorageBackend>,
+    mark: HighWaterMark,
     policy: ReclaimPolicy,
 }
 
@@ -75,6 +79,7 @@ impl ReclaimOrphans {
         policy: ReclaimPolicy,
     ) -> Self {
         Self {
+            mark: HighWaterMark::new(store.clone(), storage.clone()),
             store,
             referenced,
             storage,
@@ -82,9 +87,30 @@ impl ReclaimOrphans {
         }
     }
 
+    /// Every batch compares the mark first (C-3, C-5) and writes it one
+    /// ahead of the counter it then records (C-6). A refusal deletes
+    /// nothing and leaves the candidates for the pass after the verify.
+    async fn permitted(&self) -> bool {
+        match self.mark.permit().await {
+            Ok(true) => true,
+            Ok(false) => {
+                warn!("reclaim: the high-water mark refuses this batch, storage verify is owed");
+                false
+            }
+            Err(e) => {
+                warn!(error = %e, "reclaim: the high-water mark could not be read");
+                false
+            }
+        }
+    }
+
     /// One pass, bounded by the policy's limit at every step.
     pub async fn run(&self, now: DateTime<Utc>) -> ReclaimReport {
         let mut report = ReclaimReport::default();
+        if !self.permitted().await {
+            report.refused = true;
+            return report;
+        }
         match self.store.prune_pins(self.policy.grace, now, self.policy.limit).await {
             Ok(n) => report.pruned_pins = n,
             Err(e) => warn!(error = %e, "reclaim: pin pruning failed"),
@@ -109,6 +135,10 @@ impl ReclaimOrphans {
     /// prefixes: each claim still re-checks.
     pub async fn now(&self, candidates: &[Candidate], now: DateTime<Utc>) -> ReclaimReport {
         let mut report = ReclaimReport::default();
+        if !self.permitted().await {
+            report.refused = true;
+            return report;
+        }
         for candidate in candidates {
             self.tally(&mut report, candidate, now).await;
         }
@@ -212,6 +242,9 @@ impl ReclaimOrphans {
         let mut orphans = Vec::new();
         while let Some(meta) = objects.next().await {
             let meta = meta?;
+            if layout::reserved(&meta.key) {
+                continue;
+            }
             let covered = exact.contains(meta.key.as_str())
                 || prefixes.iter().any(|p| layout::under(&meta.key, p));
             if !covered && meta.last_modified < cutoff {

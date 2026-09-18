@@ -127,6 +127,24 @@ Job: the restore of the snapshot the marker names resumes. A restore from
 another snapshot is refused while the marker exists; deleting it by hand is
 unsupported. `{db}.lock` is permanent and carries the lock; leave it.
 
+## After a rollback
+
+A restore draws a fresh restore epoch, and the server owes a `storage verify`
+before it reclaims anything again. The same applies to a database put back by
+any other route — a file copied over, a snapshot adopted by hand: the
+high-water mark under `_opencargo/` in the artifact store is compared at
+startup and before every sweep, and a database behind it draws a fresh epoch
+by itself. Until that verify has run, nothing is deleted.
+
+`opencargo storage verify` lists the keys rows reference with no object
+behind them; there is no repair without a store that keeps noncurrent
+versions, so on a plain filesystem the loss is reported and the version,
+manifest or file has to be deleted and published again. On a store that keeps
+them, `opencargo storage verify --repair` puts the last noncurrent version of
+each of those keys back. `--orphans` lists what no row references; after a
+rollback those that lie under a live repository are queued for reclamation,
+which claims and re-checks before it deletes.
+
 ## Continuous replication
 
 Litestream (pinned `v0.5.17`) can replicate the database off the volume; it is

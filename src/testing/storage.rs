@@ -13,21 +13,48 @@ use futures_util::stream;
 use crate::storage::keys::{self, MAX_KEY_BYTES};
 use crate::storage::{
     CheckReport, CheckStep, ObjectList, ObjectMeta, ObjectWriter, ReadStream, StorageBackend,
-    StorageError, StoreIdentity, UploadPlan,
+    StorageError, StoreIdentity, UploadPlan, Versioning,
 };
 
 type Objects = Arc<Mutex<BTreeMap<String, (Bytes, DateTime<Utc>)>>>;
+type Noncurrent = Arc<Mutex<BTreeMap<String, Vec<(Bytes, DateTime<Utc>)>>>>;
 
 #[derive(Default, Clone)]
 pub struct MemStorage {
     objects: Objects,
     deleted: Arc<Mutex<Vec<String>>>,
     fail: Arc<Mutex<Vec<&'static str>>>,
+    /// What an overwrite or a delete left behind, newest last, when the
+    /// store keeps noncurrent versions.
+    noncurrent: Noncurrent,
+    keeps_versions: Arc<Mutex<bool>>,
 }
 
 impl MemStorage {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A store that keeps what an overwrite or a delete replaced, as a
+    /// versioned bucket does.
+    pub fn versioned(self) -> Self {
+        *self.keeps_versions.lock().unwrap() = true;
+        self
+    }
+
+    fn keep(&self, key: &str) {
+        if !*self.keeps_versions.lock().unwrap() {
+            return;
+        }
+        let Some(previous) = self.objects.lock().unwrap().get(key).cloned() else {
+            return;
+        };
+        self.noncurrent
+            .lock()
+            .unwrap()
+            .entry(key.to_string())
+            .or_default()
+            .push(previous);
     }
 
     /// The next call of `op` answers `Unavailable`.
@@ -44,8 +71,16 @@ impl MemStorage {
         self.objects.lock().unwrap().contains_key(key)
     }
 
+    /// Every key but the store's own tree, which no caller of this port
+    /// ever names.
     pub fn keys(&self) -> Vec<String> {
-        self.objects.lock().unwrap().keys().cloned().collect()
+        self.objects
+            .lock()
+            .unwrap()
+            .keys()
+            .filter(|k| !crate::domain::layout::reserved(k))
+            .cloned()
+            .collect()
     }
 
     /// Removes an object behind the port's back, as a racing reclaimer would.
@@ -77,6 +112,7 @@ struct MemWriter {
     key: String,
     buf: BytesMut,
     objects: Objects,
+    store: MemStorage,
 }
 
 #[async_trait]
@@ -92,6 +128,7 @@ impl ObjectWriter for MemWriter {
 
     async fn commit(self: Box<Self>) -> Result<u64, StorageError> {
         let size = self.buf.len() as u64;
+        self.store.keep(&self.key);
         self.objects
             .lock()
             .unwrap()
@@ -116,6 +153,7 @@ impl StorageBackend for MemStorage {
             key: key.to_string(),
             buf: BytesMut::new(),
             objects: self.objects.clone(),
+            store: self.clone(),
         }))
     }
 
@@ -165,6 +203,7 @@ impl StorageBackend for MemStorage {
     async fn delete(&self, key: &str) -> Result<(), StorageError> {
         keys::validate(key, MAX_KEY_BYTES)?;
         self.check("delete")?;
+        self.keep(key);
         self.objects.lock().unwrap().remove(key);
         self.deleted.lock().unwrap().push(key.to_string());
         Ok(())
@@ -175,6 +214,9 @@ impl StorageBackend for MemStorage {
             keys::validate(key, MAX_KEY_BYTES)?;
         }
         self.check("delete_batch")?;
+        for key in keys {
+            self.keep(key);
+        }
         let mut objects = self.objects.lock().unwrap();
         let mut deleted = self.deleted.lock().unwrap();
         for key in keys {
@@ -218,6 +260,27 @@ impl StorageBackend for MemStorage {
 
     async fn probe(&self) -> Result<(), StorageError> {
         self.check("probe")
+    }
+
+    async fn versioning(&self) -> Result<Versioning, StorageError> {
+        Ok(if *self.keeps_versions.lock().unwrap() {
+            Versioning::Kept
+        } else {
+            Versioning::NotKept
+        })
+    }
+
+    async fn restore_last_version(&self, key: &str) -> Result<bool, StorageError> {
+        keys::validate(key, MAX_KEY_BYTES)?;
+        self.check("restore_last_version")?;
+        let previous = self.noncurrent.lock().unwrap().get_mut(key).and_then(Vec::pop);
+        match previous {
+            Some(version) => {
+                self.objects.lock().unwrap().insert(key.to_string(), version);
+                Ok(true)
+            }
+            None => Ok(false),
+        }
     }
 
     fn upload_plan(&self) -> UploadPlan {

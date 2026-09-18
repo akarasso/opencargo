@@ -62,8 +62,82 @@ pub struct Backlog {
     pub prefixes: u64,
 }
 
+/// The methods that must run under a serializable execution, both sides of
+/// the pin/claim race under the same isolation (ha-profiles §5.3, C-11):
+/// every method that spends a `PinToken` by compare-and-set, and every
+/// method that writes a table `ReferencedKeys` reads. SQLite gets it from
+/// `BEGIN IMMEDIATE`; another dialect owes it an option of its own, and
+/// `READ COMMITTED` without a lock is refused for these.
+///
+/// The inventory is a fact of the contract, not of an adapter: a test of
+/// each adapter fails when one of its methods writes a referenced table and
+/// is not here.
+pub const SERIALIZABLE: &[&str] = &[
+    "ReclaimStore::pin",
+    "ReclaimStore::claim",
+    "ReclaimStore::enqueue",
+    "ReclaimStore::enqueue_prefix",
+    "PackageStore::publish_version",
+    "PackageStore::promote_metadata",
+    "PackageStore::set_metadata",
+    "PackageStore::set_yanked",
+    "PackageStore::delete_version",
+    "ProxyCacheStore::upsert",
+    "ProxyCacheStore::touch",
+    "ProxyCacheStore::quarantined",
+    "ProxyCacheStore::delete",
+    "ProxyCacheStore::delete_for_repo",
+    "OciStore::put_manifest",
+    "OciStore::delete_manifest",
+    "OciStore::delete_blob",
+    "OciStore::start_upload",
+    "OciStore::claim_segment",
+    "OciStore::begin_complete",
+    "OciStore::release_complete",
+    "OciStore::finish_upload",
+    "OciStore::reap_uploads",
+    "MavenFileStore::change",
+    "MavenFileStore::refuse",
+    "PypiFileStore::publish_file",
+    "PypiFileStore::set_release_yanked",
+    "PypiFileStore::delete_release",
+    "PypiFileStore::delete_project_files",
+];
+
+/// Who this installation is, which restore epoch its generations are minted
+/// under, and how far the high-water mark it wrote has gone.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Epoch {
+    pub installation: String,
+    pub epoch: String,
+    pub counter: u64,
+    /// Reclamation is refused until a `storage verify` clears it.
+    pub verify_pending: bool,
+}
+
 #[async_trait]
 pub trait ReclaimStore: Send + Sync {
+    /// The installation, its epoch and its counter.
+    async fn epoch(&self) -> Result<Epoch, StoreError>;
+
+    /// Draws a fresh opaque epoch — never a counter, so two branches of one
+    /// backup never draw the same — adopts `counter` when it is ahead of
+    /// what the database holds, and refuses reclamation until verified.
+    async fn new_epoch(&self, counter: u64) -> Result<Epoch, StoreError>;
+
+    /// Refuses reclamation until verified, under the same epoch.
+    async fn require_verify(&self) -> Result<(), StoreError>;
+
+    /// Lifts the refusal, when `epoch` is still the current one.
+    async fn verified(&self, epoch: &str) -> Result<(), StoreError>;
+
+    /// Records the counter the mark already carries: a compare-and-set on
+    /// the epoch and the counter it advances from.
+    async fn advance(&self, epoch: &str, counter: u64) -> Result<bool, StoreError>;
+
+    /// The prefixes of live incarnations: what a verify may enqueue under.
+    async fn live_prefixes(&self) -> Result<Vec<String>, StoreError>;
+
     /// One transaction for every key of one placement. A generation is
     /// reused only when a committed row references it and it was never
     /// claimed; otherwise a fresh opaque one is allocated. Never waits.

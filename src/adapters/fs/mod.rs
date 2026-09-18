@@ -15,7 +15,7 @@ use tokio::io::AsyncWriteExt;
 use crate::storage::keys::{self, BACKEND, MAX_KEY_BYTES, SCRATCH};
 use crate::storage::{
     CheckReport, CheckStep, ObjectList, ObjectMeta, ObjectWriter, ReadStream, StorageBackend,
-    StorageError, StoreIdentity, UploadPlan,
+    StorageError, StoreIdentity, UploadPlan, Versioning,
 };
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -491,6 +491,11 @@ impl StorageBackend for FilesystemStorage {
             .await
             .map_err(|e| fault("sweep", e))?;
         Ok(scratch + legacy)
+    }
+
+    /// A directory keeps nothing an overwrite replaced.
+    async fn versioning(&self) -> Result<Versioning, StorageError> {
+        Ok(Versioning::NotKept)
     }
 
     async fn probe(&self) -> Result<(), StorageError> {

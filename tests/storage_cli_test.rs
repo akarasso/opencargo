@@ -4,6 +4,13 @@
 
 mod common;
 
+fn listing() -> opencargo::app::storage_ops::Verify {
+    opencargo::app::storage_ops::Verify {
+        orphans: true,
+        ..opencargo::app::storage_ops::Verify::default()
+    }
+}
+
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -167,7 +174,7 @@ async fn verify_lists_missing_keys_and_orphans_and_check_passes() {
     let report = server::storage_check(&config).await.unwrap();
     assert!(report.ok(), "{report:?}");
 
-    let clean = server::storage_verify(&config, true, chrono::Utc::now()).await.unwrap();
+    let clean = server::storage_verify(&config, listing(), chrono::Utc::now()).await.unwrap();
     assert!(clean.missing.is_empty() && clean.orphans.is_empty(), "{clean:?}");
 
     let tarball = stored_keys(&server)
@@ -182,11 +189,11 @@ async fn verify_lists_missing_keys_and_orphans_and_check_passes() {
         .await
         .unwrap();
 
-    let now = server::storage_verify(&config, true, chrono::Utc::now()).await.unwrap();
+    let now = server::storage_verify(&config, listing(), chrono::Utc::now()).await.unwrap();
     assert_eq!(now.missing, vec![tarball]);
     assert!(now.orphans.is_empty(), "an object inside the grace window is in flight");
     let later = chrono::Utc::now() + chrono::TimeDelta::hours(3);
-    let later = server::storage_verify(&config, true, later).await.unwrap();
+    let later = server::storage_verify(&config, listing(), later).await.unwrap();
     assert_eq!(later.orphans, vec!["stray/object".to_string()]);
 }
 

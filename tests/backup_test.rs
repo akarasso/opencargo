@@ -143,7 +143,7 @@ async fn backup_then_restore_serves_every_format_byte_for_byte() {
         assert_eq!(status, StatusCode::OK, "{url}");
         assert_eq!(got, bytes, "{url}");
     }
-    let verify = server::storage_verify(&common::config_of(&server), false, chrono::Utc::now()).await.unwrap();
+    let verify = server::storage_verify(&common::config_of(&server), Default::default(), chrono::Utc::now()).await.unwrap();
     assert!(verify.missing.is_empty(), "{verify:?}");
 }
 
@@ -330,7 +330,7 @@ async fn restoring_a_database_only_snapshot_onto_an_empty_tree_is_refused() {
     assert!(err.contains("storage: false"), "{err}");
     let report = restore(&config, &snapshot.dir, true).await.unwrap();
     assert_eq!(report.gate, "opencargo storage verify");
-    let missing = server::storage_verify(&config, false, chrono::Utc::now()).await.unwrap().missing;
+    let missing = server::storage_verify(&config, Default::default(), chrono::Utc::now()).await.unwrap().missing;
     assert!(!missing.is_empty(), "the gate is what shows the rows with no object");
 }
 
@@ -442,7 +442,7 @@ async fn sink_objects_are_invisible_to_verify_orphans() {
     let snapshot = server::run_backup(&config, args(&server.tmp.path().join("b"), true)).await.unwrap();
     let name = snapshot.dir.file_name().unwrap();
     assert!(sink_root.join(name).join(MANIFEST).exists(), "the snapshot is off-box");
-    let orphans = server::storage_verify(&common::config_of(&server), true, chrono::Utc::now() + chrono::TimeDelta::hours(3))
+    let orphans = server::storage_verify(&common::config_of(&server), opencargo::app::storage_ops::Verify { orphans: true, ..Default::default() }, chrono::Utc::now() + chrono::TimeDelta::hours(3))
         .await
         .unwrap()
         .orphans;

@@ -45,6 +45,7 @@ pub mod authenticate;
 pub mod events;
 pub mod import;
 pub mod maven;
+pub mod mark;
 pub mod mcp;
 pub mod nuget;
 pub mod lease;
