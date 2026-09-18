@@ -92,6 +92,7 @@ pub struct TestServer {
     pub lease: Option<opencargo::app::lease::LeaseGuard>,
     pub srv: ServerHandle,
     pub shutdown: Shutdown,
+    pub lock: Option<opencargo::backup::lock::RestoreLock>,
     endpoint_drain: Duration,
     grace: Duration,
 }
@@ -103,6 +104,7 @@ impl TestServer {
         if let Some(lease) = self.lease.take() {
             lease.release().await;
         }
+        self.lock = None;
     }
 
     /// Production's drain, then the end of serving, then the lease: what
@@ -113,6 +115,7 @@ impl TestServer {
         if let Some(lease) = self.lease.take() {
             lease.release().await;
         }
+        self.lock = None;
     }
 }
 
@@ -269,7 +272,7 @@ async fn spawn_in(
     }
     let srv = ServerHandle::new();
     let shutdown = Shutdown::new();
-    let server::Started { mut state, lease } = start_with(&mut config, srv.clone(), shutdown.clone())
+    let server::Started { mut state, lease, lock } = start_with(&mut config, srv.clone(), shutdown.clone())
         .await
         .expect("failed to build app state");
     if let Some(tuning) = tuning {
@@ -313,6 +316,7 @@ async fn spawn_in(
         lease,
         srv,
         shutdown,
+        lock,
         endpoint_drain: config.server.endpoint_drain().expect("a valid endpoint_drain"),
         grace: config.server.shutdown_grace().expect("a valid shutdown_grace"),
     }

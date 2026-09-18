@@ -44,6 +44,30 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
+    /// Snapshot the database, and with --storage every object, into a
+    /// local directory; or verify a snapshot with --check
+    Backup {
+        #[arg(long, required_unless_present = "check")]
+        to: Option<PathBuf>,
+        #[arg(long)]
+        storage: bool,
+        #[arg(long)]
+        force: bool,
+        #[arg(long, default_value_t = 7)]
+        keep: usize,
+        /// Verify a snapshot without restoring it
+        #[arg(long, conflicts_with = "to")]
+        check: Option<PathBuf>,
+    },
+    /// Restore a snapshot, storage first; run with the server stopped. An
+    /// interrupted restore is finished by running the same command again
+    Restore {
+        #[arg(long)]
+        from: PathBuf,
+        /// Replace an existing database, or restore a database-only snapshot
+        #[arg(long)]
+        force: bool,
+    },
     /// Operate on the artifact store; the server must be stopped for
     /// `migrate` and `reclaim`
     Storage {
@@ -176,8 +200,11 @@ async fn main() -> anyhow::Result<()> {
             let shutdown = server::shutdown::Shutdown::new();
             let endpoint_drain = cfg.server.endpoint_drain()?;
             let grace = cfg.server.shutdown_grace()?;
-            let server::Started { state: app_state, lease } =
+            let server::Started { state: app_state, lease, lock } =
                 server::build_state(&cfg, srv.clone(), shutdown.clone()).await?;
+            if let Some(schedule) = server::backup_schedule(&cfg, &app_state)? {
+                tokio::spawn(schedule);
+            }
             let probe_every = config::parse_chrono_duration(&cfg.auth.sso.probe_interval)?
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(60));
@@ -243,6 +270,7 @@ async fn main() -> anyhow::Result<()> {
             if let Some(lease) = lease {
                 lease.release().await;
             }
+            drop(lock);
             info!("stopped");
         }
         Commands::ValidateConfig { path } => {
@@ -258,6 +286,45 @@ async fn main() -> anyhow::Result<()> {
         Commands::Migrate { force } => {
             server::run_migrations(&cfg, force).await?;
             println!("Migrations applied successfully.");
+        }
+        Commands::Backup { check: Some(dir), .. } => {
+            let manifest = server::check_backup(&dir).await?;
+            println!(
+                "{}: ok, taken {}, {} objects{}",
+                dir.display(),
+                manifest.taken_at.to_rfc3339(),
+                manifest.storage_keys,
+                if manifest.storage { "" } else { " (storage: false: database only, not restorable onto an empty tree)" }
+            );
+        }
+        Commands::Backup { to, storage, force, keep, check: None } => {
+            let snapshot = server::run_backup(
+                &cfg,
+                server::BackupArgs {
+                    to: to.expect("clap requires --to without --check"),
+                    storage,
+                    force,
+                    keep,
+                    space: std::sync::Arc::new(opencargo::backup::StatvfsProbe),
+                },
+            )
+            .await?;
+            println!("{}", snapshot.dir.display());
+        }
+        Commands::Restore { from, force } => {
+            let db_path = server::database_path(&cfg)
+                .ok_or_else(|| anyhow::anyhow!("a restore needs a database file"))?;
+            let lock = opencargo::backup::lock::restore_lock_guard(
+                &db_path,
+                opencargo::backup::lock::Lock::Exclusive(&from),
+            )?;
+            let report = server::run_restore(&cfg, &from, force, lock).await?;
+            println!(
+                "restored {} objects and the database of {}; now run `{}`",
+                report.objects,
+                report.manifest.taken_at.to_rfc3339(),
+                report.gate
+            );
         }
         Commands::Storage { command } => storage(&cfg, command).await?,
     }

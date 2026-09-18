@@ -55,6 +55,9 @@ rand = "0.8"
 flate2 = "1"
 tar = "0.4"
 
+# flock and statvfs for backups; already in the graph through tar -> xattr
+rustix = { version = "1", features = ["fs"] }
+
 # Async utilities
 async-trait = "0.1"
 bytes = "1"

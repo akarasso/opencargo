@@ -1983,6 +1983,7 @@ dependencies = [
  "reqwest 0.12.28",
  "roxmltree",
  "rust-embed",
+ "rustix",
  "rustls",
  "semver",
  "serde",

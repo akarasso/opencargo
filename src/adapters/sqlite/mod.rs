@@ -43,6 +43,7 @@ use crate::ports::vulns::VulnStore;
 use crate::ports::webhooks::WebhookStore;
 
 pub mod audit;
+pub mod backup;
 pub mod dashboard;
 pub mod deps;
 pub mod maven;
@@ -349,6 +350,15 @@ impl SqliteStores {
 
     pub fn secrets(&self) -> Arc<dyn ServerSecretStore> {
         Arc::new(identities::SqliteSecretStore::new(self.pool.clone()))
+    }
+
+    pub fn backup(&self) -> Arc<dyn crate::ports::backup::DatabaseBackup> {
+        Arc::new(backup::SqliteBackup::new(self.pool.clone()))
+    }
+
+    /// Closes the pool, so nothing holds the database file open.
+    pub async fn close(&self) {
+        self.pool.close().await;
     }
 
     pub fn leases(&self) -> Arc<dyn LeaseStore> {

@@ -20,6 +20,7 @@ pub struct Config {
     pub auth: AuthConfig,
     pub proxy: ProxyConfig,
     pub cleanup: CleanupConfig,
+    pub backup: BackupConfig,
     #[serde(default)]
     pub repositories: Vec<RepositoryConfig>,
     #[serde(default)]
@@ -175,6 +176,103 @@ pub struct TlsConfig {
 }
 
 // ---------------------------------------------------------------------------
+// Backup
+// ---------------------------------------------------------------------------
+
+/// The in-process backup schedule. `storage` is off for the scheduler: seven
+/// full artifact copies on the data volume would fill it.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct BackupConfig {
+    pub enabled: bool,
+    pub every: String,
+    /// `HH:MM`, UTC: the phase of `every`.
+    pub at: String,
+    pub keep: usize,
+    /// A local directory.
+    pub to: String,
+    pub storage: bool,
+    /// An off-box copy of every finished snapshot, in a keyspace disjoint
+    /// from `[storage]`; built by the run, never at boot.
+    pub sink: Option<BackupSinkConfig>,
+}
+
+impl Default for BackupConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            every: "24h".to_string(),
+            at: "03:00".to_string(),
+            keep: 7,
+            to: String::new(),
+            storage: false,
+            sink: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default)]
+pub struct BackupSinkConfig {
+    #[serde(flatten)]
+    pub storage: StorageConfig,
+    /// The root of a filesystem sink.
+    pub path: String,
+}
+
+impl BackupConfig {
+    fn problems(&self, config: &Config, problems: &mut Vec<String>) {
+        if self.enabled && self.to.trim().is_empty() {
+            problems.push("[backup] enabled needs `to`: a schedule with nowhere to write never backs up".to_string());
+        }
+        match parse_duration(&self.every) {
+            Ok(every) if every.as_secs() < 3600 => problems.push("[backup] every must be at least 1h".to_string()),
+            Ok(every) if 86_400 % every.as_secs() != 0 => problems.push(format!(
+                "[backup] every = {:?} does not divide the day, so `at` has no single phase",
+                self.every
+            )),
+            Ok(_) => {}
+            Err(_) => problems.push(format!("[backup] every = {:?} is not a duration", self.every)),
+        }
+        if crate::backup::schedule::parse_at(&self.at).is_none() {
+            problems.push(format!("[backup] at = {:?} is not HH:MM (UTC)", self.at));
+        }
+        if self.keep == 0 {
+            problems.push("[backup] keep must be at least 1".to_string());
+        }
+        if let Some(sink) = &self.sink {
+            if !sink_disjoint(sink, config) {
+                problems.push(
+                    "[backup.sink] overlaps [storage]: a snapshot would land among the artifacts".to_string(),
+                );
+            }
+        }
+    }
+}
+
+/// The declared-TOML check only: the resolved one runs with each backup.
+fn sink_disjoint(sink: &BackupSinkConfig, config: &Config) -> bool {
+    match (sink.storage.backend, config.storage.backend) {
+        (StorageKind::S3, StorageKind::S3) => {
+            let (a, b) = (&sink.storage.s3, &config.storage.s3);
+            (a.endpoint.as_deref(), a.region.as_str(), a.bucket.as_str()) != (b.endpoint.as_deref(), b.region.as_str(), b.bucket.as_str())
+                || !segments_overlap(&a.prefix, &b.prefix, '/')
+        }
+        (StorageKind::Fs, StorageKind::Fs) => {
+            !segments_overlap(&sink.path, &config.server.storage_path, std::path::MAIN_SEPARATOR)
+        }
+        _ => true,
+    }
+}
+
+/// One of the two is the other or lies under it, on segment boundaries.
+pub fn segments_overlap(a: &str, b: &str, sep: char) -> bool {
+    let (a, b) = (a.trim_end_matches(sep), b.trim_end_matches(sep));
+    let under = |x: &str, y: &str| y.is_empty() || x == y || x.starts_with(&format!("{y}{sep}"));
+    under(a, b) || under(b, a)
+}
+
+// ---------------------------------------------------------------------------
 // Storage
 // ---------------------------------------------------------------------------
 
@@ -283,7 +381,11 @@ pub fn refuse_duplicate_identities<'a>(identities: impl IntoIterator<Item = &'a 
 impl Config {
     /// The identity of every store this process builds.
     pub fn store_identities(&self) -> Vec<String> {
-        vec![self.storage.id.clone().unwrap_or_else(|| "artifacts".to_string())]
+        let mut ids = vec![self.storage.id.clone().unwrap_or_else(|| "artifacts".to_string())];
+        if let Some(sink) = &self.backup.sink {
+            ids.push(sink.storage.id.clone().unwrap_or_else(|| "backup".to_string()));
+        }
+        ids
     }
 
     /// What a config must satisfy before any store is built, every refusal
@@ -329,6 +431,7 @@ impl Config {
             }
         }
         self.server.problems(&mut problems);
+        self.backup.problems(self, &mut problems);
         problems
     }
 
@@ -738,6 +841,42 @@ mod tests {
         assert_eq!(config.server.shutdown_grace, "0");
         assert_eq!(config.server.lease_terms().unwrap().unwrap().wait.as_secs(), 90);
         assert!(config.problems().iter().any(|p| p.contains("shutdown_grace")));
+    }
+
+    #[test]
+    fn backup_rules_table() {
+        let rows: &[(&str, &str)] = &[
+            ("[backup]\nenabled = true", "enabled needs `to`"),
+            ("[backup]\nevery = \"7h\"", "does not divide the day"),
+            ("[backup]\nevery = \"30m\"", "at least 1h"),
+            ("[backup]\nevery = \"1d\"", "not a duration"),
+            ("[backup]\nat = \"3am\"", "HH:MM"),
+            ("[backup]\nkeep = 0", "keep"),
+        ];
+        for (toml, needle) in rows {
+            let problems = problems_of(toml);
+            assert!(problems.iter().any(|p| p.contains(needle)), "{toml}: {problems:?}");
+        }
+        assert!(problems_of("[backup]\nenabled = true\nto = \"/b\"\nevery = \"6h\"").is_empty());
+    }
+
+    #[test]
+    fn backup_sink_must_be_disjoint_from_storage() {
+        let s3 = |sink: &str| {
+            format!(
+                "[storage]\nbackend = \"s3\"\n[storage.s3]\nbucket = \"b\"\nprefix = \"oc\"\n\
+                 [backup.sink]\nbackend = \"s3\"\n[backup.sink.s3]\n{sink}"
+            )
+        };
+        let overlap = |toml: String| problems_of(&toml).iter().any(|p| p.contains("[backup.sink]"));
+        assert!(overlap(s3("bucket = \"b\"\nprefix = \"oc\"")), "the same keyspace");
+        assert!(overlap(s3("bucket = \"b\"\nprefix = \"oc/snapshots\"")), "inside it");
+        assert!(overlap(s3("bucket = \"b\"")), "around it");
+        assert!(!overlap(s3("bucket = \"b\"\nprefix = \"oc-backups\"")), "a sibling prefix");
+        assert!(!overlap(s3("bucket = \"b\"\nprefix = \"oc\"\nendpoint = \"https://dr.example\"")), "another endpoint");
+        let fs = |path: &str| format!("[server]\nstorage_path = \"/data/storage\"\n[backup.sink]\npath = \"{path}\"");
+        assert!(overlap(fs("/data/storage/backups")));
+        assert!(!overlap(fs("/data/storage-backups")));
     }
 
     #[test]
