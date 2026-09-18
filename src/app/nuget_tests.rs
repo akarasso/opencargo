@@ -20,7 +20,7 @@ const GRACE: Duration = Duration::from_secs(3600);
 struct ReclaimedOnce {
     inner: Arc<dyn PackageStore>,
     fakes: FakeDb,
-    storage: MemStorage,
+    vanish: Box<dyn Fn(&str) + Send + Sync>,
     commits: AtomicUsize,
 }
 
@@ -49,7 +49,7 @@ impl PackageStore for ReclaimedOnce {
             reclaim.enqueue(std::slice::from_ref(&key), Utc::now() - TimeDelta::hours(2)).await?;
             let claim = reclaim.claim(&key, GRACE, late, late + TimeDelta::minutes(5)).await?;
             assert!(matches!(claim, Claim::Claimed(_)), "{claim:?}");
-            self.storage.vanish(&key);
+            (self.vanish)(&key);
         }
         self.inner.publish_version(release).await
     }
@@ -89,11 +89,17 @@ impl PackageStore for ReclaimedOnce {
 struct Fx {
     fakes: FakeDb,
     storage: MemStorage,
+    backend: Arc<dyn StorageBackend>,
     repo: i64,
 }
 
 impl Fx {
     async fn new() -> Self {
+        let storage = MemStorage::new();
+        Self::on(storage.clone(), Arc::new(storage)).await
+    }
+
+    async fn on(storage: MemStorage, backend: Arc<dyn StorageBackend>) -> Self {
         let db = FakeDb::new();
         let repo = db
             .repositories()
@@ -112,7 +118,8 @@ impl Fx {
             .unwrap();
         Self {
             fakes: db,
-            storage: MemStorage::new(),
+            storage,
+            backend,
             repo: repo.id,
         }
     }
@@ -121,7 +128,7 @@ impl Fx {
         PublishNugetPackage::new(
             packages,
             self.fakes.repositories(),
-            Arc::new(Placer::new(self.fakes.reclaim(), Arc::new(self.storage.clone()))),
+            Arc::new(Placer::new(self.fakes.reclaim(), self.backend.clone())),
             crate::registry::rules::rules_of(crate::domain::Format::Nuget).unwrap(),
         )
     }
@@ -197,13 +204,14 @@ async fn conflict_loser_enqueues_and_deletes_nothing() {
     assert!(fx.storage.contains(&winner.version.tarball_path));
 }
 
-#[tokio::test]
-async fn superseded_push_replaces_and_commits() {
-    let fx = Fx::new().await;
+/// Arbitration NuGet 6: pin claimed and generation deleted before the
+/// commit, which is `Superseded`; the helper writes a new generation from
+/// the request's spool and commits it. Run on each backend a push can land on.
+async fn superseded_push_replaces_and_commits_on(fx: Fx, vanish: Box<dyn Fn(&str) + Send + Sync>) {
     let packages = Arc::new(ReclaimedOnce {
         inner: fx.fakes.packages(),
         fakes: fx.fakes.clone(),
-        storage: fx.storage.clone(),
+        vanish,
         commits: AtomicUsize::new(0),
     });
     let landed = fx
@@ -213,11 +221,36 @@ async fn superseded_push_replaces_and_commits() {
         .unwrap();
     assert_eq!(packages.commits.load(Ordering::SeqCst), 2, "superseded once, then committed");
     assert_eq!(
-        fx.storage.get(&landed.version.tarball_path).await.unwrap().as_ref(),
+        fx.backend.get(&landed.version.tarball_path).await.unwrap().as_ref(),
         b"spooled",
         "the new generation was written again from the spool"
     );
-    assert!(fx.storage.deleted().is_empty(), "the push deletes nothing");
+    assert!(
+        !fx.fakes.candidates().contains(&landed.version.tarball_path),
+        "the committed generation is not queued"
+    );
+}
+
+#[tokio::test]
+async fn superseded_push_replaces_and_commits() {
+    let fx = Fx::new().await;
+    let storage = fx.storage.clone();
+    let mem = storage.clone();
+    superseded_push_replaces_and_commits_on(fx, Box::new(move |key| mem.vanish(key))).await;
+    assert!(storage.deleted().is_empty(), "the push deletes nothing");
+}
+
+#[tokio::test]
+async fn superseded_push_replaces_and_commits_on_the_filesystem() {
+    let root = tempfile::TempDir::new().unwrap();
+    let fx = Fx::on(MemStorage::new(), crate::server::filesystem(root.path())).await;
+    let dir = root.path().to_path_buf();
+    let vanish = Box::new(move |key: &str| {
+        let file = dir.join(key);
+        assert!(file.is_file(), "the first generation was written: {file:?}");
+        std::fs::remove_file(file).unwrap();
+    });
+    superseded_push_replaces_and_commits_on(fx, vanish).await;
 }
 
 #[tokio::test]

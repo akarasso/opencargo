@@ -2,7 +2,9 @@
 //!
 //! The push body is multipart and its first file field is the `.nupkg`,
 //! spooled in memory under a cap: the spool is private to the request and is
-//! what `place_shared` replays from when a commit is superseded.
+//! what `place_shared` replays from when a commit is superseded. Every spool
+//! draws its bytes from one process-wide budget, so concurrent pushes cannot
+//! hold more than it; a push that cannot get its bytes in time is a 503.
 
 use axum::{
     extract::{Multipart, Path, State},
@@ -10,8 +12,12 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+
 use bytes::{Bytes, BytesMut};
 use serde_json::json;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 use tracing::info;
 
 use crate::app::nuget::{NugetDependency, NugetPush, PublishNugetPackage};
@@ -28,6 +34,15 @@ use super::read::{id_of, key_of};
 use super::version::NuGetVersion;
 
 pub const MAX_NUPKG_BYTES: usize = 250 * 1024 * 1024;
+const SPOOL_BUDGET_BYTES: usize = 512 * 1024 * 1024;
+const SPOOL_WAIT: Duration = Duration::from_secs(30);
+
+fn budget() -> Arc<Semaphore> {
+    static BUDGET: OnceLock<Arc<Semaphore>> = OnceLock::new();
+    BUDGET
+        .get_or_init(|| Arc::new(Semaphore::new(SPOOL_BUDGET_BYTES)))
+        .clone()
+}
 
 fn require_user(auth: Option<axum::Extension<AuthUser>>) -> AppResult<AuthUser> {
     auth.map(|e| e.0)
@@ -42,12 +57,25 @@ async fn writable(state: &AppState, repo_name: &str, user: &AuthUser) -> AppResu
     Ok(repo)
 }
 
-enum Spool {
-    Bytes(Bytes),
-    TooLarge,
+/// The package's bytes and their share of the budget, returned on drop.
+struct Spooled {
+    bytes: Bytes,
+    _budget: Option<OwnedSemaphorePermit>,
 }
 
-async fn spool(mut multipart: Multipart) -> AppResult<Spool> {
+enum Spool {
+    Bytes(Spooled),
+    TooLarge,
+    Busy,
+}
+
+struct Limits {
+    cap: usize,
+    budget: Arc<Semaphore>,
+    wait: Duration,
+}
+
+async fn spool(mut multipart: Multipart, limits: &Limits) -> AppResult<Spool> {
     let bad = |e: axum::extract::multipart::MultipartError| {
         AppError::BadRequest(format!("invalid multipart body: {e}"))
     };
@@ -56,14 +84,31 @@ async fn spool(mut multipart: Multipart) -> AppResult<Spool> {
         .await
         .map_err(bad)?
         .ok_or_else(|| AppError::BadRequest("the push carries no package".to_string()))?;
+    let deadline = tokio::time::Instant::now() + limits.wait;
+    let mut held: Option<OwnedSemaphorePermit> = None;
     let mut buf = BytesMut::new();
     while let Some(chunk) = field.chunk().await.map_err(bad)? {
-        if buf.len() + chunk.len() > MAX_NUPKG_BYTES {
+        if buf.len() + chunk.len() > limits.cap {
             return Ok(Spool::TooLarge);
+        }
+        let want = u32::try_from(chunk.len()).unwrap_or(u32::MAX);
+        if want > 0 {
+            let got = tokio::time::timeout_at(deadline, limits.budget.clone().acquire_many_owned(want)).await;
+            match got {
+                Ok(Ok(permit)) => match held.as_mut() {
+                    Some(h) => h.merge(permit),
+                    None => held = Some(permit),
+                },
+                Ok(Err(_)) => return Err(AppError::Internal("spool budget closed".to_string())),
+                Err(_) => return Ok(Spool::Busy),
+            }
         }
         buf.extend_from_slice(&chunk);
     }
-    Ok(Spool::Bytes(buf.freeze()))
+    Ok(Spool::Bytes(Spooled {
+        bytes: buf.freeze(),
+        _budget: held,
+    }))
 }
 
 /// PUT `/{repo}/v3/package`: 201 created, 400 invalid, 409 when the
@@ -76,8 +121,13 @@ pub async fn push(
 ) -> AppResult<Response> {
     let user = require_user(auth)?;
     let repo = writable(&state, &repo_name, &user).await?;
-    let body = match spool(multipart).await? {
-        Spool::Bytes(b) => b,
+    let limits = Limits {
+        cap: MAX_NUPKG_BYTES,
+        budget: budget(),
+        wait: SPOOL_WAIT,
+    };
+    let spooled = match spool(multipart, &limits).await? {
+        Spool::Bytes(s) => s,
         Spool::TooLarge => {
             return Ok((
                 StatusCode::PAYLOAD_TOO_LARGE,
@@ -85,7 +135,13 @@ pub async fn push(
             )
                 .into_response())
         }
+        Spool::Busy => {
+            return Err(AppError::ServiceUnavailable(
+                "too many pushes in flight, retry later".to_string(),
+            ))
+        }
     };
+    let body = spooled.bytes.clone();
     let parsing = body.clone();
     let (xml, parsed) = tokio::task::spawn_blocking(move || nuspec::from_package(&parsing))
         .await
@@ -195,4 +251,65 @@ pub async fn relist(
 ) -> AppResult<StatusCode> {
     set_listed(&state, &repo_name, &id, &version, auth, true).await?;
     Ok(StatusCode::OK)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::extract::FromRequest;
+
+    fn multipart(len: usize) -> Multipart {
+        let boundary = "b0undary";
+        let mut body = format!(
+            "--{boundary}\r\nContent-Disposition: form-data; name=\"package\"; filename=\"p.nupkg\"\r\nContent-Type: application/octet-stream\r\n\r\n"
+        )
+        .into_bytes();
+        body.extend(std::iter::repeat_n(b'x', len));
+        body.extend(format!("\r\n--{boundary}--\r\n").into_bytes());
+        let req = axum::http::Request::builder()
+            .header("content-type", format!("multipart/form-data; boundary={boundary}"))
+            .body(axum::body::Body::from(body))
+            .unwrap();
+        futures_util::FutureExt::now_or_never(Multipart::from_request(req, &()))
+            .expect("ready")
+            .expect("multipart")
+    }
+
+    fn limits(cap: usize, budget: usize) -> Limits {
+        Limits {
+            cap,
+            budget: Arc::new(Semaphore::new(budget)),
+            wait: Duration::from_secs(30),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_field_over_the_cap_is_too_large_and_holds_nothing() {
+        let l = limits(1000, 4000);
+        assert!(matches!(spool(multipart(1001), &l).await.unwrap(), Spool::TooLarge));
+        assert_eq!(l.budget.available_permits(), 4000, "the budget is whole again");
+    }
+
+    #[tokio::test]
+    async fn a_spool_holds_its_bytes_of_the_budget_until_dropped() {
+        let l = limits(1000, 4000);
+        let Spool::Bytes(held) = spool(multipart(900), &l).await.unwrap() else {
+            panic!("spooled")
+        };
+        assert_eq!(held.bytes.len(), 900);
+        assert_eq!(l.budget.available_permits(), 3100);
+        drop(held);
+        assert_eq!(l.budget.available_permits(), 4000);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn concurrent_spools_past_the_budget_wait_then_are_busy() {
+        let l = limits(1000, 1500);
+        let Spool::Bytes(first) = spool(multipart(900), &l).await.unwrap() else {
+            panic!("spooled")
+        };
+        assert!(matches!(spool(multipart(900), &l).await.unwrap(), Spool::Busy));
+        drop(first);
+        assert!(matches!(spool(multipart(900), &l).await.unwrap(), Spool::Bytes(_)));
+    }
 }

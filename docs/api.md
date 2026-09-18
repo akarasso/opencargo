@@ -160,7 +160,8 @@ GET    /{repo}/v3/search?q=&skip=&take=&prerelease=&semVerLevel=&packageType=
 Point `dotnet` at `{base_url}/{repo}/v3/index.json`. Ids are case-insensitive and
 versions normalized as NuGet does (`1.0`, `1.0.0.0`, `01.0.0` and `1.0.0+meta` are one
 version): a second push of any spelling is `409`, an invalid package `400`, a package over
-250 MiB `413`. A push takes an API token as `X-NuGet-ApiKey` (`dotnet nuget push -k`) or as
+250 MiB `413`; concurrent pushes share a 512 MiB spool, and one that waits more than 30 s for
+its share is `503`. A push takes an API token as `X-NuGet-ApiKey` (`dotnet nuget push -k`) or as
 the Basic password of `packageSourceCredentials`; every credential presented is verified, one
 invalid is `401`, and when the key and the Basic credential name different users the key wins
 on push and delete. `dotnet nuget push` sends no key of its own when only Basic credentials are

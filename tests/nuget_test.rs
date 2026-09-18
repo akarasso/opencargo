@@ -311,3 +311,22 @@ async fn a_hosted_push_places_the_nupkg_and_no_other_key() {
     assert_eq!(nuspec.status(), StatusCode::OK);
     assert!(nuspec.text().await.unwrap().contains("<id>Only.Lib</id>"));
 }
+
+/// NuGet 3.2: a field past the cap is refused before anything is placed,
+/// and leaves neither a part, a key, nor a version behind.
+#[tokio::test]
+async fn spool_field_over_cap_is_413_and_removes_part() {
+    let server = setup().await;
+    let c = reqwest::Client::new();
+    let base = &server.base_url;
+    let over = vec![0u8; opencargo::registry::nuget::publish::MAX_NUPKG_BYTES + 1];
+    let status = push_as(&c, base, "nuget", STATIC_TOKEN, over).await;
+    assert_eq!(status, StatusCode::PAYLOAD_TOO_LARGE);
+    let mut files = Vec::new();
+    files_under(&server.tmp.path().join("storage"), &mut files);
+    assert!(files.is_empty(), "{files:?}");
+    push(&c, base, "nuget", nupkg("After.Lib", "1.0.0", &[])).await;
+    let mut files = Vec::new();
+    files_under(&server.tmp.path().join("storage"), &mut files);
+    assert_eq!(files.len(), 1, "the refused push held no budget and left no key: {files:?}");
+}
