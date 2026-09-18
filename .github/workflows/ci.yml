@@ -20,6 +20,11 @@ jobs:
         with:
           persist-credentials: false
 
+      # Cheap and first: a leak count that grew fails here rather than after the
+      # full build. The maxima live in the declare block of the script.
+      - name: Boundary ratchet
+        run: scripts/boundary.sh
+
       - name: Install Rust
         uses: dtolnay/rust-toolchain@283fb51ee3c8a49cd7c8ff30102f3fcf3cfbe0e1 # 1.93.0
         with:
