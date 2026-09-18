@@ -205,6 +205,9 @@ async fn main() -> anyhow::Result<()> {
             if let Some(schedule) = server::backup_schedule(&cfg, &app_state)? {
                 tokio::spawn(schedule);
             }
+            let runner = lease
+                .as_ref()
+                .map_or_else(opencargo::app::lease::LeaseHandle::disabled, |l| l.handle());
             let probe_every = config::parse_chrono_duration(&cfg.auth.sso.probe_interval)?
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(60));
@@ -221,10 +224,13 @@ async fn main() -> anyhow::Result<()> {
                 app_state.clock.clone(),
                 cfg.cleanup.clone(),
                 app_state.reconcilers(),
+                runner.clone(),
+                app_state.server_state.clone(),
             ));
             tokio::spawn(opencargo::telemetry::cleanup::start_reconcile_task(
                 app_state.reconcilers(),
                 app_state.clock.clone(),
+                runner.clone(),
             ));
 
             tokio::spawn(opencargo::app::sweep_storage::start_storage_sweep(
@@ -232,6 +238,7 @@ async fn main() -> anyhow::Result<()> {
                     .reclaiming(app_state.reclaim_orphans())
                     .reaping_uploads(app_state.oci.clone()),
                 app_state.clock.clone(),
+                runner,
             ));
 
             // Decode %2f in scoped package names before routing: this must

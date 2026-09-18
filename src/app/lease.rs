@@ -91,6 +91,16 @@ impl LeaseHandle {
         }
     }
 
+    /// A handle that holds nothing, `held` or not: for the runners' own tests.
+    #[cfg(test)]
+    pub(crate) fn detached(held: bool) -> Self {
+        Self {
+            owner: Arc::from("detached"),
+            held: Arc::new(AtomicBool::new(held)),
+            disabled: false,
+        }
+    }
+
     /// False only once a renewal found the lease taken by someone else.
     pub fn held(&self) -> bool {
         self.held.load(Ordering::Acquire)

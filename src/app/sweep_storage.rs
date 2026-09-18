@@ -76,9 +76,15 @@ impl SweepStorage {
 }
 
 /// One pass per period, the first after one period: never at boot.
-pub async fn start_storage_sweep(sweep: SweepStorage, clock: Arc<dyn Clock>) {
+pub async fn start_storage_sweep(
+    sweep: SweepStorage,
+    clock: Arc<dyn Clock>,
+    lease: crate::app::lease::LeaseHandle,
+) {
     loop {
         tokio::time::sleep(PERIOD).await;
-        sweep.run(clock.now()).await;
+        if lease.held() {
+            sweep.run(clock.now()).await;
+        }
     }
 }
