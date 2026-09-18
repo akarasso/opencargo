@@ -32,7 +32,9 @@ pub(crate) const REFERENCED: &str = "
            || replace(m.digest, 'sha256:', ''), 0
         FROM oci_manifests m JOIN repositories r ON r.id = m.repository_id
     UNION ALL
-    SELECT 'oci/_uploads/' || id, 1 FROM oci_uploads";
+    SELECT 'oci/_uploads/' || id, 1 FROM oci_uploads
+    UNION ALL
+    SELECT physical_key, 0 FROM maven_files";
 
 /// `?1` is referenced, or (for a prefix) something under it is, or a
 /// protecting key covers it.
