@@ -153,6 +153,16 @@ pub struct AppState {
     pub srv: shutdown::ServerHandle,
     /// For the in-process backup schedule.
     pub database_backup: Arc<dyn crate::ports::backup::DatabaseBackup>,
+    pub leases: Arc<dyn crate::ports::leases::LeaseStore>,
+    pub instance: InstanceSettings,
+}
+
+/// What the instance status reports of the configuration.
+#[derive(Clone, Debug)]
+pub struct InstanceSettings {
+    pub backup_to: Option<std::path::PathBuf>,
+    pub shutdown_grace_secs: u64,
+    pub endpoint_drain_secs: u64,
 }
 
 /// What a started server is made of: the state every request clones, and
@@ -708,6 +718,14 @@ pub async fn build_state(
         shutdown,
         srv,
         database_backup: stores.backup(),
+        leases: stores.leases(),
+        instance: InstanceSettings {
+            backup_to: Some(config.backup.to.trim())
+                .filter(|to| !to.is_empty())
+                .map(std::path::PathBuf::from),
+            shutdown_grace_secs: config.server.shutdown_grace()?.as_secs(),
+            endpoint_drain_secs: config.server.endpoint_drain()?.as_secs(),
+        },
     };
     Ok(Started { state, lease, lock })
 }
@@ -1494,6 +1512,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
         .route("/api/v1/system/storage", get(crate::api::storage::storage_status))
+        .route("/api/v1/system/instance", get(crate::api::system::instance_status))
         .route("/api/v1/maven/{repo}/decide", post(crate::api::maven::decide))
         .route(
             "/api/v1/policy/report",

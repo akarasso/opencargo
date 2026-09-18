@@ -329,3 +329,20 @@ export interface StorageStatus {
   reclaim_candidates: number;
   reclaim_prefixes: number;
 }
+
+/** `GET /api/v1/system/instance`: the one instance, never a host or a path.
+ * `open_http_connections` excludes WebSocket clients. */
+export interface InstanceStatus {
+  owner: string;
+  version: string;
+  acquired_at: string | null;
+  renewed_at: string | null;
+  lease: 'held' | 'lost' | 'disabled';
+  last_backup_at: string | null;
+  last_sweep_at: string | null;
+  last_backup_wal: 'truncated' | 'busy' | null;
+  incomplete_snapshots: number;
+  shutdown_grace_secs: number;
+  endpoint_drain_secs: number;
+  open_http_connections: number;
+}

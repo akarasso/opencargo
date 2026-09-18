@@ -9,6 +9,7 @@ pub mod policy;
 pub mod promote;
 pub mod repositories;
 pub mod storage;
+pub mod system;
 pub mod tokens;
 pub mod users;
 pub mod vulns;

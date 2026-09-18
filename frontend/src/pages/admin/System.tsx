@@ -2,7 +2,9 @@ import { For, Show, createSignal } from 'solid-js';
 import Icon from '../../components/Icon.tsx';
 import { RequireAdmin } from '../../components/guards.tsx';
 import { LoadError, TableSkeleton } from '../../components/bits.tsx';
-import { fetchHealthReady, fetchMetrics, fetchStorageStatus } from '../../core/api.ts';
+import { fetchHealthReady, fetchInstanceStatus, fetchMetrics, fetchStorageStatus } from '../../core/api.ts';
+import { backupTone, leaseTone, type Tone } from '../../core/instance.ts';
+import { timeAgo } from '../../core/format.ts';
 import { createLiveResource } from '../../core/stores/live.ts';
 import { parsePrometheusMetrics } from '../../core/prometheus.ts';
 
@@ -19,6 +21,14 @@ function SystemInner() {
   const [health, refetchHealth] = createLiveResource(fetchHealthReady, [], { debounce: 500, pollMs: 15_000 });
   const [metricsRaw, refetchMetrics] = createLiveResource(fetchMetrics, [], { debounce: 500, pollMs: 15_000 });
   const [storage, refetchStorage] = createLiveResource(fetchStorageStatus, [], { debounce: 500, pollMs: 15_000 });
+  const [instance, refetchInstance] = createLiveResource(fetchInstanceStatus, [], { debounce: 500, pollMs: 15_000 });
+  const tint = (tone: Tone) => (tone === 'ok' ? 'var(--ok)' : tone === 'amber' ? 'var(--warn)' : 'var(--steel)');
+  const instanceTone = (): Tone => {
+    const s = instance();
+    if (!s) return 'grey';
+    const tones = [leaseTone(s), backupTone(s, new Date())];
+    return tones.includes('amber') ? 'amber' : tones[0];
+  };
   const [filter, setFilter] = createSignal('');
 
   const metrics = () => {
@@ -46,6 +56,7 @@ function SystemInner() {
               void refetchHealth();
               void refetchMetrics();
               void refetchStorage();
+              void refetchInstance();
             }}
           >
             <Icon name="refresh" size={14} />
@@ -55,7 +66,7 @@ function SystemInner() {
       </div>
 
       <div class="stagger">
-        <section class="stats-grid section" style={{ 'grid-template-columns': 'repeat(3, minmax(0, 1fr))' }}>
+        <section class="stats-grid section" style={{ 'grid-template-columns': 'repeat(4, minmax(0, 1fr))' }}>
           <div class="stat" style={{ '--stat-tint': health()?.status === 'ok' ? 'var(--ok)' : 'var(--danger)' }}>
             <div class="stat-head">
               <span class="stat-label">Database</span>
@@ -89,6 +100,41 @@ function SystemInner() {
               </Show>
             </div>
           </div>
+          <div class="stat" style={{ '--stat-tint': tint(instanceTone()) }}>
+            <div class="stat-head">
+              <span class="stat-label">Instance</span>
+              <Icon name="activity" size={16} />
+            </div>
+            <div class="stat-value" style={{ 'font-size': '1.3rem' }}>
+              <Show when={instance()} fallback={<span class="dim">checking…</span>}>
+                <>Single instance</>
+              </Show>
+            </div>
+            <div class="stat-foot">
+              <Show when={instance()} fallback={<>—</>}>
+                {(s) => (
+                  <>
+                    <div>
+                      v{s().version} ·{' '}
+                      {s().lease === 'held'
+                        ? `lease held ${timeAgo(s().renewed_at)}`
+                        : s().lease === 'lost'
+                          ? 'lease lost'
+                          : 'lease disabled'}
+                    </div>
+                    <div>
+                      Backup: {s().last_backup_at ? timeAgo(s().last_backup_at) : 'never'}
+                      {s().last_backup_wal === 'busy' ? ' · WAL not truncated' : ''}
+                      {s().incomplete_snapshots > 0 ? ` · ${s().incomplete_snapshots} interrupted` : ''}
+                    </div>
+                    <div title="WebSocket clients are not counted: they leave the count once upgraded">
+                      {s().open_http_connections} HTTP connections open
+                    </div>
+                  </>
+                )}
+              </Show>
+            </div>
+          </div>
           <div class="stat" style={{ '--stat-tint': 'var(--steel)' }}>
             <div class="stat-head">
               <span class="stat-label">Metrics exported</span>
@@ -103,6 +149,9 @@ function SystemInner() {
 
         <Show when={storage.error}>
           <LoadError what="storage status" />
+        </Show>
+        <Show when={instance.error}>
+          <LoadError what="instance status" />
         </Show>
         <Show when={metricsRaw.error}>
           <LoadError what="metrics" />

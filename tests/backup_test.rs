@@ -485,3 +485,24 @@ async fn an_unreachable_sink_fails_the_run_not_the_boot() {
     let stores = server::open_stores(&db_path(&server)).await.unwrap();
     assert_eq!(stores.server_state().get(LAST_BACKUP_AT).await.unwrap(), None, "a failed run is not a backup");
 }
+
+#[tokio::test]
+async fn incomplete_snapshots_counts_an_attended_run_directory() {
+    let server = spawn_server(opts()).await;
+    let to = server.tmp.path().join("attended");
+    server::run_backup(&common::config_of(&server), args(&to, false)).await.unwrap();
+    std::fs::create_dir_all(to.join("opencargo-20000101T000000.000Z")).unwrap();
+    let body: serde_json::Value = Client::new()
+        .get(format!("{}/api/v1/system/instance", server.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(body["incomplete_snapshots"], 1, "{body}");
+    assert!(body["last_backup_at"].is_string());
+    assert_eq!(body["last_backup_wal"], "truncated");
+    assert!(!body.to_string().contains("attended"), "no path in the body");
+}

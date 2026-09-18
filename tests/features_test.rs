@@ -805,3 +805,30 @@ fn helm_access_mode_defaults_to_read_write_once() {
     let pvc = document(&defaults[0], "PersistentVolumeClaim").unwrap();
     assert_eq!(items(&block(&pvc, "accessModes")), ["ReadWriteOnce"]);
 }
+
+#[tokio::test]
+async fn system_instance_admin_only() {
+    let server = spawn_server(SpawnOpts { lease: true, ..Default::default() }).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/system/instance", server.base_url);
+    assert_eq!(client.get(&url).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let reader = common::named_token(&client, &server.base_url, "watcher", "t").await;
+    assert_eq!(client.get(&url).bearer_auth(&reader).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    let resp = client.get(&url).bearer_auth(common::STATIC_TOKEN).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["lease"], "held");
+    assert_eq!(body["owner"].as_str().unwrap().len(), 8);
+    assert!(body["renewed_at"].is_string() && body["acquired_at"].is_string());
+    assert!(body["last_backup_at"].is_null() && body["last_backup_wal"].is_null());
+    assert_eq!(body["incomplete_snapshots"], 0);
+    assert_eq!(body["shutdown_grace_secs"], 30);
+    assert_eq!(body["endpoint_drain_secs"], 0);
+    assert!(body["open_http_connections"].is_u64());
+    let tmp = server.tmp.path().to_string_lossy().into_owned();
+    for leak in [tmp.as_str(), "127.0.0.1", "localhost"] {
+        assert!(!text.contains(leak), "{text} names {leak}");
+    }
+}
