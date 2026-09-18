@@ -2,12 +2,18 @@
 //! files, or its project names. Each leaf carries port 15; `Cx` names no
 //! format.
 
+use std::sync::Arc;
+
 use crate::domain::{CacheRepo, Outcome};
 use crate::ports::pypi::{PypiFile, PypiFileStore};
 use crate::proxy::Payload;
 use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
+use super::memo::{PageKey, PageMemo};
+use super::names::parse_filename;
+use super::parse::{parse_html, parse_json, UpstreamFile, UpstreamPage};
 use super::simple::{Page, PageFile, Yanked};
+use super::upstream::{allowed_host, file_hosts, is_json, page_url, same_endpoint, PypiArtifact, PypiStrategy};
 use super::version;
 
 /// The URL a page lists a file under: our own files route, relative to
@@ -44,9 +50,93 @@ pub fn hosted_page(project: &str, files: &[PypiFile]) -> Page {
     }
 }
 
+/// A member's upstream page, parsed once per cache row it came from.
+pub async fn fetch_page(
+    cx: &Cx<'_>,
+    memo: &PageMemo,
+    member: CacheRepo<'_>,
+    up: &Upstream,
+    project: &str,
+) -> Result<Outcome<Arc<UpstreamPage>>, ResolveError> {
+    let artifact = PypiArtifact::Page {
+        project: project.to_string(),
+    };
+    let cached = match cx.proxy.fetch(&PypiStrategy, up, member, &artifact).await? {
+        Outcome::Found(cached) => cached,
+        Outcome::NotFound => return Ok(Outcome::NotFound),
+    };
+    let key = PageKey {
+        row: cached.entry.id,
+        fetched_at: cached.entry.fetched_at,
+        digest: cached.entry.digest.clone(),
+    };
+    if !cached.stale {
+        if let Some(page) = memo.get(&key) {
+            return Ok(Outcome::Found(page));
+        }
+    }
+    let body = cx.proxy.bytes(&cached).await?;
+    let url = page_url(up, project)?;
+    let page = if is_json(cached.entry.content_type.as_deref()) {
+        parse_json(&body, &url)
+            .ok_or_else(|| ResolveError::Upstream(format!("unreadable JSON page for {project}")))?
+    } else {
+        parse_html(&String::from_utf8_lossy(&body), &url)
+    };
+    let page = Arc::new(page);
+    if !cached.stale {
+        memo.insert(key, page.clone());
+    }
+    Ok(Outcome::Found(page))
+}
+
+/// The files of an upstream page this server will serve: named for the
+/// project, on an allowed host.
+pub fn servable<'p>(
+    page: &'p UpstreamPage,
+    project: &'p str,
+    hosts: &'p [String],
+) -> impl Iterator<Item = &'p UpstreamFile> + 'p {
+    page.files.iter().filter(move |f| {
+        parse_filename(&f.filename).is_ok_and(|p| p.project == project) && allowed_host(&f.url, hosts)
+    })
+}
+
+fn proxied_page(project: &str, page: &UpstreamPage, hosts: &[String]) -> Page {
+    let files: Vec<PageFile> = servable(page, project, hosts)
+        .map(|f| PageFile {
+            filename: f.filename.clone(),
+            url: file_url(project, &f.filename),
+            sha256: f.sha256.clone(),
+            requires_python: f.requires_python.clone(),
+            yanked: f.yanked.clone(),
+            core_metadata: f.core_metadata.clone(),
+            size: None,
+            upload_time: None,
+        })
+        .collect();
+    let mut versions: Vec<String> = files
+        .iter()
+        .filter_map(|f| parse_filename(&f.filename).ok())
+        .map(|p| p.version.normalized())
+        .collect();
+    versions.sort_by(|a, b| version::compare(a, b));
+    versions.dedup_by(|a, b| version::compare(a, b).is_eq());
+    Page {
+        name: project.to_string(),
+        files,
+        versions,
+    }
+}
+
+fn hosts_of(cx: &Cx<'_>, member: CacheRepo<'_>, up: &Upstream) -> Vec<String> {
+    file_hosts(up, &cx.creds.for_repo(&member.0.name).file_hosts)
+}
+
 /// One member's page of a project; `Found` only when it lists something.
 pub struct PageLeaf<'a> {
     pub files: &'a dyn PypiFileStore,
+    pub memo: &'a PageMemo,
     pub project: String,
 }
 
@@ -64,11 +154,20 @@ impl Leaf for PageLeaf<'_> {
 
     async fn proxy(
         &self,
-        _cx: &Cx<'_>,
-        _member: CacheRepo<'_>,
-        _up: &Upstream,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+        up: &Upstream,
     ) -> Result<Outcome<Page>, ResolveError> {
-        Ok(Outcome::NotFound)
+        let page = match fetch_page(cx, self.memo, member, up, &self.project).await? {
+            Outcome::Found(page) => page,
+            Outcome::NotFound => return Ok(Outcome::NotFound),
+        };
+        let page = proxied_page(&self.project, &page, &hosts_of(cx, member, up));
+        Ok(if page.files.is_empty() {
+            Outcome::NotFound
+        } else {
+            Outcome::Found(page)
+        })
     }
 }
 
@@ -78,10 +177,13 @@ impl Leaf for PageLeaf<'_> {
 pub enum Served {
     Payload(Payload),
     Absent,
+    /// The owning member's upstream failed; the walk does not go on.
+    Unavailable(String),
 }
 
 pub struct FileLeaf<'a> {
     pub files: &'a dyn PypiFileStore,
+    pub memo: &'a PageMemo,
     pub project: String,
     pub filename: String,
     /// The PEP 658 document rather than the artifact.
@@ -114,11 +216,46 @@ impl Leaf for FileLeaf<'_> {
 
     async fn proxy(
         &self,
-        _cx: &Cx<'_>,
-        _member: CacheRepo<'_>,
-        _up: &Upstream,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+        up: &Upstream,
     ) -> Result<Outcome<Served>, ResolveError> {
-        Ok(Outcome::NotFound)
+        let page = match fetch_page(cx, self.memo, member, up, &self.project).await? {
+            Outcome::Found(page) => page,
+            Outcome::NotFound => return Ok(Outcome::NotFound),
+        };
+        let hosts = hosts_of(cx, member, up);
+        let Some(listed) = servable(&page, &self.project, &hosts).find(|f| f.filename == self.filename) else {
+            return Ok(Outcome::NotFound);
+        };
+        let (filename, url, sha256) = if self.metadata {
+            let Some(sha256) = listed.core_metadata.clone() else {
+                return Ok(Outcome::Found(Served::Absent));
+            };
+            let mut url = listed.url.clone();
+            url.set_path(&format!("{}.metadata", url.path()));
+            (format!("{}.metadata", listed.filename), url, sha256)
+        } else {
+            (listed.filename.clone(), listed.url.clone(), listed.sha256.clone())
+        };
+        let artifact = PypiArtifact::File {
+            project: self.project.clone(),
+            filename,
+            on_index: same_endpoint(&url, &up.base),
+            url,
+            sha256,
+            allow_private: up.dl_allow_private,
+        };
+        let served = match cx.proxy.fetch(&PypiStrategy, up, member, &artifact).await {
+            Ok(Outcome::Found(cached)) => Served::Payload(cached.into_payload()),
+            Ok(Outcome::NotFound) => Served::Absent,
+            Err(err) => match ResolveError::from(err) {
+                ResolveError::Upstream(why) => Served::Unavailable(why),
+                ResolveError::NotFound(_) => Served::Absent,
+                other => return Err(other),
+            },
+        };
+        Ok(Outcome::Found(served))
     }
 }
 

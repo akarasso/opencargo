@@ -100,6 +100,8 @@ pub struct AppState {
     pub pypi: Arc<dyn PypiFileStore>,
     /// Bounds the archives inspected at once; inspection is CPU on a blocking thread.
     pub archive_permits: Arc<tokio::sync::Semaphore>,
+    /// Parsed upstream PyPI pages, shared by the leaves and the policy facts.
+    pub pypi_pages: Arc<crate::registry::pypi::memo::PageMemo>,
     pub reclaim: Arc<dyn ReclaimStore>,
     pub referenced: Arc<dyn ReferencedKeys>,
     pub audit: Arc<dyn AuditStore>,
@@ -343,6 +345,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         oci: stores.oci(),
         pypi: stores.pypi(),
         archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
+        pypi_pages: Arc::new(crate::registry::pypi::memo::PageMemo::default()),
         reclaim: stores.reclaim(),
         referenced: stores.referenced(),
         audit: stores.audit(),
@@ -1085,6 +1088,7 @@ fn load_upstream_creds(
                 auth: repo.upstream_auth.clone(),
                 token_realms,
                 dl_allow_private: repo.dl_allow_private,
+                file_hosts: repo.file_hosts.clone(),
             },
         );
     }

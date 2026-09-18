@@ -94,6 +94,7 @@ pub async fn project(
     let repo = open(&state, &repo_name, auth).await?;
     let leaf = PageLeaf {
         files: state.pypi.as_ref(),
+        memo: &state.pypi_pages,
         project: project.clone(),
     };
     let Collected { hits, degraded } = collect(&cx(&state, auth, &repo), &repo, &leaf).await?;
@@ -125,6 +126,7 @@ pub async fn file(
     let repo = open(&state, &repo_name, auth).await?;
     let leaf = FileLeaf {
         files: state.pypi.as_ref(),
+        memo: &state.pypi_pages,
         project,
         filename: filename.clone(),
         metadata,
@@ -134,6 +136,7 @@ pub async fn file(
         Served::Absent => {
             return Err(AppError::NotFound(format!("no file named '{requested}'")).into());
         }
+        Served::Unavailable(why) => return Err(AppError::BadGateway(why).into()),
     };
     let mut payload = payload;
     payload.content_type = Some(

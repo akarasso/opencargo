@@ -1,13 +1,16 @@
 pub mod auth_rules;
 pub mod leaves;
 pub mod manage;
+pub mod memo;
 pub mod metadata;
 pub mod multipart;
 pub mod names;
+pub mod parse;
 pub mod read;
 pub mod routes;
 pub mod simple;
 pub mod upload;
+pub mod upstream;
 pub mod version;
 
 use axum::http::{header, HeaderValue, StatusCode};

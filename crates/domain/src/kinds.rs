@@ -75,11 +75,8 @@ impl Format {
         }
     }
 
-    pub const fn supports_kind(self, kind: RepoKind) -> bool {
-        !matches!(
-            (self, kind),
-            (Format::Pypi, RepoKind::Proxy | RepoKind::Group)
-        )
+    pub const fn supports_kind(self, _kind: RepoKind) -> bool {
+        true
     }
 }
 
@@ -144,8 +141,7 @@ mod tests {
         for format in Format::ALL {
             assert_eq!(format.as_str().parse::<Format>().unwrap(), format);
             for kind in RepoKind::ALL {
-                let expected = format != Format::Pypi || kind == RepoKind::Hosted;
-                assert_eq!(format.supports_kind(kind), expected, "{format:?}/{kind:?}");
+                assert!(format.supports_kind(kind), "{format:?}/{kind:?}");
             }
         }
         assert_eq!(Format::Cargo.osv_ecosystem(), Some("crates.io"));
