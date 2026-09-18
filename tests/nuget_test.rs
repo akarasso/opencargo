@@ -278,3 +278,36 @@ async fn search_filters_before_the_window_and_never_shows_an_unlisted_version() 
     assert_eq!(all["totalHits"], 3);
     assert_eq!(all["data"][0]["version"], "2.0.0-rc.1");
 }
+
+fn files_under(dir: &std::path::Path, out: &mut Vec<String>) {
+    for entry in std::fs::read_dir(dir).into_iter().flatten().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            files_under(&path, out);
+        } else {
+            out.push(path.to_string_lossy().into_owned());
+        }
+    }
+}
+
+/// NuGet 2.5 as implemented: the hosted `.nuspec` is read out of the stored
+/// `.nupkg` at push and kept in the version row, so the `.nupkg` is the one
+/// shared key a push places; a second key would escape port 23's clause.
+#[tokio::test]
+async fn a_hosted_push_places_the_nupkg_and_no_other_key() {
+    let server = setup().await;
+    let c = reqwest::Client::new();
+    let base = &server.base_url;
+    push(&c, base, "nuget", nupkg("Only.Lib", "1.0.0", &[])).await;
+    let mut files = Vec::new();
+    files_under(&server.tmp.path().join("storage"), &mut files);
+    assert_eq!(files.len(), 1, "{files:?}");
+    assert!(files[0].contains("only.lib.1.0.0.nupkg"), "{files:?}");
+    let nuspec = c
+        .get(format!("{base}/nuget/v3/flatcontainer/only.lib/1.0.0/only.lib.nuspec"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(nuspec.status(), StatusCode::OK);
+    assert!(nuspec.text().await.unwrap().contains("<id>Only.Lib</id>"));
+}

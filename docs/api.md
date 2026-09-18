@@ -171,6 +171,8 @@ Delete is an unlist: the version leaves search and stays restorable by exact ver
 carries `WWW-Authenticate: Basic`, and an anonymous caller on a group with a member it cannot
 read gets a 401 whatever the package, so `dotnet restore` asks for credentials instead of
 reporting NU1101; an authenticated caller sees the group as if that member were absent.
+A hosted push stores the `.nupkg` and nothing else: the `.nuspec` is read out of it at push,
+kept with the version row and served from there, never stored as a file of its own.
 
 A `proxy` takes a v3 service index as `upstream` (`https://api.nuget.org/v3/index.json`). Its
 documents are rendered with this server's URLs, except `catalogEntry.@id`. A `.nupkg` is
