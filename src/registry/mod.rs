@@ -1,6 +1,7 @@
 pub mod cargo;
 pub mod go;
 pub mod npm;
+pub mod nuget;
 pub mod oci;
 pub mod resolve;
 pub mod rules;

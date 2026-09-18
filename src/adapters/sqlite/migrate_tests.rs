@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "020", "025"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "020", "025"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "020", "025"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.
@@ -283,7 +283,12 @@ fn every_file_in_the_directory_is_a_migration() {
     present.sort();
 
     let listed: Vec<String> = MIGRATIONS.iter().map(|m| m.id.to_string()).collect();
-    assert_eq!(present, listed);
+    let files: Vec<String> = MIGRATIONS
+        .iter()
+        .filter(|m| matches!(m.step, Step::Sql(_)))
+        .map(|m| m.id.to_string())
+        .collect();
+    assert_eq!(present, files);
 
     // Ids are keys, so the list is what `present` can be compared against only
     // if it is itself unique and ordered.
@@ -386,7 +391,7 @@ fn boxed(err: sqlx::Error) -> StoreError {
 /// Every migration this binary carries, plus one `Rust` step at the next id
 /// `nuget.md` is allocated.
 fn with_step(step: fn(&mut SqliteConnection) -> StepFuture<'_>) -> Vec<Migration> {
-    let mut steps = MIGRATIONS.to_vec();
+    let mut steps: Vec<Migration> = MIGRATIONS.iter().filter(|m| m.id != "020").copied().collect();
     steps.push(Migration {
         id: "020",
         sentinel: Sentinel::Unprovable,
@@ -483,4 +488,158 @@ async fn migration_025_allocates_incarnations_and_legacy_prefixes_once() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted).last(), Some(&"025"), "its sentinel is there");
+}
+
+// ---------------------------------------------------------------------------
+// (e) A1 C2: the shared format-widening rebuild, 020 its first user
+// ---------------------------------------------------------------------------
+
+fn widen_mcp(conn: &mut SqliteConnection) -> StepFuture<'_> {
+    Box::pin(widen_format_check(conn, "mcp"))
+}
+
+fn widen_maven(conn: &mut SqliteConnection) -> StepFuture<'_> {
+    Box::pin(widen_format_check(conn, "maven"))
+}
+
+/// 023 and 024 stand in for mcp and Maven, the helper's other users.
+fn step(id: &'static str) -> Migration {
+    match id {
+        "023" => Migration {
+            id,
+            sentinel: Sentinel::Unprovable,
+            step: Step::Rust(widen_mcp),
+        },
+        "024" => Migration {
+            id,
+            sentinel: Sentinel::Unprovable,
+            step: Step::Rust(widen_maven),
+        },
+        _ => *MIGRATIONS.iter().find(|m| m.id == id).unwrap(),
+    }
+}
+
+async fn admitted(pool: &SqlitePool) -> BTreeSet<String> {
+    let ddl: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'repositories'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    check_formats(&ddl).unwrap().into_iter().collect()
+}
+
+async fn incarnation_rows(pool: &SqlitePool) -> Vec<(i64, String)> {
+    sqlx::query_as("SELECT repository_id, incarnation FROM repository_incarnations ORDER BY 1")
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+/// The legacy files, two repositories and a package, a third repository
+/// deleted so the id sequence is ahead of the highest surviving id.
+async fn seeded_pre_018() -> (TempDir, SqlitePool) {
+    let (tmp, pool) = pool().await;
+    legacy_migrate(&pool).await;
+    insert_repository(&pool, "npm-hosted", "hosted", "npm").await.unwrap();
+    insert_repository(&pool, "gone", "hosted", "cargo").await.unwrap();
+    insert_repository(&pool, "go-proxy", "proxy", "go").await.unwrap();
+    sqlx::raw_sql(
+        "DELETE FROM repositories WHERE name = 'go-proxy';
+         INSERT INTO packages (repository_id, name) VALUES (1, 'left-pad');",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    (tmp, pool)
+}
+
+async fn run_steps(pool: &SqlitePool, ids: &[&'static str]) {
+    let steps: Vec<Migration> = ids.iter().map(|id| step(id)).collect();
+    run(pool, &steps).await.unwrap();
+}
+
+#[tokio::test]
+async fn migration_020_alone_admits_nuget_and_keeps_every_row() {
+    let (_tmp, pool) = seeded_pre_018().await;
+    run_steps(&pool, &["020"]).await;
+
+    assert_eq!(
+        admitted(&pool).await,
+        set(["npm", "cargo", "oci", "go", "pypi", "nuget"])
+    );
+    insert_repository(&pool, "nuget-hosted", "hosted", "nuget").await.unwrap();
+    let ids: Vec<i64> = sqlx::query_scalar("SELECT id FROM repositories ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(ids, [1, 2, 4], "a deleted repository's id is never handed out again");
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM packages").await, 1);
+    assert!(insert_repository(&pool, "deb", "hosted", "deb").await.is_err());
+    assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
+}
+
+#[tokio::test]
+async fn migration_020_twice_is_a_no_op() {
+    let (_tmp, pool) = seeded_pre_018().await;
+    run_steps(&pool, &["020"]).await;
+    let before: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'repositories'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    widen_format_check(&mut conn, "nuget").await.unwrap();
+    drop(conn);
+    let after: String = sqlx::query_scalar("SELECT sql FROM sqlite_master WHERE name = 'repositories'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    assert_eq!(after.matches("'nuget'").count(), 1);
+}
+
+#[tokio::test]
+async fn migration_020_after_023_keeps_what_023_added() {
+    let (_tmp, pool) = seeded_pre_018().await;
+    run_steps(&pool, &["023", "020"]).await;
+    let formats = admitted(&pool).await;
+    assert!(formats.contains("mcp") && formats.contains("nuget"), "{formats:?}");
+}
+
+#[tokio::test]
+async fn every_order_of_the_helper_users_ends_with_the_union() {
+    let orders: [[&'static str; 3]; 6] = [
+        ["020", "023", "024"],
+        ["020", "024", "023"],
+        ["023", "020", "024"],
+        ["023", "024", "020"],
+        ["024", "020", "023"],
+        ["024", "023", "020"],
+    ];
+    let expected = set(["npm", "cargo", "oci", "go", "pypi", "nuget", "mcp", "maven"]);
+    for order in orders {
+        let (_tmp, pool) = seeded_pre_018().await;
+        run_steps(&pool, &order).await;
+        assert_eq!(admitted(&pool).await, expected, "{order:?}");
+    }
+}
+
+#[tokio::test]
+async fn migration_025_before_or_after_020_keeps_incarnations() {
+    for order in [["025", "020"], ["020", "025"]] {
+        let (_tmp, pool) = seeded_pre_018().await;
+        run_steps(&pool, &order).await;
+        let before = incarnation_rows(&pool).await;
+        assert_eq!(before.len(), 2, "{order:?}");
+        run_steps(&pool, &["023"]).await;
+        assert_eq!(incarnation_rows(&pool).await, before, "{order:?}");
+        assert_eq!(count(&pool, "SELECT COUNT(*) FROM pragma_foreign_key_check").await, 0);
+        sqlx::query("DELETE FROM repositories WHERE name = 'gone'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            incarnation_rows(&pool).await.len(),
+            1,
+            "the cascade of 025 survives the rebuild: {order:?}"
+        );
+    }
 }

@@ -134,12 +134,117 @@ pub const MIGRATIONS: &[Migration] = &[
         "017_storage_multipart.sql",
         Sentinel::Object("idx_storage_multipart_touched")
     ),
+    Migration {
+        id: "020",
+        sentinel: Sentinel::Unprovable,
+        step: Step::Rust(nuget_format),
+    },
     sql_migration!(
         "025",
         "025_reclaim.sql",
         Sentinel::Object("idx_reclaim_candidates_enqueued")
     ),
 ];
+
+fn nuget_format(conn: &mut SqliteConnection) -> StepFuture<'_> {
+    Box::pin(widen_format_check(conn, "nuget"))
+}
+
+const FORMAT_CHECK: &str = "CHECK(format IN (";
+
+/// The formats the `repositories` CHECK admits, as its DDL spells them.
+pub(crate) fn check_formats(ddl: &str) -> Option<Vec<String>> {
+    let start = ddl.find(FORMAT_CHECK)? + FORMAT_CHECK.len();
+    let end = start + ddl[start..].find(')')?;
+    Some(
+        ddl[start..end]
+            .split(',')
+            .map(|v| v.trim().trim_matches('\'').to_string())
+            .collect(),
+    )
+}
+
+/// The one rebuild every format migration shares (A1 C2): the CHECK becomes
+/// what it already admits plus `format`, never a literal list, so no format
+/// migration drops one another added. Idempotent: a format already admitted
+/// rebuilds nothing. Tables that reference `repositories` keep their rows,
+/// the incarnations of 025 included, and the id sequence never goes back.
+pub async fn widen_format_check(
+    conn: &mut SqliteConnection,
+    format: &str,
+) -> Result<(), StoreError> {
+    let ddl: String = sqlx::query_scalar(
+        "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'repositories'",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(other)?;
+    let formats = check_formats(&ddl)
+        .ok_or_else(|| StoreError::Other("repositories has no format CHECK".into()))?;
+    if formats.iter().any(|f| f == format) {
+        return Ok(());
+    }
+    let mut widened = formats.clone();
+    widened.push(format.to_string());
+    let list = |values: &[String]| {
+        values
+            .iter()
+            .map(|v| format!("'{v}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let body_at = ddl
+        .find('(')
+        .ok_or_else(|| StoreError::Other("unreadable repositories DDL".into()))?;
+    let body = ddl[body_at..].replacen(
+        &format!("{FORMAT_CHECK}{})", list(&formats)),
+        &format!("{FORMAT_CHECK}{})", list(&widened)),
+        1,
+    );
+    if check_formats(&body).as_deref() != Some(&widened[..]) {
+        return Err(StoreError::Other(
+            "the repositories format CHECK is not in the shape the rebuild writes".into(),
+        ));
+    }
+
+    exec(conn, "PRAGMA foreign_keys = OFF").await?;
+    exec(conn, "BEGIN IMMEDIATE").await?;
+    let seq: Option<i64> =
+        sqlx::query_scalar("SELECT seq FROM sqlite_sequence WHERE name = 'repositories'")
+            .fetch_optional(&mut *conn)
+            .await
+            .map_err(other)?;
+    exec(conn, &format!("CREATE TABLE repositories_widened {body}")).await?;
+    exec(conn, "INSERT INTO repositories_widened SELECT * FROM repositories").await?;
+    exec(conn, "DROP TABLE repositories").await?;
+    exec(conn, "ALTER TABLE repositories_widened RENAME TO repositories").await?;
+    if let Some(seq) = seq {
+        sqlx::query("UPDATE sqlite_sequence SET seq = MAX(seq, ?1) WHERE name = 'repositories'")
+            .bind(seq)
+            .execute(&mut *conn)
+            .await
+            .map_err(other)?;
+    }
+    let orphans: Option<String> = sqlx::query_scalar("SELECT \"table\" FROM pragma_foreign_key_check")
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(other)?;
+    if let Some(table) = orphans {
+        return Err(StoreError::Other(
+            format!("widening the format CHECK would orphan rows of {table}").into(),
+        ));
+    }
+    exec(conn, "COMMIT").await?;
+    exec(conn, "PRAGMA foreign_keys = ON").await
+}
+
+async fn exec(conn: &mut SqliteConnection, sql: &str) -> Result<(), StoreError> {
+    sqlx::query(sql)
+        .execute(&mut *conn)
+        .await
+        .map(|_| ())
+        .map_err(other)
+}
 
 /// Bring a database up to date with every migration this binary carries.
 pub async fn run_all(pool: &SqlitePool) -> Result<Vec<(&'static str, Outcome)>, StoreError> {
