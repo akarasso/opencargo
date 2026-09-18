@@ -11,7 +11,7 @@ pub mod singleflight;
 pub mod strategy;
 
 pub use auth::{UpstreamAuth, UpstreamCreds};
-pub use engine::{Payload, ProxyEngine, Timeouts, TtlConfig};
+pub use engine::{IntoPayload, Payload, ProxyEngine, Timeouts, TtlConfig};
 pub use strategy::UpstreamStrategy;
 
 /// True for addresses the proxy must never reach. Names are resolved once

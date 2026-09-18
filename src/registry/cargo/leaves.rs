@@ -3,7 +3,7 @@ use serde_json::{json, Value};
 use crate::domain::{CacheRepo, Format, Outcome};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
-use crate::proxy::{Payload, ProxyEngine};
+use crate::proxy::{IntoPayload, Payload, ProxyEngine};
 use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
 use super::line_field;

@@ -22,10 +22,12 @@ declare_row dialect-sql    max  49 "AUTOINCREMENT|CHECK\(|fts5|CREATE TRIGGER|da
 declare_row concrete-fs    eq    0 'FilesystemStorage'       plain src '*.rs' src/storage src/adapters/fs # eq, not max: clippy cannot see `FilesystemStorage::new(..)` in expression position, so this row is the real check (4.1)
 declare_row storage-error  eq    0 '(crate|opencargo)::error' plain 'src/storage src/adapters/fs' '*.rs' # the storage port answers with StorageError; AppError is the layer above's word (2.1)
 declare_row adapter-import max   0 '(crate|opencargo)::adapters::' plain src '*.rs' src/adapters src/server.rs src/main.rs # the composition root is those two files
-declare_row domain-paths   max   0 '(crate|opencargo)::(error|server|db|api|registry|proxy|storage|telemetry|auth|app|adapters)\b' plain src/domain '*.rs'
-declare_row domain-names   max   0 'AppError|AppResult|sqlx|axum|reqwest' plain src/domain '*.rs'
+# The two `src/domain/` grep rows retired at step 9: the domain is a crate of
+# its own, so what it may name is a resolution error and what it may depend on
+# is `check_domain_deps` below -- stronger than any pattern, because a grep
+# cannot see a dependency reached through a rename or a dev-dependency.
 declare_row tests-raw-sql  max  41 'sqlx::query|SqlitePool'  plain tests '*.rs' tests/common/contract.rs # ratchet-only (7.4); the contract suite is the one exclusion
-declare_row unit-tests     min 314 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 278 -> 314: the four OCI write use cases (7, orphan set/shared layer/ledger/reference refusal), the three WS envelope pins, DomainEvent's three variants and the broadcast adapter's three, the audience fan-out and its unreadable-repository case (3), the row codec's three decode cases, the name rule and the corrupt-column startup guard (3), the nine admin use cases §1.2 claims (12, repositories/users/tokens/permissions) and the dist-tag and yank orderings (3) -- less the four that went with src/db/. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
+declare_row unit-tests     min 314 '#\[(tokio::)?test\]'     plain 'src crates/domain/src' '*.rs' # 278 -> 314: the four OCI write use cases (7, orphan set/shared layer/ledger/reference refusal), the three WS envelope pins, DomainEvent's three variants and the broadcast adapter's three, the audience fan-out and its unreadable-repository case (3), the row codec's three decode cases, the name rule and the corrupt-column startup guard (3), the nine admin use cases §1.2 claims (12, repositories/users/tokens/permissions) and the dist-tag and yank orderings (3) -- less the four that went with src/db/. The scope is both crates since step 9 moved the domain's 39 cases out of `src/`. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
 declare_row integ-tests    min 321 '#\[(tokio::)?test\]'     plain tests '*.rs' # 317 -> 321: cascade_contract! gains the manifest cascade -- the orphan set, the unknown manifest, the re-push that replaces its layers and the upload ledger -- asserted against both halves
 
 # files <roots> <glob> [excluded paths...] -- the scope, one path per line
@@ -133,6 +135,31 @@ check_migrations() {
   fi
 }
 
+# The domain's whole rule, since step 9 made it a crate: it depends on vocabulary and on nothing
+# else, so nothing it names can perform I/O. `--depth 1` is the check -- the transitive closure
+# (serde_derive, syn, iana-time-zone, ...) is nobody's direct choice -- and the list is an upper
+# bound: a crate on it that no module uses yet is simply absent from the output.
+DOMAIN_ALLOWED="bytes chrono serde serde_json thiserror"
+
+check_domain_deps() {
+  local dep n=0
+  while read -r dep _; do
+    case " $DOMAIN_ALLOWED " in
+    *" $dep "*) n=$((n + 1)) ;;
+    *)
+      printf 'FAIL %-14s %s is not vocabulary: the domain depends on nothing that performs I/O\n' domain-deps "$dep"
+      fail=1
+      ;;
+    esac
+  done < <(cargo tree -p opencargo-domain --depth 1 --prefix none | tail -n +2)
+  if [ "$n" -eq 0 ]; then
+    printf 'FAIL %-14s cargo tree resolved no dependency: the domain crate is missing or unreadable\n' domain-deps
+    fail=1
+  elif [ "$fail" -eq 0 ]; then
+    printf '%-4s %-14s %4d direct dependencies, all vocabulary\n' ok domain-deps "$n"
+  fi
+}
+
 # An empty scope and a pattern that matches nothing are the two ways a ratcheted row reaches 0.
 self_test() {
   local mode n
@@ -149,6 +176,7 @@ self_test() {
 
 self_test
 check_migrations
+check_domain_deps
 for row in "${rows[@]}"; do
   IFS=$'\x1f' read -r -a fields <<<"$row"
   check "${fields[@]}"

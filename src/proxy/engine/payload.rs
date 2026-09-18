@@ -35,8 +35,15 @@ impl Cached {
     }
 }
 
-impl Outcome<Cached> {
-    pub fn into_payload(self) -> Outcome<Payload> {
+/// `Outcome` is the domain's word and `Payload` the proxy's, so the map from
+/// one to the other is an extension trait here, never an inherent `impl` on a
+/// type this layer does not own.
+pub trait IntoPayload {
+    fn into_payload(self) -> Outcome<Payload>;
+}
+
+impl IntoPayload for Outcome<Cached> {
+    fn into_payload(self) -> Outcome<Payload> {
         match self {
             Outcome::Found(c) => Outcome::Found(c.into_payload()),
             Outcome::NotFound => Outcome::NotFound,

@@ -20,7 +20,7 @@ use super::auth::{send_with_auth, TokenCache};
 use super::singleflight::Singleflight;
 use super::strategy::{CacheKey, CachePolicy, Classified, Ttl, UpstreamStrategy, UrlSource};
 
-pub use payload::{cache_path, Cached, PartFile, Payload, Src};
+pub use payload::{cache_path, Cached, IntoPayload, PartFile, Payload, Src};
 use transfer::Reply;
 
 #[derive(Clone, Copy, Debug)]

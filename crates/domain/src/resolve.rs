@@ -113,7 +113,7 @@ impl<T> Walk<T> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{RepoConfig, Visibility};
+    use crate::{RepoConfig, Visibility};
 
     fn repo(id: i64) -> Repository {
         Repository {

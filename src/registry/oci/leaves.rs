@@ -1,6 +1,6 @@
 use crate::domain::{CacheRepo, Format, Outcome};
 use crate::policy::{self, Source};
-use crate::proxy::engine::Cached;
+use crate::proxy::engine::{Cached, IntoPayload};
 use crate::proxy::Payload;
 use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 

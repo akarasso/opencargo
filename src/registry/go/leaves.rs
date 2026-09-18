@@ -4,7 +4,7 @@ use serde_json::Value;
 use crate::domain::{CacheRepo, Format, Outcome, Package, Version};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
-use crate::proxy::Payload;
+use crate::proxy::{IntoPayload, Payload};
 use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
 use super::escape::unescape;
