@@ -4,9 +4,9 @@ use axum::http::{header, HeaderMap, StatusCode};
 use chrono::{DateTime, Utc};
 use sha2::{Digest, Sha256};
 
-use crate::domain::{CacheEntry, NewEntry};
+use crate::domain::{CacheEntry, CacheRepo, NewEntry};
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{CacheRepo, Upstream};
+use crate::registry::resolve::Upstream;
 
 use super::super::auth::send_with_auth;
 use super::super::strategy::{Classified, Transfer, UpstreamStrategy};

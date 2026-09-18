@@ -4,6 +4,7 @@
 //! behind it is chosen by the composition root and named nowhere else.
 
 pub mod multipart;
+pub mod oci;
 pub mod packages;
 pub mod permissions;
 pub mod proxy_cache;

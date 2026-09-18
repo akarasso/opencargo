@@ -11,7 +11,8 @@ use serde_json::Value;
 use crate::auth::middleware::AuthUser;
 use crate::domain::Repository;
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{collect, first_hit, Collected, Cx, UrlRepo};
+use crate::registry::cx;
+use crate::registry::resolve::{collect, first_hit, Collected};
 use crate::server::AppState;
 
 use super::compare_versions;
@@ -19,13 +20,6 @@ use super::escape::{validate_escaped_module, validate_escaped_version};
 use super::leaves::{FileLeaf, LatestLeaf, ListLeaf};
 use super::upstream::FileKind;
 
-fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Repository) -> Cx<'a> {
-    Cx {
-        state,
-        auth,
-        url: UrlRepo(&repo.name),
-    }
-}
 
 /// Every read validates the escaped module before any key or URL is built,
 /// then enforces read access once.

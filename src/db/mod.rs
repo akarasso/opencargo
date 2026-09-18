@@ -218,34 +218,6 @@ pub async fn get_repository_by_name(pool: &SqlitePool, name: &str) -> AppResult<
     Ok(row.map(Repository::try_from).transpose()?)
 }
 
-pub async fn get_package(pool: &SqlitePool, repo_id: i64, name: &str) -> AppResult<Option<Package>> {
-    let row: Option<PackageRow> =
-        sqlx::query_as("SELECT * FROM packages WHERE repository_id = ?1 AND name = ?2")
-            .bind(repo_id)
-            .bind(name)
-            .fetch_optional(pool)
-            .await?;
-    Ok(row.map(Package::try_from).transpose()?)
-}
-
-/// Case-insensitive lookup for ecosystems whose names are unique regardless
-/// of case (cargo): the row keeps the case it was published with.
-pub async fn get_package_nocase(
-    pool: &SqlitePool,
-    repo_id: i64,
-    name: &str,
-) -> AppResult<Option<Package>> {
-    let row: Option<PackageRow> = sqlx::query_as(
-        "SELECT * FROM packages WHERE repository_id = ?1 AND name = ?2 COLLATE NOCASE
-         ORDER BY id LIMIT 1",
-    )
-    .bind(repo_id)
-    .bind(name)
-    .fetch_optional(pool)
-    .await?;
-    Ok(row.map(Package::try_from).transpose()?)
-}
-
 pub async fn create_package(
     pool: &SqlitePool,
     repo_id: i64,
@@ -380,22 +352,6 @@ pub async fn get_dist_tags(
         .fetch_all(pool)
         .await?;
     Ok(rows.into_iter().map(DistTag::from).collect())
-}
-
-pub async fn record_download(
-    pool: &SqlitePool,
-    version_id: i64,
-) -> Result<(), sqlx::Error> {
-    // Aggregate counter (one row per version) instead of one row per download.
-    sqlx::query(
-        "INSERT INTO download_counts (version_id, count) VALUES (?1, 1)
-         ON CONFLICT(version_id) DO UPDATE SET count = count + 1",
-    )
-    .bind(version_id)
-    .execute(pool)
-    .await?;
-
-    Ok(())
 }
 
 pub async fn set_yanked(

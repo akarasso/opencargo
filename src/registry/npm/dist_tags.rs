@@ -12,12 +12,12 @@ use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Package};
 use crate::error::{AppError, AppResult};
 use crate::ports::packages::NameMatch;
-use crate::registry::extract_package_name;
 use crate::registry::resolve::first_hit;
+use crate::registry::{cx, extract_package_name};
 use crate::server::AppState;
 
 use super::leaves::DistTagsLeaf;
-use super::{cx, param};
+use super::param;
 
 pub async fn get_dist_tags(
     State(state): State<AppState>,

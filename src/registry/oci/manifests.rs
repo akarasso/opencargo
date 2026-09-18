@@ -6,41 +6,35 @@ use axum::{
     http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
-use sqlx::SqlitePool;
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::db::oci::OciTag;
 use crate::domain::{Format, Repository};
-use crate::error::{AppError, AppResult};
+use crate::error::{AppError, AppResult, StoreError};
+use crate::ports::oci::OciStore;
+use crate::registry::cx;
 use crate::registry::resolve::first_hit;
 use crate::server::AppState;
 
 use super::leaves::ManifestLeaf;
-use super::{cx, is_digest, param, parse_digest, paths, refs, respond, sha256_digest, OciRef};
+use super::{is_digest, param, parse_digest, paths, refs, respond, sha256_digest, OciRef};
 
 const MAX_MANIFEST_BYTES: usize = 10 * 1024 * 1024;
 const DEFAULT_MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";
 
-/// The digest a hosted reference names: itself, or the tag's target.
+/// The digest a hosted reference names: itself, or the tag's target. A
+/// reference that already is a digest names itself, which is why the store is
+/// only ever asked about a tag.
 pub(super) async fn resolve_hosted_digest(
-    db: &SqlitePool,
+    store: &dyn OciStore,
     repository_id: i64,
     name: &str,
     reference: &str,
-) -> AppResult<Option<String>> {
+) -> Result<Option<String>, StoreError> {
     if is_digest(reference) {
         return Ok(Some(reference.to_string()));
     }
-    let tag: Option<OciTag> = sqlx::query_as(
-        "SELECT * FROM oci_tags WHERE repository_id = ?1 AND name = ?2 AND tag = ?3",
-    )
-    .bind(repository_id)
-    .bind(name)
-    .bind(reference)
-    .fetch_optional(db)
-    .await?;
-    Ok(tag.map(|t| t.manifest_digest))
+    store.digest_for_ref(repository_id, name, reference).await
 }
 
 fn parse_reference(reference: &str) -> AppResult<String> {
@@ -240,7 +234,7 @@ pub async fn delete_manifest(
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
 
-    let digest = resolve_hosted_digest(&state.db, repo.id, &r.name, &reference)
+    let digest = resolve_hosted_digest(state.oci.as_ref(), repo.id, &r.name, &reference)
         .await?
         .ok_or_else(|| {
             AppError::NotFound(format!(

@@ -10,13 +10,14 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::middleware::AuthUser;
-use crate::error::AppResult;
-use crate::ports::search::{SearchQuery as Tokens, SearchScope};
+use crate::error::{AppResult, StoreError};
+use crate::ports::packages::PackageStore;
+use crate::ports::search::{SearchIndex, SearchQuery as Tokens, SearchScope};
+use crate::registry::cx;
 use crate::registry::resolve::collect;
 use crate::server::AppState;
 use crate::wire::wire_ts;
 
-use super::cx;
 use super::leaves::SearchLeaf;
 
 #[derive(Deserialize)]
@@ -78,16 +79,16 @@ fn dedup_by_name(hits: Vec<Vec<Value>>) -> Vec<Value> {
 
 /// The first `limit` search objects of one repository.
 pub async fn search_in_repo(
-    state: &AppState,
+    index: &dyn SearchIndex,
+    store: &dyn PackageStore,
     repo_id: i64,
     text: &str,
     limit: i64,
-) -> AppResult<Vec<Value>> {
+) -> Result<Vec<Value>, StoreError> {
     let Some(query) = browse_or_match(text) else {
         return Ok(Vec::new());
     };
-    let packages = state
-        .search
+    let packages = index
         .search(
             SearchScope::Repo(repo_id),
             query.as_ref(),
@@ -97,8 +98,8 @@ pub async fn search_in_repo(
 
     let mut objects = Vec::with_capacity(packages.len());
     for pkg in &packages {
-        let versions = state.packages.versions(pkg.id).await?;
-        let dist_tags = state.packages.dist_tags(pkg.id).await?;
+        let versions = store.versions(pkg.id).await?;
+        let dist_tags = store.dist_tags(pkg.id).await?;
         let latest = dist_tags
             .iter()
             .find(|dt| dt.tag == "latest")

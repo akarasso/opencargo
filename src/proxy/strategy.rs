@@ -1,7 +1,6 @@
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode};
 
-use crate::error::AppResult;
-use crate::registry::resolve::Upstream;
+use crate::registry::resolve::{ResolveError, Upstream};
 
 /// The vocabulary a strategy answers in is registry semantics, not proxy
 /// machinery, so it lives in the domain; the hooks below are its only
@@ -23,7 +22,7 @@ pub struct CacheKey {
 pub trait UpstreamStrategy: Send + Sync {
     type Artifact: std::fmt::Debug + Send + Sync;
 
-    fn upstream_url(&self, up: &Upstream, a: &Self::Artifact) -> AppResult<reqwest::Url>;
+    fn upstream_url(&self, up: &Upstream, a: &Self::Artifact) -> Result<url::Url, ResolveError>;
 
     fn url_source(&self, _up: &Upstream, _a: &Self::Artifact) -> UrlSource {
         UrlSource::Admin
@@ -41,7 +40,7 @@ pub trait UpstreamStrategy: Send + Sync {
         _a: &Self::Artifact,
         _h: &HeaderMap,
         _body_sha256: &str,
-    ) -> AppResult<()> {
+    ) -> Result<(), ResolveError> {
         Ok(())
     }
 

@@ -10,14 +10,14 @@ use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, TimeDelta, Utc};
 use sqlx::SqlitePool;
 
-use crate::domain::{CacheEntry, CacheEntryId, NewEntry, RepoId, Repository};
-use crate::error::{AppResult, StoreError};
+use crate::domain::{CacheEntry, CacheEntryId, CacheRepo, NewEntry, RepoId, Repository};
+use crate::error::StoreError;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::proxy::engine::{ProxyEngine, Timeouts, TtlConfig};
 use crate::proxy::strategy::{
     CacheKey, CachePolicy, Transfer, Ttl, UpstreamStrategy, UrlSource, DEFAULT_MAX_UPSTREAM_BYTES,
 };
-use crate::registry::resolve::{CacheRepo, Upstream};
+use crate::registry::resolve::{ResolveError, Upstream};
 use crate::storage::StorageBackend;
 
 #[derive(Default)]
@@ -139,7 +139,7 @@ impl Default for Strat {
 impl UpstreamStrategy for Strat {
     type Artifact = String;
 
-    fn upstream_url(&self, up: &Upstream, a: &String) -> AppResult<reqwest::Url> {
+    fn upstream_url(&self, up: &Upstream, a: &String) -> Result<url::Url, ResolveError> {
         Ok(up.base.join(a).unwrap())
     }
 

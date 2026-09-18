@@ -7,7 +7,7 @@ use sqlx::SqlitePool;
 use crate::domain::{Pending, RepoKind, RepoSpec, Repository};
 use crate::error::{AppError, AppResult};
 use crate::ports::repositories::RepositoryStore;
-use crate::registry::resolve::MAX_GROUP_DEPTH;
+use crate::domain::MAX_GROUP_DEPTH;
 
 trait SpecRules {
     fn refuse_upstream(&self) -> AppResult<()>;

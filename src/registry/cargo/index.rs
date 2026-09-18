@@ -12,9 +12,10 @@ use sha2::{Digest, Sha256};
 use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
-use crate::domain::{Format, Visibility};
+use crate::domain::{Format, UrlRepo, Visibility};
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{collect, Cx, UrlRepo};
+use crate::registry::cx;
+use crate::registry::resolve::collect;
 use crate::server::AppState;
 
 use super::leaves::{IndexLeaf, IndexLines};
@@ -35,13 +36,9 @@ pub async fn config_json(
     if auth.is_some() {
         crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
     }
-    let cx = Cx {
-        state: &state,
-        auth,
-        url: UrlRepo(&repo.name),
-    };
+    let cx = cx(&state, auth, &repo);
     Ok(Json(config_body(
-        &cx.state.base_url,
+        cx.base_url,
         cx.url,
         repo.visibility != Visibility::Public,
     )))
@@ -77,11 +74,7 @@ pub async fn get_index_entry(
     let auth = auth.as_ref().map(|e| &e.0);
     crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
-    let cx = Cx {
-        state: &state,
-        auth,
-        url: UrlRepo(&repo.name),
-    };
+    let cx = cx(&state, auth, &repo);
     let leaf = IndexLeaf {
         name: name.to_string(),
     };

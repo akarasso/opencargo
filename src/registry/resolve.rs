@@ -1,65 +1,126 @@
-use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 
 use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
-use crate::domain::{RepoKind, Repository};
-use crate::error::{AppError, AppResult};
-use crate::proxy::auth::{default_token_realms, UpstreamAuth};
-use crate::server::AppState;
+use crate::domain::{
+    CacheRepo, DomainError, Miss, Outcome, RepoKind, Repository, UrlRepo, Visit, Walk,
+    MAX_GROUP_DEPTH,
+};
+use crate::error::{AppError, StoreError};
+use crate::policy::ResolutionRecorder;
+use crate::ports::oci::OciStore;
+use crate::ports::packages::PackageStore;
+use crate::ports::permissions::PermissionStore;
+use crate::ports::repositories::RepositoryStore;
+use crate::ports::search::SearchIndex;
+use crate::proxy::auth::{default_token_realms, UpstreamAuth, UpstreamCredsSource};
+use crate::proxy::ProxyEngine;
 
-pub const MAX_GROUP_DEPTH: u32 = 5;
+/// How resolving a name refuses, in the resolver's own vocabulary.
+///
+/// `Store` and `Internal` are not padding. A group walk reads repositories
+/// and grants on its way down, and both refusals it can meet there carry a
+/// status of their own — a store that is merely busy is retryable, a group
+/// nested deeper than a write would ever allow is this server's fault — so
+/// folding either into `Upstream` or `Domain` would answer the client wrong.
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveError {
+    #[error("{0}")]
+    NotFound(String),
 
-/// The repository the client addressed: the only name in URLs it sees.
-#[derive(Clone, Copy, Debug)]
-pub struct UrlRepo<'a>(pub &'a str);
+    /// A member could not be reached, or answered something unusable.
+    #[error("{0}")]
+    Upstream(String),
 
-/// The member repository that owns cached bytes: the only name allowed in
-/// cache keys, storage paths and `repository_id`.
-#[derive(Clone, Copy, Debug)]
-pub struct CacheRepo<'a>(pub &'a Repository);
+    #[error(transparent)]
+    Domain(#[from] DomainError),
 
-pub struct Cx<'a> {
-    pub state: &'a AppState,
-    pub auth: Option<&'a AuthUser>,
-    pub url: UrlRepo<'a>,
+    #[error(transparent)]
+    Store(#[from] StoreError),
+
+    /// A configuration fault rather than a registry one: a row write-time
+    /// validation should have refused, or an upstream URL that is not one.
+    #[error("{0}")]
+    Internal(String),
 }
 
-#[derive(Debug)]
-pub enum Outcome<T> {
-    Found(T),
-    NotFound,
+impl From<ResolveError> for AppError {
+    fn from(err: ResolveError) -> Self {
+        match err {
+            ResolveError::NotFound(why) => AppError::NotFound(why),
+            ResolveError::Upstream(why) => AppError::BadGateway(why),
+            ResolveError::Domain(err) => AppError::from(err),
+            ResolveError::Store(err) => AppError::from(err),
+            ResolveError::Internal(why) => AppError::Internal(why),
+        }
+    }
+}
+
+/// The proxy engine and the per-format packument builders still answer in
+/// `AppError`; this is the one place their vocabulary crosses into the
+/// resolver's, and every status the resolver serves survives it. A 4xx does
+/// not: the engine's read path constructs only 404, 502 and 500, so a client
+/// error arriving from it is the engine misreporting itself — a 500, like the
+/// driver failures it wraps, which already reach the client as one.
+impl From<AppError> for ResolveError {
+    fn from(err: AppError) -> Self {
+        match err {
+            AppError::NotFound(why) => ResolveError::NotFound(why),
+            AppError::BadGateway(why) => ResolveError::Upstream(why),
+            AppError::Internal(why) => ResolveError::Internal(why),
+            AppError::ServiceUnavailable(_) => ResolveError::Store(StoreError::Unavailable),
+            other => ResolveError::Store(StoreError::Other(Box::new(other))),
+        }
+    }
+}
+
+/// One request's way to everything a leaf may reach: ports, the proxy engine
+/// and who is asking. Built once by the HTTP adapter, where the composition
+/// root's state lives; nothing below it knows a pool exists.
+pub struct Cx<'a> {
+    pub repos: &'a dyn RepositoryStore,
+    pub perms: &'a dyn PermissionStore,
+    pub packages: &'a dyn PackageStore,
+    pub oci: &'a dyn OciStore,
+    pub search: &'a dyn SearchIndex,
+    pub proxy: &'a ProxyEngine,
+    pub policy: &'a dyn ResolutionRecorder,
+    pub creds: &'a dyn UpstreamCredsSource,
+    pub auth: Option<&'a AuthUser>,
+    pub url: UrlRepo<'a>,
+    pub base_url: &'a str,
 }
 
 #[derive(Clone, Debug)]
 pub struct Upstream {
-    pub base: reqwest::Url,
+    pub base: url::Url,
     pub auth: Option<UpstreamAuth>,
-    pub token_realms: Vec<reqwest::Url>,
+    pub token_realms: Vec<url::Url>,
     pub dl_allow_private: bool,
 }
 
 impl Upstream {
-    pub fn for_member(state: &AppState, member: &Repository) -> AppResult<Self> {
+    /// The credentials are looked up rather than handed down: the member is
+    /// discovered mid-walk, so the handler never saw its name.
+    pub fn for_member(
+        creds: &dyn UpstreamCredsSource,
+        member: &Repository,
+    ) -> Result<Self, ResolveError> {
         let raw = member.upstream_url.as_deref().ok_or_else(|| {
-            AppError::Internal(format!(
+            ResolveError::Internal(format!(
                 "proxy repository {} has no upstream_url configured",
                 member.name
             ))
         })?;
-        let base = reqwest::Url::parse(raw).map_err(|e| {
-            AppError::Internal(format!(
+        let base = url::Url::parse(raw).map_err(|e| {
+            ResolveError::Internal(format!(
                 "proxy repository {} has an invalid upstream_url: {e}",
                 member.name
             ))
         })?;
-        let creds = state
-            .upstream_auth
-            .get(&member.name)
-            .cloned()
-            .unwrap_or_default();
+        let creds = creds.for_repo(&member.name);
         let token_realms = if creds.token_realms.is_empty() {
             default_token_realms(&base)
         } else {
@@ -77,13 +138,17 @@ impl Upstream {
 #[async_trait::async_trait]
 pub trait Leaf: Send + Sync {
     type Out: Send;
-    async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Self::Out>>;
+    async fn hosted(
+        &self,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
+    ) -> Result<Outcome<Self::Out>, ResolveError>;
     async fn proxy(
         &self,
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> AppResult<Outcome<Self::Out>>;
+    ) -> Result<Outcome<Self::Out>, ResolveError>;
 }
 
 pub struct Collected<T> {
@@ -93,11 +158,16 @@ pub struct Collected<T> {
 
 /// First `Found` in member order; none is `NotFound`, or `BadGateway` when a
 /// member failed on the way.
-pub async fn first_hit<L: Leaf>(cx: &Cx<'_>, repo: &Repository, leaf: &L) -> AppResult<L::Out> {
+pub async fn first_hit<L: Leaf>(
+    cx: &Cx<'_>,
+    repo: &Repository,
+    leaf: &L,
+) -> Result<L::Out, ResolveError> {
     let mut w = Walk::new(repo, true);
     walk(cx, repo, leaf, 0, &mut w).await?;
-    let hits = std::mem::take(&mut w.hits);
-    hits.into_iter().next().ok_or_else(|| w.miss(cx))
+    let miss = w.miss();
+    let (hits, _) = w.finish();
+    hits.into_iter().next().ok_or_else(|| missed(cx.url, miss))
 }
 
 /// Every `Found` in member order; zero hits after a failure is `BadGateway`,
@@ -106,55 +176,36 @@ pub async fn collect<L: Leaf>(
     cx: &Cx<'_>,
     repo: &Repository,
     leaf: &L,
-) -> AppResult<Collected<L::Out>> {
+) -> Result<Collected<L::Out>, ResolveError> {
     let mut w = Walk::new(repo, false);
     walk(cx, repo, leaf, 0, &mut w).await?;
-    if w.hits.is_empty() && w.failure.is_some() {
-        return Err(w.miss(cx));
-    }
-    Ok(Collected {
-        hits: w.hits,
-        degraded: w.failure,
-    })
-}
-
-struct Walk<T> {
-    hits: Vec<T>,
-    first_only: bool,
-    seen: HashSet<i64>,
-    failure: Option<String>,
-}
-
-impl<T> Walk<T> {
-    fn new(root: &Repository, first_only: bool) -> Self {
-        Self {
-            hits: Vec::new(),
-            first_only,
-            seen: HashSet::from([root.id]),
-            failure: None,
+    if !w.found() {
+        if let degraded @ Miss::Degraded(_) = w.miss() {
+            return Err(missed(cx.url, degraded));
         }
     }
+    let (hits, degraded) = w.finish();
+    Ok(Collected { hits, degraded })
+}
 
-    fn done(&self) -> bool {
-        self.first_only && !self.hits.is_empty()
+/// The walk says why there was no hit; only the application knows which name
+/// the client used to ask.
+fn missed(url: UrlRepo<'_>, miss: Miss) -> ResolveError {
+    match miss {
+        Miss::Degraded(why) => ResolveError::Upstream(format!("group {}: {why}", url.0)),
+        Miss::Nothing => ResolveError::NotFound(format!("not found in repository '{}'", url.0)),
     }
+}
 
-    fn record(&mut self, member: &str, result: AppResult<Outcome<T>>) {
-        match result {
-            Ok(Outcome::Found(hit)) => self.hits.push(hit),
-            Ok(Outcome::NotFound) | Err(AppError::NotFound(_)) => {}
-            Err(e) => {
-                warn!(member, error = %e, "member failed; trying the next one");
-                self.failure
-                    .get_or_insert_with(|| format!("member {member} failed: {e}"));
-            }
-        }
-    }
-
-    fn miss(&self, cx: &Cx<'_>) -> AppError {
-        match &self.failure {
-            Some(why) => AppError::BadGateway(format!("group {}: {why}", cx.url.0)),
-            None => AppError::NotFound(format!("not found in repository '{}'", cx.url.0)),
+/// What one member's answer contributes. A member that has nothing is not a
+/// failure however it says so, and a member that failed does not end the walk.
+fn visit<T>(member: &str, result: Result<Outcome<T>, ResolveError>) -> Visit<T> {
+    match result {
+        Ok(Outcome::Found(hit)) => Visit::Hit(hit),
+        Ok(Outcome::NotFound) | Err(ResolveError::NotFound(_)) => Visit::Nothing,
+        Err(e) => {
+            warn!(member, error = %e, "member failed; trying the next one");
+            Visit::Failed(format!("member {member} failed: {e}"))
         }
     }
 }
@@ -165,17 +216,20 @@ fn walk<'a, L: Leaf + 'a>(
     leaf: &'a L,
     depth: u32,
     w: &'a mut Walk<L::Out>,
-) -> Pin<Box<dyn Future<Output = AppResult<()>> + Send + 'a>> {
+) -> Pin<Box<dyn Future<Output = Result<(), ResolveError>> + Send + 'a>> {
     Box::pin(async move {
         let member = CacheRepo(repo);
         match repo.kind()? {
-            RepoKind::Hosted => w.record(&repo.name, leaf.hosted(cx, member).await),
+            RepoKind::Hosted => {
+                let answer = leaf.hosted(cx, member).await;
+                w.record(visit(&repo.name, answer));
+            }
             RepoKind::Proxy => {
-                let result = match Upstream::for_member(cx.state, repo) {
+                let answer = match Upstream::for_member(cx.creds, repo) {
                     Ok(up) => leaf.proxy(cx, member, &up).await,
                     Err(e) => Err(e),
                 };
-                w.record(&repo.name, result);
+                w.record(visit(&repo.name, answer));
             }
             RepoKind::Group => walk_members(cx, repo, leaf, depth, w).await?,
         }
@@ -189,10 +243,10 @@ async fn walk_members<'a, L: Leaf + 'a>(
     leaf: &'a L,
     depth: u32,
     w: &'a mut Walk<L::Out>,
-) -> AppResult<()> {
+) -> Result<(), ResolveError> {
     // Only pre-validation rows can get here: writes refuse a deeper stack.
     if depth >= MAX_GROUP_DEPTH {
-        return Err(AppError::Internal(
+        return Err(ResolveError::Internal(
             "group nesting depth exceeded".to_string(),
         ));
     }
@@ -206,20 +260,18 @@ async fn walk_members<'a, L: Leaf + 'a>(
         if w.done() {
             return Ok(());
         }
-        let Some(member) = crate::db::get_repository_by_name(&cx.state.db, name).await? else {
+        let Some(member) = cx.repos.by_name(name).await? else {
             warn!(group = %group.name, member = %name, "group member repository not found, skipping");
             continue;
         };
-        match super::ensure_can_read(&*cx.state.permissions, &member, cx.auth).await {
-            Ok(()) => {}
-            Err(AppError::Unauthorized(_) | AppError::Forbidden(_)) => continue,
-            Err(e) => return Err(e),
+        if !readable(cx, &member).await? {
+            continue;
         }
         if member.fmt()? != format {
             warn!(group = %group.name, member = %name, "group member has another format, skipping");
             continue;
         }
-        if !w.seen.insert(member.id) {
+        if !w.first_visit(member.id) {
             continue;
         }
         walk(cx, &member, leaf, depth + 1, w).await?;
@@ -227,189 +279,17 @@ async fn walk_members<'a, L: Leaf + 'a>(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::config::{Config, DatabaseConfig, RepositoryConfig, ServerConfig, Visibility};
-    use crate::domain::Format;
-
-    struct Script;
-
-    fn scripted(repo: &Repository) -> AppResult<Outcome<String>> {
-        match repo.name.as_str() {
-            n if n.ends_with("-miss") => Ok(Outcome::NotFound),
-            n if n.ends_with("-err404") => Err(AppError::NotFound(n.to_string())),
-            n if n.ends_with("-fail") => Err(AppError::BadGateway(format!("{n} is down"))),
-            n => Ok(Outcome::Found(n.to_string())),
-        }
-    }
-
-    #[async_trait::async_trait]
-    impl Leaf for Script {
-        type Out = String;
-
-        async fn hosted(&self, _cx: &Cx<'_>, m: CacheRepo<'_>) -> AppResult<Outcome<String>> {
-            scripted(m.0)
-        }
-
-        async fn proxy(
-            &self,
-            _cx: &Cx<'_>,
-            m: CacheRepo<'_>,
-            _up: &Upstream,
-        ) -> AppResult<Outcome<String>> {
-            scripted(m.0)
-        }
-    }
-
-    fn hosted(name: &str, format: Format, vis: Visibility) -> RepositoryConfig {
-        RepositoryConfig {
-            name: name.into(),
-            format,
-            visibility: vis,
-            ..Default::default()
-        }
-    }
-
-    fn group(name: &str, members: &[&str]) -> RepositoryConfig {
-        RepositoryConfig {
-            name: name.into(),
-            repo_type: RepoKind::Group,
-            visibility: Visibility::Public,
-            members: Some(members.iter().map(|m| m.to_string()).collect()),
-            ..Default::default()
-        }
-    }
-
-    fn fixture() -> Vec<RepositoryConfig> {
-        let mut repos = vec![
-            hosted("h-found", Format::Npm, Visibility::Public),
-            hosted("h-miss", Format::Npm, Visibility::Public),
-            hosted("h-err404", Format::Npm, Visibility::Public),
-            hosted("h-fail", Format::Npm, Visibility::Public),
-            hosted("h-private", Format::Npm, Visibility::Private),
-            hosted("cargo-found", Format::Cargo, Visibility::Public),
-            RepositoryConfig {
-                name: "p-found".into(),
-                repo_type: RepoKind::Proxy,
-                visibility: Visibility::Public,
-                upstream: Some("http://127.0.0.1:1".into()),
-                ..Default::default()
-            },
-            group("g-order", &["h-miss", "h-err404", "h-found", "p-found"]),
-            group("g-fail-then-found", &["h-fail", "h-found"]),
-            group("g-fail-only", &["h-fail", "h-miss"]),
-            group("g-nested", &["g-order"]),
-        ];
-        // d2 -> d3 -> d4 -> d5 -> d6 -> h-found: the five levels a write allows.
-        for i in 2..7 {
-            let next = if i == 6 { "h-found".to_string() } else { format!("d{}", i + 1) };
-            repos.push(group(&format!("d{i}"), &[&next]));
-        }
-        repos
-    }
-
-    async fn state(tmp: &tempfile::TempDir) -> AppState {
-        let config = Config {
-            server: ServerConfig {
-                storage_path: tmp.path().join("storage").display().to_string(),
-                ..Default::default()
-            },
-            database: DatabaseConfig {
-                url: format!("sqlite:{}?mode=rwc", tmp.path().join("t.db").display()),
-            },
-            repositories: fixture(),
-            ..Default::default()
-        };
-        let state = crate::server::build_state(&config).await.unwrap();
-        // Rows the seed now refuses but the resolver must still tolerate.
-        for (name, members) in [
-            ("g-skips", r#"["nope","h-private","cargo-found","h-miss"]"#),
-            ("g-empty", "[]"),
-            ("g-cycle-a", r#"["g-cycle-b"]"#),
-            ("g-cycle-b", r#"["g-cycle-a","p-found"]"#),
-            ("d1", r#"["d2"]"#),
-            ("d0", r#"["d1"]"#),
-        ] {
-            sqlx::query(
-                "INSERT INTO repositories (name, repo_type, format, visibility, config_json)
-                 VALUES (?1, 'group', 'npm', 'public', ?2)",
-            )
-            .bind(name)
-            .bind(format!(r#"{{"members":{members}}}"#))
-            .execute(&state.db)
-            .await
-            .unwrap();
-        }
-        state
-    }
-
-    async fn repo(state: &AppState, name: &str) -> Repository {
-        crate::db::get_repository_by_name(&state.db, name)
-            .await
-            .unwrap()
-            .unwrap()
-    }
-
-    fn cx(state: &AppState) -> Cx<'_> {
-        Cx {
-            state,
-            auth: None,
-            url: UrlRepo("requested"),
-        }
-    }
-
-    async fn first(state: &AppState, name: &str) -> AppResult<String> {
-        first_hit(&cx(state), &repo(state, name).await, &Script).await
-    }
-
-    async fn all(state: &AppState, name: &str) -> AppResult<Collected<String>> {
-        collect(&cx(state), &repo(state, name).await, &Script).await
-    }
-
-    #[tokio::test]
-    async fn error_policy_table() {
-        let tmp = tempfile::TempDir::new().unwrap();
-        let st = state(&tmp).await;
-
-        assert_eq!(first(&st, "h-found").await.unwrap(), "h-found");
-        assert_eq!(first(&st, "p-found").await.unwrap(), "p-found");
-        assert!(matches!(first(&st, "h-miss").await, Err(AppError::NotFound(_))));
-        assert!(matches!(first(&st, "h-fail").await, Err(AppError::BadGateway(_))));
-        assert!(matches!(all(&st, "h-fail").await, Err(AppError::BadGateway(_))));
-
-        assert_eq!(first(&st, "g-order").await.unwrap(), "h-found");
-        let ordered = all(&st, "g-order").await.unwrap();
-        assert_eq!(ordered.hits, vec!["h-found", "p-found"]);
-        assert_eq!(ordered.degraded, None);
-
-        assert_eq!(first(&st, "g-fail-then-found").await.unwrap(), "h-found");
-        let degraded = all(&st, "g-fail-then-found").await.unwrap();
-        assert_eq!(degraded.hits, vec!["h-found"]);
-        assert!(degraded.degraded.unwrap().contains("h-fail is down"));
-
-        let Err(AppError::BadGateway(msg)) = first(&st, "g-fail-only").await else {
-            panic!("no hit after a failure is 502");
-        };
-        assert!(msg.contains("group requested") && msg.contains("h-fail"), "{msg}");
-        assert!(matches!(all(&st, "g-fail-only").await, Err(AppError::BadGateway(_))));
-
-        assert!(matches!(first(&st, "g-skips").await, Err(AppError::NotFound(_))));
-        let skipped = all(&st, "g-skips").await.unwrap();
-        assert!(skipped.hits.is_empty() && skipped.degraded.is_none());
-        assert!(matches!(first(&st, "g-empty").await, Err(AppError::NotFound(_))));
-        assert!(all(&st, "g-empty").await.unwrap().hits.is_empty());
-
-        assert_eq!(first(&st, "g-cycle-a").await.unwrap(), "p-found");
-        assert_eq!(all(&st, "g-cycle-b").await.unwrap().hits, vec!["p-found"]);
-        assert_eq!(first(&st, "g-nested").await.unwrap(), "h-found");
-
-        assert_eq!(first(&st, "d2").await.unwrap(), "h-found");
-        for too_deep in ["d1", "d0"] {
-            let Err(AppError::Internal(msg)) = first(&st, too_deep).await else {
-                panic!("{too_deep}: a sixth nested group exceeds the depth cap");
-            };
-            assert!(msg.contains("depth"), "{msg}");
-        }
+/// Whether the caller may read this member, and the one refusal that is not a
+/// verdict: while the grant cannot be read at all, "the store is unreliable"
+/// and "authorization is unsafe to decide" are the same fact, so the walk
+/// stops with a retryable answer instead of silently skipping the member.
+async fn readable(cx: &Cx<'_>, member: &Repository) -> Result<bool, ResolveError> {
+    match super::ensure_can_read(cx.perms, member, cx.auth).await {
+        Ok(()) => Ok(true),
+        Err(AppError::Unauthorized(_) | AppError::Forbidden(_)) => Ok(false),
+        Err(_) => Err(ResolveError::Store(StoreError::Unavailable)),
     }
 }
+
+#[cfg(test)]
+mod tests;

@@ -6,7 +6,7 @@ use tracing::warn;
 
 use crate::domain::{RepoKind, Repository};
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{CacheRepo, MAX_GROUP_DEPTH};
+use crate::domain::{CacheRepo, MAX_GROUP_DEPTH};
 use crate::server::AppState;
 
 /// Proxy: rows, legacy meta and files; Group: every proxy member, nested

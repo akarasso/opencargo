@@ -1,52 +1,8 @@
-//! Data-access layer for the OCI registry tables. Holds the row types that were
-//! previously defined inside the OCI handlers (and, incrementally, the typed
-//! queries that replace the inline SQL there).
+//! What is left of the OCI data-access layer: the upload ledger, which the
+//! push half still reads through the pool. The three read queries a leaf
+//! makes are `OciStore`'s now.
 
 use sqlx::SqlitePool;
-
-#[derive(Debug, sqlx::FromRow)]
-pub struct OciBlob {
-    #[allow(dead_code)]
-    pub id: i64,
-    #[allow(dead_code)]
-    pub repository_id: i64,
-    #[allow(dead_code)]
-    pub digest: String,
-    pub size: i64,
-    pub content_type: Option<String>,
-    #[allow(dead_code)]
-    pub created_at: String,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-pub struct OciManifest {
-    #[allow(dead_code)]
-    pub id: i64,
-    #[allow(dead_code)]
-    pub repository_id: i64,
-    #[allow(dead_code)]
-    pub name: String,
-    #[allow(dead_code)]
-    pub digest: String,
-    pub content_type: String,
-    pub size: i64,
-    #[allow(dead_code)]
-    pub created_at: String,
-}
-
-#[derive(Debug, sqlx::FromRow)]
-pub struct OciTag {
-    #[allow(dead_code)]
-    pub id: i64,
-    #[allow(dead_code)]
-    pub repository_id: i64,
-    #[allow(dead_code)]
-    pub name: String,
-    pub tag: String,
-    pub manifest_digest: String,
-    #[allow(dead_code)]
-    pub created_at: String,
-}
 
 #[derive(Debug, sqlx::FromRow)]
 pub struct OciUpload {
@@ -57,38 +13,6 @@ pub struct OciUpload {
     pub name: String,
     #[allow(dead_code)]
     pub started_at: String,
-}
-
-// ---------------------------------------------------------------------------
-// Typed read queries (replace the inline SELECTs in the OCI handlers).
-// ---------------------------------------------------------------------------
-
-pub async fn get_blob(
-    pool: &SqlitePool,
-    repository_id: i64,
-    digest: &str,
-) -> Result<Option<OciBlob>, sqlx::Error> {
-    sqlx::query_as("SELECT * FROM oci_blobs WHERE repository_id = ?1 AND digest = ?2")
-        .bind(repository_id)
-        .bind(digest)
-        .fetch_optional(pool)
-        .await
-}
-
-pub async fn get_manifest(
-    pool: &SqlitePool,
-    repository_id: i64,
-    name: &str,
-    digest: &str,
-) -> Result<Option<OciManifest>, sqlx::Error> {
-    sqlx::query_as(
-        "SELECT * FROM oci_manifests WHERE repository_id = ?1 AND name = ?2 AND digest = ?3",
-    )
-    .bind(repository_id)
-    .bind(name)
-    .bind(digest)
-    .fetch_optional(pool)
-    .await
 }
 
 pub async fn get_upload(

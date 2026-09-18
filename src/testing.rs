@@ -19,3 +19,8 @@ pub mod fakes;
 /// itself no longer knows what a pool is.
 #[cfg(test)]
 pub mod fixture;
+
+/// A resolver context over those fakes: what `Cx` collapses into once it
+/// holds ports instead of the whole application state.
+#[cfg(test)]
+pub mod resolver;

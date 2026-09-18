@@ -23,6 +23,7 @@ use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
+use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
@@ -72,6 +73,7 @@ pub struct AppState {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub oci: Arc<dyn OciStore>,
     pub vuln_scanner: Arc<VulnScanner>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
@@ -170,6 +172,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         repos,
         packages: stores.packages(),
         search: stores.search(),
+        oci: stores.oci(),
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,

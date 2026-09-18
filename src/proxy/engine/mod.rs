@@ -10,10 +10,10 @@ use bytes::Bytes;
 use chrono::{DateTime, Utc};
 use tracing::warn;
 
-use crate::domain::{CacheEntry, NewEntry};
+use crate::domain::{CacheEntry, CacheRepo, NewEntry, Outcome};
 use crate::error::{AppError, AppResult};
 use crate::ports::proxy_cache::ProxyCacheStore;
-use crate::registry::resolve::{CacheRepo, Outcome, Upstream};
+use crate::registry::resolve::Upstream;
 use crate::storage::StorageBackend;
 
 use super::auth::{send_with_auth, TokenCache};

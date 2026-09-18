@@ -9,10 +9,11 @@ use std::collections::HashMap;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
-use crate::domain::{Format, RepoKind, Repository, Visibility};
+use crate::domain::{Format, RepoKind, Repository, UrlRepo, Visibility};
 use crate::error::{AppError, AppResult};
 use crate::ports::permissions::PermissionStore;
 use crate::ports::repositories::RepositoryStore;
+use crate::registry::resolve::Cx;
 use crate::server::AppState;
 
 /// Extract the full package name from path parameters.
@@ -24,6 +25,25 @@ pub fn extract_package_name(params: &HashMap<String, String>) -> String {
     match params.get("scope") {
         Some(scope) => format!("@{}/{}", scope, params.get("name").unwrap_or(&String::new())),
         None => params.get("name").cloned().unwrap_or_default(),
+    }
+}
+
+/// The request's resolver context: the one place the composition root's
+/// state is projected onto the ports a leaf may reach, so no leaf and no
+/// format module ever holds the whole of it.
+pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Repository) -> Cx<'a> {
+    Cx {
+        repos: state.repos.as_ref(),
+        perms: state.permissions.as_ref(),
+        packages: state.packages.as_ref(),
+        oci: state.oci.as_ref(),
+        search: state.search.as_ref(),
+        proxy: &state.proxy,
+        policy: &state.policy,
+        creds: state.upstream_auth.as_ref(),
+        auth,
+        url: UrlRepo(&repo.name),
+        base_url: &state.base_url,
     }
 }
 

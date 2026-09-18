@@ -12,6 +12,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::domain::DomainError;
 use crate::error::StoreError;
+use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
@@ -23,6 +24,7 @@ use crate::ports::webhooks::WebhookStore;
 
 pub mod migrate;
 pub mod multipart;
+pub mod oci;
 pub mod packages;
 pub mod permissions;
 pub mod proxy_cache;
@@ -218,5 +220,9 @@ impl SqliteStores {
 
     pub fn search(&self) -> Arc<dyn SearchIndex> {
         Arc::new(search::SqliteSearchIndex::new(self.pool.clone()))
+    }
+
+    pub fn oci(&self) -> Arc<dyn OciStore> {
+        Arc::new(oci::SqliteOciStore::new(self.pool.clone()))
     }
 }

@@ -6,7 +6,8 @@ use axum::{
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{first_hit, Cx, UrlRepo};
+use crate::registry::cx;
+use crate::registry::resolve::first_hit;
 use crate::server::AppState;
 
 use super::leaves::CrateLeaf;
@@ -22,11 +23,7 @@ pub async fn download_crate(
     let auth = auth.as_ref().map(|e| &e.0);
     crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
-    let cx = Cx {
-        state: &state,
-        auth,
-        url: UrlRepo(&repo.name),
-    };
+    let cx = cx(&state, auth, &repo);
     let leaf = CrateLeaf {
         name: name.clone(),
         version: version.clone(),

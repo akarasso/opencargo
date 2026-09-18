@@ -10,12 +10,12 @@ use axum::{
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::proxy;
-use crate::registry::extract_package_name;
 use crate::registry::resolve::first_hit;
+use crate::registry::{cx, extract_package_name};
 use crate::server::AppState;
 
 use super::leaves::{PackumentLeaf, TarballLeaf};
-use super::{cx, param};
+use super::param;
 
 const ABBREVIATED_TYPE: &str = "application/vnd.npm.install-v1+json";
 

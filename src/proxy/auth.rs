@@ -7,7 +7,8 @@ use reqwest::{Client, RequestBuilder, Response, Url};
 use tracing::warn;
 
 use crate::error::{AppError, AppResult};
-use crate::registry::resolve::{CacheRepo, Upstream};
+use crate::domain::CacheRepo;
+use crate::registry::resolve::Upstream;
 
 const DEFAULT_TOKEN_TTL: Duration = Duration::from_secs(300);
 const DOCKER_HUB_HOSTS: [&str; 3] = ["registry-1.docker.io", "index.docker.io", "docker.io"];
@@ -49,6 +50,24 @@ pub struct UpstreamCreds {
     pub auth: Option<UpstreamAuth>,
     pub token_realms: Vec<Url>,
     pub dl_allow_private: bool,
+}
+
+/// Where a proxy member's credentials come from.
+///
+/// A port rather than a resolved `&UpstreamCreds` because the member that
+/// needs them is discovered mid-walk, inside the group the client addressed:
+/// no single value can be handed down from the handler, only the lookup.
+pub trait UpstreamCredsSource: Send + Sync {
+    /// A repository nobody configured credentials for has the default ones,
+    /// which is the absence of credentials rather than a refusal.
+    fn for_repo(&self, name: &str) -> UpstreamCreds;
+}
+
+/// The configured map is the real source; the composition root owns it.
+impl UpstreamCredsSource for HashMap<String, UpstreamCreds> {
+    fn for_repo(&self, name: &str) -> UpstreamCreds {
+        self.get(name).cloned().unwrap_or_default()
+    }
 }
 
 pub fn is_docker_hub_host(host: &str) -> bool {

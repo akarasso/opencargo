@@ -399,4 +399,16 @@ impl PackageStore for SqlitePackageStore {
         }
         Ok(())
     }
+
+    async fn record_download(&self, version: i64) -> Result<(), StoreError> {
+        sqlx::query(
+            "INSERT INTO download_counts (version_id, count) VALUES (?1, 1)
+             ON CONFLICT(version_id) DO UPDATE SET count = count + 1",
+        )
+        .bind(version)
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(())
+    }
 }

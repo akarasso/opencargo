@@ -2,10 +2,9 @@ use std::collections::HashMap;
 
 use serde_json::{json, Value};
 
-use crate::domain::Version;
-use crate::error::AppResult;
+use crate::domain::{CacheRepo, Outcome, Version};
+use crate::error::StoreError;
 use crate::ports::packages::{NameMatch, PackageStore};
-use crate::registry::resolve::{CacheRepo, Outcome};
 use crate::wire::wire_ts;
 
 /// A packument before the handler rewrites its tarball URLs.
@@ -21,7 +20,7 @@ pub async fn hosted_packument(
     member: CacheRepo<'_>,
     package_name: &str,
     abbreviated: bool,
-) -> AppResult<Outcome<Value>> {
+) -> Result<Outcome<Value>, StoreError> {
     let found = packages
         .package(member.0.id, package_name, NameMatch::Exact)
         .await?;
@@ -59,7 +58,7 @@ pub async fn dist_tags_map(
     packages: &dyn PackageStore,
     package_id: i64,
     versions: &[Version],
-) -> AppResult<HashMap<String, String>> {
+) -> Result<HashMap<String, String>, StoreError> {
     let dist_tags = packages.dist_tags(package_id).await?;
     Ok(dist_tags
         .iter()

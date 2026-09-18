@@ -8,6 +8,7 @@ pub mod names;
 pub mod permission;
 pub mod proxy;
 pub mod repository;
+pub mod resolve;
 pub mod user;
 pub mod webhook;
 
@@ -21,5 +22,6 @@ pub use proxy::{
     CacheEntry, CacheEntryId, CachePolicy, Classified, NewEntry, RepoId, Transfer, Ttl, UrlSource,
 };
 pub use repository::{DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version};
+pub use resolve::{CacheRepo, Miss, Outcome, UrlRepo, Visit, Walk, MAX_GROUP_DEPTH};
 pub use user::{ApiToken, User};
 pub use webhook::{Subscription, Webhook};

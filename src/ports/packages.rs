@@ -134,4 +134,9 @@ pub trait PackageStore: Send + Sync {
     async fn set_metadata(&self, version: i64, metadata_json: &str) -> Result<(), StoreError>;
 
     async fn set_yanked(&self, version: i64, yanked: bool) -> Result<(), StoreError>;
+
+    /// One more download of a version, as a counter rather than a row per
+    /// download. Best-effort at every call site: a served artifact is not
+    /// unserved because the tally could not be kept.
+    async fn record_download(&self, version: i64) -> Result<(), StoreError>;
 }

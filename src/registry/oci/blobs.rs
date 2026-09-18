@@ -9,11 +9,12 @@ use axum::{
 use crate::auth::middleware::AuthUser;
 use crate::domain::Format;
 use crate::error::{AppError, AppResult};
+use crate::registry::cx;
 use crate::registry::resolve::first_hit;
 use crate::server::AppState;
 
 use super::leaves::BlobLeaf;
-use super::{cx, param, parse_digest, paths, respond, OciRef};
+use super::{param, parse_digest, paths, respond, OciRef};
 
 pub async fn head_blob(
     State(state): State<AppState>,

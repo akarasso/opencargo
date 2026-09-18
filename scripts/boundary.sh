@@ -12,11 +12,11 @@ declare_row() { local IFS=$'\x1f'; rows+=("$*"); }
 # Bounds are measured occurrences at 6c9747a, never lines: `\bdb::` is 232 occurrences over 231
 # lines, so a max fed by a line count licenses one free violation. A raise is an edit to this
 # block, in the commit that needs it, with the reason on the line -- never a silent bump.
-declare_row db-calls       max  46 '\bdb::'                  plain src '*.rs' src/db src/adapters # 159 -> 46: the proxy cache, users, tokens, permissions, packages, repositories and search are ports
-declare_row pool-field     max  63 '\.db\b'                  strip src '*.rs' src/db src/adapters # 209 -> 63: the engine, the authz gates, publish, promote and the repo CRUD hold stores, not the pool. strip: `"...opencargo.db"` is a filename, not a pool
-declare_row stray-sql      max  81 'sqlx::query'             plain src '*.rs' src/db src/adapters # 96 -> 81: 0 in src/proxy/ and src/auth/; the cache sweep, npm search and the repo delete count go through ports. covers _as and _scalar
-declare_row pool-leak      max  47 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 70 -> 47: 0 in src/proxy/ (7a's Cx.proxy precondition), AuthState holds a UserStore and a TokenStore, and the packument, the seed and the repo validator take ports
-declare_row context-bypass max  25 'cx\.state\b'             plain src '*.rs'                     # word boundary: `cx.state` is also passed whole
+declare_row db-calls       max  29 '\bdb::'                  plain src '*.rs' src/db src/adapters # 46 -> 29: every hosted leaf read is PackageStore's or OciStore's, so no format module calls the DAL to resolve
+declare_row pool-field     max  50 '\.db\b'                  strip src '*.rs' src/db src/adapters # 63 -> 50: Cx holds ports, so the thirteen `cx.state.db` sites and the resolver's temp-database fixture are gone. strip: `"...opencargo.db"` is a filename, not a pool
+declare_row stray-sql      max  78 'sqlx::query'             plain src '*.rs' src/db src/adapters # 81 -> 78: 0 in src/proxy/ and src/auth/; the tag listing and the hosted digest lookup are OciStore's. covers _as and _scalar
+declare_row pool-leak      max  45 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 47 -> 45: 0 in src/proxy/ (7a's Cx.proxy precondition), AuthState holds a UserStore and a TokenStore, and the packument, the seed and the repo validator take ports
+declare_row context-bypass eq    0 'cx\.state\b'             plain src '*.rs'                     # eq, not max: Cx holds eleven ports and borrowed values, and AppState is projected onto them in one place. Word boundary, because `cx.state` used to be passed whole
 declare_row dialect-rs     max  13 'datetime\(|julianday\(|strftime\(|AUTOINCREMENT|INSERT OR ' plain src '*.rs' src/db src/adapters/sqlite # 21 -> 13: the cache predicates bind the caller's clock, and permissions.rs's AUTOINCREMENT comment went with its temp-DB fixture
 declare_row dialect-sql    max  49 "AUTOINCREMENT|CHECK\(|fts5|CREATE TRIGGER|datetime\('now'\)" plain 'src/db/migrations src/adapters/sqlite/migrations' '*.sql' # scoped, not eliminated: SQLite DDL belongs in a SQLite directory
 declare_row concrete-fs    eq    0 'FilesystemStorage'       plain src '*.rs' src/storage src/adapters/fs # eq, not max: clippy cannot see `FilesystemStorage::new(..)` in expression position, so this row is the real check (4.1)
@@ -25,7 +25,7 @@ declare_row adapter-import max   0 '(crate|opencargo)::adapters::' plain src '*.
 declare_row domain-paths   max   0 '(crate|opencargo)::(error|server|db|api|registry|proxy|storage|telemetry|auth|app|adapters)\b' plain src/domain '*.rs'
 declare_row domain-names   max   0 'AppError|AppResult|sqlx|axum|reqwest' plain src/domain '*.rs'
 declare_row tests-raw-sql  max  41 'sqlx::query|SqlitePool'  plain tests '*.rs' tests/common/contract.rs # ratchet-only (7.4); the contract suite is the one exclusion
-declare_row unit-tests     min 255 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 241 -> 255: the freshness rule, the engine's expiry case, the permission ladder, the token expiry, the publish and promote use cases and the browse rule. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
+declare_row unit-tests     min 266 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 255 -> 266: the walk state machine, the resolver's statuses, the depth cap, the failing grant lookup and the three hosted OCI reads. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
 declare_row integ-tests    min 300 '#\[(tokio::)?test\]'     plain tests '*.rs' # 278 -> 300: proxy_cache_contract! and package_contract! against two adapters, the user and token timestamp surfaces, and npm's browse and empty-query arms
 
 # files <roots> <glob> [excluded paths...] -- the scope, one path per line

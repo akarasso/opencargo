@@ -24,6 +24,7 @@ use opencargo::domain::{
     Repository, Rights, User, Version, Visibility, Webhook,
 };
 use opencargo::error::StoreError;
+use opencargo::ports::oci::{Blob, Manifest, OciStore};
 use opencargo::ports::packages::{NameMatch, NewRelease, PackageStore, Promotion, Release};
 use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::ports::proxy_cache::ProxyCacheStore;
@@ -44,6 +45,7 @@ pub enum PortId {
     Users,
     Tokens,
     Permissions,
+    Oci,
 }
 
 /// One grant, keyed the way the table is.
@@ -52,6 +54,34 @@ struct Grant {
     user_id: i64,
     repository_id: i64,
     rights: Rights,
+}
+
+/// One stored blob of an image.
+#[derive(Clone)]
+struct BlobRow {
+    repository_id: i64,
+    digest: String,
+    size: i64,
+    content_type: Option<String>,
+}
+
+/// One stored manifest of an image.
+#[derive(Clone)]
+struct ManifestRow {
+    repository_id: i64,
+    name: String,
+    digest: String,
+    content_type: String,
+    size: i64,
+}
+
+/// One tag, which is a name for a manifest digest.
+#[derive(Clone)]
+struct TagRow {
+    repository_id: i64,
+    name: String,
+    tag: String,
+    manifest_digest: String,
 }
 
 /// One audit row, kept because a promotion writes it in the same transaction
@@ -78,6 +108,9 @@ struct State {
     users: Vec<User>,
     tokens: Vec<ApiToken>,
     grants: Vec<Grant>,
+    oci_blobs: Vec<BlobRow>,
+    oci_manifests: Vec<ManifestRow>,
+    oci_tags: Vec<TagRow>,
     next_id: i64,
     next_cache_id: i64,
     /// Queued refusals: a fake that cannot fail only ever proves the happy
@@ -126,6 +159,47 @@ impl FakeDb {
 
     pub fn proxy_cache(&self) -> Arc<dyn ProxyCacheStore> {
         Arc::new(ProxyCache(self.0.clone()))
+    }
+
+    pub fn oci(&self) -> Arc<dyn OciStore> {
+        Arc::new(Oci(self.0.clone()))
+    }
+
+    /// The OCI push half is not a port yet, so its rows are seeded here
+    /// rather than written through one.
+    pub fn add_blob(&self, repository: i64, digest: &str, size: i64, content_type: Option<&str>) {
+        self.0.lock().unwrap().oci_blobs.push(BlobRow {
+            repository_id: repository,
+            digest: digest.to_string(),
+            size,
+            content_type: content_type.map(str::to_string),
+        });
+    }
+
+    pub fn add_manifest(
+        &self,
+        repository: i64,
+        name: &str,
+        digest: &str,
+        content_type: &str,
+        size: i64,
+    ) {
+        self.0.lock().unwrap().oci_manifests.push(ManifestRow {
+            repository_id: repository,
+            name: name.to_string(),
+            digest: digest.to_string(),
+            content_type: content_type.to_string(),
+            size,
+        });
+    }
+
+    pub fn add_tag(&self, repository: i64, name: &str, tag: &str, digest: &str) {
+        self.0.lock().unwrap().oci_tags.push(TagRow {
+            repository_id: repository,
+            name: name.to_string(),
+            tag: tag.to_string(),
+            manifest_digest: digest.to_string(),
+        });
     }
 
     pub fn users(&self) -> Arc<dyn UserStore> {
@@ -706,6 +780,12 @@ impl PackageStore for Packages {
             Ok(())
         })
     }
+
+    /// Nothing to keep: the tally has no read side on this port, so a fake
+    /// that stored it could never be asserted against.
+    async fn record_download(&self, _version: i64) -> Result<(), StoreError> {
+        self.with(|_| Ok(()))
+    }
 }
 
 struct Search(Arc<Mutex<State>>);
@@ -1127,6 +1207,74 @@ impl ProxyCacheStore for ProxyCache {
         with(&self.0, PortId::ProxyCache, |state| {
             state.cache.retain(|row| row.id != id);
             Ok(())
+        })
+    }
+}
+
+struct Oci(Arc<Mutex<State>>);
+
+#[async_trait]
+impl OciStore for Oci {
+    async fn blob(&self, repository: i64, digest: &str) -> Result<Option<Blob>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            Ok(state
+                .oci_blobs
+                .iter()
+                .find(|row| row.repository_id == repository && row.digest == digest)
+                .map(|row| Blob {
+                    size: row.size,
+                    content_type: row.content_type.clone(),
+                }))
+        })
+    }
+
+    async fn manifest(
+        &self,
+        repository: i64,
+        name: &str,
+        digest: &str,
+    ) -> Result<Option<Manifest>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            Ok(state
+                .oci_manifests
+                .iter()
+                .find(|row| {
+                    row.repository_id == repository && row.name == name && row.digest == digest
+                })
+                .map(|row| Manifest {
+                    content_type: row.content_type.clone(),
+                    size: row.size,
+                }))
+        })
+    }
+
+    async fn digest_for_ref(
+        &self,
+        repository: i64,
+        name: &str,
+        reference: &str,
+    ) -> Result<Option<String>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            Ok(state
+                .oci_tags
+                .iter()
+                .find(|row| {
+                    row.repository_id == repository && row.name == name && row.tag == reference
+                })
+                .map(|row| row.manifest_digest.clone()))
+        })
+    }
+
+    async fn tags(&self, repository: i64, name: &str) -> Result<Vec<String>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let mut tags: Vec<String> = state
+                .oci_tags
+                .iter()
+                .filter(|row| row.repository_id == repository && row.name == name)
+                .map(|row| row.tag.clone())
+                .collect();
+            tags.sort();
+            Ok(tags)
         })
     }
 }

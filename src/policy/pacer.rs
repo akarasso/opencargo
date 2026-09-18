@@ -10,7 +10,8 @@ use crate::error::AppError;
 use crate::proxy::engine::Cached;
 use crate::proxy::UpstreamStrategy;
 use crate::registry::cargo::upstream::{CargoArtifact, CargoUpstream};
-use crate::registry::resolve::{CacheRepo, Outcome, Upstream};
+use crate::domain::{CacheRepo, Outcome};
+use crate::registry::resolve::Upstream;
 
 use super::rules::PolicyConfig;
 use super::Shared;

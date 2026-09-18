@@ -11,7 +11,8 @@ use crate::proxy::UpstreamStrategy;
 use crate::registry::cargo::upstream::{CargoArtifact, CargoUpstream};
 use crate::registry::go::escape::escape;
 use crate::registry::go::upstream::{FileKind, GoArtifact, GoUpstream};
-use crate::registry::resolve::{CacheRepo, Outcome, Upstream};
+use crate::domain::{CacheRepo, Outcome};
+use crate::registry::resolve::Upstream;
 
 use super::rules::PolicyConfig;
 use super::{Facts, Pending, Resolution, Shared, Source};

@@ -7,7 +7,7 @@ use chrono::DateTime;
 use serde_json::{json, Value};
 
 use super::*;
-use crate::domain::CacheEntry;
+use crate::domain::{CacheEntry, CacheRepo, Outcome};
 use crate::policy::rules::PolicyConfig;
 use crate::policy::testing::{engine_over, engine_with, fast, pending, repo, scanner, FakeOsv};
 use crate::policy::{PolicyEngine, Source, Tuning, QUEUE};
@@ -15,7 +15,6 @@ use crate::testing::fixture::Fx;
 use crate::proxy::engine::Cached;
 use crate::proxy::UpstreamStrategy;
 use crate::registry::oci::upstream::{OciArtifact, OciUpstream};
-use crate::registry::resolve::{CacheRepo, Outcome};
 use crate::telemetry::vulns::severity::Severity;
 
 const MANIFEST_TYPE: &str = "application/vnd.oci.image.manifest.v1+json";

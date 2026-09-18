@@ -1,5 +1,7 @@
 use super::*;
+use crate::testing::fakes::FakeDb;
 use crate::testing::fixture::Fx;
+use crate::testing::resolver::{Recorder, Resolver};
 
 fn user(user_id: Option<i64>, username: &str, token_name: Option<&str>) -> AuthUser {
     AuthUser {
@@ -37,7 +39,7 @@ fn actor_of_token_user_static_anonymous() {
 }
 
 #[tokio::test]
-async fn record_is_noop_without_rules() {
+async fn record_runs_only_for_a_watched_member() {
     let fx = Fx::new().await;
     let (engine, _writer) = testing::engine_over(&fx, PolicyConfig::default(), Tuning::default());
     assert!(!engine.records("p"));
@@ -52,30 +54,12 @@ async fn record_is_noop_without_rules() {
     );
     assert!(on.records("p"));
     assert!(!on.records("other"));
-    let config = crate::config::Config::default();
-    let state = crate::server::build_state(&crate::config::Config {
-        server: crate::config::ServerConfig {
-            storage_path: fx.storage.resolve("").unwrap().display().to_string(),
-            ..Default::default()
-        },
-        database: crate::config::DatabaseConfig {
-            url: format!(
-                "sqlite:{}?mode=rwc",
-                fx.storage.resolve("s.db").unwrap().display()
-            ),
-        },
-        ..config
-    })
-    .await
-    .unwrap();
-    let cx = Cx {
-        state: &state,
-        auth: None,
-        url: crate::registry::resolve::UrlRepo("requested"),
-    };
+    // The free function's own short-circuit, against a recorder that watches
+    // nobody: no engine, no queue and no database behind it.
+    let resolver = Resolver::default();
     let ran = std::cell::Cell::new(false);
     record(
-        &cx,
+        &resolver.cx(None, "requested"),
         CacheRepo(&fx.repo),
         &fx.up,
         Format::Npm,
@@ -92,7 +76,29 @@ async fn record_is_noop_without_rules() {
         !ran.get(),
         "the source closure never runs for an unconfigured member"
     );
-    assert_eq!(state.policy.dropped(), 0);
+    assert!(resolver.policy.recorded().is_empty());
+
+    let watching = Resolver::new(
+        FakeDb::new(),
+        Recorder::watching(&[fx.repo.name.as_str()]),
+    );
+    let ran = std::cell::Cell::new(false);
+    record(
+        &watching.cx(None, "requested"),
+        CacheRepo(&fx.repo),
+        &fx.up,
+        Format::Npm,
+        "lodash",
+        None,
+        || {
+            ran.set(true);
+            Source::Cargo {
+                cksum: String::new(),
+            }
+        },
+    );
+    assert!(ran.get(), "a watched member runs it");
+    assert_eq!(watching.policy.recorded(), vec![fx.repo.name.clone()]);
 }
 
 #[tokio::test]

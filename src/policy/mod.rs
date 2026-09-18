@@ -23,11 +23,11 @@ use tokio::sync::Semaphore;
 use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
-use crate::domain::{Format, Repository};
+use crate::domain::{CacheRepo, Format, Repository};
 use crate::events::EventBus;
 use crate::proxy::engine::Cached;
 use crate::proxy::ProxyEngine;
-use crate::registry::resolve::{CacheRepo, Cx, Upstream};
+use crate::registry::resolve::{Cx, Upstream};
 use crate::telemetry::vulns::VulnScanner;
 
 pub use age::Age;
@@ -408,6 +408,25 @@ impl PolicyEngine {
     }
 }
 
+/// What the resolver needs of the policy report: whether this member is
+/// watched at all, and somewhere to put what it resolved. Two methods, not a
+/// `PolicyEngine`, so a leaf can be walked without a queue, a writer and a
+/// database behind it.
+pub trait ResolutionRecorder: Send + Sync {
+    fn records(&self, member: &str) -> bool;
+    fn record(&self, pending: Pending);
+}
+
+impl ResolutionRecorder for PolicyEngine {
+    fn records(&self, member: &str) -> bool {
+        PolicyEngine::records(self, member)
+    }
+
+    fn record(&self, pending: Pending) {
+        PolicyEngine::record(self, pending)
+    }
+}
+
 /// The one line each proxy leaf adds over its `Found(cached)`. Returns at
 /// once unless the member records; only then clones member and upstream
 /// and runs `source`.
@@ -420,11 +439,10 @@ pub fn record(
     version: Option<String>,
     source: impl FnOnce() -> Source,
 ) {
-    let engine = &cx.state.policy;
-    if !engine.records(&member.0.name) {
+    if !cx.policy.records(&member.0.name) {
         return;
     }
-    engine.record(Pending {
+    cx.policy.record(Pending {
         requested_repo: cx.url.0.to_string(),
         member: member.0.clone(),
         upstream: up.clone(),

@@ -21,10 +21,8 @@ use serde_json::json;
 use sha2::Digest;
 
 use crate::auth::middleware::AuthUser;
-use crate::domain::Repository;
 use crate::error::{AppError, AppResult};
 use crate::proxy::Payload;
-use crate::registry::resolve::{Cx, UrlRepo};
 use crate::server::AppState;
 
 use upstream::DOCKER_CONTENT_DIGEST;
@@ -82,13 +80,6 @@ impl OciRef {
     }
 }
 
-fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Repository) -> Cx<'a> {
-    Cx {
-        state,
-        auth,
-        url: UrlRepo(&repo.name),
-    }
-}
 
 /// Serve a resolved blob or manifest; `Docker-Content-Digest` is whatever the
 /// leaf derived from the content, never the client's reference.

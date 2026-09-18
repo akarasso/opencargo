@@ -11,11 +11,12 @@ use serde_json::json;
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
+use crate::registry::cx;
 use crate::registry::resolve::collect;
 use crate::server::AppState;
 
 use super::leaves::TagsLeaf;
-use super::{cx, OciRef, MAX_TAGS};
+use super::{OciRef, MAX_TAGS};
 
 #[derive(Deserialize)]
 pub struct ListTagsQuery {
