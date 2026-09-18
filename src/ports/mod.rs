@@ -11,6 +11,7 @@ pub mod events;
 pub mod handoffs;
 pub mod identities;
 pub mod identity_provider;
+pub mod import;
 pub mod ids;
 pub mod maven;
 pub mod multipart;

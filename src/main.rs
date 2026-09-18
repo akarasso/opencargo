@@ -46,6 +46,12 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommand,
     },
+    /// Copy another registry into this one's hosted repositories, and report
+    /// what could not be copied
+    Import {
+        #[command(subcommand)]
+        command: opencargo::adapters::import::cli::Import,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -134,6 +140,12 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
+
+    if let Some(Commands::Import { command }) = cli.command {
+        let ran = opencargo::adapters::import::cli::execute(command).await;
+        print!("{}", ran.stdout);
+        std::process::exit(i32::from(ran.code));
+    }
 
     let mut cfg = config::load_config(cli.config.as_deref())?;
     if let Some(base_url) = cli.base_url {
@@ -236,6 +248,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Migrations applied successfully.");
         }
         Commands::Storage { command } => storage(&cfg, command).await?,
+        Commands::Import { .. } => unreachable!("dispatched before the config is loaded"),
     }
 
     Ok(())

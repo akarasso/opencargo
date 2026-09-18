@@ -43,6 +43,7 @@
 pub mod audit;
 pub mod authenticate;
 pub mod events;
+pub mod import;
 pub mod maven;
 pub mod nuget;
 pub mod login_gate;
