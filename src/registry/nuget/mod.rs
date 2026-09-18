@@ -1,4 +1,11 @@
 pub mod auth_rules;
+pub mod leaves;
+pub mod model;
 pub mod nuspec;
+pub mod publish;
+pub mod read;
+pub mod render;
+pub mod routes;
 pub mod rules;
+pub mod upstream;
 pub mod version;

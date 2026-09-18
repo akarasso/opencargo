@@ -766,6 +766,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::cargo::routes::routes())
         .merge(crate::registry::go::routes::routes())
         .merge(crate::registry::oci::routes::routes())
+        .merge(crate::registry::nuget::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
         .merge(dashboard_routes)
