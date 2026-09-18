@@ -44,8 +44,8 @@ pub async fn publish_module(
     let repo_name = param(&params, "repo")?;
     let module_name = param(&params, "module")?;
     let version_str = param(&params, "version")?;
-    crate::domain::validate_package_name("go", module_name)?;
-    crate::domain::validate_version(version_str)?;
+    crate::registry::rules::rules_of(crate::domain::Format::Go)?.validate(module_name)?;
+    crate::registry::rules::rules_of(crate::domain::Format::Go)?.validate_version(version_str)?;
 
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_can_write(&*state.permissions, &repo, &auth_user).await?;

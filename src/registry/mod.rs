@@ -3,6 +3,7 @@ pub mod go;
 pub mod npm;
 pub mod oci;
 pub mod resolve;
+pub mod rules;
 
 use std::collections::HashMap;
 

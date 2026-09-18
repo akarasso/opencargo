@@ -45,7 +45,7 @@ fn parse_reference(reference: &str) -> AppResult<String> {
     if is_digest(reference) {
         parse_digest(reference)
     } else {
-        crate::domain::validate_oci_tag(reference)?;
+        crate::registry::rules::rules_of(crate::domain::Format::Oci)?.validate_version(reference)?;
         Ok(reference.to_string())
     }
 }

@@ -4,6 +4,7 @@
 
 pub mod error;
 pub mod events;
+pub mod format_rules;
 pub mod kinds;
 pub mod names;
 pub mod permission;
@@ -19,6 +20,7 @@ pub use error::{Action, DomainError, Resource};
 pub use events::{
     announce, Audience, DomainEvent, PackagePromotion, PackageRelease, ResolutionCounts,
 };
+pub use format_rules::FormatRules;
 pub use kinds::{Format, RepoKind, Visibility};
 pub use names::{
     validate_npm_read_name, validate_oci_tag, validate_package_name, validate_version,

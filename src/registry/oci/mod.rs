@@ -67,7 +67,7 @@ impl OciRef {
     pub fn parse(params: &HashMap<String, String>) -> AppResult<Self> {
         let repo = param(params, "repo")?;
         let name = param(params, "name")?;
-        crate::domain::validate_package_name("oci", name)?;
+        crate::registry::rules::rules_of(crate::domain::Format::Oci)?.validate(name)?;
         Ok(Self {
             repo: repo.to_string(),
             name: name.to_string(),

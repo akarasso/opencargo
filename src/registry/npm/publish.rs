@@ -89,7 +89,7 @@ pub async fn publish_package(
 
     let repo_name = super::param(&params, "repo")?;
     let package_name = extract_package_name(&params);
-    crate::domain::validate_package_name("npm", &package_name)?;
+    crate::registry::rules::rules_of(crate::domain::Format::Npm)?.validate(&package_name)?;
     if body.name != package_name {
         return Err(AppError::BadRequest(format!(
             "package name in body ('{}') does not match URL ('{}')",
@@ -144,7 +144,7 @@ async fn plan_versions(
         .await?;
     let mut steps = Vec::with_capacity(body.versions.len());
     for (version_str, version_meta) in &body.versions {
-        crate::domain::validate_version(version_str)?;
+        crate::registry::rules::rules_of(crate::domain::Format::Npm)?.validate_version(version_str)?;
 
         // A publish carries a tarball attachment; `npm deprecate` does not.
         let attachment = find_attachment_key(&body.attachments, package_name, version_str)
