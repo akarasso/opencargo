@@ -125,6 +125,9 @@ pub enum Source {
     Go {
         digest: Option<String>,
     },
+    Nuget {
+        digest: Option<String>,
+    },
     Oci {
         body: Cached,
         served: Option<Cached>,

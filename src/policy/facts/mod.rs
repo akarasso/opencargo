@@ -74,6 +74,10 @@ pub(crate) async fn gather(shared: &Shared, cfg: &PolicyConfig, p: Pending) -> R
             facts.date_source = source;
             (digest, version, at)
         }
+        Source::Nuget { digest } => {
+            facts.date_source = "none";
+            (digest, version, None)
+        }
         Source::Oci {
             body,
             served,

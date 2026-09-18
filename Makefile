@@ -54,7 +54,7 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 		--test go_test --test go_proxy_test --test oci_test --test oci_nested_test --test oci_proxy_test \
 		--test vuln_test --test group_resolver_test --test auth_test --test features_test \
 		--test promote_test --test permissions_test --test policy_test \
-		--test nuget_test --test nuget_feed_store_test
+		--test nuget_test --test nuget_feed_store_test --test nuget_proxy_test
 
 test-load: ## Test de charge du writer policy (5 000 evenements a 500/s, ~16 s)
 	cargo test --lib burst_over_cold_rate_drops_nothing -- --ignored
