@@ -123,12 +123,12 @@ engine, in audit mode first**: rules versioned with your code
 `license in [AGPL]`), evaluated at resolution time, scoped per repository so
 internal packages are not judged like public ones. The first deliverable is a
 weekly report of *what would have been blocked*, before anything is actually
-blocked. Then PyPI, migration importers from Nexus / Artifactory / Verdaccio /
+blocked. Then migration importers from Nexus / Artifactory / Verdaccio /
 GitHub Packages, and governance of MCP servers and agent skills distributed
 through npm, PyPI and OCI.
 
-The registry and audit mode are and will stay MIT. Organisation-level
-enforcement (quarantine, approvals, SSO, audit exports, compliance reports)
+The registry, audit mode and OIDC SSO are and will stay MIT. Organisation-level
+enforcement (quarantine, approvals, audit exports, compliance reports)
 is planned as a paid add-on for self-hosted deployments. If you run opencargo
 and would talk for 30 minutes about what you would want blocked, open an
 issue or write to the address in `SECURITY.md`.
@@ -150,10 +150,9 @@ issue or write to the address in `SECURITY.md`.
 
 Read this before the comparison table sells you anything.
 
-- No PyPI, Maven or NuGet. If you need those today, Forgejo Packages or Nexus
-  are better choices.
-- Storage is local disk (a volume or PVC), no S3 backend yet. No SSO; users
-  and tokens are local.
+- PyPI, Maven and NuGet (hosted, proxy, group), S3-compatible storage and
+  OIDC SSO are new and in preview: tested in CI, not yet validated on a
+  second deployment. The comparison table above does not count them yet.
 - The Go checksum database is not proxied: exclude private modules with
   `GONOSUMDB` or run with `GOSUMDB=off`. `go` gets a `404` for an unknown
   module and moves on to the next `GOPROXY` entry, but a `502` (upstream down)
