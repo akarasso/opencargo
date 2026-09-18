@@ -305,6 +305,64 @@ async fn delete_version_enqueues_and_deletes_nothing_under_an_identical_publish(
 }
 
 #[tokio::test]
+async fn delete_version_under_an_identical_publish_whose_pin_is_pruned_rewrites_fresh() {
+    let fx = Fx::new().await;
+    let first = fx.publisher().run(artifact(fx.repo, "1.0.0", b"same"), Utc::now()).await.unwrap();
+    let reused = first.version.tarball_path.clone();
+    let packages = fx.store.packages();
+    let entries = [Entry {
+        logical_key: reused.rsplit_once('~').unwrap().0.to_string(),
+        source: Source::Bytes(Bytes::from_static(b"same")),
+    }];
+    let attempts = AtomicUsize::new(0);
+    let landed = fx
+        .placer()
+        .place_shared(
+            &fx.prefix,
+            &entries,
+            |pins| {
+                let (fx, packages, first, attempts) = (&fx, packages.clone(), &first, &attempts);
+                async move {
+                    if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+                        assert_eq!(pins[0].physical_key, first.version.tarball_path, "G is reused");
+                        packages.delete_version(first.version.id, Utc::now()).await.unwrap();
+                        let now = Utc::now();
+                        let claim = fx
+                            .store
+                            .reclaim()
+                            .claim(&pins[0].physical_key, Duration::ZERO, now, now + TimeDelta::minutes(5))
+                            .await
+                            .unwrap();
+                        assert_eq!(claim, Claim::Pinned, "the publisher's pin protects G");
+                        let report = crate::app::reclaim::ReclaimOrphans::new(
+                            fx.store.reclaim(),
+                            fx.store.referenced(),
+                            Arc::new(fx.storage.clone()),
+                            crate::app::reclaim::ReclaimPolicy::default(),
+                        )
+                        .run(Utc::now() + TimeDelta::hours(3))
+                        .await;
+                        assert_eq!((report.pruned_pins, report.reclaimed), (1, 1), "{report:?}");
+                        assert!(!fx.storage.contains(&pins[0].physical_key), "G is gone");
+                    }
+                    let answer = packages.publish_version(&release(fx.repo, "1.0.0", &pins)).await;
+                    if attempts.load(Ordering::SeqCst) == 1 {
+                        assert!(matches!(answer, Err(StoreError::Superseded(_))), "{answer:?}");
+                    }
+                    answer
+                }
+            },
+            Utc::now(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(attempts.load(Ordering::SeqCst), 2, "superseded once, then committed");
+    assert_ne!(landed.version.tarball_path, reused, "a fresh generation");
+    assert_eq!(fx.storage.get(&landed.version.tarball_path).await.unwrap().as_ref(), b"same");
+    assert_eq!(fx.row("1.0.0").await, Some(landed.version.tarball_path));
+}
+
+#[tokio::test]
 async fn draft_placement_relocates_under_pin_and_enqueues_on_superseded() {
     let fx = Fx::new().await;
     let placer = fx.placer();
