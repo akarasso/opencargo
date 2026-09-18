@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget test-e2e-import clean frontend release docker deploy undeploy logs publish lint fmt
 
 # Load .env if it exists
 -include .env
@@ -91,6 +91,9 @@ test-e2e-maven: ## E2E mvn et gradle (MVN_BIN, GRADLE_BIN pour un Gradle >= 8)
 
 test-e2e-nuget: ## E2E dotnet (DOTNET_BIN, ou scripts/dotnet-in-docker)
 	DOTNET_BIN=$${DOTNET_BIN:-$(CURDIR)/scripts/dotnet-in-docker} OPENCARGO_E2E_REQUIRE=1 cargo test --test nuget_e2e_test dotnet
+
+test-e2e-import: ## E2E import contre Verdaccio, Nexus et registry:2 en conteneurs (docker requis)
+	OPENCARGO_E2E_CONTAINERS=1 OPENCARGO_E2E_REQUIRE=1 cargo test --test import_e2e_test
 
 lint: ## Lancer clippy
 	cargo clippy -- -D warnings

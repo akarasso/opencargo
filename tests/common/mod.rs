@@ -4,6 +4,7 @@
 
 #![allow(dead_code)]
 
+pub mod containers;
 pub mod contract;
 pub mod fake_idp;
 pub mod fake_source;

@@ -253,7 +253,7 @@ impl Source for Nexus {
                                 Origin::Asset {
                                     endpoint: redact(&self.url("repository/")?),
                                     repo: stream.to_string(),
-                                    path: s(&asset, "path").unwrap_or_default(),
+                                    path: s(&asset, "path").unwrap_or_default().trim_start_matches('/').to_string(),
                                 },
                                 digests(&asset),
                                 false,
@@ -317,7 +317,7 @@ impl Source for Nexus {
                         origin: Origin::Asset {
                             endpoint: redact(&self.url("repository/")?),
                             repo: stream.to_string(),
-                            path: s(&asset, "path").unwrap_or_default(),
+                            path: s(&asset, "path").unwrap_or_default().trim_start_matches('/').to_string(),
                         },
                         pkg: PkgExtra::default(),
                         extra: VersionExtra::default(),

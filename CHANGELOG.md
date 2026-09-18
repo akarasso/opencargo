@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `opencargo import run|resume|status|report|permissions|forget`, a preview:
+  copies Verdaccio, Nexus, Artifactory, GitHub Packages and any OCI
+  distribution registry (npm, cargo, go, OCI) into hosted repositories over
+  opencargo's own publish protocols, resumable from a state file, with a gap
+  report whose kinds set the exit code. See `docs/import.md`.
+- The cargo sparse index now carries `v` and `rust_version` when a publish
+  declared them.
 - S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
   validated against MinIO, not yet against a hosted provider. Credentials
   come only from an allowlisted environment; TLS trusts the compiled-in

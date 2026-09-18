@@ -123,9 +123,10 @@ engine, in audit mode first**: rules versioned with your code
 `license in [AGPL]`), evaluated at resolution time, scoped per repository so
 internal packages are not judged like public ones. The first deliverable is a
 weekly report of *what would have been blocked*, before anything is actually
-blocked. Then migration importers from Nexus / Artifactory / Verdaccio /
-GitHub Packages, and governance of MCP servers and agent skills distributed
-through npm, PyPI and OCI.
+blocked. Migration importers from Nexus / Artifactory / Verdaccio /
+GitHub Packages are in preview (`opencargo import`, see
+[docs/import.md](docs/import.md)); governance of MCP servers and agent
+skills distributed through npm, PyPI and OCI comes after.
 
 The registry, audit mode and OIDC SSO are and will stay MIT. Organisation-level
 enforcement (quarantine, approvals, audit exports, compliance reports)
@@ -529,6 +530,9 @@ group whose proxy member fronts another instance; locally they print
 
 - [docs/api.md](docs/api.md): every HTTP route, the WebSocket protocol, webhook
   payloads and Prometheus metrics.
+- [docs/import.md](docs/import.md): `opencargo import`, copying Nexus,
+  Artifactory, Verdaccio, GitHub Packages or any OCI registry into opencargo,
+  and the gap report.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).
