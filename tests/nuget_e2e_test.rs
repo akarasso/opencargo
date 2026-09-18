@@ -9,7 +9,8 @@
 //!
 //! Skipped unless `DOTNET_BIN` (or `dotnet` on PATH) runs, a failure under
 //! `OPENCARGO_E2E_REQUIRE=1`; `scripts/dotnet-in-docker` is a pinned SDK
-//! image that can stand in. The proxy needs `docker`.
+//! image that can stand in, `scripts/nuget-in-docker` a pinned Mono image
+//! running the `nuget.exe` that `NUGET_EXE` names. The proxy needs `docker`.
 
 mod common;
 
