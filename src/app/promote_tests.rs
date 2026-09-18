@@ -205,3 +205,39 @@ async fn claimed_draft_fails_promote_retryably() {
         .await;
     assert!(again.is_ok(), "a retry goes through: {again:?}");
 }
+
+#[tokio::test]
+async fn failed_promote_during_identical_publish_keeps_bytes() {
+    let fx = Fx::new().await;
+    let sha = format!("{:x}", Sha256::digest(b"tgz!"));
+    let recorded = fx.staged(Some(&sha)).await;
+    let published = fx
+        .promote()
+        .run(request(&recorded, &fx.target, &[]), alex(), DateTime::UNIX_EPOCH)
+        .await
+        .unwrap();
+
+    for source in [fx.staged(Some(&sha)).await, fx.staged(None).await] {
+        let refused = fx
+            .promote()
+            .run(request(&source, &fx.target, &[]), alex(), DateTime::UNIX_EPOCH)
+            .await
+            .unwrap_err();
+        assert!(is_conflict(&refused), "{refused:?}");
+        assert_eq!(
+            fx.store.candidates(),
+            vec![published.tarball_path.clone()],
+            "the loser wrote onto the reused generation and enqueued it"
+        );
+        let report = crate::app::reclaim::ReclaimOrphans::new(
+            fx.store.reclaim(),
+            fx.store.referenced(),
+            Arc::new(fx.storage.clone()),
+            crate::app::reclaim::ReclaimPolicy::default(),
+        )
+        .run(Utc::now() + TimeDelta::hours(3))
+        .await;
+        assert_eq!((report.reclaimed, report.referenced), (0, 1), "{report:?}");
+        assert_eq!(fx.storage.get(&published.tarball_path).await.unwrap().as_ref(), b"tgz!");
+    }
+}
