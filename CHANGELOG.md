@@ -5,6 +5,13 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Maven repositories under `/maven/{repo}/`: hosted (deploy with `mvn` or
+  Gradle's `maven-publish`), proxy and group. A deposit is visible once its
+  POM lands; checksums served are always computed by the server, and a
+  declared checksum that disagrees with the file is refused. A version
+  deposited without a POM is published after ten minutes unless another
+  user contested it, in which case an administrator decides through
+  `POST /api/v1/maven/{repo}/decide`.
 - The `maven` repository format. Migration 024 admits it and refuses to run
   while a repository is named `maven`, because `/maven/` becomes the Maven
   endpoint: rename that repository with the previous release before
