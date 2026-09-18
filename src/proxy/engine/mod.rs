@@ -485,6 +485,16 @@ impl ProxyEngine {
         Ok(self.storage.get(path).await?)
     }
 
+    /// The cached body as a stream, for a caller that digests what it serves.
+    pub async fn read_stream(&self, c: &Cached) -> AppResult<crate::storage::ReadStream> {
+        let path = c
+            .entry
+            .storage_path
+            .as_deref()
+            .ok_or_else(|| AppError::BadGateway("cache row has no file".into()))?;
+        Ok(self.storage.read_stream(path).await?)
+    }
+
     pub async fn stream_response(
         &self,
         p: &Payload,

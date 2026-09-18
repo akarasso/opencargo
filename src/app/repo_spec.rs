@@ -57,6 +57,18 @@ fn validate_name(name: &str) -> AppResult<()> {
     )))
 }
 
+/// Refuse a new name that a protocol adapter mounts as a path prefix: the
+/// list comes from the composition root, which collects it from the
+/// adapters.
+pub fn refuse_reserved(name: &str, reserved: &[&str]) -> AppResult<()> {
+    if reserved.contains(&name) {
+        return Err(AppError::BadRequest(format!(
+            "invalid repository name '{name}': reserved, /{name}/ is a protocol endpoint"
+        )));
+    }
+    Ok(())
+}
+
 /// Refuse a repository definition that could not be served or purged: name
 /// rule, kind supported by the format, upstream on proxies only, members on
 /// groups only, each member existing (in the DB or `pending`, the config list

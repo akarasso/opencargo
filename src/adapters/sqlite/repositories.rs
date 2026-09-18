@@ -154,7 +154,12 @@ async fn retire_row(
             .bind(repo)
             .fetch_one(&mut **tx)
             .await?;
-    if packages > 0 {
+    let maven: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM maven_values WHERE repository_id = ?1")
+            .bind(repo)
+            .fetch_one(&mut **tx)
+            .await?;
+    if packages > 0 || maven > 0 {
         return Ok(Err(StoreError::Conflict));
     }
     match holders(tx, name).await? {

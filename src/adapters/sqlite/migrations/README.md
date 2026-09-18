@@ -42,7 +42,7 @@ checksum in the same commit.
 | 021 | - | sso.md (sso) | - |
 | 022 | - | ha-options.md (server_leases) | - |
 | 023 | - | mcp-governance.md (mcp, reusing 020's rebuild) | - |
-| 024 | - | maven.md (maven format, through the shared rebuild helper) | - |
+| 024 | 024_maven.sql | maven.md (maven format through the shared rebuild helper `rebuild::widen_formats`, port 18 tables) | 58ca2fdd771fe0dc453d1c21499855df9f303d520f85451b7b508c907170b95d |
 | 025 | 025_reclaim.sql | s3.md S2r (reclamation, incarnations, retired prefixes) | aec372d3addae7af66c944632d4296f5041b659c5971a5f97569eef8aa8f2654 |
 
 Ids from 018 on are order-independent: none reads or alters a table another

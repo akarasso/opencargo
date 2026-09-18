@@ -12,7 +12,7 @@ use chrono::{DateTime, Utc};
 
 use crate::app::audit::{self, Actor};
 use crate::app::reclaim::ReclaimOrphans;
-use crate::app::repo_spec::validate_spec;
+use crate::app::repo_spec::{refuse_reserved, validate_spec};
 use crate::domain::{
     layout, Audience, DomainEvent, Format, RepoConfig, RepoKind, RepoSpec, Repository, Visibility,
 };
@@ -58,6 +58,7 @@ pub struct CreateRepository {
     audit: Arc<dyn AuditStore>,
     events: Arc<dyn Events>,
     storage: Option<Arc<dyn StorageBackend>>,
+    reserved: &'static [&'static str],
 }
 
 impl CreateRepository {
@@ -71,7 +72,15 @@ impl CreateRepository {
             audit,
             events,
             storage: None,
+            reserved: &[],
         }
+    }
+
+    /// The path prefixes the protocol adapters mount, which no new
+    /// repository may take as its name.
+    pub fn reserving(mut self, names: &'static [&'static str]) -> Self {
+        self.reserved = names;
+        self
     }
 
     /// Refuse a name whose name-keyed prefixes still hold bytes: the only
@@ -113,6 +122,7 @@ impl CreateRepository {
                 spec.name
             )));
         }
+        refuse_reserved(spec.name, self.reserved)?;
         validate_spec(self.repos.as_ref(), spec, &[]).await?;
         if let Some(prefix) = self.legacy_bytes(spec.name).await? {
             return Err(AppError::Conflict(format!(
@@ -338,6 +348,23 @@ mod tests {
         assert!(matches!(refused, AppError::BadRequest(_)), "{refused:?}");
         assert!(db.repositories().all().await.unwrap().is_empty());
         assert!(db.audit_rows().is_empty());
+    }
+
+    /// A name an adapter mounts is refused before the write, whatever the
+    /// format; the same name is free where nothing reserves it.
+    #[tokio::test]
+    async fn a_reserved_name_is_refused_before_the_write() {
+        let db = FakeDb::new();
+        let refused = CreateRepository::new(db.repositories(), db.audit(), crate::server::event_bus())
+            .reserving(crate::server::RESERVED_NAMES)
+            .run(&spec("maven", &[]), &by(), Utc::now())
+            .await
+            .unwrap_err();
+
+        assert!(matches!(refused, AppError::BadRequest(ref m) if m.contains("reserved")), "{refused:?}");
+        assert!(db.repositories().all().await.unwrap().is_empty());
+        assert!(db.audit_rows().is_empty());
+        create(&db, &spec("maven", &[])).await.unwrap();
     }
 
     /// What a delete consults before it asks the store: the groups still

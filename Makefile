@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven clean frontend release docker deploy undeploy logs publish lint fmt
 
 # Load .env if it exists
 -include .env
@@ -54,7 +54,8 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 		--test go_test --test go_proxy_test --test oci_test --test oci_nested_test --test oci_proxy_test \
 		--test vuln_test --test group_resolver_test --test auth_test --test features_test \
 		--test promote_test --test permissions_test --test policy_test \
-		--test pypi_test --test pypi_store_test --test pypi_proxy_test
+		--test pypi_test --test pypi_store_test --test pypi_proxy_test \
+		--test maven_test --test maven_proxy_test
 
 test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
 	scripts/test-s3.sh
@@ -68,9 +69,9 @@ test-network: ## Tests contre npmjs.org / osv.dev (OPENCARGO_NETWORK_TESTS=1)
 test-docker: ## Tests Docker/OCI (HTTP, sans client docker)
 	cargo test --test oci_test --test oci_nested_test --test oci_proxy_test --test docker_e2e_test
 
-test-e2e: ## Tests E2E avec les vrais clients (pnpm, cargo, go, docker requis)
+test-e2e: ## Tests E2E avec les vrais clients (pnpm, cargo, go, docker, mvn, gradle requis)
 	OPENCARGO_E2E_REQUIRE=1 cargo test --test pnpm_e2e_test --test e2e_scoped_test \
-		--test cargo_e2e_test --test go_e2e_test --test docker_cli_e2e_test
+		--test cargo_e2e_test --test go_e2e_test --test docker_cli_e2e_test --test maven_e2e_test
 
 test-e2e-cargo: ## E2E cargo (client cargo requis, ou CARGO_BIN)
 	OPENCARGO_E2E_REQUIRE=1 cargo test --test cargo_e2e_test
@@ -80,6 +81,9 @@ test-e2e-go: ## E2E go (client go requis, ou GO_BIN)
 
 test-e2e-docker: ## E2E docker CLI (client docker requis, ou DOCKER_BIN)
 	OPENCARGO_E2E_REQUIRE=1 cargo test --test docker_cli_e2e_test
+
+test-e2e-maven: ## E2E mvn et gradle (MVN_BIN, GRADLE_BIN pour un Gradle >= 8)
+	OPENCARGO_E2E_REQUIRE=1 cargo test --test maven_e2e_test
 
 lint: ## Lancer clippy
 	cargo clippy -- -D warnings

@@ -19,6 +19,8 @@ use tracing::{info, warn};
 
 use crate::adapters::sqlite::SqliteStores;
 use crate::app::events::Announce;
+use crate::app::maven::deposit::MavenDeposits;
+use crate::app::maven::versions::MavenVersions;
 use crate::app::place::Placer;
 use crate::app::promote::PromoteVersion;
 use crate::app::publish::PublishVersion;
@@ -42,6 +44,7 @@ use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
 use crate::ports::events::Events;
 use crate::ports::ids::Ids;
+use crate::ports::maven::MavenFileStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
@@ -105,6 +108,7 @@ pub struct AppState {
     pub archive_permits: Arc<tokio::sync::Semaphore>,
     /// Parsed upstream PyPI pages, shared by the leaves and the policy facts.
     pub pypi_pages: Arc<crate::registry::pypi::memo::PageMemo>,
+    pub maven: Arc<dyn MavenFileStore>,
     pub reclaim: Arc<dyn ReclaimStore>,
     pub referenced: Arc<dyn ReferencedKeys>,
     pub multipart: Arc<dyn MultipartLedger>,
@@ -168,6 +172,45 @@ impl AppState {
         )
     }
 
+    /// Maven's versions rows, announced through the shared publish tail.
+    pub fn maven_versions(&self) -> Arc<MavenVersions> {
+        Arc::new(MavenVersions::new(
+            self.maven.clone(),
+            self.packages.clone(),
+            self.repos.clone(),
+            self.storage.clone(),
+            Arc::new(self.publish_tail()),
+            crate::registry::maven::pom::metadata_json,
+        ))
+    }
+
+    pub fn maven_deposits(&self) -> MavenDeposits {
+        MavenDeposits::new(
+            self.repos.clone(),
+            self.storage.clone(),
+            self.placer(),
+            self.maven_versions(),
+        )
+    }
+
+    /// Every format's reconciler, for `RunCleanup` to iterate.
+    pub fn reconcilers(&self) -> Vec<Arc<dyn crate::app::reconcile::Reconciler>> {
+        vec![Arc::new(crate::app::maven::reconcile::MavenReconcile::new(
+            self.maven_versions(),
+            MAVEN_PROMOTION_WINDOW,
+            1000,
+            crate::registry::maven::hosted::scopes_of_unit,
+        ))]
+    }
+
+    pub fn decide_maven_unit(&self) -> crate::app::maven::admin::DecideUnit {
+        crate::app::maven::admin::DecideUnit::new(
+            self.maven_versions(),
+            self.audit.clone(),
+            self.events.clone(),
+        )
+    }
+
     /// The only deleter of shared keys, over this state's stores.
     pub fn reclaim_orphans(&self) -> ReclaimOrphans {
         ReclaimOrphans::new(
@@ -184,6 +227,14 @@ impl AppState {
         Announce::new(self.events.clone(), self.repos.clone())
     }
 }
+
+/// How long a Maven unit deposited without its POM waits before
+/// `RunCleanup` may make it visible.
+const MAVEN_PROMOTION_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
+
+/// The path prefixes the protocol adapters mount under the root, which no
+/// new repository may be named after.
+pub const RESERVED_NAMES: &[&str] = &[crate::registry::maven::MOUNT];
 
 /// Migrate a database and nothing else: the `opencargo migrate` subcommand, so
 /// the binary reaches the adapter through the composition root rather than
@@ -517,6 +568,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         pypi: stores.pypi(),
         archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
         pypi_pages: Arc::new(crate::registry::pypi::memo::PageMemo::default()),
+        maven: stores.maven(),
         reclaim: stores.reclaim(),
         referenced: stores.referenced(),
         multipart: stores.multipart(),
@@ -562,6 +614,7 @@ fn auth_state(
             }),
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
             Arc::new(crate::registry::pypi::auth_rules::PypiRouteRules),
+            Arc::new(crate::registry::maven::auth_rules::MavenRouteRules),
         ],
         trusted_proxies: config.auth.trusted_proxies.clone(),
     })
@@ -721,6 +774,10 @@ async fn seed_repositories(
     // names a member seeded earlier in this same pass must see its row, or a
     // mutual membership would validate as two pending entries and be seeded.
     for spec in &specs {
+        if store.by_name(spec.name).await?.is_none() {
+            crate::app::repo_spec::refuse_reserved(spec.name, RESERVED_NAMES)
+                .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;
+        }
         crate::app::repo_spec::validate_spec(store, spec, &pending)
             .await
             .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;
@@ -853,6 +910,7 @@ pub fn build_router(state: AppState) -> Router {
         )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
         .route("/api/v1/system/storage", get(crate::api::storage::storage_status))
+        .route("/api/v1/maven/{repo}/decide", post(crate::api::maven::decide))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),
@@ -954,6 +1012,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::go::routes::routes())
         .merge(crate::registry::pypi::routes::routes())
         .merge(crate::registry::oci::routes::routes())
+        .merge(crate::registry::maven::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
         .merge(dashboard_routes)

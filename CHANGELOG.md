@@ -13,6 +13,17 @@ All notable changes to this project will be documented in this file.
   `GET /api/v1/system/storage` with a Storage tile on the System page.
 - OCI: `GET` on an upload location reports its range; the upload `POST`
   answers `OCI-Chunk-Min-Length`.
+- Maven repositories under `/maven/{repo}/`: hosted (deploy with `mvn` or
+  Gradle's `maven-publish`), proxy and group. A deposit is visible once its
+  POM lands; checksums served are always computed by the server, and a
+  declared checksum that disagrees with the file is refused. A version
+  deposited without a POM is published after ten minutes unless another
+  user contested it, in which case an administrator decides through
+  `POST /api/v1/maven/{repo}/decide`.
+- The `maven` repository format. Migration 024 admits it and refuses to run
+  while a repository is named `maven`, because `/maven/` becomes the Maven
+  endpoint: rename that repository with the previous release before
+  upgrading. `maven` is a reserved repository name from now on.
 
 ### Changed
 - OCI: a `PATCH` whose `Content-Range` does not start where the upload

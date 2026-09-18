@@ -128,7 +128,7 @@ pub fn shipped(format: Format) -> Option<&'static Lists> {
                 include_str!("../lists/known/pypi.txt"),
             )
         }),
-        Format::Oci => return None,
+        Format::Oci | Format::Maven => return None,
     })
 }
 

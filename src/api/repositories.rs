@@ -65,6 +65,7 @@ pub async fn create_repository(
 
     let repo = CreateRepository::new(state.repos.clone(), state.audit.clone(), state.events.clone())
         .guarding(state.storage.clone())
+        .reserving(crate::server::RESERVED_NAMES)
         .run(
             &RepoSpec {
                 name: &body.name,

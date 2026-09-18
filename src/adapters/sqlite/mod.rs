@@ -22,6 +22,7 @@ use crate::ports::audit::AuditStore;
 use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
 use crate::ports::multipart::MultipartLedger;
+use crate::ports::maven::MavenFileStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
@@ -40,6 +41,7 @@ use crate::ports::webhooks::WebhookStore;
 pub mod audit;
 pub mod dashboard;
 pub mod deps;
+pub mod maven;
 pub mod migrate;
 pub mod multipart;
 pub mod oci;
@@ -49,6 +51,7 @@ pub mod policy;
 pub mod proxy_cache;
 pub mod pypi;
 pub mod reclaim;
+pub mod rebuild;
 pub mod repositories;
 pub mod rows;
 pub mod search;
@@ -319,6 +322,10 @@ impl SqliteStores {
 
     pub fn referenced(&self) -> Arc<dyn ReferencedKeys> {
         Arc::new(reclaim::SqliteReferencedKeys::new(self.pool.clone()))
+    }
+
+    pub fn maven(&self) -> Arc<dyn MavenFileStore> {
+        Arc::new(maven::SqliteMavenFileStore::new(self.pool.clone()))
     }
 
     pub fn dashboard(&self) -> Arc<dyn DashboardRead> {

@@ -4,6 +4,7 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use tracing::{error, info, warn};
 
+use crate::app::reconcile::{Reconciled, Reconciler};
 use crate::config::CleanupConfig;
 use crate::ports::clock::Clock;
 use crate::ports::packages::PackageStore;
@@ -32,6 +33,48 @@ pub(crate) struct CleanupStats {
     pub prereleases: Option<u64>,
     pub proxy: Option<SweepStats>,
     pub policy: Option<u64>,
+    pub reconciled: Vec<(&'static str, crate::app::reconcile::Item)>,
+}
+
+/// How often the registered reconcilers run: a Maven unit waits this long
+/// past its promotion window at most.
+const RECONCILE_EVERY: Duration = Duration::from_secs(60);
+
+/// The reconcilers the composition root registered, on their own period:
+/// they repair within minutes what the daily sweeps would leave for a day.
+pub async fn start_reconcile_task(reconcilers: Vec<Arc<dyn Reconciler>>, clock: Arc<dyn Clock>) {
+    if reconcilers.is_empty() {
+        return;
+    }
+    loop {
+        reconcile(&reconcilers, clock.now()).await;
+        tokio::time::sleep(RECONCILE_EVERY).await;
+    }
+}
+
+/// Every reconciler's pass, each item logged; a failed item never stops a
+/// pass, and a failed reconciler never stops the next one.
+pub(crate) async fn reconcile(
+    reconcilers: &[Arc<dyn Reconciler>],
+    now: DateTime<Utc>,
+) -> Vec<(&'static str, crate::app::reconcile::Item)> {
+    let mut all = Vec::new();
+    for r in reconcilers {
+        for item in r.pass(now).await {
+            match &item.outcome {
+                Reconciled::Repaired => info!(reconciler = r.name(), item = %item.name, "repaired"),
+                Reconciled::Clean => {}
+                Reconciled::Skipped(why) => {
+                    info!(reconciler = r.name(), item = %item.name, why = %why, "left as is")
+                }
+                Reconciled::Failed(why) => {
+                    warn!(reconciler = r.name(), item = %item.name, error = %why, "not repaired; next pass")
+                }
+            }
+            all.push((r.name(), item));
+        }
+    }
+    all
 }
 
 fn proxy_idle_days(config: &CleanupConfig) -> Option<u64> {
@@ -60,6 +103,7 @@ pub async fn start_cleanup_task(
     reclaim: Arc<dyn ReclaimStore>,
     clock: Arc<dyn Clock>,
     config: CleanupConfig,
+    reconcilers: Vec<Arc<dyn Reconciler>>,
 ) {
     if !sweeps_configured(&config) {
         info!("Cleanup task is disabled");
@@ -75,6 +119,7 @@ pub async fn start_cleanup_task(
             cache: cache.as_ref(),
             policy: policy.as_ref(),
             reclaim: reclaim.as_ref(),
+            reconcilers: &reconcilers,
         };
         sweeps.run(&config, clock.now()).await;
         tokio::time::sleep(Duration::from_secs(86400)).await;
@@ -87,6 +132,7 @@ pub(crate) struct RunCleanup<'a> {
     pub cache: &'a dyn ProxyCacheStore,
     pub policy: &'a dyn PolicyStore,
     pub reclaim: &'a dyn ReclaimStore,
+    pub reconcilers: &'a [Arc<dyn Reconciler>],
 }
 
 impl RunCleanup<'_> {
@@ -117,6 +163,8 @@ impl RunCleanup<'_> {
                 Err(e) => error!(error = %e, "Failed to sweep the policy report"),
             }
         }
+
+        stats.reconciled = reconcile(self.reconcilers, now).await;
         stats
     }
 }
@@ -257,6 +305,7 @@ mod tests {
                 cache: self.cache.as_ref(),
                 policy: self.policy.as_ref(),
                 reclaim: self.reclaim.as_ref(),
+                reconcilers: &[],
             }
         }
 
@@ -558,5 +607,47 @@ mod tests {
         let stats = fx.sweeps().run(&off, now()).await;
         assert_eq!(stats.policy, None);
         assert_eq!(fx.policy_left().await.0.len(), 2);
+    }
+
+    struct Scripted(&'static str, Vec<Reconciled>);
+
+    #[async_trait::async_trait]
+    impl Reconciler for Scripted {
+        fn name(&self) -> &'static str {
+            self.0
+        }
+
+        async fn pass(&self, _now: DateTime<Utc>) -> Vec<crate::app::reconcile::Item> {
+            self.1
+                .iter()
+                .enumerate()
+                .map(|(i, outcome)| crate::app::reconcile::Item {
+                    name: format!("{}-{i}", self.0),
+                    outcome: outcome.clone(),
+                })
+                .collect()
+        }
+    }
+
+    /// `RunCleanup` knows no format: it runs whatever was registered, and a
+    /// failed item or reconciler stops neither the pass nor the next one.
+    #[tokio::test]
+    async fn every_registered_reconciler_runs_and_reports_every_item() {
+        let fx = fixture().await;
+        let reconcilers: Vec<Arc<dyn Reconciler>> = vec![
+            Arc::new(Scripted("a", vec![Reconciled::Failed("boom".into()), Reconciled::Repaired])),
+            Arc::new(Scripted("b", vec![Reconciled::Skipped("conflict".into())])),
+        ];
+        let sweeps = RunCleanup {
+            reconcilers: &reconcilers,
+            ..fx.sweeps()
+        };
+        let stats = sweeps.run(&CleanupConfig::default(), now()).await;
+        let names: Vec<(&str, String)> = stats
+            .reconciled
+            .iter()
+            .map(|(r, item)| (*r, item.name.clone()))
+            .collect();
+        assert_eq!(names, [("a", "a-0".to_string()), ("a", "a-1".to_string()), ("b", "b-0".to_string())]);
     }
 }

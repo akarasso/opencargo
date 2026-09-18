@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::contract::{reclaim_contract, ReclaimHandles};
+use common::contract::{reclaim_contract, ReclaimHandles, Referencing};
 use common::fakes::FakeDb;
 use opencargo::adapters::sqlite::SqliteStores;
 use tempfile::TempDir;
@@ -13,8 +13,11 @@ async fn fake() -> ReclaimHandles {
     let db = FakeDb::new();
     ReclaimHandles::new(
         db.repositories(),
-        db.packages(),
-        db.oci(),
+        Referencing {
+            packages: db.packages(),
+            oci: db.oci(),
+            maven: db.maven(),
+        },
         db.reclaim(),
         db.referenced(),
         Box::new(db),
@@ -28,8 +31,11 @@ async fn sqlite() -> ReclaimHandles {
         .unwrap();
     ReclaimHandles::new(
         stores.repositories(),
-        stores.packages(),
-        stores.oci(),
+        Referencing {
+            packages: stores.packages(),
+            oci: stores.oci(),
+            maven: stores.maven(),
+        },
         stores.reclaim(),
         stores.referenced(),
         Box::new((tmp, stores)),

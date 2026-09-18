@@ -1773,24 +1773,32 @@ pub struct ReclaimHandles {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub oci: Arc<dyn OciStore>,
+    pub maven: Arc<dyn opencargo::ports::maven::MavenFileStore>,
     pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
     pub referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
     _keep: Box<dyn Any + Send>,
 }
 
+/// The referencing ports of `ReclaimHandles`.
+pub struct Referencing {
+    pub packages: Arc<dyn PackageStore>,
+    pub oci: Arc<dyn OciStore>,
+    pub maven: Arc<dyn opencargo::ports::maven::MavenFileStore>,
+}
+
 impl ReclaimHandles {
     pub fn new(
         repos: Arc<dyn RepositoryStore>,
-        packages: Arc<dyn PackageStore>,
-        oci: Arc<dyn OciStore>,
+        referencing: Referencing,
         reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
         referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
         keep: Box<dyn Any + Send>,
     ) -> Self {
         Self {
             repos,
-            packages,
-            oci,
+            packages: referencing.packages,
+            oci: referencing.oci,
+            maven: referencing.maven,
             reclaim,
             referenced,
             _keep: keep,
@@ -2243,6 +2251,46 @@ macro_rules! reclaim_contract {
             }
 
             #[tokio::test]
+            async fn maven_keys_agree_between_ports_18_and_23() {
+                use ::opencargo::ports::maven::{Digests, NewFile, UnitChange, UnitKey};
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let tokens = pin(&h, &prefix, &[&format!("{prefix}/g/a/x/a-1.jar")], 2).await;
+                let key = UnitKey { repository: r.id, ga: "g:a", version: "1", build: "" };
+                let digests = Digests::default();
+                h.maven
+                    .change(&UnitChange {
+                        key,
+                        revision: None,
+                        depositor: "alice",
+                        file: Some(NewFile {
+                            filename: "a-1.jar",
+                            physical_key: &tokens[0].physical_key,
+                            size: 1,
+                            digests: &digests,
+                            depositor: "alice",
+                        }),
+                        declarations: &[],
+                        contest: false,
+                        reveal: false,
+                        scopes: &[],
+                        pins: &tokens,
+                        now: at(2),
+                    })
+                    .await
+                    .unwrap();
+                let physical = tokens[0].physical_key.clone();
+                assert!(listed(&h, 10).await.contains(&physical));
+                h.reclaim.enqueue(std::slice::from_ref(&physical), at(1)).await.unwrap();
+                assert_eq!(claim(&h, &physical, 10).await, Claim::Referenced);
+
+                let released = h.maven.refuse(&key, 1, &[], at(11)).await.unwrap().released;
+                assert_eq!(released, vec![physical.clone()]);
+                assert!(!listed(&h, 13).await.contains(&physical));
+                assert!(matches!(claim(&h, &physical, 13).await, Claim::Claimed(_)));
+            }
+
+            #[tokio::test]
             async fn forgetting_a_retired_prefix_keeps_the_rest_retired() {
                 let h = $open().await;
                 let (_, prefix) = repo(&h, "r").await;
@@ -2560,3 +2608,432 @@ macro_rules! pypi_contract {
 
 #[allow(unused_imports)]
 pub(crate) use pypi_contract;
+
+/// What `maven_contract!` needs of an adapter: port 18, and the ports it
+/// fences with and contributes to.
+pub struct MavenHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub maven: Arc<dyn opencargo::ports::maven::MavenFileStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+    pub referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+    _keep: Box<dyn Any + Send>,
+}
+
+impl MavenHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        maven: Arc<dyn opencargo::ports::maven::MavenFileStore>,
+        reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+        referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            maven,
+            reclaim,
+            referenced,
+            _keep: keep,
+        }
+    }
+}
+
+/// `maven_contract!(name, opener)`: port 18 answers alike on every adapter.
+#[allow(unused_macros)]
+macro_rules! maven_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, TimeZone, Utc};
+            use ::futures_util::TryStreamExt;
+            use ::opencargo::domain::{layout, Format, RepoKind, RepoSpec, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::maven::{
+                ClientMetadata, Declaration, Digests, NewFile, SumAlgorithm, UnitChange, UnitKey,
+            };
+            use ::opencargo::ports::reclaim::{Claim, PinToken, Pinned};
+            use ::std::time::Duration;
+
+            const GRACE: Duration = Duration::from_secs(3600);
+            const GA: &str = "org.example:lib";
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 18, hour, 0, 0).unwrap()
+            }
+
+            fn digests(seed: &str) -> Digests {
+                Digests {
+                    sha1: format!("{seed}1"),
+                    md5: format!("{seed}5"),
+                    sha256: format!("{seed}256"),
+                    sha512: format!("{seed}512"),
+                }
+            }
+
+            async fn repo(h: &MavenHandles) -> (i64, String) {
+                let repo = h
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            name: "m",
+                            kind: RepoKind::Hosted,
+                            format: Format::Maven,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                let incarnation = h.repos.incarnation(repo.id).await.unwrap().unwrap();
+                (repo.id, layout::incarnation_prefix(&incarnation))
+            }
+
+            async fn pin(h: &MavenHandles, prefix: &str, logical: &str, until: u32) -> Vec<PinToken> {
+                match h.reclaim.pin(prefix, &[logical.to_string()], at(until)).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("{prefix} is live"),
+                }
+            }
+
+            fn key(repository: i64, version: &str) -> UnitKey<'_> {
+                UnitKey {
+                    repository,
+                    ga: GA,
+                    version,
+                    build: "",
+                }
+            }
+
+            fn scopes() -> Vec<String> {
+                vec![GA.to_string()]
+            }
+
+            struct Deposit<'a> {
+                repository: i64,
+                version: &'a str,
+                revision: Option<i64>,
+                filename: &'a str,
+                pins: &'a [PinToken],
+                digests: &'a Digests,
+                declarations: &'a [Declaration],
+                contest: bool,
+                reveal: bool,
+                scopes: &'a [String],
+                now: u32,
+            }
+
+            async fn deposit(h: &MavenHandles, d: Deposit<'_>) -> Result<::opencargo::ports::maven::Changed, StoreError> {
+                h.maven
+                    .change(&UnitChange {
+                        key: key(d.repository, d.version),
+                        revision: d.revision,
+                        depositor: "alice",
+                        file: d.pins.first().map(|p| NewFile {
+                            filename: d.filename,
+                            physical_key: &p.physical_key,
+                            size: 3,
+                            digests: d.digests,
+                            depositor: "alice",
+                        }),
+                        declarations: d.declarations,
+                        contest: d.contest,
+                        reveal: d.reveal,
+                        scopes: d.scopes,
+                        pins: d.pins,
+                        now: at(d.now),
+                    })
+                    .await
+            }
+
+            fn plain<'a>(
+                repository: i64,
+                revision: Option<i64>,
+                pins: &'a [PinToken],
+                digests: &'a Digests,
+                scopes: &'a [String],
+            ) -> Deposit<'a> {
+                Deposit {
+                    repository,
+                    version: "1.0",
+                    revision,
+                    filename: "lib-1.0.jar",
+                    pins,
+                    digests,
+                    declarations: &[],
+                    contest: false,
+                    reveal: false,
+                    scopes,
+                    now: 2,
+                }
+            }
+
+            async fn due(h: &MavenHandles) -> Vec<String> {
+                h.reclaim
+                    .due(Duration::ZERO, at(20), 100)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.key)
+                    .collect()
+            }
+
+            #[tokio::test]
+            async fn a_unit_round_trips_with_its_files_declarations_and_depositor() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let pins = pin(&h, &prefix, &format!("{prefix}/a"), 9).await;
+                let d = digests("a");
+                let declared = [Declaration {
+                    filename: "lib-1.0.pom".to_string(),
+                    algorithm: SumAlgorithm::Sha1,
+                    value: "ff".to_string(),
+                }];
+                let s = scopes();
+                let changed = deposit(&h, Deposit { declarations: &declared, ..plain(r, None, &pins, &d, &s) })
+                    .await
+                    .unwrap();
+                assert_eq!(changed.revision, 1);
+                assert!(changed.released.is_empty());
+                let unit = h.maven.unit(&key(r, "1.0")).await.unwrap().unwrap();
+                assert_eq!(unit.revision, 1);
+                assert_eq!(unit.depositor, "alice");
+                assert!(!unit.contested && !unit.refused && unit.visible_at.is_none());
+                assert_eq!(unit.created_at, at(2));
+                let file = unit.file("lib-1.0.jar").unwrap();
+                assert_eq!(file.physical_key, pins[0].physical_key);
+                assert_eq!(file.digests, d);
+                assert_eq!(file.size, 3);
+                assert_eq!(unit.declarations, declared.to_vec());
+                assert!(h.maven.unit(&key(r, "2.0")).await.unwrap().is_none());
+            }
+
+            #[tokio::test]
+            async fn replacing_a_file_releases_its_key_and_its_declarations() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let first = pin(&h, &prefix, &format!("{prefix}/a"), 9).await;
+                let (d1, d2) = (digests("a"), digests("b"));
+                let s = scopes();
+                let declared = [Declaration {
+                    filename: "lib-1.0.jar".to_string(),
+                    algorithm: SumAlgorithm::Md5,
+                    value: "a5".to_string(),
+                }];
+                deposit(&h, Deposit { declarations: &declared, ..plain(r, None, &first, &d1, &s) })
+                    .await
+                    .unwrap();
+                let second = pin(&h, &prefix, &format!("{prefix}/b"), 9).await;
+                let changed = deposit(&h, plain(r, Some(1), &second, &d2, &s)).await.unwrap();
+                assert_eq!(changed.released, vec![first[0].physical_key.clone()]);
+                assert!(due(&h).await.contains(&first[0].physical_key), "enqueued, not deleted");
+                let unit = h.maven.unit(&key(r, "1.0")).await.unwrap().unwrap();
+                assert_eq!(unit.files.len(), 1);
+                assert_eq!(unit.files[0].physical_key, second[0].physical_key);
+                assert!(unit.declarations.is_empty(), "the old bytes' declarations went with them");
+            }
+
+            #[tokio::test]
+            async fn a_revoked_pin_is_superseded_and_writes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let pins = pin(&h, &prefix, &format!("{prefix}/a"), 2).await;
+                h.reclaim.enqueue(&[pins[0].physical_key.clone()], at(1)).await.unwrap();
+                let claim = h.reclaim.claim(&pins[0].physical_key, GRACE, at(5), at(6)).await.unwrap();
+                assert!(matches!(claim, Claim::Claimed(_)), "{claim:?}");
+                let d = digests("a");
+                let s = scopes();
+                let refused = deposit(&h, plain(r, None, &pins, &d, &s)).await;
+                assert!(
+                    matches!(&refused, Err(StoreError::Superseded(keys)) if keys == &vec![pins[0].physical_key.clone()]),
+                    "{refused:?}"
+                );
+                assert!(h.maven.unit(&key(r, "1.0")).await.unwrap().is_none());
+                assert_eq!(h.maven.counter(r, GA).await.unwrap().value, 0);
+            }
+
+            #[tokio::test]
+            async fn a_referenced_key_is_referenced_for_claim_and_listed() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let pins = pin(&h, &prefix, &format!("{prefix}/a"), 2).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, plain(r, None, &pins, &d, &s)).await.unwrap();
+                let physical = pins[0].physical_key.clone();
+                let listed: Vec<String> = h
+                    .referenced
+                    .referenced(GRACE, at(10))
+                    .map_ok(|k| k.key)
+                    .try_collect()
+                    .await
+                    .unwrap();
+                assert!(listed.contains(&physical), "{listed:?}");
+                h.reclaim.enqueue(std::slice::from_ref(&physical), at(1)).await.unwrap();
+                assert_eq!(
+                    h.reclaim.claim(&physical, GRACE, at(10), at(11)).await.unwrap(),
+                    Claim::Referenced
+                );
+            }
+
+            #[tokio::test]
+            async fn a_stale_revision_or_a_second_creation_is_a_conflict() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, plain(r, None, &[], &d, &s)).await.unwrap();
+                let again = deposit(&h, plain(r, None, &[], &d, &s)).await;
+                assert!(matches!(again, Err(StoreError::Conflict)), "{again:?}");
+                deposit(&h, plain(r, Some(1), &[], &d, &s)).await.unwrap();
+                let stale = deposit(&h, plain(r, Some(1), &[], &d, &s)).await;
+                assert!(matches!(stale, Err(StoreError::Conflict)), "{stale:?}");
+
+                let fresh = |v: &'static str| {
+                    let h = &h;
+                    let d = &d;
+                    let s = &s;
+                    async move {
+                        deposit(h, Deposit { version: v, ..plain(r, None, &[], d, s) }).await
+                    }
+                };
+                let (a, b) = tokio::join!(fresh("2.0"), fresh("2.0"));
+                let conflicts = [&a, &b].iter().filter(|x| matches!(x, Err(StoreError::Conflict))).count();
+                let oks = [&a, &b].iter().filter(|x| x.is_ok()).count();
+                assert_eq!((oks, conflicts), (1, 1), "{a:?} {b:?}");
+            }
+
+            #[tokio::test]
+            async fn the_contest_and_visibility_marks_stick() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, Deposit { contest: true, ..plain(r, None, &[], &d, &s) }).await.unwrap();
+                deposit(&h, Deposit { reveal: true, now: 3, ..plain(r, Some(1), &[], &d, &s) })
+                    .await
+                    .unwrap();
+                deposit(&h, Deposit { reveal: true, now: 4, ..plain(r, Some(2), &[], &d, &s) })
+                    .await
+                    .unwrap();
+                let unit = h.maven.unit(&key(r, "1.0")).await.unwrap().unwrap();
+                assert!(unit.contested, "nothing clears the mark");
+                assert_eq!(unit.visible_at, Some(at(3)), "revealed once");
+                assert!(unit.visible());
+            }
+
+            #[tokio::test]
+            async fn every_change_moves_the_counters_it_names_and_no_other() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let d = digests("a");
+                let both = vec![GA.to_string(), format!("{GA}@1.0")];
+                deposit(&h, plain(r, None, &[], &d, &both)).await.unwrap();
+                let one = scopes();
+                deposit(&h, Deposit { now: 5, ..plain(r, Some(1), &[], &d, &one) }).await.unwrap();
+                let ga = h.maven.counter(r, GA).await.unwrap();
+                assert_eq!((ga.value, ga.updated_at), (2, Some(at(5))));
+                assert_eq!(h.maven.counter(r, &format!("{GA}@1.0")).await.unwrap().value, 1);
+                assert_eq!(h.maven.counter(r, "other").await.unwrap().value, 0);
+                h.maven.refuse(&key(r, "1.0"), 2, &one, at(6)).await.unwrap();
+                assert_eq!(h.maven.counter(r, GA).await.unwrap().value, 3);
+            }
+
+            #[tokio::test]
+            async fn refusing_releases_every_key_and_keeps_the_unit_refused() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let pins = pin(&h, &prefix, &format!("{prefix}/a"), 9).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, plain(r, None, &pins, &d, &s)).await.unwrap();
+                let stale = h.maven.refuse(&key(r, "1.0"), 7, &s, at(3)).await;
+                assert!(matches!(stale, Err(StoreError::Conflict)), "{stale:?}");
+                let changed = h.maven.refuse(&key(r, "1.0"), 1, &s, at(3)).await.unwrap();
+                assert_eq!(changed.released, vec![pins[0].physical_key.clone()]);
+                assert!(due(&h).await.contains(&pins[0].physical_key));
+                let unit = h.maven.unit(&key(r, "1.0")).await.unwrap().unwrap();
+                assert!(unit.refused && unit.files.is_empty() && !unit.visible());
+                let views = h.maven.artifact(r, GA).await.unwrap();
+                assert!(views.iter().all(|v| v.refused));
+            }
+
+            #[tokio::test]
+            async fn a_repository_holding_maven_values_is_not_retired() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let d = digests("a");
+                let s = scopes();
+                deposit(&h, plain(r, None, &[], &d, &s)).await.unwrap();
+                let refused = h.repos.retire("m", at(3)).await;
+                assert!(matches!(refused, Err(StoreError::Conflict)), "{refused:?}");
+                assert!(h.repos.by_name("m").await.unwrap().is_some());
+            }
+
+            #[tokio::test]
+            async fn pending_and_unversioned_list_what_the_reconciler_needs() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h).await;
+                let d = digests("a");
+                let s = scopes();
+                let waiting = [Declaration {
+                    filename: "lib-sources.jar".to_string(),
+                    algorithm: SumAlgorithm::Sha1,
+                    value: d.sha1.clone(),
+                }];
+                for (i, version) in ["0.1", "0.2", "0.3", "1.0"].into_iter().enumerate() {
+                    let pins = pin(&h, &prefix, &format!("{prefix}/{i}"), 9).await;
+                    let files: &[PinToken] = if version == "0.3" { &[] } else { &pins };
+                    let declarations: &[Declaration] = if version == "0.2" { &waiting } else { &[] };
+                    deposit(&h, Deposit { version, contest: version == "0.1", declarations, ..plain(r, None, files, &d, &s) })
+                        .await
+                        .unwrap();
+                }
+                deposit(&h, Deposit { version: "2.0", now: 4, reveal: true, ..plain(r, None, &[], &d, &s) })
+                    .await
+                    .unwrap();
+                deposit(&h, Deposit { version: "3.0", now: 4, reveal: true, ..plain(r, None, &[], &d, &s) })
+                    .await
+                    .unwrap();
+                let pending = h.maven.pending(at(3), 1).await.unwrap();
+                assert_eq!(pending.len(), 1, "contested, waiting and empty units are not offered");
+                assert_eq!((pending[0].ga.as_str(), pending[0].version.as_str()), (GA, "1.0"));
+                assert!(h.maven.pending(at(2), 10).await.unwrap().is_empty(), "created at 2, not before");
+                let first = h.maven.unversioned(None, 1).await.unwrap();
+                assert_eq!(first.len(), 1);
+                assert_eq!(first[0].version, "2.0");
+                let next = h.maven.unversioned(Some(&first[0]), 10).await.unwrap();
+                assert_eq!(next.len(), 1);
+                assert_eq!(next[0].version, "3.0", "paged past the cursor");
+                h.maven.mark_versioned(r, GA, "2.0").await.unwrap();
+                h.maven.mark_versioned(r, GA, "3.0").await.unwrap();
+                assert!(h.maven.unversioned(None, 10).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_client_document_round_trips_and_moves_its_counters() {
+                let h = $open().await;
+                let (r, _) = repo(&h).await;
+                let doc = ClientMetadata {
+                    repository: r,
+                    dir: "org/example/lib".to_string(),
+                    digests: digests("m"),
+                    release: Some("1.0".to_string()),
+                    latest: None,
+                    plugins: vec![("ex".to_string(), "ex-maven-plugin".to_string(), "Ex".to_string())],
+                };
+                let s = scopes();
+                h.maven.record_client_metadata(&doc, &s, at(3)).await.unwrap();
+                assert_eq!(h.maven.client_metadata(r, "org/example/lib").await.unwrap(), Some(doc.clone()));
+                let newer = ClientMetadata { release: None, ..doc };
+                h.maven.record_client_metadata(&newer, &s, at(4)).await.unwrap();
+                assert_eq!(h.maven.client_metadata(r, "org/example/lib").await.unwrap(), Some(newer));
+                assert!(h.maven.client_metadata(r, "org/example").await.unwrap().is_none());
+                assert_eq!(h.maven.counter(r, GA).await.unwrap().value, 2);
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use maven_contract;

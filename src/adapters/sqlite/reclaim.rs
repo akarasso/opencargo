@@ -31,7 +31,9 @@ pub(crate) const REFERENCED: &str = "
     UNION ALL
     SELECT storage_key, 0 FROM oci_manifests WHERE storage_key IS NOT NULL
     UNION ALL
-    SELECT COALESCE(segment_prefix, 'oci/_uploads/' || id), 1 FROM oci_uploads";
+    SELECT COALESCE(segment_prefix, 'oci/_uploads/' || id), 1 FROM oci_uploads
+    UNION ALL
+    SELECT physical_key, 0 FROM maven_files";
 
 /// Every port's contribution, as one union.
 fn referenced() -> String {

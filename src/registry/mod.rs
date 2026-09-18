@@ -1,5 +1,6 @@
 pub mod cargo;
 pub mod go;
+pub mod maven;
 pub mod npm;
 pub mod archive;
 pub mod oci;
@@ -39,6 +40,7 @@ pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Reposit
         perms: state.permissions.as_ref(),
         packages: state.packages.as_ref(),
         oci: state.oci.as_ref(),
+        maven: state.maven.as_ref(),
         search: state.search.as_ref(),
         proxy: &state.proxy,
         policy: &state.policy,

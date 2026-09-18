@@ -30,6 +30,10 @@ use opencargo::ports::oci::{
     BeginComplete, Blob, Finished, LeaseToken, Manifest, NewBlob, NewManifest, OciStore, Orphaned,
     Segment, SegmentClaim, UploadSession,
 };
+use opencargo::ports::maven::{
+    Changed, ClientMetadata, Counter, MavenFileStore, PendingUnit, StoredFile, Unit, UnitChange,
+    UnitKey, UnitView, Unversioned,
+};
 use opencargo::ports::packages::{
     NameMatch, NewRelease, PackageStore, Promotion, Release, StalePrerelease,
 };
@@ -70,6 +74,7 @@ pub enum PortId {
     Policy,
     Reclaim,
     Pypi,
+    Maven,
 }
 
 /// One grant, keyed the way the table is.
@@ -179,6 +184,7 @@ struct State {
     oci_segments: Vec<(String, Segment)>,
     pypi_files: Vec<PypiFile>,
     reclaim: ReclaimState,
+    maven: MavenState,
     next_id: i64,
     next_cache_id: i64,
     /// Queued refusals: a fake that cannot fail only ever proves the happy
@@ -243,6 +249,10 @@ impl FakeDb {
 
     pub fn referenced(&self) -> Arc<dyn ReferencedKeys> {
         Arc::new(Reclaim(self.0.clone()))
+    }
+
+    pub fn maven(&self) -> Arc<dyn MavenFileStore> {
+        Arc::new(Maven(self.0.clone()))
     }
 
     /// The keys waiting for reclamation, sorted.
@@ -609,7 +619,9 @@ impl RepositoryStore for Repositories {
     async fn retire(&self, name: &str, now: DateTime<Utc>) -> Result<Vec<String>, StoreError> {
         self.with(|state| {
             let repo = found(state, name).ok_or(StoreError::NotFound)?.clone();
-            if state.packages.iter().any(|pkg| pkg.repository_id == repo.id) {
+            if state.packages.iter().any(|pkg| pkg.repository_id == repo.id)
+                || state.maven.values.iter().any(|v| v.repository == repo.id)
+            {
                 return Err(StoreError::Conflict);
             }
             let held = state
@@ -622,6 +634,8 @@ impl RepositoryStore for Repositories {
             state.repositories.retain(|stored| stored.id != repo.id);
             state.grants.retain(|g| g.repository_id != repo.id);
             state.cache.retain(|e| e.repository_id != repo.id);
+            state.maven.client.retain(|m| m.repository != repo.id);
+            state.maven.counters.retain(|(r, _, _)| *r != repo.id);
             let Some(at) = state
                 .reclaim
                 .incarnations
@@ -2765,6 +2779,7 @@ fn row_references(state: &State) -> Vec<(String, bool)> {
         refs.push((f.key.clone(), false));
         refs.extend(f.metadata_key.clone().map(|k| (k, false)));
     }
+    refs.extend(state.maven.keys().map(|k| (k.clone(), false)));
     refs
 }
 
@@ -3043,5 +3058,361 @@ impl ReferencedKeys for Reclaim {
         );
         all.sort();
         Box::pin(futures_util::stream::iter(all.into_iter().map(Ok)))
+    }
+}
+
+/// Port 18's tables: values, the units under them, their files and
+/// declarations, the client documents and the counters.
+#[derive(Default)]
+struct MavenState {
+    values: Vec<MavenValue>,
+    units: Vec<MavenUnit>,
+    client: Vec<ClientMetadata>,
+    counters: Vec<(i64, String, Counter)>,
+}
+
+struct MavenValue {
+    id: i64,
+    repository: i64,
+    ga: String,
+    version: String,
+    versioned: bool,
+}
+
+struct MavenUnit {
+    value: i64,
+    unit: Unit,
+}
+
+impl MavenState {
+    fn value(&self, repository: i64, ga: &str, version: &str) -> Option<&MavenValue> {
+        self.values
+            .iter()
+            .find(|v| v.repository == repository && v.ga == ga && v.version == version)
+    }
+
+    fn unit_mut(&mut self, key: &UnitKey<'_>) -> Option<&mut Unit> {
+        let value = self.value(key.repository, key.ga, key.version)?.id;
+        self.units
+            .iter_mut()
+            .find(|u| u.value == value && u.unit.build == key.build)
+            .map(|u| &mut u.unit)
+    }
+
+    fn bump(&mut self, repository: i64, scopes: &[String], now: DateTime<Utc>) {
+        for scope in scopes {
+            match self
+                .counters
+                .iter_mut()
+                .find(|(r, s, _)| *r == repository && s == scope)
+            {
+                Some((_, _, counter)) => {
+                    counter.value += 1;
+                    counter.updated_at = Some(now);
+                }
+                None => self.counters.push((
+                    repository,
+                    scope.clone(),
+                    Counter {
+                        value: 1,
+                        updated_at: Some(now),
+                    },
+                )),
+            }
+        }
+    }
+
+    fn keys(&self) -> impl Iterator<Item = &String> {
+        self.units
+            .iter()
+            .flat_map(|u| u.unit.files.iter().map(|f| &f.physical_key))
+    }
+}
+
+struct Maven(Arc<Mutex<State>>);
+
+impl Maven {
+    fn with<T>(
+        &self,
+        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        with(&self.0, PortId::Maven, act)
+    }
+}
+
+fn change_unit(state: &mut State, change: &UnitChange<'_>) -> Result<Changed, StoreError> {
+    state.reclaim.live_pins(change.pins)?;
+    let key = change.key;
+    let revision = match (change.revision, state.maven.unit_mut(&key)) {
+        (None, Some(_)) => return Err(StoreError::Conflict),
+        (Some(r), Some(unit)) if unit.revision != r => return Err(StoreError::Conflict),
+        (Some(_), None) => return Err(StoreError::Conflict),
+        (Some(r), Some(_)) => r + 1,
+        (None, None) => {
+            let value = match state.maven.value(key.repository, key.ga, key.version) {
+                Some(v) => v.id,
+                None => {
+                    let id = state.id();
+                    state.maven.values.push(MavenValue {
+                        id,
+                        repository: key.repository,
+                        ga: key.ga.to_string(),
+                        version: key.version.to_string(),
+                        versioned: false,
+                    });
+                    id
+                }
+            };
+            state.maven.units.push(MavenUnit {
+                value,
+                unit: Unit {
+                    version: key.version.to_string(),
+                    build: key.build.to_string(),
+                    revision: 0,
+                    depositor: change.depositor.to_string(),
+                    contested: false,
+                    refused: false,
+                    visible_at: None,
+                    created_at: change.now,
+                    files: Vec::new(),
+                    declarations: Vec::new(),
+                },
+            });
+            1
+        }
+    };
+    state.reclaim.spend(change.pins);
+    let unit = state.maven.unit_mut(&key).expect("the unit exists");
+    unit.revision = revision;
+    let mut released = Vec::new();
+    if let Some(file) = &change.file {
+        if let Some(old) = unit.files.iter().position(|f| f.filename == file.filename) {
+            let old = unit.files.remove(old);
+            unit.declarations.retain(|d| d.filename != file.filename);
+            if old.physical_key != file.physical_key {
+                released.push(old.physical_key);
+            }
+        }
+        unit.files.push(StoredFile {
+            filename: file.filename.to_string(),
+            physical_key: file.physical_key.to_string(),
+            size: file.size,
+            digests: file.digests.clone(),
+            depositor: file.depositor.to_string(),
+            created_at: change.now,
+        });
+        unit.files.sort_by(|a, b| a.filename.cmp(&b.filename));
+    }
+    for d in change.declarations {
+        unit.declarations
+            .retain(|x| !(x.filename == d.filename && x.algorithm == d.algorithm));
+        unit.declarations.push(d.clone());
+    }
+    unit.declarations
+        .sort_by(|a, b| (&a.filename, a.algorithm.as_str()).cmp(&(&b.filename, b.algorithm.as_str())));
+    unit.contested |= change.contest;
+    if change.reveal && unit.visible_at.is_none() {
+        unit.visible_at = Some(change.now);
+    }
+    for key in &released {
+        state.reclaim.enqueue(key, false, change.now);
+    }
+    state.maven.bump(key.repository, change.scopes, change.now);
+    Ok(Changed { revision, released })
+}
+
+#[async_trait]
+impl MavenFileStore for Maven {
+    async fn unit(&self, key: &UnitKey<'_>) -> Result<Option<Unit>, StoreError> {
+        self.with(|state| Ok(state.maven.unit_mut(key).map(|u| u.clone())))
+    }
+
+    async fn change(&self, change: &UnitChange<'_>) -> Result<Changed, StoreError> {
+        self.with(|state| change_unit(state, change))
+    }
+
+    async fn refuse(
+        &self,
+        key: &UnitKey<'_>,
+        revision: i64,
+        scopes: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<Changed, StoreError> {
+        self.with(|state| {
+            let unit = state.maven.unit_mut(key).ok_or(StoreError::NotFound)?;
+            if unit.revision != revision {
+                return Err(StoreError::Conflict);
+            }
+            unit.revision += 1;
+            unit.refused = true;
+            unit.declarations.clear();
+            let released: Vec<String> =
+                unit.files.drain(..).map(|f| f.physical_key).collect();
+            let revision = unit.revision;
+            for k in &released {
+                state.reclaim.enqueue(k, false, now);
+            }
+            state.maven.bump(key.repository, scopes, now);
+            Ok(Changed { revision, released })
+        })
+    }
+
+    async fn artifact(&self, repository: i64, ga: &str) -> Result<Vec<UnitView>, StoreError> {
+        self.with(|state| {
+            let values: Vec<i64> = state
+                .maven
+                .values
+                .iter()
+                .filter(|v| v.repository == repository && v.ga == ga)
+                .map(|v| v.id)
+                .collect();
+            Ok(state
+                .maven
+                .units
+                .iter()
+                .filter(|u| values.contains(&u.value))
+                .map(|u| UnitView {
+                    version: u.unit.version.clone(),
+                    build: u.unit.build.clone(),
+                    visible_at: u.unit.visible_at,
+                    refused: u.unit.refused,
+                    files: u.unit.files.clone(),
+                })
+                .collect())
+        })
+    }
+
+    async fn counter(&self, repository: i64, scope: &str) -> Result<Counter, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .maven
+                .counters
+                .iter()
+                .find(|(r, s, _)| *r == repository && s == scope)
+                .map(|(_, _, c)| *c)
+                .unwrap_or_default())
+        })
+    }
+
+    async fn record_client_metadata(
+        &self,
+        metadata: &ClientMetadata,
+        scopes: &[String],
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.with(|state| {
+            state
+                .maven
+                .client
+                .retain(|m| !(m.repository == metadata.repository && m.dir == metadata.dir));
+            state.maven.client.push(metadata.clone());
+            state.maven.bump(metadata.repository, scopes, now);
+            Ok(())
+        })
+    }
+
+    async fn client_metadata(
+        &self,
+        repository: i64,
+        dir: &str,
+    ) -> Result<Option<ClientMetadata>, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .maven
+                .client
+                .iter()
+                .find(|m| m.repository == repository && m.dir == dir)
+                .cloned())
+        })
+    }
+
+    async fn pending(
+        &self,
+        before: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<Vec<PendingUnit>, StoreError> {
+        self.with(|state| {
+            let mut pending: Vec<PendingUnit> = state
+                .maven
+                .units
+                .iter()
+                .filter(|u| {
+                    let unit = &u.unit;
+                    unit.visible_at.is_none()
+                        && !unit.refused
+                        && !unit.contested
+                        && unit.created_at < before
+                        && !unit.files.is_empty()
+                        && unit.declarations.iter().all(|d| unit.file(&d.filename).is_some())
+                })
+                .filter_map(|u| {
+                    let value = state.maven.values.iter().find(|v| v.id == u.value)?;
+                    Some(PendingUnit {
+                        repository: value.repository,
+                        ga: value.ga.clone(),
+                        version: value.version.clone(),
+                        build: u.unit.build.clone(),
+                        created_at: u.unit.created_at,
+                    })
+                })
+                .collect();
+            pending.sort_by_key(|p| p.created_at);
+            pending.truncate(limit as usize);
+            Ok(pending)
+        })
+    }
+
+    async fn unversioned(
+        &self,
+        after: Option<&Unversioned>,
+        limit: u32,
+    ) -> Result<Vec<Unversioned>, StoreError> {
+        let key = |r: i64, ga: &str, v: &str| (r, ga.to_string(), v.to_string());
+        let after = after.map(|a| key(a.repository, &a.ga, &a.version));
+        self.with(|state| {
+            let mut values: Vec<_> = state
+                .maven
+                .values
+                .iter()
+                .filter(|v| !v.versioned)
+                .filter(|v| after.as_ref().is_none_or(|a| key(v.repository, &v.ga, &v.version) > *a))
+                .collect();
+            values.sort_by_key(|v| key(v.repository, &v.ga, &v.version));
+            Ok(values
+                .into_iter()
+                .filter(|v| {
+                    state
+                        .maven
+                        .units
+                        .iter()
+                        .any(|u| u.value == v.id && u.unit.visible())
+                })
+                .take(limit as usize)
+                .map(|v| Unversioned {
+                    repository: v.repository,
+                    ga: v.ga.clone(),
+                    version: v.version.clone(),
+                })
+                .collect())
+        })
+    }
+
+    async fn mark_versioned(
+        &self,
+        repository: i64,
+        ga: &str,
+        version: &str,
+    ) -> Result<(), StoreError> {
+        self.with(|state| {
+            if let Some(v) = state
+                .maven
+                .values
+                .iter_mut()
+                .find(|v| v.repository == repository && v.ga == ga && v.version == version)
+            {
+                v.versioned = true;
+            }
+            Ok(())
+        })
     }
 }

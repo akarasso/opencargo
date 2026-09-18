@@ -9,6 +9,7 @@ pub mod dashboard;
 pub mod deps;
 pub mod events;
 pub mod ids;
+pub mod maven;
 pub mod multipart;
 pub mod oci;
 pub mod packages;

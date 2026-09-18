@@ -43,6 +43,7 @@
 pub mod audit;
 pub mod authenticate;
 pub mod events;
+pub mod maven;
 pub mod oci;
 pub mod permissions;
 pub mod place;
@@ -51,6 +52,7 @@ pub mod pypi;
 pub mod publish;
 pub mod publish_tail;
 pub mod reclaim;
+pub mod reconcile;
 pub mod releases;
 pub mod repo_spec;
 pub mod repositories;

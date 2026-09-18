@@ -110,6 +110,8 @@ axum-server = { version = "0.7", features = ["tls-rustls"] }
 rustls = { version = "0.23", default-features = false, features = ["aws-lc-rs"] }
 zip = "8.3.1"
 cvss = "2.2"
+roxmltree = "0.20"
+md-5 = "0.10"
 
 [dev-dependencies]
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
