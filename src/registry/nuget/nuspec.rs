@@ -237,6 +237,23 @@ pub fn from_package(nupkg: &[u8]) -> Result<(Vec<u8>, Nuspec), NuspecError> {
     Ok((bytes, parsed))
 }
 
+/// PowerShell scripts NuGet runs, and MSBuild files it imports into the
+/// consuming build: what `install_scripts` means for a package.
+pub fn executes_on_install(entries: &[String]) -> bool {
+    entries.iter().any(|e| {
+        let e = e.to_ascii_lowercase();
+        let script = e.starts_with("tools/")
+            && ["install.ps1", "init.ps1", "uninstall.ps1"]
+                .iter()
+                .any(|s| e.ends_with(&format!("/{s}")) || e == format!("tools/{s}"));
+        let msbuild = ["build/", "buildtransitive/", "buildmultitargeting/"]
+            .iter()
+            .any(|d| e.starts_with(d))
+            && (e.ends_with(".props") || e.ends_with(".targets"));
+        script || msbuild
+    })
+}
+
 /// Every entry path of a `.nupkg`, for the facts policy reads.
 pub fn entries(nupkg: &[u8]) -> Result<Vec<String>, NuspecError> {
     let archive = zip::ZipArchive::new(std::io::Cursor::new(nupkg))
@@ -331,6 +348,18 @@ pub(crate) mod tests {
         );
         assert!(parse(big.as_bytes()).is_err());
         assert!(parse(b"<package><metadata><id>a</id></metadata></package>").is_err());
+    }
+
+    #[test]
+    fn install_assets_are_scripts_and_msbuild_imports() {
+        let has = |paths: &[&str]| {
+            executes_on_install(&paths.iter().map(|p| p.to_string()).collect::<Vec<_>>())
+        };
+        assert!(has(&["tools/install.ps1"]));
+        assert!(has(&["tools/net45/init.ps1"]));
+        assert!(has(&["build/My.Lib.targets"]));
+        assert!(has(&["buildTransitive/net8.0/My.Lib.props"]));
+        assert!(!has(&["lib/net8.0/My.Lib.dll", "tools/readme.txt", "content/build.props"]));
     }
 
     #[test]

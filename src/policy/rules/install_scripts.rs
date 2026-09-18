@@ -5,7 +5,8 @@ use crate::domain::Format;
 use crate::domain::{RuleVerdict, Verdict};
 use crate::policy::Resolution;
 
-/// npm only: the fact was gathered from the packument by the recorder.
+/// npm's install scripts, gathered from the packument, and NuGet's install
+/// scripts and MSBuild imports, gathered from the served package.
 pub struct InstallScripts;
 
 impl Rule for InstallScripts {
@@ -18,13 +19,17 @@ impl Rule for InstallScripts {
     }
 
     fn evaluate(&self, _: &PolicyConfig, r: &Resolution, _: DateTime<Utc>) -> Option<RuleVerdict> {
-        let (verdict, reason) = if r.format != Format::Npm {
+        let (verdict, reason) = if !matches!(r.format, Format::Npm | Format::Nuget) {
             (
                 Verdict::NotApplicable,
-                format!("{}: install scripts are an npm notion", r.format.as_str()),
+                format!("{}: install scripts are an npm and NuGet notion", r.format.as_str()),
             )
         } else {
             match (r.facts.install_scripts, &r.version) {
+                (Some(true), _) if r.format == Format::Nuget => (
+                    Verdict::WouldBlock,
+                    "ships install scripts or MSBuild imports".to_string(),
+                ),
                 (Some(true), _) => (
                     Verdict::WouldBlock,
                     "declares preinstall/install/postinstall".to_string(),

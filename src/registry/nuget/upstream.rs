@@ -11,6 +11,7 @@ use std::sync::OnceLock;
 use std::time::Duration;
 
 use axum::http::HeaderMap;
+use chrono::{DateTime, Utc};
 use base64::Engine;
 use bytes::Bytes;
 use serde_json::Value;
@@ -326,31 +327,32 @@ pub async fn entries(
 }
 
 /// The sha512 a package must match: the registration's, else its catalog
-/// leaf's, else none.
+/// leaf's, else none; and when the registration says, its publish date.
 async fn expected_sha512(
     cx: &Cx<'_>,
     member: CacheRepo<'_>,
     up: &Upstream,
     at: &Coordinates,
     key: &str,
-) -> Result<Option<String>, ResolveError> {
+) -> Result<(Option<String>, Option<DateTime<Utc>>), ResolveError> {
     let Outcome::Found(found) = catalog_entries(cx, member, up, &at.id).await? else {
-        return Ok(None);
+        return Ok((None, None));
     };
     let Some((entry, hash)) = found.into_iter().find(|(e, _)| e.key == key) else {
-        return Ok(None);
+        return Ok((None, None));
     };
+    let published = entry.published.filter(|_| entry.listed);
     if hash.is_some() {
-        return Ok(hash);
+        return Ok((hash, published));
     }
     let Some(url) = entry.catalog.as_deref().and_then(|u| url::Url::parse(u).ok()) else {
-        return Ok(None);
+        return Ok((None, published));
     };
-    Ok(match document(cx, member, up, &NugetArtifact::CatalogLeaf { url }).await {
-        Ok(Outcome::Found(leaf)) => package_hash(&leaf),
-        Ok(Outcome::NotFound) => None,
-        Err(e) => return Err(e),
-    })
+    let hash = match document(cx, member, up, &NugetArtifact::CatalogLeaf { url }).await? {
+        Outcome::Found(leaf) => package_hash(&leaf),
+        Outcome::NotFound => None,
+    };
+    Ok((hash, published))
 }
 
 pub async fn nupkg(
@@ -363,7 +365,7 @@ pub async fn nupkg(
         return Ok(Outcome::NotFound);
     };
     let flat = resources(cx, member, up).await?.flat.ok_or_else(|| missing("flat container"))?;
-    let sha512 = expected_sha512(cx, member, up, at, key).await?;
+    let (sha512, published) = expected_sha512(cx, member, up, at, key).await?;
     if sha512.is_none() {
         tracing::info!(member = %member.0.name, id = %at.id, key, "no upstream document declares this package's hash; served unverified");
     }
@@ -378,7 +380,8 @@ pub async fn nupkg(
     if let Outcome::Found(c) = &cached {
         crate::policy::record(cx, member, up, crate::domain::Format::Nuget, &at.id, Some(key.to_string()), || {
             crate::policy::Source::Nuget {
-                digest: c.entry.digest.clone(),
+                body: c.clone(),
+                published,
             }
         });
     }

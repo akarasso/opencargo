@@ -12,6 +12,7 @@ pub fn extract_dependencies(metadata: &str, ecosystem: &str) -> Vec<(String, Str
     match ecosystem {
         "npm" => npm_dependencies(&meta),
         "crates.io" => cargo_dependencies(&meta),
+        "NuGet" => nuget_dependencies(&meta),
         _ => Vec::new(),
     }
 }
@@ -51,6 +52,34 @@ fn cargo_dependencies(meta: &Value) -> Vec<(String, String)> {
             (!name.is_empty() && !clean.is_empty()).then(|| (name.to_string(), clean))
         })
         .collect()
+}
+
+/// The nuspec's dependency groups, each range read as its lower bound.
+fn nuget_dependencies(meta: &Value) -> Vec<(String, String)> {
+    let groups = meta
+        .pointer("/nuspec/dependency_groups")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten();
+    let mut deps: Vec<(String, String)> = Vec::new();
+    for dep in groups
+        .filter_map(|g| g.get("dependencies").and_then(|d| d.as_array()))
+        .flatten()
+    {
+        let name = dep.get("id").and_then(|n| n.as_str()).unwrap_or("");
+        let range = dep.get("range").and_then(|r| r.as_str()).unwrap_or("");
+        let lower = range
+            .trim_start_matches(['[', '('])
+            .split(',')
+            .next()
+            .unwrap_or("")
+            .trim_end_matches([']', ')']);
+        let clean = clean_version_string(lower);
+        if !name.is_empty() && !clean.is_empty() && !deps.iter().any(|(n, v)| n == name && *v == clean) {
+            deps.push((name.to_string(), clean));
+        }
+    }
+    deps
 }
 
 /// `require` directives of a go.mod, single-line and parenthesised blocks;
@@ -110,6 +139,21 @@ fn clean_version_string(version: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn nuget_dependencies_are_the_lower_bounds_of_every_group() {
+        let meta = r#"{"nuspec": {"dependency_groups": [
+            {"target_framework": "net8.0", "dependencies": [{"id": "Newtonsoft.Json", "range": "[13.0.1, )"}]},
+            {"target_framework": "netstandard2.0", "dependencies": [{"id": "Newtonsoft.Json", "range": "[13.0.1, )"}, {"id": "A", "range": "1.2.3"}, {"id": "B"}]}
+        ]}}"#;
+        assert_eq!(
+            extract_dependencies(meta, "NuGet"),
+            vec![
+                ("Newtonsoft.Json".to_string(), "13.0.1".to_string()),
+                ("A".to_string(), "1.2.3".to_string())
+            ]
+        );
+    }
 
     #[test]
     fn test_extract_npm_dependencies() {

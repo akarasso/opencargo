@@ -126,7 +126,8 @@ pub enum Source {
         digest: Option<String>,
     },
     Nuget {
-        digest: Option<String>,
+        body: Cached,
+        published: Option<DateTime<Utc>>,
     },
     Oci {
         body: Cached,
