@@ -356,7 +356,9 @@ mod tests {
             assert_eq!(f.as_str().parse::<SourceFormat>().unwrap(), f);
             let _ = f.target();
         }
-        for format in Format::ALL {
+        // Mcp is a catalog of servers, not a store of artifacts: no source
+        // registry publishes one, so no source format maps onto it.
+        for format in Format::ALL.into_iter().filter(|f| *f != Format::Mcp) {
             assert!(
                 SourceFormat::ALL.iter().any(|s| s.target() == Some(format)),
                 "{format:?} is served but no source format maps onto it"
