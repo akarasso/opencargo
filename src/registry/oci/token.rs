@@ -27,19 +27,25 @@ const TTL_SECS: i64 = 3600;
 const MAX_SCOPES: usize = 16;
 const MAX_SCOPE_LEN: usize = 256;
 
-/// Signs and verifies registry tokens with a key that lives for one process:
-/// a restart invalidates every outstanding token, which is fine for a
-/// one-hour credential the client re-requests on any 401.
+/// Signs and verifies registry tokens with the key `ServerSecretStore`
+/// holds under [`SIGNING_KEY`].
 #[derive(Clone)]
 pub struct TokenSigner {
-    key: [u8; 32],
+    key: Vec<u8>,
 }
+
+pub const SIGNING_KEY: &str = "registry_token_key";
 
 impl TokenSigner {
     pub fn random() -> Self {
-        let mut key = [0u8; 32];
-        rand::thread_rng().fill(&mut key);
-        Self { key }
+        Self { key: fresh_key() }
+    }
+
+    pub async fn from_store(
+        secrets: &dyn crate::ports::secrets::ServerSecretStore,
+    ) -> Result<Self, crate::error::StoreError> {
+        let key = secrets.get_or_init(SIGNING_KEY, &fresh_key()).await?;
+        Ok(Self { key })
     }
 
     fn mac(&self) -> Hmac<Sha256> {
@@ -62,6 +68,12 @@ impl RegistryTokenSigner for TokenSigner {
         let claims: Claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
         (claims.exp > chrono::Utc::now().timestamp()).then_some(claims)
     }
+}
+
+fn fresh_key() -> Vec<u8> {
+    let mut key = [0u8; 32];
+    rand::thread_rng().fill(&mut key);
+    key.to_vec()
 }
 
 /// `GET /v2/token?service=opencargo&scope=repository:{repo}/{name}:pull`.
@@ -235,6 +247,35 @@ mod tests {
             ..claims(i64::MAX)
         });
         assert!(signer.verify(&admin).expect("valid").static_token);
+    }
+
+    /// Two signers over one secret store verify each other's tokens: the key
+    /// is the store's, not the process's.
+    #[tokio::test]
+    async fn the_signing_key_is_read_from_the_secret_store() {
+        use crate::ports::secrets::ServerSecretStore;
+
+        struct One(std::sync::Mutex<Option<Vec<u8>>>);
+
+        #[async_trait::async_trait]
+        impl ServerSecretStore for One {
+            async fn get_or_init(
+                &self,
+                name: &str,
+                candidate: &[u8],
+            ) -> Result<Vec<u8>, crate::error::StoreError> {
+                assert_eq!(name, SIGNING_KEY);
+                let mut held = self.0.lock().unwrap();
+                Ok(held.get_or_insert_with(|| candidate.to_vec()).clone())
+            }
+        }
+
+        let store = One(std::sync::Mutex::new(None));
+        let first = TokenSigner::from_store(&store).await.unwrap();
+        let second = TokenSigner::from_store(&store).await.unwrap();
+        let token = first.sign(&claims(i64::MAX));
+        assert!(second.verify(&token).is_some());
+        assert!(TokenSigner::random().verify(&token).is_none());
     }
 
     #[test]

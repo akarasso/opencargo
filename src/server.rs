@@ -22,6 +22,7 @@ use crate::app::events::Announce;
 use crate::app::publish_tail::{PublishGate, PublishTail};
 use crate::app::authenticate::{Authenticate, AuthenticateDeps, OpenGate, Refusal};
 use crate::auth::middleware::{auth_middleware, AuthState};
+use crate::ports::secrets::ServerSecretStore;
 use crate::ports::signing::RegistryTokenSigner;
 use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
@@ -175,8 +176,11 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 
-    let registry_tokens: Arc<dyn RegistryTokenSigner> =
-        Arc::new(crate::registry::oci::token::TokenSigner::random());
+    let secrets: Arc<dyn ServerSecretStore> =
+        Arc::new(crate::adapters::system::ProcessSecrets::default());
+    let registry_tokens: Arc<dyn RegistryTokenSigner> = Arc::new(
+        crate::registry::oci::token::TokenSigner::from_store(secrets.as_ref()).await?,
+    );
     let auth = auth_state(config, &users, &tokens, &registry_tokens);
 
     ensure_admin_user(users.as_ref(), config).await?;

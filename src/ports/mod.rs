@@ -17,6 +17,7 @@ pub mod policy;
 pub mod proxy_cache;
 pub mod repositories;
 pub mod search;
+pub mod secrets;
 pub mod signing;
 pub mod tokens;
 pub mod users;
