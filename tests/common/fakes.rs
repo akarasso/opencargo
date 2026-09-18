@@ -37,6 +37,7 @@ use opencargo::ports::policy::{
 use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::domain::layout;
 use opencargo::ports::proxy_cache::ProxyCacheStore;
+use opencargo::ports::pypi::{NewPypiFile, Published, PypiFile, PypiFileStore};
 use opencargo::ports::reclaim::{
     Candidate, Claim, ClaimToken, PinToken, Pinned, ReclaimStore, Renewal,
 };
@@ -65,6 +66,7 @@ pub enum PortId {
     Vulns,
     Policy,
     Reclaim,
+    Pypi,
 }
 
 /// One grant, keyed the way the table is.
@@ -163,6 +165,7 @@ struct State {
     oci_tags: Vec<TagRow>,
     oci_links: Vec<LinkRow>,
     oci_uploads: Vec<UploadRow>,
+    pypi_files: Vec<PypiFile>,
     reclaim: ReclaimState,
     next_id: i64,
     next_cache_id: i64,
@@ -216,6 +219,10 @@ impl FakeDb {
 
     pub fn oci(&self) -> Arc<dyn OciStore> {
         Arc::new(Oci(self.0.clone()))
+    }
+
+    pub fn pypi(&self) -> Arc<dyn PypiFileStore> {
+        Arc::new(Pypi(self.0.clone()))
     }
 
     pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {
@@ -2108,6 +2115,258 @@ impl PolicyStore for Policy {
     }
 }
 
+struct Pypi(Arc<Mutex<State>>);
+
+impl Pypi {
+    fn with<T>(
+        &self,
+        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        with(&self.0, PortId::Pypi, act)
+    }
+}
+
+fn pypi_file(state: &State, row: &PypiFile) -> PypiFile {
+    let mut file = row.clone();
+    if let Some(p) = state.packages.iter().find(|p| p.id == row.package_id) {
+        file.project = p.name.clone();
+    }
+    if let Some(v) = state.versions.iter().find(|v| v.id == row.version_id) {
+        file.version = v.version.clone();
+    }
+    file
+}
+
+fn pypi_release_versions(
+    state: &State,
+    repository: i64,
+    project: &str,
+    version: Option<&str>,
+) -> Vec<i64> {
+    let Some(package) = state
+        .packages
+        .iter()
+        .find(|p| p.repository_id == repository && p.name == project)
+    else {
+        return Vec::new();
+    };
+    state
+        .versions
+        .iter()
+        .filter(|v| v.package_id == package.id && version.is_none_or(|want| v.version == want))
+        .map(|v| v.id)
+        .collect()
+}
+
+fn pypi_purge(state: &mut State, versions: &[i64], now: DateTime<Utc>) -> Vec<String> {
+    let mut keys = Vec::new();
+    for &version in versions {
+        for f in state.pypi_files.iter().filter(|f| f.version_id == version) {
+            keys.push(f.key.clone());
+            keys.extend(f.metadata_key.clone());
+        }
+        if let Some(v) = state.versions.iter().find(|v| v.id == version) {
+            keys.push(v.tarball_path.clone());
+        }
+        state.pypi_files.retain(|f| f.version_id != version);
+        state.dist_tags.retain(|t| t.version_id != version);
+        state.versions.retain(|v| v.id != version);
+    }
+    keys.sort();
+    keys.dedup();
+    for key in &keys {
+        state.reclaim.enqueue(key, false, now);
+    }
+    keys
+}
+
+#[async_trait]
+impl PypiFileStore for Pypi {
+    async fn publish_file(&self, file: &NewPypiFile<'_>) -> Result<Published, StoreError> {
+        self.with(|state| {
+            let Some(artifact) = file.pins.first() else {
+                return Err(StoreError::Other("a file row needs its artifact's pin".into()));
+            };
+            state.reclaim.live_pins(file.pins)?;
+            if state
+                .pypi_files
+                .iter()
+                .any(|f| f.repository == file.repository && f.filename == file.filename)
+            {
+                return Err(StoreError::Conflict);
+            }
+            let package = match state
+                .packages
+                .iter()
+                .find(|p| p.repository_id == file.repository && p.name == file.project)
+            {
+                Some(p) => p.id,
+                None => {
+                    let id = state.id();
+                    state.packages.push(Package {
+                        id,
+                        repository_id: file.repository,
+                        name: file.project.to_string(),
+                        description: file.summary.map(str::to_string),
+                        readme: None,
+                        license: None,
+                        created_at: file.now,
+                        updated_at: file.now,
+                    });
+                    id
+                }
+            };
+            let existing = state
+                .versions
+                .iter()
+                .find(|v| v.package_id == package && v.version == file.version)
+                .map(|v| v.id);
+            let (version, version_created) = match existing {
+                Some(id) => (id, false),
+                None => {
+                    let id = state.id();
+                    let mut row = blank_version(file.version, file.metadata_json);
+                    row.id = id;
+                    row.package_id = package;
+                    row.checksum_sha256 = Some(file.sha256.to_string());
+                    row.size = file.size;
+                    row.tarball_path = artifact.physical_key.clone();
+                    row.published_at = file.now;
+                    state.versions.push(row);
+                    (id, true)
+                }
+            };
+            let row = PypiFile {
+                id: state.id(),
+                repository: file.repository,
+                package_id: package,
+                version_id: version,
+                project: file.project.to_string(),
+                version: file.version.to_string(),
+                filename: file.filename.to_string(),
+                packagetype: file.packagetype.to_string(),
+                sha256: file.sha256.to_string(),
+                size: file.size,
+                key: artifact.physical_key.clone(),
+                metadata_key: file.pins.get(1).map(|p| p.physical_key.clone()),
+                metadata_sha256: file.metadata_sha256.map(str::to_string),
+                requires_python: file.requires_python.map(str::to_string),
+                yanked: false,
+                yanked_reason: None,
+                uploaded_at: file.now,
+            };
+            state.pypi_files.push(row.clone());
+            state.reclaim.spend(file.pins);
+            Ok(Published {
+                version_created,
+                file: row,
+            })
+        })
+    }
+
+    async fn file_by_name(
+        &self,
+        repository: i64,
+        filename: &str,
+    ) -> Result<Option<PypiFile>, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .pypi_files
+                .iter()
+                .find(|f| f.repository == repository && f.filename == filename)
+                .map(|f| pypi_file(state, f)))
+        })
+    }
+
+    async fn project_files(
+        &self,
+        repository: i64,
+        project: &str,
+    ) -> Result<Vec<PypiFile>, StoreError> {
+        self.with(|state| {
+            let mut files: Vec<PypiFile> = state
+                .pypi_files
+                .iter()
+                .filter(|f| f.repository == repository)
+                .map(|f| pypi_file(state, f))
+                .filter(|f| f.project == project)
+                .collect();
+            files.sort_by_key(|f| f.id);
+            Ok(files)
+        })
+    }
+
+    async fn list_projects(&self, repository: i64) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let mut names: Vec<String> = state
+                .pypi_files
+                .iter()
+                .filter(|f| f.repository == repository)
+                .map(|f| pypi_file(state, f).project)
+                .collect();
+            names.sort();
+            names.dedup();
+            Ok(names)
+        })
+    }
+
+    async fn set_release_yanked(
+        &self,
+        repository: i64,
+        project: &str,
+        version: &str,
+        reason: Option<&str>,
+        yanked: bool,
+        _now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        self.with(|state| {
+            let Some(&id) = pypi_release_versions(state, repository, project, Some(version)).first()
+            else {
+                return Err(StoreError::NotFound);
+            };
+            if let Some(v) = state.versions.iter_mut().find(|v| v.id == id) {
+                v.yanked = yanked;
+            }
+            for f in state.pypi_files.iter_mut().filter(|f| f.version_id == id) {
+                f.yanked = yanked;
+                f.yanked_reason = if yanked { reason.map(str::to_string) } else { None };
+            }
+            Ok(())
+        })
+    }
+
+    async fn delete_release(
+        &self,
+        repository: i64,
+        project: &str,
+        version: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let versions = pypi_release_versions(state, repository, project, Some(version));
+            if versions.is_empty() {
+                return Err(StoreError::NotFound);
+            }
+            Ok(pypi_purge(state, &versions, now))
+        })
+    }
+
+    async fn delete_project_files(
+        &self,
+        repository: i64,
+        project: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let versions = pypi_release_versions(state, repository, project, None);
+            if versions.is_empty() {
+                return Err(StoreError::NotFound);
+            }
+            Ok(pypi_purge(state, &versions, now))
+        })
+    }
+}
+
 struct PinRow {
     token: String,
     physical_key: String,
@@ -2229,6 +2488,10 @@ fn row_references(state: &State) -> Vec<(String, bool)> {
             let image = &m.name;
             refs.push((format!("oci/{repo}/{image}/manifests/{image}/sha256/{hex}"), false));
         }
+    }
+    for f in &state.pypi_files {
+        refs.push((f.key.clone(), false));
+        refs.extend(f.metadata_key.clone().map(|k| (k, false)));
     }
     refs.extend(
         state

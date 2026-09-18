@@ -134,6 +134,7 @@ pub const MIGRATIONS: &[Migration] = &[
         "017_storage_multipart.sql",
         Sentinel::Object("idx_storage_multipart_touched")
     ),
+    sql_migration!("019", "019_pypi.sql", Sentinel::Object("idx_pypi_files_package")),
     sql_migration!(
         "025",
         "025_reclaim.sql",

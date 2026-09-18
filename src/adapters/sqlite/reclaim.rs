@@ -34,6 +34,11 @@ pub(crate) const REFERENCED: &str = "
     UNION ALL
     SELECT 'oci/_uploads/' || id, 1 FROM oci_uploads";
 
+/// Every port's contribution, as one union.
+fn referenced() -> String {
+    format!("{REFERENCED} UNION ALL {}", super::pypi::REFERENCED)
+}
+
 /// `?1` is referenced, or (for a prefix) something under it is, or a
 /// protecting key covers it.
 const REFERENCES_KEY: &str = "
@@ -45,7 +50,7 @@ const REFERENCES_KEY: &str = "
     )";
 
 fn references_key() -> String {
-    REFERENCES_KEY.replace("REFERENCED", REFERENCED)
+    REFERENCES_KEY.replace("REFERENCED", &referenced())
 }
 
 pub(crate) async fn enqueue_keys(
@@ -145,8 +150,9 @@ async fn is_retired(tx: &mut Tx, repo_prefix: &str) -> Result<bool, sqlx::Error>
 /// ever took.
 async fn reusable(tx: &mut Tx, logical: &str) -> Result<Option<String>, sqlx::Error> {
     let stem = layout::physical_key(logical, "");
+    let referenced = referenced();
     sqlx::query_scalar(&format!(
-        "SELECT refs.k FROM ({REFERENCED}) refs
+        "SELECT refs.k FROM ({referenced}) refs
          WHERE refs.p = 0 AND substr(refs.k, 1, length(?1)) = ?1
            AND instr(substr(refs.k, length(?1) + 1), '/') = 0
            AND refs.k NOT IN (SELECT physical_key FROM reclaim_claimed)
@@ -535,8 +541,9 @@ impl ReferencedKeys for SqliteReferencedKeys {
     fn referenced(&self, grace: Duration, now: DateTime<Utc>) -> ReferencedStream {
         let pool = self.pool.clone();
         let since = bind_ts(cutoff(grace, now));
+        let referenced = referenced();
         let query = format!(
-            "SELECT k, p FROM ({REFERENCED}
+            "SELECT k, p FROM ({referenced}
                  UNION ALL SELECT physical_key, 0 FROM reclaim_pins WHERE until > ?1)
              ORDER BY k, p LIMIT ?2 OFFSET ?3"
         );

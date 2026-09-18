@@ -37,7 +37,7 @@ checksum in the same commit.
 | 016 | - | (free, slack) | - |
 | 017 | 017_storage_multipart.sql | s3.md (storage_multipart) | d33bf7772baee4f379535f7983837a5c56e0f707211e3e4cbf00b359efe0f6d2 |
 | 018 | - | s3.md (oci_upload_progress) | - |
-| 019 | - | pypi.md (pypi_files) | - |
+| 019 | 019_pypi.sql | pypi.md (pypi_files) | d301499e72c72ddbb460fee30d6c39dbf0b4cbdf2e7a609ba2ee0b0d91f5108e |
 | 020 | - | nuget.md (nuget_format + its Step::Rust rebuild) | - |
 | 021 | - | sso.md (sso) | - |
 | 022 | - | ha-options.md (server_leases) | - |
