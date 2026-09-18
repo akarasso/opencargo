@@ -40,6 +40,7 @@ CREATE TABLE IF NOT EXISTS gap (scope TEXT NOT NULL, kind TEXT NOT NULL, source_
 
 pub struct SqliteImportJournal {
     pool: SqlitePool,
+    owner: std::sync::Mutex<Option<String>>,
 }
 
 fn io(e: impl std::fmt::Display) -> JournalError {
@@ -111,11 +112,38 @@ impl SqliteImportJournal {
             .execute(&pool)
             .await
             .map_err(io)?;
-        Ok(Self { pool })
+        Ok(Self { pool, owner: std::sync::Mutex::default() })
     }
 
     pub async fn close(self) {
         self.pool.close().await;
+    }
+
+    fn owner(&self) -> Option<String> {
+        self.owner.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    async fn fence(&self, tx: &mut sqlx::SqliteConnection) -> Result<(), JournalError> {
+        let Some(me) = self.owner() else { return Ok(()) };
+        let held: Option<String> = sqlx::query_scalar("SELECT owner FROM run WHERE id = 1")
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(io)?
+            .flatten();
+        if held.as_deref() == Some(me.as_str()) {
+            return Ok(());
+        }
+        Err(JournalError::Lost(held.unwrap_or_else(|| "nobody".into())))
+    }
+
+    async fn lost(&self) -> JournalError {
+        let held: Option<String> = sqlx::query_scalar("SELECT owner FROM run WHERE id = 1")
+            .fetch_optional(&self.pool)
+            .await
+            .ok()
+            .flatten()
+            .flatten();
+        JournalError::Lost(held.unwrap_or_else(|| "nobody".into()))
     }
 }
 
@@ -278,31 +306,52 @@ impl ImportJournal for SqliteImportJournal {
                 sqlx::query(stmt).execute(&mut *tx).await.map_err(io)?;
             }
         }
-        tx.commit().await.map_err(io)
+        tx.commit().await.map_err(io)?;
+        *self.owner.lock().unwrap_or_else(|e| e.into_inner()) = Some(owner.to_string());
+        Ok(())
     }
 
     async fn heartbeat(&self, owner: &str, now: DateTime<Utc>) -> Result<(), JournalError> {
-        sqlx::query("UPDATE run SET heartbeat = ? WHERE id = 1 AND owner = ?")
+        let done = sqlx::query("UPDATE run SET heartbeat = ? WHERE id = 1 AND owner = ?")
             .bind(bind_ts(now))
             .bind(owner)
             .execute(&self.pool)
             .await
             .map_err(io)?;
+        if done.rows_affected() == 0 {
+            return Err(self.lost().await);
+        }
         Ok(())
     }
 
     async fn finish(&self, phase: &str, now: DateTime<Utc>) -> Result<(), JournalError> {
-        sqlx::query("UPDATE run SET phase = ?, finished_at = ?, owner = NULL, heartbeat = NULL WHERE id = 1")
-            .bind(phase)
-            .bind(bind_ts(now))
-            .execute(&self.pool)
-            .await
-            .map_err(io)?;
+        let Some(me) = self.owner.lock().unwrap_or_else(|e| e.into_inner()).take() else {
+            sqlx::query("UPDATE run SET phase = ?, finished_at = ? WHERE id = 1 AND owner IS NULL")
+                .bind(phase)
+                .bind(bind_ts(now))
+                .execute(&self.pool)
+                .await
+                .map_err(io)?;
+            return Ok(());
+        };
+        let done = sqlx::query(
+            "UPDATE run SET phase = ?, finished_at = ?, owner = NULL, heartbeat = NULL WHERE id = 1 AND owner = ?",
+        )
+        .bind(phase)
+        .bind(bind_ts(now))
+        .bind(&me)
+        .execute(&self.pool)
+        .await
+        .map_err(io)?;
+        if done.rows_affected() == 0 {
+            return Err(self.lost().await);
+        }
         Ok(())
     }
 
     async fn streams(&self, names: &[String]) -> Result<(), JournalError> {
         let mut tx = self.pool.begin().await.map_err(io)?;
+        self.fence(&mut tx).await?;
         for n in names {
             sqlx::query("INSERT INTO cursor (stream) VALUES (?) ON CONFLICT(stream) DO NOTHING")
                 .bind(n)
@@ -335,6 +384,7 @@ impl ImportJournal for SqliteImportJournal {
             check_redacted(p)?;
         }
         let mut tx = self.pool.begin().await.map_err(io)?;
+        self.fence(&mut tx).await?;
         if restarted {
             sqlx::query("DELETE FROM gap WHERE scope = ?")
                 .bind(stream)
@@ -388,6 +438,7 @@ impl ImportJournal for SqliteImportJournal {
 
     async fn replace_run_gaps(&self, gaps: &[Gap]) -> Result<(), JournalError> {
         let mut tx = self.pool.begin().await.map_err(io)?;
+        self.fence(&mut tx).await?;
         sqlx::query("DELETE FROM gap WHERE scope = ?")
             .bind(RUN_SCOPE)
             .execute(&mut *tx)
@@ -398,6 +449,8 @@ impl ImportJournal for SqliteImportJournal {
     }
 
     async fn claim(&self, lane: Lane, now: DateTime<Utc>) -> Result<Option<Journaled>, JournalError> {
+        let mut tx = self.pool.begin().await.map_err(io)?;
+        self.fence(&mut tx).await?;
         let row = sqlx::query(
             "UPDATE item SET status = 'running', attempts = attempts + 1, claimed_at = ?
              WHERE source_ref = (SELECT source_ref FROM item WHERE status = 'pending' AND (target_format = 'oci') = ?
@@ -406,15 +459,17 @@ impl ImportJournal for SqliteImportJournal {
         )
         .bind(bind_ts(now))
         .bind(lane == Lane::Blob)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(io)?;
+        tx.commit().await.map_err(io)?;
         row.as_ref().map(journaled).transpose()
     }
 
     async fn complete(&self, source_ref: &str, o: &Outcome) -> Result<(), JournalError> {
         let scope = format!("item:{source_ref}");
         let mut tx = self.pool.begin().await.map_err(io)?;
+        self.fence(&mut tx).await?;
         sqlx::query("UPDATE item SET status = ?, bytes = ?, sha256 = ?, error = ?, note = ? WHERE source_ref = ?")
             .bind(o.status.as_str())
             .bind(o.bytes.map(|b| b as i64))
@@ -442,6 +497,7 @@ impl ImportJournal for SqliteImportJournal {
 
     async fn take_collisions(&self) -> Result<Vec<Gap>, JournalError> {
         let mut tx = self.pool.begin().await.map_err(io)?;
+        self.fence(&mut tx).await?;
         let rows = sqlx::query(
             "SELECT target_repo, target_name, version, group_concat(source_ref, ' and ') AS refs FROM
                (SELECT target_repo, target_name, version, source_ref FROM item ORDER BY source_ref)
@@ -536,6 +592,7 @@ impl ImportJournal for SqliteImportJournal {
     async fn sealed(&self, target_repo: &str, name: &str, gaps: &[Gap]) -> Result<(), JournalError> {
         let scope = format!("seal:{target_repo}/{name}");
         let mut tx = self.pool.begin().await.map_err(io)?;
+        self.fence(&mut tx).await?;
         sqlx::query("DELETE FROM gap WHERE scope = ?").bind(&scope).execute(&mut *tx).await.map_err(io)?;
         insert_gaps(&mut tx, &scope, gaps).await.map_err(io)?;
         sqlx::query("UPDATE pkg SET sealed = 1 WHERE target_repo = ? AND name = ?")
@@ -691,6 +748,49 @@ mod tests {
         assert_eq!(err, JournalError::Busy("host:1".into()));
         let later = now + chrono::Duration::seconds(STALE_OWNER_SECS + 1);
         j.begin(&header(), "host:2", false, later).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_owner_taken_over_is_fenced_out_of_every_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = journal(&dir).await;
+        let b = journal(&dir).await;
+        let now = Utc::now();
+        a.begin(&header(), "host:1", true, now).await.unwrap();
+        let items = vec![
+            planned("x", "x", "1.0.1", crate::domain::Format::Npm),
+            planned("y", "y", "1.0.1", crate::domain::Format::Npm),
+        ];
+        a.record("s", true, &items, &[], &None, true).await.unwrap();
+        let held = a.claim(Lane::File, now).await.unwrap().unwrap();
+        let later = now + chrono::Duration::seconds(STALE_OWNER_SECS + 1);
+        b.begin(&header(), "host:2", false, later).await.unwrap();
+        let mine = b.claim(Lane::File, later).await.unwrap().unwrap();
+        assert_eq!(mine.planned.item.source_ref, held.planned.item.source_ref);
+
+        let lost = JournalError::Lost("host:2".into());
+        let done = Outcome { status: ItemStatus::Copied, bytes: Some(1), sha256: None, error: None, note: None, gaps: Vec::new() };
+        assert_eq!(a.complete(&held.planned.item.source_ref, &done).await.err(), Some(lost.clone()));
+        assert_eq!(a.claim(Lane::File, later).await.err(), Some(lost.clone()));
+        assert_eq!(a.sealed("t", "x", &[]).await.err(), Some(lost.clone()));
+        assert_eq!(a.record("s", false, &items, &[], &None, true).await.err(), Some(lost.clone()));
+        assert_eq!(a.replace_run_gaps(&[]).await.err(), Some(lost.clone()));
+        assert_eq!(a.take_collisions().await.err(), Some(lost.clone()));
+        assert_eq!(a.heartbeat("host:1", later).await.err(), Some(lost.clone()));
+        assert_eq!(a.finish("finished", later).await.err(), Some(lost));
+
+        let run = b.header().await.unwrap().unwrap();
+        assert_eq!(run.owner.as_deref(), Some("host:2"));
+        assert_eq!(run.finished_at, None);
+        let rows = b.items().await.unwrap();
+        assert_eq!(rows.len(), 2);
+        let running = rows.iter().find(|r| r.planned.item.source_ref == mine.planned.item.source_ref).unwrap();
+        assert_eq!(running.status, ItemStatus::Running);
+        let err = b.begin(&header(), "host:3", true, later).await.err().unwrap();
+        assert_eq!(err, JournalError::Busy("host:2".into()));
+        b.complete(&mine.planned.item.source_ref, &done).await.unwrap();
+        b.finish("finished", later).await.unwrap();
+        assert_eq!(b.header().await.unwrap().unwrap().owner, None);
     }
 
     #[tokio::test]

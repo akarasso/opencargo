@@ -123,11 +123,13 @@ enum Step {
     Abort(String),
 }
 
-async fn heartbeat_loop(journal: Arc<dyn ImportJournal>, clock: Arc<dyn Clock>, owner: String, every: Duration) {
+async fn heartbeat_loop(journal: Arc<dyn ImportJournal>, clock: Arc<dyn Clock>, owner: String, every: Duration) -> JournalError {
     loop {
         tokio::time::sleep(every).await;
-        if let Err(e) = journal.heartbeat(&owner, clock.now()).await {
-            warn!("heartbeat: {e}");
+        match journal.heartbeat(&owner, clock.now()).await {
+            Err(e @ JournalError::Lost(_)) => return e,
+            Err(e) => warn!("heartbeat: {e}"),
+            Ok(()) => {}
         }
     }
 }
@@ -379,13 +381,19 @@ impl RunImport<'_> {
         if let Err(e) = self.journal.begin(&opts.header, &opts.owner, opts.fresh, self.clock.now()).await {
             return Finished::refused(journal_err(e));
         }
-        let beat = tokio::spawn(heartbeat_loop(
+        let mut beat = tokio::spawn(heartbeat_loop(
             self.journal.clone(),
             self.clock.clone(),
             opts.owner.clone(),
             opts.heartbeat,
         ));
-        let mut finished = self.run_claimed(opts, cancel).await;
+        let mut finished = tokio::select! {
+            f = self.run_claimed(opts, cancel) => f,
+            lost = &mut beat => {
+                let why = lost.map_or_else(|e| format!("heartbeat: {e}"), journal_err);
+                Finished { code: EXIT_ABORTED, report: None, message: Some(why), probe: None, notes: Vec::new() }
+            }
+        };
         beat.abort();
         let phase = match finished.code {
             EXIT_NOT_STARTED => "refused",

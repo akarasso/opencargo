@@ -360,6 +360,9 @@ pub struct Unsealed {
 pub enum JournalError {
     #[error("the state file is held by {0}")]
     Busy(String),
+    /// Another owner took the journal over; this run must stop writing.
+    #[error("the state file was taken over by {0}")]
+    Lost(String),
     #[error("{0}")]
     Incompatible(String),
     /// An origin carried a query string or credentials.
@@ -384,6 +387,9 @@ pub trait ImportJournal: Send + Sync {
         now: DateTime<Utc>,
     ) -> Result<(), JournalError>;
 
+    /// Once `begin` succeeded, every write through this handle, including
+    /// `heartbeat` and `finish`, is refused with `Lost` if another owner has
+    /// since taken the journal over.
     async fn heartbeat(&self, owner: &str, now: DateTime<Utc>) -> Result<(), JournalError>;
 
     async fn finish(&self, phase: &str, now: DateTime<Utc>) -> Result<(), JournalError>;
