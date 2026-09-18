@@ -353,11 +353,16 @@ impl Fx {
     }
 
     pub fn engine(&self, timeouts: Timeouts) -> ProxyEngine {
+        self.engine_over(self.storage.clone(), timeouts)
+    }
+
+    /// The engine over another storage, typically the fixture's own wrapped.
+    pub fn engine_over(&self, storage: Arc<dyn StorageBackend>, timeouts: Timeouts) -> ProxyEngine {
         let ttl = TtlConfig {
             default_secs: 3600,
             negative_secs: 600,
         };
-        ProxyEngine::new(self.storage.clone(), self.cache.clone(), timeouts, ttl)
+        ProxyEngine::new(storage, self.cache.clone(), timeouts, ttl)
     }
 
     pub fn member(&self) -> CacheRepo<'_> {

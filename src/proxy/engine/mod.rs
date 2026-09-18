@@ -91,6 +91,9 @@ struct Pass {
     miss: Miss,
     /// Revalidate a fresh `200` row instead of serving it.
     force_stale: bool,
+    /// Bounds the upstream awaits and the wait for the singleflight guard,
+    /// never a storage write.
+    deadline: Option<tokio::time::Instant>,
 }
 
 impl Pass {
@@ -99,6 +102,7 @@ impl Pass {
             now: Utc::now(),
             miss,
             force_stale,
+            deadline: None,
         }
     }
 }
@@ -167,8 +171,23 @@ impl ProxyEngine {
             .await
     }
 
-    /// Lookup, singleflight, exchange, settle; cache hit and miss are
-    /// counted for client fetches only.
+    /// `observe` whose upstream awaits end at `limit`; `None` when they did.
+    /// The storage write of a body that arrived in time is never cut short.
+    pub async fn observe_within<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        limit: Duration,
+    ) -> AppResult<Option<Outcome<Cached>>> {
+        let pass = Pass {
+            deadline: Some(tokio::time::Instant::now() + limit),
+            ..Pass::new(Miss::Ignore, false)
+        };
+        self.run_timed(s, up, member, a, pass).await
+    }
+
     async fn run<S: UpstreamStrategy>(
         &self,
         s: &S,
@@ -177,21 +196,48 @@ impl ProxyEngine {
         a: &S::Artifact,
         pass: Pass,
     ) -> AppResult<Outcome<Cached>> {
+        let settled = self.run_timed(s, up, member, a, pass).await?;
+        settled.ok_or_else(|| AppError::BadGateway("upstream deadline exceeded".into()))
+    }
+
+    /// Lookup, then singleflight, exchange, settle. A warm answer never
+    /// takes the guard; cache hit and miss are counted for client fetches
+    /// only.
+    async fn run_timed<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        up: &Upstream,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        pass: Pass,
+    ) -> AppResult<Option<Outcome<Cached>>> {
         let key = s.cache_key(a);
-        let _guard = self.lock(member, &key, pass.force_stale).await;
         let counted = pass.miss == Miss::Record;
+        if !pass.force_stale {
+            if let Some(warm) = self.warm(s, member, a, &key, pass, counted).await? {
+                return Ok(Some(warm));
+            }
+        }
+        let locking = self.lock(member, &key, pass.force_stale);
+        let _guard = match pass.deadline {
+            Some(deadline) => match tokio::time::timeout_at(deadline, locking).await {
+                Ok(guard) => guard,
+                Err(_) => return Ok(None),
+            },
+            None => locking.await,
+        };
         let stale = match self.lookup(s, member, a, &key, pass).await? {
             Lookup::Fresh(cached) => {
                 if counted {
                     crate::telemetry::record_cache_hit(&member.0.name);
                 }
-                return Ok(Outcome::Found(cached));
+                return Ok(Some(Outcome::Found(cached)));
             }
             Lookup::Negative => {
                 if counted {
                     crate::telemetry::record_cache_hit(&member.0.name);
                 }
-                return Ok(Outcome::NotFound);
+                return Ok(Some(Outcome::NotFound));
             }
             Lookup::Stale(stale) => Some(stale),
             Lookup::Cold => None,
@@ -200,9 +246,35 @@ impl ProxyEngine {
             crate::telemetry::record_cache_miss(&member.0.name);
         }
         let reply = self
-            .exchange(s, up, member, a, stale.as_ref(), pass.now)
+            .exchange(s, up, member, a, stale.as_ref(), pass)
             .await;
-        self.settle(s, member, a, reply, stale, pass).await
+        let reply = match reply {
+            Ok(Reply::TimedOut(_)) if pass.deadline.is_some() => return Ok(None),
+            Ok(Reply::TimedOut(why)) => Ok(Reply::Failed(why)),
+            other => other,
+        };
+        self.settle(s, member, a, reply, stale, pass).await.map(Some)
+    }
+
+    /// The fresh answers, read without the singleflight guard.
+    async fn warm<S: UpstreamStrategy>(
+        &self,
+        s: &S,
+        member: CacheRepo<'_>,
+        a: &S::Artifact,
+        key: &CacheKey,
+        pass: Pass,
+        counted: bool,
+    ) -> AppResult<Option<Outcome<Cached>>> {
+        let found = match self.lookup(s, member, a, key, pass).await? {
+            Lookup::Fresh(cached) => Outcome::Found(cached),
+            Lookup::Negative => Outcome::NotFound,
+            Lookup::Stale(_) | Lookup::Cold => return Ok(None),
+        };
+        if counted {
+            crate::telemetry::record_cache_hit(&member.0.name);
+        }
+        Ok(Some(found))
     }
 
     /// The cached body, fresh or stale, with no upstream request and no
@@ -222,7 +294,7 @@ impl ProxyEngine {
             return Ok(None);
         }
         let fresh = row.fresh;
-        Ok(self.resolve_row(s, a, row, now).await.map(|entry| Cached {
+        Ok(self.resolve_row(s, a, row, now).await?.map(|entry| Cached {
             entry,
             stale: !fresh,
         }))
@@ -276,7 +348,7 @@ impl ProxyEngine {
                 Lookup::Cold
             });
         }
-        let Some(target) = self.resolve_row(s, a, row.clone(), pass.now).await else {
+        let Some(target) = self.resolve_row(s, a, row.clone(), pass.now).await? else {
             return Ok(Lookup::Cold);
         };
         if row.fresh && !pass.force_stale {
@@ -323,7 +395,7 @@ impl ProxyEngine {
                 Ok(Outcome::NotFound)
             }
             Ok(Reply::Miss(_)) | Ok(Reply::Refused) => Ok(Outcome::NotFound),
-            Ok(Reply::Failed(why)) => match stale {
+            Ok(Reply::Failed(why) | Reply::TimedOut(why)) => match stale {
                 Some(Stale { target, .. }) if pass.miss == Miss::Record => {
                     warn!(key = %key.key, error = %why, "upstream failed; serving stale cache");
                     Ok(Outcome::Found(Cached {
@@ -356,7 +428,7 @@ impl ProxyEngine {
             if row.status != 200 {
                 return Ok(Outcome::NotFound);
             }
-            if let Some(target) = self.resolve_row(s, a, row.clone(), now).await {
+            if let Some(target) = self.resolve_row(s, a, row.clone(), now).await? {
                 let e = self.hit(&row, target, now).await?.entry;
                 let size = e.size.max(0) as u64;
                 return Ok(Outcome::Found(Payload::head_only(
@@ -378,10 +450,7 @@ impl ProxyEngine {
             .storage_path
             .as_deref()
             .ok_or_else(|| AppError::BadGateway("cache row has no file".into()))?;
-        self.storage
-            .get(path)
-            .await
-            .map_err(|e| AppError::BadGateway(format!("cached file unreadable: {e}")))
+        Ok(self.storage.get(path).await?)
     }
 
     pub async fn stream_response(
@@ -439,33 +508,40 @@ impl ProxyEngine {
     }
 
     /// The row whose file exists: a pointer's target, or the row itself.
+    /// A store or storage fault is an error, never a miss: a miss would
+    /// refetch and overwrite on a hiccup.
     async fn resolve_row<S: UpstreamStrategy>(
         &self,
         s: &S,
         a: &S::Artifact,
         row: CacheEntry,
         now: DateTime<Utc>,
-    ) -> Option<CacheEntry> {
+    ) -> AppResult<Option<CacheEntry>> {
         let target = match (&row.storage_path, &row.digest) {
             (Some(_), _) => row,
             (None, Some(digest)) => {
                 let key = s.store_key(a, digest);
-                self.cache
+                match self
+                    .cache
                     .entry(row.repository_id, key.kind, &key.key, now)
-                    .await
-                    .ok()
-                    .flatten()?
+                    .await?
+                {
+                    Some(target) => target,
+                    None => return Ok(None),
+                }
             }
-            (None, None) => return None,
+            (None, None) => return Ok(None),
         };
         if !s
             .expected_digests(a, &HeaderMap::new())
             .admits_stored_sha256(target.digest.as_deref())
         {
-            return None;
+            return Ok(None);
         }
-        let path = target.storage_path.as_deref()?;
-        self.storage.head(path).await.ok()?.map(|_| target)
+        let Some(path) = target.storage_path.as_deref() else {
+            return Ok(None);
+        };
+        Ok(self.storage.head(path).await?.map(|_| target))
     }
 
     // An untouched pointer would be evicted under a hot tag.

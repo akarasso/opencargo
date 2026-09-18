@@ -924,3 +924,194 @@ async fn a_body_contradicting_its_known_digest_is_refused() {
     assert!(matches!(res, Err(AppError::BadGateway(_))), "{res:?}");
     assert!(fx.row("t-item", "art/x").await.is_none(), "nothing recorded");
 }
+
+/// The fixture's storage with its writer's `reserve` and `commit` slowed:
+/// the queue and the completion no caller may bound.
+struct Slow {
+    inner: Arc<dyn crate::storage::StorageBackend>,
+    reserve: Duration,
+    commit: Duration,
+}
+
+struct SlowWriter {
+    inner: Box<dyn crate::storage::ObjectWriter>,
+    reserve: Duration,
+    commit: Duration,
+}
+
+#[async_trait::async_trait]
+impl crate::storage::ObjectWriter for SlowWriter {
+    async fn reserve(&mut self, next_len: usize) -> Result<(), crate::storage::StorageError> {
+        tokio::time::sleep(self.reserve).await;
+        self.inner.reserve(next_len).await
+    }
+
+    async fn write(&mut self, chunk: bytes::Bytes) -> Result<(), crate::storage::StorageError> {
+        self.inner.write(chunk).await
+    }
+
+    async fn commit(self: Box<Self>) -> Result<u64, crate::storage::StorageError> {
+        tokio::time::sleep(self.commit).await;
+        self.inner.commit().await
+    }
+}
+
+#[async_trait::async_trait]
+impl crate::storage::StorageBackend for Slow {
+    async fn get(&self, key: &str) -> Result<bytes::Bytes, crate::storage::StorageError> {
+        self.inner.get(key).await
+    }
+
+    async fn writer(
+        &self,
+        key: &str,
+    ) -> Result<Box<dyn crate::storage::ObjectWriter>, crate::storage::StorageError> {
+        Ok(Box::new(SlowWriter {
+            inner: self.inner.writer(key).await?,
+            reserve: self.reserve,
+            commit: self.commit,
+        }))
+    }
+
+    async fn read_stream(
+        &self,
+        key: &str,
+    ) -> Result<crate::storage::ReadStream, crate::storage::StorageError> {
+        self.inner.read_stream(key).await
+    }
+
+    async fn copy_object(&self, from: &str, to: &str) -> Result<(), crate::storage::StorageError> {
+        self.inner.copy_object(from, to).await
+    }
+
+    async fn relocate(&self, from: &str, to: &str) -> Result<(), crate::storage::StorageError> {
+        self.inner.relocate(from, to).await
+    }
+
+    async fn head(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::storage::ObjectMeta>, crate::storage::StorageError> {
+        self.inner.head(key).await
+    }
+
+    async fn stat(
+        &self,
+        key: &str,
+    ) -> Result<Option<crate::storage::ObjectMeta>, crate::storage::StorageError> {
+        self.inner.stat(key).await
+    }
+
+    async fn delete(&self, key: &str) -> Result<(), crate::storage::StorageError> {
+        self.inner.delete(key).await
+    }
+
+    async fn delete_batch(&self, keys: &[String]) -> Result<(), crate::storage::StorageError> {
+        self.inner.delete_batch(keys).await
+    }
+
+    fn list(&self, prefix: &str) -> crate::storage::ObjectList {
+        self.inner.list(prefix)
+    }
+
+    async fn sweep_abandoned(
+        &self,
+        older_than: Duration,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<u64, crate::storage::StorageError> {
+        self.inner.sweep_abandoned(older_than, now).await
+    }
+
+    async fn probe(&self) -> Result<(), crate::storage::StorageError> {
+        self.inner.probe().await
+    }
+
+    fn upload_plan(&self) -> crate::storage::UploadPlan {
+        self.inner.upload_plan()
+    }
+
+    async fn self_check(&self) -> crate::storage::CheckReport {
+        self.inner.self_check().await
+    }
+
+    fn identity(&self) -> crate::storage::StoreIdentity {
+        self.inner.identity()
+    }
+}
+
+fn slow(fx: &Fx, reserve: Duration, commit: Duration) -> Arc<dyn crate::storage::StorageBackend> {
+    Arc::new(Slow {
+        inner: fx.storage.clone(),
+        reserve,
+        commit,
+    })
+}
+
+#[tokio::test]
+async fn queued_writer_is_not_bounded_by_a_write_deadline() {
+    let fx = Fx::new().await;
+    let engine = fx.engine_over(
+        slow(&fx, Duration::from_millis(600), Duration::ZERO),
+        Timeouts {
+            buffered_total: Duration::from_millis(200),
+            ..timeouts()
+        },
+    );
+    let got = found(
+        engine
+            .fetch(&Strat::default(), &fx.up, fx.member(), &"art/q".to_string())
+            .await,
+    );
+    assert_eq!(engine.bytes(&got).await.unwrap().as_ref(), b"hello upstream");
+}
+
+#[tokio::test]
+async fn recorder_timeout_does_not_abort_a_completed_upload() {
+    let fx = Fx::new().await;
+    let engine = fx.engine_over(slow(&fx, Duration::ZERO, Duration::from_millis(600)), timeouts());
+    let art = "art/rec".to_string();
+    let observed = engine
+        .observe_within(&Strat::default(), &fx.up, fx.member(), &art, Duration::from_millis(200))
+        .await
+        .unwrap();
+    let Some(Outcome::Found(cached)) = observed else {
+        panic!("the body arrived in time, its commit is not cut: {observed:?}");
+    };
+    assert_eq!(engine.bytes(&cached).await.unwrap().as_ref(), b"hello upstream");
+}
+
+#[tokio::test]
+async fn upstream_deadline_does_not_cover_the_writer() {
+    let fx = Fx::new().await;
+    fx.set(|s| s.delay = Duration::from_millis(800));
+    let engine = fx.engine(timeouts());
+    let observed = engine
+        .observe_within(
+            &Strat::default(),
+            &fx.up,
+            fx.member(),
+            &"art/late".to_string(),
+            Duration::from_millis(200),
+        )
+        .await
+        .unwrap();
+    assert!(observed.is_none(), "a late upstream is the recorder's timeout");
+    assert!(fx.row("t-item", "art/late").await.is_none());
+}
+
+#[tokio::test]
+async fn warm_hits_of_one_key_do_not_serialize() {
+    let fx = Fx::new().await;
+    let engine = fx.engine(timeouts());
+    let (strat, art) = (Strat::default(), "art/warm".to_string());
+    found(engine.fetch(&strat, &fx.up, fx.member(), &art).await);
+    let key = strat.cache_key(&art);
+    let _held = engine.lock(fx.member(), &key, false).await;
+    let warm = tokio::time::timeout(
+        Duration::from_millis(500),
+        engine.fetch(&strat, &fx.up, fx.member(), &art),
+    )
+    .await
+    .expect("a warm hit never waits on the guard");
+    found(warm);
+}

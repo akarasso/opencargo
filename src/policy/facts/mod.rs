@@ -3,7 +3,6 @@ mod oci;
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use serde_json::Value;
-use tokio::time::timeout;
 use tracing::debug;
 
 use crate::proxy::engine::Cached;
@@ -142,16 +141,15 @@ pub(crate) async fn fetch_missing<S: UpstreamStrategy>(
     if !cfg.fetch_missing_facts {
         return (None, "not-fetched");
     }
-    match timeout(
-        shared.tuning.gather_timeout,
-        shared.proxy.observe(s, up, member, a),
-    )
-    .await
-    {
-        Err(_) => (None, "timeout"),
-        Ok(Ok(Outcome::Found(cached))) => (Some(cached), "fetch"),
-        Ok(Ok(Outcome::NotFound)) => (None, "not-found"),
-        Ok(Err(e)) => {
+    let observed = shared
+        .proxy
+        .observe_within(s, up, member, a, shared.tuning.gather_timeout)
+        .await;
+    match observed {
+        Ok(None) => (None, "timeout"),
+        Ok(Some(Outcome::Found(cached))) => (Some(cached), "fetch"),
+        Ok(Some(Outcome::NotFound)) => (None, "not-found"),
+        Err(e) => {
             debug!(artifact = ?a, error = %e, "fact fetch failed");
             (None, "failed")
         }

@@ -17,6 +17,7 @@ use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::SearchIndex;
 use crate::proxy::auth::{default_token_realms, UpstreamAuth, UpstreamCredsSource};
 use crate::proxy::ProxyEngine;
+use crate::storage::StorageError;
 
 /// How resolving a name refuses, in the resolver's own vocabulary.
 ///
@@ -40,6 +41,10 @@ pub enum ResolveError {
     #[error(transparent)]
     Store(#[from] StoreError),
 
+    /// Our own storage failed: a 503, never a group miss.
+    #[error(transparent)]
+    Storage(#[from] StorageError),
+
     /// A configuration fault rather than a registry one: a row write-time
     /// validation should have refused, or an upstream URL that is not one.
     #[error("{0}")]
@@ -53,6 +58,7 @@ impl From<ResolveError> for AppError {
             ResolveError::Upstream(why) => AppError::BadGateway(why),
             ResolveError::Domain(err) => AppError::from(err),
             ResolveError::Store(err) => AppError::from(err),
+            ResolveError::Storage(err) => AppError::from(err),
             ResolveError::Internal(why) => AppError::Internal(why),
         }
     }
@@ -103,19 +109,21 @@ pub struct Upstream {
 
 impl Upstream {
     /// The credentials are looked up rather than handed down: the member is
-    /// discovered mid-walk, so the handler never saw its name.
+    /// discovered mid-walk, so the handler never saw its name. A member's
+    /// broken upstream configuration is that member's failure (`Upstream`),
+    /// so a group falls through to its next member.
     pub fn for_member(
         creds: &dyn UpstreamCredsSource,
         member: &Repository,
     ) -> Result<Self, ResolveError> {
         let raw = member.upstream_url.as_deref().ok_or_else(|| {
-            ResolveError::Internal(format!(
+            ResolveError::Upstream(format!(
                 "proxy repository {} has no upstream_url configured",
                 member.name
             ))
         })?;
         let base = url::Url::parse(raw).map_err(|e| {
-            ResolveError::Internal(format!(
+            ResolveError::Upstream(format!(
                 "proxy repository {} has an invalid upstream_url: {e}",
                 member.name
             ))
@@ -198,15 +206,22 @@ fn missed(url: UrlRepo<'_>, miss: Miss) -> ResolveError {
 }
 
 /// What one member's answer contributes. A member that has nothing is not a
-/// failure however it says so, and a member that failed does not end the walk.
-fn visit<T>(member: &str, result: Result<Outcome<T>, ResolveError>) -> Visit<T> {
+/// failure however it says so; a member whose upstream failed does not end
+/// the walk; every other refusal is ours and ends it with its own status.
+fn visit<T>(member: &str, result: Result<Outcome<T>, ResolveError>) -> Result<Visit<T>, ResolveError> {
     match result {
-        Ok(Outcome::Found(hit)) => Visit::Hit(hit),
-        Ok(Outcome::NotFound) | Err(ResolveError::NotFound(_)) => Visit::Nothing,
-        Err(e) => {
-            warn!(member, error = %e, "member failed; trying the next one");
-            Visit::Failed(format!("member {member} failed: {e}"))
+        Ok(Outcome::Found(hit)) => Ok(Visit::Hit(hit)),
+        Ok(Outcome::NotFound) | Err(ResolveError::NotFound(_)) => Ok(Visit::Nothing),
+        Err(ResolveError::Upstream(why)) => {
+            warn!(member, error = %why, "member failed; trying the next one");
+            Ok(Visit::Failed(format!("member {member} failed: {why}")))
         }
+        Err(
+            e @ (ResolveError::Domain(_)
+            | ResolveError::Store(_)
+            | ResolveError::Storage(_)
+            | ResolveError::Internal(_)),
+        ) => Err(e),
     }
 }
 
@@ -222,14 +237,14 @@ fn walk<'a, L: Leaf + 'a>(
         match repo.kind()? {
             RepoKind::Hosted => {
                 let answer = leaf.hosted(cx, member).await;
-                w.record(visit(&repo.name, answer));
+                w.record(visit(&repo.name, answer)?);
             }
             RepoKind::Proxy => {
                 let answer = match Upstream::for_member(cx.creds, repo) {
                     Ok(up) => leaf.proxy(cx, member, &up).await,
                     Err(e) => Err(e),
                 };
-                w.record(visit(&repo.name, answer));
+                w.record(visit(&repo.name, answer)?);
             }
             RepoKind::Group => walk_members(cx, repo, leaf, depth, w).await?,
         }

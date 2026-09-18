@@ -65,6 +65,7 @@ const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
 #[derive(Clone)]
 pub struct AppState {
     pub storage: Arc<dyn StorageBackend>,
+    pub storage_ready: Arc<StorageReadiness>,
     /// What the proxy remembers; the engine holds it too, and the background
     /// sweep needs it without going through the engine.
     pub cache: Arc<dyn ProxyCacheStore>,
@@ -273,6 +274,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     report_ready(config, &policy_notes);
 
     Ok(AppState {
+        storage_ready: Arc::new(StorageReadiness::new(storage.clone())),
         storage,
         cache,
         auth,
@@ -804,12 +806,48 @@ async fn health_ready(
     // Wider than the `SELECT 1` this replaced, on purpose: a pool that is up
     // over a database with no `repositories` table is not ready either, and
     // used to report itself healthy.
-    match state.repos.by_name("").await {
-        Ok(_) => (StatusCode::OK, Json(json!({"status": "ok"}))),
-        Err(_) => (
+    if state.repos.by_name("").await.is_err() {
+        return (
             StatusCode::SERVICE_UNAVAILABLE,
             Json(json!({"status": "unavailable", "reason": "database"})),
-        ),
+        );
+    }
+    if !state.storage_ready.ready().await {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "unavailable", "reason": "storage"})),
+        );
+    }
+    (StatusCode::OK, Json(json!({"status": "ok"})))
+}
+
+/// The storage probe behind `/health/ready`, memoized briefly so a probe
+/// storm never becomes a storage storm.
+pub struct StorageReadiness {
+    storage: Arc<dyn StorageBackend>,
+    last: tokio::sync::Mutex<Option<(std::time::Instant, bool)>>,
+}
+
+impl StorageReadiness {
+    const MEMO: std::time::Duration = std::time::Duration::from_secs(5);
+
+    pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
+        Self {
+            storage,
+            last: tokio::sync::Mutex::new(None),
+        }
+    }
+
+    pub async fn ready(&self) -> bool {
+        let mut last = self.last.lock().await;
+        if let Some((at, ok)) = *last {
+            if at.elapsed() < Self::MEMO {
+                return ok;
+            }
+        }
+        let ok = self.storage.probe().await.is_ok();
+        *last = Some((std::time::Instant::now(), ok));
+        ok
     }
 }
 

@@ -80,6 +80,7 @@ impl Default for Resolver {
 
 impl Resolver {
     pub fn new(db: FakeDb, policy: Recorder) -> Self {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
         let proxy = ProxyEngine::new(
             Arc::new(NoStorage),
             db.proxy_cache(),

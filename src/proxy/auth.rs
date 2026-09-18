@@ -182,7 +182,7 @@ pub(crate) async fn send_with_auth(
 ) -> AppResult<Response> {
     let retry = req
         .try_clone()
-        .ok_or_else(|| AppError::Internal("upstream request is not replayable".into()))?;
+        .ok_or_else(|| AppError::BadGateway("upstream request is not replayable".into()))?;
     let first = match scope.and_then(|s| cache.get(member.0.id, &up.base, s)) {
         Some(token) => req.bearer_auth(token),
         None => up.auth.iter().fold(req, |r, a| a.apply(r)),

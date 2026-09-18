@@ -131,12 +131,10 @@ impl Payload {
     }
 }
 
-/// A missing file stays a 404; any other local fault is ours, not the upstream's.
+/// A missing file stays a 404; any other fault is ours, never the upstream's,
+/// and keeps the storage port's status.
 fn unreadable(e: StorageError) -> AppError {
-    match e {
-        StorageError::NotFound => AppError::NotFound(e.to_string()),
-        other => AppError::Internal(format!("stored file unreadable: {other}")),
-    }
+    AppError::from(e)
 }
 
 /// `_proxy_cache/{member}/{kind}/{h[..2]}/{h}`, `h = hex(sha256(key))`, so a

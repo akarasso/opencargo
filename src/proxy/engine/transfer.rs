@@ -1,5 +1,7 @@
 use std::future::Future;
 
+use tokio::time::Instant;
+
 use axum::http::{header, HeaderMap, StatusCode};
 use bytes::{Bytes, BytesMut};
 use chrono::{DateTime, Utc};
@@ -15,7 +17,7 @@ use super::super::auth::send_with_auth;
 use super::super::strategy::{
     Classified, DigestAlgorithm, ExpectedDigests, RedirectRule, Transfer, UpstreamStrategy,
 };
-use super::{cache_path, ProxyEngine, Stale};
+use super::{cache_path, Pass, ProxyEngine, Stale};
 
 /// What one upstream exchange ended in; `Failed` is stale-eligible, an
 /// integrity refusal (cap, digest, headers) is an `Err` and never serves stale.
@@ -25,6 +27,8 @@ pub(super) enum Reply {
     Miss(StatusCode),
     Refused,
     Failed(String),
+    /// An upstream await outran its deadline.
+    TimedOut(String),
 }
 
 struct Body {
@@ -42,8 +46,9 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
         stale: Option<&Stale>,
-        now: DateTime<Utc>,
+        pass: Pass,
     ) -> AppResult<Reply> {
+        let now = pass.now;
         let url = self.guarded_url(s, up, a).await?;
         let mut req = self.http.get(url.clone());
         for (name, value) in s.request_headers(a) {
@@ -63,21 +68,20 @@ impl ProxyEngine {
                     .map_err(|e| AppError::BadGateway(format!("upstream request failed: {e}")))
             }
         };
-        match s.transfer(a) {
-            Transfer::Buffered => {
-                let bounded = tokio::time::timeout(
-                    self.timeouts.buffered_total,
-                    self.complete(s, member, a, &url, send, now),
-                );
-                match bounded.await {
-                    Ok(reply) => reply,
-                    Err(_) => Ok(Reply::Failed(format!(
-                        "upstream {url} exceeded the buffered transfer timeout"
-                    ))),
-                }
-            }
-            Transfer::Streamed => self.complete(s, member, a, &url, send, now).await,
-        }
+        let buffered = match s.transfer(a) {
+            Transfer::Buffered => Some(Instant::now() + self.timeouts.buffered_total),
+            Transfer::Streamed => None,
+        };
+        let deadline = match (buffered, pass.deadline) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let leg = Leg {
+            asked: &url,
+            now,
+            deadline,
+        };
+        self.complete(s, member, a, leg, send).await
     }
 
     async fn complete<S: UpstreamStrategy>(
@@ -85,14 +89,19 @@ impl ProxyEngine {
         s: &S,
         member: CacheRepo<'_>,
         a: &S::Artifact,
-        asked: &reqwest::Url,
+        leg: Leg<'_>,
         send: impl Future<Output = AppResult<reqwest::Response>>,
-        now: DateTime<Utc>,
     ) -> AppResult<Reply> {
-        let resp = match send.await {
-            Ok(resp) => resp,
-            Err(AppError::BadGateway(why)) => return Ok(Reply::Failed(why)),
-            Err(e) => return Err(e),
+        let Leg {
+            asked,
+            now,
+            deadline,
+        } = leg;
+        let resp = match upstream(deadline, send).await {
+            Err(()) => return Ok(Reply::TimedOut(format!("upstream {asked} exceeded its deadline"))),
+            Ok(Ok(resp)) => resp,
+            Ok(Err(AppError::BadGateway(why))) => return Ok(Reply::Failed(why)),
+            Ok(Err(e)) => return Err(e),
         };
         if !redirect_allowed(s.final_url_must_match(a), asked, resp.url()) {
             return Err(AppError::BadGateway("upstream redirected off its origin".into()));
@@ -108,10 +117,11 @@ impl ProxyEngine {
                 Classified::Fail => Reply::Failed(format!("upstream answered {status}")),
             });
         }
-        let body = self.read_body(s, member, a, resp).await?;
+        let body = self.read_body(s, member, a, resp, deadline).await?;
         match body {
             Ok(body) => self.record(s, member, a, body, now).await,
-            Err(why) => Ok(Reply::Failed(why)),
+            Err(Cut::Transport(why)) => Ok(Reply::Failed(why)),
+            Err(Cut::Deadline) => Ok(Reply::TimedOut(format!("upstream {asked} body exceeded its deadline"))),
         }
     }
 
@@ -126,7 +136,8 @@ impl ProxyEngine {
         member: CacheRepo<'_>,
         a: &S::Artifact,
         mut resp: reqwest::Response,
-    ) -> AppResult<Result<Body, String>> {
+        deadline: Option<Instant>,
+    ) -> AppResult<Result<Body, Cut>> {
         let headers = resp.headers().clone();
         let expected = s.expected_digests(a, &headers);
         let mut digests = Hashers::for_expected(&expected);
@@ -137,10 +148,11 @@ impl ProxyEngine {
         };
         let mut size = 0u64;
         loop {
-            let chunk = match resp.chunk().await {
-                Ok(Some(chunk)) => chunk,
-                Ok(None) => break,
-                Err(e) => return Ok(Err(format!("upstream body read failed: {e}"))),
+            let chunk = match upstream(deadline, resp.chunk()).await {
+                Err(()) => return Ok(Err(Cut::Deadline)),
+                Ok(Ok(Some(chunk))) => chunk,
+                Ok(Ok(None)) => break,
+                Ok(Err(e)) => return Ok(Err(Cut::Transport(format!("upstream body read failed: {e}")))),
             };
             size += chunk.len() as u64;
             if size > max {
@@ -222,6 +234,29 @@ impl ProxyEngine {
 
 fn header_str(headers: &HeaderMap, name: header::HeaderName) -> Option<&str> {
     headers.get(name).and_then(|v| v.to_str().ok())
+}
+
+/// One upstream exchange: what was asked, the pass's clock, and the
+/// deadline its upstream awaits run under.
+struct Leg<'u> {
+    asked: &'u reqwest::Url,
+    now: DateTime<Utc>,
+    deadline: Option<Instant>,
+}
+
+/// Why a body stopped arriving.
+enum Cut {
+    Transport(String),
+    Deadline,
+}
+
+/// One upstream await under the pass's deadline, if it has one. Storage
+/// awaits never go through here.
+async fn upstream<T>(deadline: Option<Instant>, fut: impl Future<Output = T>) -> Result<T, ()> {
+    match deadline {
+        Some(at) => tokio::time::timeout_at(at, fut).await.map_err(|_| ()),
+        None => Ok(fut.await),
+    }
 }
 
 enum Sink {

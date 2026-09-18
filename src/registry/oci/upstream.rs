@@ -81,7 +81,7 @@ impl UpstreamStrategy for OciUpstream {
         let mut url = up.base.clone();
         if is_hub(up) {
             url.set_host(Some(HUB_REGISTRY))
-                .map_err(|e| ResolveError::Internal(format!("hub host rewrite failed: {e}")))?;
+                .map_err(|e| ResolveError::Upstream(format!("hub host rewrite failed: {e}")))?;
         }
         let prefix = up.base.path().trim_matches('/');
         let path = if prefix.is_empty() {

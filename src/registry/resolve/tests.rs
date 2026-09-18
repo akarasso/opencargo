@@ -15,6 +15,10 @@ fn scripted(repo: &Repository) -> Result<Outcome<String>, ResolveError> {
         n if n.ends_with("-miss") => Ok(Outcome::NotFound),
         n if n.ends_with("-err404") => Err(ResolveError::NotFound(n.to_string())),
         n if n.ends_with("-fail") => Err(ResolveError::Upstream(format!("{n} is down"))),
+        n if n.ends_with("-storage") => Err(ResolveError::Storage(StorageError::Unavailable)),
+        n if n.ends_with("-store") => Err(ResolveError::Store(StoreError::Unavailable)),
+        n if n.ends_with("-internal") => Err(ResolveError::Internal(n.to_string())),
+        n if n.ends_with("-domain") => Err(ResolveError::Domain(DomainError::InvalidName(n.to_string()))),
         n => Ok(Outcome::Found(n.to_string())),
     }
 }
@@ -66,7 +70,16 @@ async fn add(db: &FakeDb, name: &str, kind: RepoKind, members: &[&str]) {
 /// stack one level past the cap.
 async fn fixture() -> Resolver {
     let db = FakeDb::new();
-    for hosted in ["h-found", "h-miss", "h-err404", "h-fail"] {
+    for hosted in [
+        "h-found",
+        "h-miss",
+        "h-err404",
+        "h-fail",
+        "h-storage",
+        "h-store",
+        "h-internal",
+        "h-domain",
+    ] {
         add(&db, hosted, RepoKind::Hosted, &[]).await;
     }
     add(&db, "p-found", RepoKind::Proxy, &[]).await;
@@ -91,7 +104,22 @@ async fn fixture() -> Resolver {
         .await
         .unwrap();
 
-    let groups: [(&str, &[&str]); 8] = [
+    db.repositories()
+        .create(
+            &RepoSpec {
+                upstream: None,
+                ..spec("p-misconfigured", RepoKind::Proxy, &[])
+            },
+            DateTime::UNIX_EPOCH,
+        )
+        .await
+        .unwrap();
+    let groups: [(&str, &[&str]); 13] = [
+        ("g-storage", &["h-storage", "h-found"]),
+        ("g-store", &["h-store", "h-found"]),
+        ("g-internal", &["h-internal", "h-found"]),
+        ("g-domain", &["h-domain", "h-found"]),
+        ("g-misconfigured", &["p-misconfigured", "h-found"]),
         ("g-order", &["h-miss", "h-err404", "h-found", "p-found"]),
         ("g-fail-then-found", &["h-fail", "h-found"]),
         ("g-fail-only", &["h-fail", "h-miss"]),
@@ -247,6 +275,8 @@ fn every_status_the_resolver_serves() {
             500,
         ),
         (ResolveError::Internal("x".into()), 500),
+        (ResolveError::Storage(StorageError::Unavailable), 503),
+        (ResolveError::Storage(StorageError::NotFound), 404),
     ];
     for (err, expected) in cases {
         assert_eq!(status(err).as_u16(), expected);
@@ -267,4 +297,34 @@ fn the_engines_vocabulary_crosses_without_changing_a_status() {
     for (err, expected) in cases {
         assert_eq!(status(ResolveError::from(err)).as_u16(), expected);
     }
+}
+
+/// Our own faults end the walk with their status; only an upstream failure
+/// and a miss let it go on to the next member.
+#[tokio::test]
+async fn walk_stops_on_every_non_upstream_error() {
+    let fx = fixture().await;
+    let cases = [
+        ("g-storage", 503),
+        ("g-store", 503),
+        ("g-internal", 500),
+        ("g-domain", 400),
+    ];
+    for (group, expected) in cases {
+        let err = first(&fx, group).await.unwrap_err();
+        assert_eq!(status(err).as_u16(), expected, "{group}");
+        let err = all(&fx, group).await.err().expect(group);
+        assert_eq!(status(err).as_u16(), expected, "{group}");
+    }
+    assert_eq!(first(&fx, "g-fail-then-found").await.unwrap(), "h-found");
+}
+
+/// A member whose upstream is not configured falls through as it always
+/// did, and alone it answers the 502 it always answered.
+#[tokio::test]
+async fn misconfigured_member_status_is_unchanged() {
+    let fx = fixture().await;
+    assert_eq!(first(&fx, "g-misconfigured").await.unwrap(), "h-found");
+    let alone = first(&fx, "p-misconfigured").await.unwrap_err();
+    assert_eq!(status(alone), axum::http::StatusCode::BAD_GATEWAY);
 }
