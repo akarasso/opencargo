@@ -1,14 +1,17 @@
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Extension, Query, State},
     response::IntoResponse,
     Json,
 };
 use serde::{Deserialize, Serialize};
-use sqlx::SqlitePool;
 
+use crate::auth::middleware::AuthUser;
+use crate::domain::Visibility;
+use crate::error::{AppError, AppResult};
+use crate::ports::dashboard::{PackageFilter, Reach};
+use crate::ports::search::{SearchQuery as Tokens, SearchScope};
 use crate::server::AppState;
-use crate::wire::wire_stored_ts;
+use crate::wire::wire_ts;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -41,7 +44,7 @@ struct RepoResponse {
     #[serde(rename = "type")]
     repo_type: String,
     format: String,
-    visibility: String,
+    visibility: Visibility,
     upstream: Option<String>,
 }
 
@@ -129,6 +132,34 @@ pub struct SearchQuery {
 // ---------------------------------------------------------------------------
 
 const PAGE_SIZE: i64 = 20;
+const RECENT: i64 = 10;
+const SEARCH_RESULTS: u32 = 50;
+
+/// What a package has been released as when no version row claims it: a
+/// package created by a publish that then failed.
+const NO_VERSION: &str = "-";
+
+type Caller = Option<Extension<AuthUser>>;
+
+/// Which packages a caller may count, list and search. Admins see every
+/// repository; everyone else, authenticated or not, sees the public ones.
+fn package_reach(caller: &Caller) -> Reach {
+    match caller.as_ref().map(|user| user.0.role == "admin") {
+        Some(true) => Reach::Everything,
+        _ => Reach::PublicOnly,
+    }
+}
+
+/// Repositories answer to a different caller, and always have: any
+/// authenticated user sees the whole list, an anonymous one the public part.
+/// Before that filter the endpoint leaked private repository names to anyone
+/// whenever `anonymous_read` was on.
+fn repository_reach(caller: &Caller) -> Reach {
+    match caller {
+        Some(_) => Reach::Everything,
+        None => Reach::PublicOnly,
+    }
+}
 
 fn format_size(bytes: i64) -> String {
     if bytes < 1024 {
@@ -148,492 +179,243 @@ fn render_markdown(md: &str) -> String {
     options.insert(Options::ENABLE_TASKLISTS);
     let parser = Parser::new_ext(md, options);
     let mut html_output = String::new();
-    html::push_html(&mut html_output, parser);
     // Allowlist-based HTML sanitization via ammonia, replacing the previous
     // hand-rolled blocklist which was trivially bypassable (stored XSS in
     // package READMEs, e.g. `<img src=x onmouseover=...>`).
+    html::push_html(&mut html_output, parser);
     ammonia::clean(&html_output)
-}
-
-async fn count_scalar(pool: &SqlitePool, query: &str) -> i64 {
-    // Don't swallow DB errors silently (which previously returned a misleading
-    // 0). Log them so a failing dashboard query is at least diagnosable.
-    sqlx::query_scalar::<_, i64>(query)
-        .fetch_one(pool)
-        .await
-        .unwrap_or_else(|e| {
-            tracing::warn!(query, "dashboard count query failed: {e}");
-            0
-        })
 }
 
 // ---------------------------------------------------------------------------
 // Handlers
 // ---------------------------------------------------------------------------
 
-/// SQL fragments restricting `packages` rows to publicly-visible repositories
-/// for non-admin/anonymous callers (both empty for admins). `.0` is an ` AND …`
-/// fragment for queries that already have a WHERE; `.1` is a ` WHERE …` fragment
-/// for those that don't. `repository_id` is unambiguous — only `packages` has it.
-fn visibility_sql(
-    auth: &Option<axum::Extension<crate::auth::middleware::AuthUser>>,
-) -> (&'static str, &'static str) {
-    let is_admin = auth.as_ref().map(|e| e.0.role == "admin").unwrap_or(false);
-    if is_admin {
-        ("", "")
-    } else {
-        (
-            " AND repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')",
-            " WHERE repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')",
-        )
-    }
-}
-
 pub async fn dashboard_stats(
     State(state): State<AppState>,
-    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
-) -> impl IntoResponse {
-    let pool = &state.db;
-    let (_, where_vis) = visibility_sql(&auth);
+    caller: Caller,
+) -> AppResult<impl IntoResponse> {
+    let reach = package_reach(&caller);
+    let totals = state.dashboard.totals(reach).await?;
+    let total_repos = state
+        .dashboard
+        .repository_count(repository_reach(&caller))
+        .await?;
+    let recent = state.dashboard.recent_versions(reach, RECENT).await?;
 
-    let total_packages =
-        count_scalar(pool, &format!("SELECT COUNT(*) FROM packages{where_vis}")).await;
-    // Versions/downloads respect the same visibility rule as packages: an
-    // anonymous caller must not learn how much private activity exists.
-    let total_versions = count_scalar(
-        pool,
-        &format!(
-            "SELECT COUNT(*) FROM versions v
-             JOIN packages p ON p.id = v.package_id
-             {}",
-            if where_vis.is_empty() {
-                String::new()
-            } else {
-                " WHERE p.repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
-                    .to_string()
-            }
-        ),
-    )
-    .await;
-    let total_downloads = count_scalar(
-        pool,
-        &format!(
-            "SELECT COALESCE(SUM(dc.count), 0) FROM download_counts dc
-             JOIN versions v ON v.id = dc.version_id
-             JOIN packages p ON p.id = v.package_id
-             {}",
-            if where_vis.is_empty() {
-                String::new()
-            } else {
-                " WHERE p.repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')"
-                    .to_string()
-            }
-        ),
-    )
-    .await;
-    // Same rule as list_repositories: anonymous callers only count public
-    // repos; any authenticated user sees the full count.
-    let total_repos = if auth.is_some() {
-        count_scalar(pool, "SELECT COUNT(*) FROM repositories").await
-    } else {
-        count_scalar(
-            pool,
-            "SELECT COUNT(*) FROM repositories WHERE visibility = 'public'",
-        )
-        .await
-    };
-
-    let recent = sqlx::query_as::<_, (String, String, String)>(&format!(
-        "SELECT p.name, v.version, v.published_at
-         FROM versions v
-         JOIN packages p ON p.id = v.package_id{where_vis}
-         ORDER BY v.published_at DESC
-         LIMIT 10",
-    ))
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let recent_versions: Vec<RecentVersionResponse> = recent
-        .into_iter()
-        .map(|(package_name, version, published_at)| RecentVersionResponse {
-            package_name,
-            version,
-            published_at: wire_stored_ts(&published_at),
-        })
-        .collect();
-
-    Json(DashboardResponse {
-        total_packages,
-        total_versions,
-        total_downloads,
+    Ok(Json(DashboardResponse {
+        total_packages: totals.packages,
+        total_versions: totals.versions,
+        total_downloads: totals.downloads,
         total_repos,
-        recent_versions,
-    })
+        recent_versions: recent
+            .into_iter()
+            .map(|line| RecentVersionResponse {
+                package_name: line.package,
+                version: line.version,
+                published_at: wire_ts(line.published_at),
+            })
+            .collect(),
+    }))
 }
 
 pub async fn list_repositories(
     State(state): State<AppState>,
-    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
-) -> impl IntoResponse {
-    let pool = &state.db;
-
-    // Anonymous callers only see public repositories; before this filter the
-    // endpoint leaked private repo names to anyone when anonymous_read was on.
-    let sql = if auth.is_some() {
-        "SELECT name, repo_type, format, visibility, upstream_url FROM repositories ORDER BY name"
-    } else {
-        "SELECT name, repo_type, format, visibility, upstream_url FROM repositories
-         WHERE visibility = 'public' ORDER BY name"
-    };
-
-    let repos =
-        sqlx::query_as::<_, (String, String, String, String, Option<String>)>(sql)
-            .fetch_all(pool)
-            .await
-            .unwrap_or_default();
-
+    caller: Caller,
+) -> AppResult<impl IntoResponse> {
+    let reach = repository_reach(&caller);
     // Upstream URLs stay behind authentication: they can carry credentials in
-    // userinfo and reveal internal mirror hosts. Anonymous callers only need
-    // the name/format/visibility to browse.
-    let authenticated = auth.is_some();
-    let repositories: Vec<RepoResponse> = repos
+    // userinfo and reveal internal mirror hosts.
+    let authenticated = reach == Reach::Everything;
+
+    let repositories = state
+        .repos
+        .all()
+        .await?
         .into_iter()
-        .map(|(name, repo_type, format, visibility, upstream)| RepoResponse {
-            name,
-            repo_type,
-            format,
-            visibility,
-            upstream: if authenticated { upstream } else { None },
+        .filter(|repo| authenticated || repo.visibility == Visibility::Public)
+        .map(|repo| RepoResponse {
+            name: repo.name,
+            repo_type: repo.repo_type,
+            format: repo.format,
+            visibility: repo.visibility,
+            upstream: authenticated.then_some(repo.upstream_url).flatten(),
         })
         .collect();
 
-    Json(RepositoriesResponse { repositories })
+    Ok(Json(RepositoriesResponse { repositories }))
 }
 
 pub async fn list_packages(
     State(state): State<AppState>,
     Query(params): Query<PackagesQuery>,
-    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
-) -> impl IntoResponse {
-    let pool = &state.db;
-    let (and_vis, where_vis) = visibility_sql(&auth);
-    let page = if params.page < 1 { 1 } else { params.page };
+    caller: Caller,
+) -> AppResult<impl IntoResponse> {
+    let page = params.page.max(1);
     // saturating_* so a huge `page` cannot overflow the i64 multiplication
     // (panics in debug, wraps to a negative OFFSET in release).
     let offset = page.saturating_sub(1).saturating_mul(PAGE_SIZE);
 
-    let (pkg_rows, count) = if !params.repo.is_empty() && !params.q.is_empty() {
-        let search = format!("%{}%", params.q);
-        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(&format!(
-            "SELECT p.id, p.name, p.description, p.updated_at
-             FROM packages p
-             JOIN repositories r ON r.id = p.repository_id
-             WHERE r.name = ?1 AND p.name LIKE ?2{and_vis}
-             ORDER BY p.updated_at DESC
-             LIMIT ?3 OFFSET ?4",
-        ))
-        .bind(&params.repo)
-        .bind(&search)
-        .bind(PAGE_SIZE)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
+    let found = state
+        .dashboard
+        .packages(&PackageFilter {
+            reach: package_reach(&caller),
+            repository: some_text(&params.repo),
+            name_contains: some_text(&params.q),
+            limit: PAGE_SIZE,
+            offset,
+        })
+        .await?;
 
-        let cnt = sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT COUNT(*) FROM packages p
-             JOIN repositories r ON r.id = p.repository_id
-             WHERE r.name = ?1 AND p.name LIKE ?2{and_vis}",
-        ))
-        .bind(&params.repo)
-        .bind(&search)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-
-        (rows, cnt)
-    } else if !params.repo.is_empty() {
-        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(&format!(
-            "SELECT p.id, p.name, p.description, p.updated_at
-             FROM packages p
-             JOIN repositories r ON r.id = p.repository_id
-             WHERE r.name = ?1{and_vis}
-             ORDER BY p.updated_at DESC
-             LIMIT ?2 OFFSET ?3",
-        ))
-        .bind(&params.repo)
-        .bind(PAGE_SIZE)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-
-        let cnt = sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT COUNT(*) FROM packages p
-             JOIN repositories r ON r.id = p.repository_id
-             WHERE r.name = ?1{and_vis}",
-        ))
-        .bind(&params.repo)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-
-        (rows, cnt)
-    } else if !params.q.is_empty() {
-        let search = format!("%{}%", params.q);
-        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(&format!(
-            "SELECT p.id, p.name, p.description, p.updated_at
-             FROM packages p
-             WHERE p.name LIKE ?1{and_vis}
-             ORDER BY p.updated_at DESC
-             LIMIT ?2 OFFSET ?3",
-        ))
-        .bind(&search)
-        .bind(PAGE_SIZE)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-
-        let cnt = sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT COUNT(*) FROM packages p WHERE p.name LIKE ?1{and_vis}",
-        ))
-        .bind(&search)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-
-        (rows, cnt)
-    } else {
-        let rows = sqlx::query_as::<_, (i64, String, Option<String>, String)>(&format!(
-            "SELECT p.id, p.name, p.description, p.updated_at
-             FROM packages p{where_vis}
-             ORDER BY p.updated_at DESC
-             LIMIT ?1 OFFSET ?2",
-        ))
-        .bind(PAGE_SIZE)
-        .bind(offset)
-        .fetch_all(pool)
-        .await
-        .unwrap_or_default();
-
-        let cnt = sqlx::query_scalar::<_, i64>(&format!(
-            "SELECT COUNT(*) FROM packages{where_vis}"
-        ))
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-
-        (rows, cnt)
-    };
-
-    let mut packages = Vec::with_capacity(pkg_rows.len());
-    for (pkg_id, name, description, updated_at) in pkg_rows {
-        let latest = sqlx::query_scalar::<_, String>(
-            "SELECT version FROM versions WHERE package_id = ?1 ORDER BY id DESC LIMIT 1",
-        )
-        .bind(pkg_id)
-        .fetch_optional(pool)
-        .await
-        .unwrap_or(None)
-        .unwrap_or_else(|| "-".to_string());
-
-        let downloads = sqlx::query_scalar::<_, i64>(
-            "SELECT COALESCE(SUM(dc.count), 0) FROM download_counts dc
-             JOIN versions v ON v.id = dc.version_id
-             WHERE v.package_id = ?1",
-        )
-        .bind(pkg_id)
-        .fetch_one(pool)
-        .await
-        .unwrap_or(0);
-
-        packages.push(PackageResponse {
-            name,
-            latest_version: latest,
-            description: description.unwrap_or_default(),
-            downloads,
-            published_at: wire_stored_ts(&updated_at),
-        });
-    }
-
-    let has_next = offset.saturating_add(PAGE_SIZE) < count;
-
-    Json(PackagesResponse {
-        packages,
-        total: count,
+    Ok(Json(PackagesResponse {
+        packages: found
+            .packages
+            .into_iter()
+            .map(|pkg| PackageResponse {
+                name: pkg.name,
+                latest_version: pkg.latest_version.unwrap_or_else(|| NO_VERSION.to_string()),
+                description: pkg.description.unwrap_or_default(),
+                downloads: pkg.downloads,
+                published_at: wire_ts(pkg.updated_at),
+            })
+            .collect(),
+        total: found.total,
         page,
         page_size: PAGE_SIZE,
-        has_next,
-    })
+        has_next: offset.saturating_add(PAGE_SIZE) < found.total,
+    }))
 }
 
 pub async fn package_detail(
     State(state): State<AppState>,
     axum::extract::Path(path): axum::extract::Path<String>,
-    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
-) -> impl IntoResponse {
-    let pool = &state.db;
-    let pkg_name = path.as_str();
-    let (and_vis, _) = visibility_sql(&auth);
+    caller: Caller,
+) -> AppResult<impl IntoResponse> {
+    let detail = state
+        .dashboard
+        .package_detail(&path, package_reach(&caller))
+        .await?
+        .ok_or_else(|| AppError::NotFound("package not found".to_string()))?;
 
-    let pkg = sqlx::query_as::<_, (i64, String, Option<String>, Option<String>, Option<String>)>(
-        &format!("SELECT id, name, description, readme, license FROM packages WHERE name = ?1{and_vis} LIMIT 1"),
-    )
-    .bind(pkg_name)
-    .fetch_optional(pool)
-    .await;
-
-    let (pkg_id, name, description, readme, license) = match pkg {
-        Ok(Some(row)) => row,
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({"error": "package not found"})),
-            )
-                .into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({"error": e.to_string()})),
-            )
-                .into_response();
-        }
-    };
-
-    let version_rows = sqlx::query_as::<_, (String, i64, String)>(
-        "SELECT version, size, published_at FROM versions WHERE package_id = ?1 ORDER BY id DESC",
-    )
-    .bind(pkg_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let versions: Vec<VersionResponse> = version_rows
-        .into_iter()
-        .map(|(version, size, published_at)| VersionResponse {
-            version,
-            size_display: format_size(size),
-            published_at: wire_stored_ts(&published_at),
-        })
-        .collect();
-
-    let dt_rows = sqlx::query_as::<_, (String, String)>(
-        "SELECT dt.tag, v.version
-         FROM dist_tags dt
-         JOIN versions v ON v.id = dt.version_id
-         WHERE dt.package_id = ?1",
-    )
-    .bind(pkg_id)
-    .fetch_all(pool)
-    .await
-    .unwrap_or_default();
-
-    let dist_tags: Vec<DistTagResponse> = dt_rows
-        .into_iter()
-        .map(|(tag, version)| DistTagResponse { tag, version })
-        .collect();
-
-    let total_downloads = sqlx::query_scalar::<_, i64>(
-        "SELECT COUNT(*) FROM downloads d
-         JOIN versions v ON v.id = d.version_id
-         WHERE v.package_id = ?1",
-    )
-    .bind(pkg_id)
-    .fetch_one(pool)
-    .await
-    .unwrap_or(0);
-
-    let readme_html = readme
-        .as_deref()
-        .map(render_markdown)
-        .unwrap_or_default();
-
-    Json(PackageDetailResponse {
-        name,
-        description: description.unwrap_or_default(),
-        license: license.unwrap_or_default(),
-        readme_html,
-        total_downloads,
-        versions,
-        dist_tags,
-    })
-    .into_response()
+    Ok(Json(PackageDetailResponse {
+        name: detail.package.name,
+        description: detail.package.description.unwrap_or_default(),
+        license: detail.package.license.unwrap_or_default(),
+        readme_html: detail.package.readme.as_deref().map(render_markdown).unwrap_or_default(),
+        total_downloads: detail.total_downloads,
+        versions: detail
+            .versions
+            .into_iter()
+            .map(|version| VersionResponse {
+                version: version.version,
+                size_display: format_size(version.size),
+                published_at: wire_ts(version.published_at),
+            })
+            .collect(),
+        dist_tags: detail
+            .dist_tags
+            .into_iter()
+            .map(|tagged| DistTagResponse {
+                tag: tagged.tag,
+                version: tagged.version,
+            })
+            .collect(),
+    }))
 }
 
 pub async fn search(
     State(state): State<AppState>,
     Query(params): Query<SearchQuery>,
-    auth: Option<axum::Extension<crate::auth::middleware::AuthUser>>,
-) -> impl IntoResponse {
-    let pool = &state.db;
-    let (and_vis, _) = visibility_sql(&auth);
-
-    let results = if !params.q.is_empty() {
-        // Try FTS5 first, fallback to LIKE
-        let fts_query = params.q
-            .split_whitespace()
-            .map(|word| format!("\"{}\"", word.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" ");
-
-        let fts_result = sqlx::query_as::<_, (i64, String, Option<String>)>(&format!(
-            "SELECT p.id, p.name, p.description
-             FROM packages p
-             JOIN packages_fts fts ON p.id = fts.rowid
-             WHERE packages_fts MATCH ?1{and_vis}
-             ORDER BY rank
-             LIMIT 50",
-        ))
-        .bind(&fts_query)
-        .fetch_all(pool)
-        .await;
-
-        let rows = match fts_result {
-            Ok(r) => r,
-            Err(_) => {
-                // Fallback to LIKE
-                let search = format!("%{}%", params.q);
-                sqlx::query_as::<_, (i64, String, Option<String>)>(&format!(
-                    "SELECT p.id, p.name, p.description
-                     FROM packages p
-                     WHERE (p.name LIKE ?1 OR p.description LIKE ?1){and_vis}
-                     ORDER BY p.name
-                     LIMIT 50",
-                ))
-                .bind(&search)
-                .fetch_all(pool)
-                .await
-                .unwrap_or_default()
-            }
-        };
-
-        let mut results = Vec::with_capacity(rows.len());
-        for (pkg_id, name, description) in rows {
-            let latest = sqlx::query_scalar::<_, String>(
-                "SELECT version FROM versions WHERE package_id = ?1 ORDER BY id DESC LIMIT 1",
-            )
-            .bind(pkg_id)
-            .fetch_optional(pool)
-            .await
-            .unwrap_or(None)
-            .unwrap_or_else(|| "-".to_string());
-
-            results.push(SearchResultResponse {
-                name,
-                latest_version: latest,
-                description: description.unwrap_or_default(),
-            });
-        }
-        results
-    } else {
-        Vec::new()
+    caller: Caller,
+) -> AppResult<impl IntoResponse> {
+    // No query at all, and a query that sanitises to no token, are the same
+    // answer here: the panel searches, it never browses, and an expression
+    // FTS5 would refuse never reaches the index.
+    let results = match Tokens::parse(&params.q) {
+        Some(query) => hits(&state, &query, package_reach(&caller)).await?,
+        None => Vec::new(),
     };
 
-    Json(SearchResponse {
+    Ok(Json(SearchResponse {
         query: params.q,
         results,
-    })
+    }))
+}
+
+/// The search panel's rows: the index answers with packages, and what each
+/// was last released as is one more call, not one per row.
+async fn hits(
+    state: &AppState,
+    query: &Tokens,
+    reach: Reach,
+) -> AppResult<Vec<SearchResultResponse>> {
+    let scope = match reach {
+        Reach::Everything => SearchScope::All,
+        Reach::PublicOnly => SearchScope::PublicOnly,
+    };
+    let found = state.search.search(scope, Some(query), SEARCH_RESULTS).await?;
+    let latest = state
+        .dashboard
+        .latest_versions(&found.iter().map(|pkg| pkg.id).collect::<Vec<_>>())
+        .await?;
+
+    Ok(found
+        .into_iter()
+        .map(|pkg| SearchResultResponse {
+            latest_version: latest
+                .get(&pkg.id)
+                .cloned()
+                .unwrap_or_else(|| NO_VERSION.to_string()),
+            name: pkg.name,
+            description: pkg.description.unwrap_or_default(),
+        })
+        .collect())
+}
+
+/// An absent filter box and an empty one are the same request.
+fn some_text(raw: &str) -> Option<&str> {
+    (!raw.is_empty()).then_some(raw)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn caller(role: &str) -> Caller {
+        Some(Extension(AuthUser {
+            token: String::new(),
+            user_id: Some(1),
+            username: "u".to_string(),
+            role: role.to_string(),
+            must_change_password: false,
+            token_name: None,
+        }))
+    }
+
+    /// The two rules the panels used to splice into their SQL, which differ:
+    /// a plain user counts every repository but only public packages.
+    #[test]
+    fn a_caller_reaches_repositories_and_packages_by_different_rules() {
+        assert_eq!(package_reach(&caller("admin")), Reach::Everything);
+        assert_eq!(package_reach(&caller("user")), Reach::PublicOnly);
+        assert_eq!(package_reach(&None), Reach::PublicOnly);
+
+        assert_eq!(repository_reach(&caller("admin")), Reach::Everything);
+        assert_eq!(repository_reach(&caller("user")), Reach::Everything);
+        assert_eq!(repository_reach(&None), Reach::PublicOnly);
+    }
+
+    #[test]
+    fn an_empty_filter_box_is_no_filter() {
+        assert_eq!(some_text(""), None);
+        assert_eq!(some_text("left-pad"), Some("left-pad"));
+    }
+
+    /// The panel's deleted `LIKE` fallback used to absorb these; now they
+    /// never reach the index, which is the same empty answer without the 500.
+    #[test]
+    fn a_query_that_sanitises_away_asks_the_index_nothing() {
+        assert!(Tokens::parse(" ").is_none());
+        assert!(Tokens::parse("\"").is_none());
+        assert!(Tokens::parse("left-pad").is_some());
+    }
 }

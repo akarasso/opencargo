@@ -24,6 +24,7 @@ use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
 use crate::ports::audit::AuditStore;
+use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
@@ -84,6 +85,9 @@ pub struct AppState {
     /// The report's rows; the engine beside it owns the writing and the
     /// totals cache, and holds the same store.
     pub policy_store: Arc<dyn PolicyStore>,
+    /// The web UI's read model: one method per panel, and the only reader of
+    /// the joins no store owns.
+    pub dashboard: Arc<dyn DashboardRead>,
     pub vuln_scanner: Arc<dyn VulnFeed>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
@@ -193,6 +197,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         deps: stores.dependencies(),
         vulns: stores.vulns(),
         policy_store,
+        dashboard: stores.dashboard(),
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,

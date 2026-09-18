@@ -1,3 +1,5 @@
+use chrono::{DateTime, Utc};
+
 /// Which events a webhook asked for: every one, or a named list.
 ///
 /// The `"*"`-or-comma-separated spelling is the one the stored column, the
@@ -58,10 +60,8 @@ pub struct Webhook {
     pub events: Subscription,
     pub secret: Option<String>,
     pub active: bool,
-    /// Stored stamps, still as text: section 1.5 gives their retype to
-    /// `DateTime<Utc>` to the step that owns the surfaces serving them.
-    pub created_at: String,
-    pub updated_at: String,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
 }
 
 #[cfg(test)]

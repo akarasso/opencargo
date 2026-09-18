@@ -13,6 +13,7 @@ use crate::domain::{Subscription, Webhook};
 use crate::error::{AppError, AppResult, StoreError};
 use crate::ports::webhooks::WebhookPatch;
 use crate::server::AppState;
+use crate::wire::wire_ts;
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -44,8 +45,8 @@ fn format_webhook(wh: &Webhook) -> serde_json::Value {
         "url": wh.url,
         "events": wh.events.names(),
         "active": wh.active,
-        "created_at": wh.created_at,
-        "updated_at": wh.updated_at,
+        "created_at": wire_ts(wh.created_at),
+        "updated_at": wire_ts(wh.updated_at),
     })
 }
 

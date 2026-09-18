@@ -4,6 +4,7 @@
 //! behind it is chosen by the composition root and named nowhere else.
 
 pub mod audit;
+pub mod dashboard;
 pub mod deps;
 pub mod multipart;
 pub mod oci;
