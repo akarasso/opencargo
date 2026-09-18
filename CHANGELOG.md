@@ -4,7 +4,35 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
+  validated against MinIO, not yet against a hosted provider. Credentials
+  come only from an allowlisted environment; TLS trusts the compiled-in
+  Mozilla roots. See `docs/storage.md`.
+- `opencargo storage check|verify|migrate|reclaim`, and
+  `GET /api/v1/system/storage` with a Storage tile on the System page.
+- OCI: `GET` on an upload location reports its range; the upload `POST`
+  answers `OCI-Chunk-Min-Length`.
+
 ### Changed
+- OCI: a `PATCH` whose `Content-Range` does not start where the upload
+  stands is `416` with the current `Range`; an unknown upload id, or one
+  started in another repository, is `404 BLOB_UPLOAD_UNKNOWN`; more than
+  10 000 chunks in one upload is `413`; upload, digest and manifest refusals
+  carry an `errors[]` body.
+- OCI: a manifest listing a config or layer blob the repository does not
+  hold is refused with `400 MANIFEST_BLOB_UNKNOWN` (it used to be stored).
+- OCI uploads started before this version are dropped by the storage sweep;
+  a client restarts them.
+- Deleting a manifest, a blob or a version, evicting a proxy entry or
+  removing a repository no longer frees its bytes at once: the keys are
+  queued and reclaimed by the storage sweep after a two-hour grace.
+- New artifacts are stored under an opaque per-repository incarnation and a
+  digest-keyed path (`r/<incarnation>/…`); existing files keep their paths
+  and keep serving.
+- Deprecated: legacy `.part-` scratch files beside finished objects are
+  still skipped by listings and swept; that carve-out will be removed in a
+  later release.
 - A credential that does not verify is refused with 401 on every route,
   including an invalid or revoked Bearer on a public repository, which used
   to fall back to anonymous. A request with no credential is still anonymous.

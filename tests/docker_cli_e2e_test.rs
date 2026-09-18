@@ -180,3 +180,65 @@ async fn docker_push_nested_then_pull_through_proxy_and_group() {
     }
     docker.run_quietly(&["logout", &registry_b]).await;
 }
+
+/// A root filesystem whose one file does not compress: its layer spans
+/// several parts of an S3 multipart upload.
+fn write_large_rootfs_tar(dir: &Path, len: usize) -> PathBuf {
+    let path = dir.join("large-rootfs.tar");
+    let mut builder = tar::Builder::new(std::fs::File::create(&path).unwrap());
+    let mut state: u64 = 0x9E37_79B9_7F4A_7C15;
+    let content: Vec<u8> = (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect();
+    let mut header = tar::Header::new_gnu();
+    header.set_path("noise.bin").unwrap();
+    header.set_size(content.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    builder.append(&header, content.as_slice()).unwrap();
+    builder.finish().unwrap();
+    path
+}
+
+/// A layer larger than several parts goes up and comes back whole, on
+/// whichever store the suite runs.
+#[tokio::test]
+async fn docker_push_and_pull_a_multipart_sized_layer() {
+    let Some(bin) = docker_bin() else {
+        return;
+    };
+    let server = spawn_server(SpawnOpts {
+        repositories: vec![hosted("oci-hosted", RepositoryFormat::Oci, Visibility::Public)],
+        ..Default::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+    create_user(&client, &server.base_url, STATIC_TOKEN, USER, "publisher").await;
+    set_password(&server.base_url, USER, PASSWORD).await;
+
+    let work = tempfile::TempDir::new().unwrap();
+    let docker = Docker {
+        bin,
+        config_dir: work.path().join("docker-config"),
+        cwd: work.path().to_path_buf(),
+    };
+    std::fs::create_dir_all(&docker.config_dir).unwrap();
+    let rootfs = write_large_rootfs_tar(work.path(), 24 * 1024 * 1024);
+    let registry = format!("127.0.0.1:{}", server.port);
+    let image = format!("{registry}/oci-hosted/big/layer:1.0");
+
+    docker.run(&["import", rootfs.to_str().unwrap(), &image]).await;
+    let layer = docker.layer_id(&image).await;
+    docker.run(&["login", &registry, "-u", USER, "-p", PASSWORD]).await;
+    docker.run(&["push", &image]).await;
+    docker.run(&["rmi", &image]).await;
+    docker.run(&["pull", &image]).await;
+    assert_eq!(docker.layer_id(&image).await, layer);
+    docker.run(&["rmi", &image]).await;
+    docker.run_quietly(&["logout", &registry]).await;
+}
