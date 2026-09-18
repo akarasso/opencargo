@@ -24,7 +24,7 @@ pub use events::{
     announce, Audience, DomainEvent, PackagePromotion, PackageRelease, ResolutionCounts,
 };
 pub use format_rules::FormatRules;
-pub use governance::{AllowRule, Effect, GateMode};
+pub use governance::{AllowRule, Decision, Drift, Effect, Fingerprint, GateMode};
 pub use identity::CredentialKind;
 pub use kinds::{Format, RepoKind, Visibility};
 pub use names::{
