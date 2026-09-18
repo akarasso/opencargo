@@ -6,6 +6,7 @@ pub mod gate;
 pub mod ingest;
 pub mod probe;
 pub mod publish;
+pub mod record;
 pub mod routes;
 pub mod rules;
 pub mod scan;

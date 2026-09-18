@@ -1,4 +1,5 @@
 pub mod install_scripts;
+pub mod mcp;
 pub mod min_release_age;
 pub mod osv_severity;
 pub mod typosquat;
@@ -28,6 +29,10 @@ pub struct PolicyConfig {
     pub install_scripts: bool,
     pub typosquat: bool,
     pub fetch_missing_facts: bool,
+    pub mcp_allowlist: bool,
+    pub mcp_injection: bool,
+    pub mcp_transport: bool,
+    pub mcp_drift: bool,
 }
 
 /// `Severity` deserialises `unknown` too, the level of an advisory
@@ -49,6 +54,10 @@ impl Default for PolicyConfig {
             install_scripts: false,
             typosquat: false,
             fetch_missing_facts: true,
+            mcp_allowlist: false,
+            mcp_injection: false,
+            mcp_transport: false,
+            mcp_drift: false,
         }
     }
 }
@@ -59,6 +68,10 @@ impl PolicyConfig {
             && self.osv_severity.is_none()
             && !self.install_scripts
             && !self.typosquat
+            && !self.mcp_allowlist
+            && !self.mcp_injection
+            && !self.mcp_transport
+            && !self.mcp_drift
     }
 
     pub fn needs_packument(&self) -> bool {
@@ -79,14 +92,18 @@ pub trait Rule: Send + Sync {
     ) -> Option<RuleVerdict>;
 }
 
-/// The four strategies, in report order; `osv_severity` shares its memo
-/// with the writer's flush.
+/// The strategies, in report order; `osv_severity` shares its memo with
+/// the writer's flush.
 pub fn all_rules(scanner: Arc<dyn VulnFeed>, memo: Arc<OsvMemo>) -> Vec<Box<dyn Rule>> {
     vec![
         Box::new(min_release_age::MinReleaseAge),
         Box::new(OsvSeverity::new(scanner, memo)),
         Box::new(install_scripts::InstallScripts),
         Box::new(typosquat::Typosquat),
+        Box::new(mcp::McpAllowlist),
+        Box::new(mcp::McpInjection),
+        Box::new(mcp::McpTransport),
+        Box::new(mcp::McpDrift),
     ]
 }
 
@@ -120,6 +137,10 @@ mod tests {
         assert!(scripts.needs_packument());
         let squat: PolicyConfig = toml::from_str("typosquat = true").unwrap();
         assert!(!squat.needs_packument() && !squat.is_empty());
+        for key in ["mcp_allowlist", "mcp_injection", "mcp_transport", "mcp_drift"] {
+            let only: PolicyConfig = toml::from_str(&format!("{key} = true")).unwrap();
+            assert!(!only.is_empty() && !only.needs_packument(), "a repo with only {key} records");
+        }
     }
 
     #[test]
@@ -140,7 +161,11 @@ mod tests {
                 "min_release_age",
                 "osv_severity",
                 "install_scripts",
-                "typosquat"
+                "typosquat",
+                "mcp_allowlist",
+                "mcp_injection",
+                "mcp_transport",
+                "mcp_drift"
             ]
         );
         let r = Resolution {

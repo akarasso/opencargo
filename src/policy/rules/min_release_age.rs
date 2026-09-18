@@ -77,6 +77,7 @@ mod tests {
             facts: Facts {
                 install_scripts: None,
                 date_source,
+                mcp: None,
             },
         }
     }

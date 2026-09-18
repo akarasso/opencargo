@@ -1276,7 +1276,7 @@ fn warn_policy_notes(notes: &crate::policy::startup::StartupNotes) {
         warn!(keys = ?notes.unknown, "[policy.*] keys naming no configured repository");
     }
     if !notes.inapplicable.is_empty() {
-        warn!(rules = ?notes.inapplicable, "policy rules that can only answer not_applicable on an OCI member");
+        warn!(rules = ?notes.inapplicable, "policy rules that can only answer not_applicable on these members");
     }
 }
 

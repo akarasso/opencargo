@@ -310,7 +310,8 @@ pub async fn get_version(
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
     let repo = open(&state, &repo_name, auth).await?;
-    let (_, row, visibility, _) = resolve_version(&state, &repo, auth, &server, &version).await?;
+    let (member, row, visibility, gates) = resolve_version(&state, &repo, auth, &server, &version).await?;
+    super::record::served(&state, &repo, &member, &row, &gates, auth).await;
     Ok(Json(render(&row, &repo.name, &visibility)?))
 }
 

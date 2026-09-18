@@ -33,12 +33,24 @@ pub fn startup_notes(config: &Config) -> Result<StartupNotes, String> {
             continue;
         }
         notes.recording.push(key.clone());
-        if repo.format == Format::Oci {
+        if matches!(repo.format, Format::Oci | Format::Mcp) {
             if cfg.typosquat {
                 notes.inapplicable.push((key.clone(), "typosquat"));
             }
             if cfg.osv_severity.is_some() {
                 notes.inapplicable.push((key.clone(), "osv_severity"));
+            }
+        }
+        if repo.format != Format::Mcp {
+            for (on, rule) in [
+                (cfg.mcp_allowlist, "mcp_allowlist"),
+                (cfg.mcp_injection, "mcp_injection"),
+                (cfg.mcp_transport, "mcp_transport"),
+                (cfg.mcp_drift, "mcp_drift"),
+            ] {
+                if on {
+                    notes.inapplicable.push((key.clone(), rule));
+                }
             }
         }
     }
