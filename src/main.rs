@@ -79,7 +79,7 @@ async fn main() -> anyhow::Result<()> {
             // app_state: the pre-release sweep needs cleanup.enabled, the proxy
             // cache sweep runs whenever proxy_cache_older_than_days is set.
             tokio::spawn(opencargo::telemetry::cleanup::start_cleanup_task(
-                app_state.db.clone(),
+                app_state.packages.clone(),
                 app_state.cache.clone(),
                 app_state.policy_store.clone(),
                 app_state.storage.clone(),
