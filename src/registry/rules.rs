@@ -157,6 +157,7 @@ pub fn rules(format: Format) -> Option<&'static dyn FormatRules> {
         Format::Pypi => Some(&super::pypi::names::PypiRules),
         Format::Maven => Some(&MavenRules),
         Format::Nuget => Some(&super::nuget::rules::NugetRules),
+        Format::Mcp => Some(&super::mcp::rules::McpRules),
     }
 }
 

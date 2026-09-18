@@ -29,6 +29,82 @@ pub struct Config {
     /// Policy rules per proxy repository name; a member with none on records nothing.
     #[serde(default)]
     pub policy: HashMap<String, PolicyConfig>,
+    /// MCP governance per `mcp` repository name.
+    #[serde(default)]
+    pub mcp: HashMap<String, McpConfig>,
+}
+
+// ---------------------------------------------------------------------------
+// MCP governance
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct McpConfig {
+    pub mode: crate::domain::GateMode,
+    /// Seeded as `allow` rules at startup; editable through the API after.
+    pub allowlist: Vec<String>,
+    pub denylist: Vec<String>,
+    /// `pattern` or `pattern:tool`, seeded as suppressions of this repository.
+    pub suppress: Vec<String>,
+    /// Let `medium` findings gate as well as `high` ones.
+    pub scan_medium: bool,
+    pub sync_interval: String,
+    pub probe_remotes: bool,
+    pub probe_interval: String,
+    pub probe_concurrency: usize,
+    /// Probe remotes resolving to loopback or private addresses.
+    pub probe_allow_private: bool,
+    /// `Header-Name: value` sent with every probe.
+    pub probe_auth: Option<String>,
+    /// This repository is what a VS Code gallery points at.
+    pub gallery: bool,
+    /// The command Claude Code runs to authenticate a skill download.
+    pub headers_helper: Option<String>,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        Self {
+            mode: crate::domain::GateMode::Warn,
+            allowlist: Vec::new(),
+            denylist: Vec::new(),
+            suppress: Vec::new(),
+            scan_medium: false,
+            sync_interval: "1h".to_string(),
+            probe_remotes: false,
+            probe_interval: "24h".to_string(),
+            probe_concurrency: 4,
+            probe_allow_private: false,
+            probe_auth: None,
+            gallery: false,
+            headers_helper: None,
+        }
+    }
+}
+
+impl McpConfig {
+    /// Every value refused at startup rather than defaulted.
+    pub fn validate(&self, repo: &str) -> Result<()> {
+        for pattern in self.allowlist.iter().chain(&self.denylist) {
+            crate::domain::governance::validate_pattern(pattern)
+                .map_err(|e| anyhow::anyhow!("[mcp.{repo}] {e}"))?;
+        }
+        for entry in &self.suppress {
+            let pattern = entry.split_once(':').map_or(entry.as_str(), |(p, _)| p);
+            anyhow::ensure!(!pattern.is_empty(), "[mcp.{repo}] empty suppression '{entry}'");
+        }
+        parse_chrono_duration(&self.sync_interval).with_context(|| format!("[mcp.{repo}] sync_interval"))?;
+        parse_chrono_duration(&self.probe_interval).with_context(|| format!("[mcp.{repo}] probe_interval"))?;
+        anyhow::ensure!(self.probe_concurrency > 0, "[mcp.{repo}] probe_concurrency must be at least 1");
+        if let Some(header) = &self.probe_auth {
+            anyhow::ensure!(
+                header.split_once(':').is_some_and(|(n, _)| !n.trim().is_empty()),
+                "[mcp.{repo}] probe_auth is 'Header-Name: value'"
+            );
+        }
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -221,6 +297,9 @@ impl Config {
             anyhow::bail!("a storage id may not be empty");
         }
         refuse_duplicate_identities(ids.iter().map(String::as_str))?;
+        for (repo, mcp) in &self.mcp {
+            mcp.validate(repo)?;
+        }
         if self.storage.backend == StorageKind::S3 {
             let s3 = &self.storage.s3;
             if s3.bucket.trim().is_empty() && std::env::var("OPENCARGO_S3_BUCKET").is_err() {
@@ -544,6 +623,29 @@ mod tests {
         assert!(refuse_duplicate_identities(["artifacts", "artifacts"]).is_err());
         let blank: Config = toml::from_str("[storage]\nid = \" \"\n").unwrap();
         assert!(blank.validate().is_err());
+    }
+
+    #[test]
+    fn mcp_sections_take_defaults_and_refuse_what_cannot_be_read() {
+        let config: Config = toml::from_str(
+            "[mcp.mirror]\nmode = \"hide\"\nallowlist = [\"io.github.acme/*\"]\nsuppress = [\"cross_tool:search\"]\n",
+        )
+        .unwrap();
+        let mirror = &config.mcp["mirror"];
+        assert_eq!(mirror.mode, crate::domain::GateMode::Hide);
+        assert_eq!((mirror.sync_interval.as_str(), mirror.probe_concurrency), ("1h", 4));
+        config.validate().unwrap();
+
+        for bad in [
+            "[mcp.m]\nallowlist = [\"io.github*\"]\n",
+            "[mcp.m]\nsync_interval = \"soon\"\n",
+            "[mcp.m]\nprobe_concurrency = 0\n",
+            "[mcp.m]\nprobe_auth = \"no header\"\n",
+        ] {
+            let config: Config = toml::from_str(bad).unwrap();
+            assert!(config.validate().is_err(), "{bad}");
+        }
+        assert!(toml::from_str::<Config>("[mcp.m]\nmodes = \"hide\"\n").is_err(), "unknown keys fail to parse");
     }
 
     #[test]

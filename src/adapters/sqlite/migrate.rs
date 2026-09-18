@@ -147,6 +147,11 @@ pub const MIGRATIONS: &[Migration] = &[
     },
     sql_migration!("021", "021_sso.sql", Sentinel::Object("idx_login_handoffs_expires")),
     Migration {
+        id: "023",
+        sentinel: Sentinel::Object("idx_mcp_approvals_subject"),
+        step: Step::Rust(mcp),
+    },
+    Migration {
         id: "024",
         sentinel: Sentinel::Object("idx_maven_units_pending"),
         step: Step::Rust(maven),
@@ -161,6 +166,29 @@ pub const MIGRATIONS: &[Migration] = &[
 /// 020: the `nuget` format, through the shared rebuild; no table of its own.
 fn nuget_format(conn: &mut SqliteConnection) -> StepFuture<'_> {
     Box::pin(super::rebuild::widen_formats(conn, "nuget"))
+}
+
+const MCP_TABLES: &str = include_str!("migrations/023_mcp.sql");
+
+/// 023: the `mcp` format and its governance tables, one connection, so the
+/// widening and the tables land together or not at all on this id.
+fn mcp(conn: &mut SqliteConnection) -> StepFuture<'_> {
+    Box::pin(mcp_step(conn))
+}
+
+async fn mcp_step(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    super::rebuild::widen_formats(conn, "mcp").await?;
+    statements(conn, MCP_TABLES).await
+}
+
+async fn statements(conn: &mut SqliteConnection, file: &str) -> Result<(), StoreError> {
+    for statement in file.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        sqlx::query(statement)
+            .execute(&mut *conn)
+            .await
+            .map_err(other)?;
+    }
+    Ok(())
 }
 
 const MAVEN_TABLES: &str = include_str!("migrations/024_maven.sql");
@@ -187,13 +215,7 @@ async fn maven_step(conn: &mut SqliteConnection) -> Result<(), StoreError> {
         ));
     }
     super::rebuild::widen_formats(conn, "maven").await?;
-    for statement in MAVEN_TABLES.split(';').map(str::trim).filter(|s| !s.is_empty()) {
-        sqlx::query(statement)
-            .execute(&mut *conn)
-            .await
-            .map_err(other)?;
-    }
-    Ok(())
+    statements(conn, MAVEN_TABLES).await
 }
 
 /// Bring a database up to date with every migration this binary carries.

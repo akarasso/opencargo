@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "023", "024", "025"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "023", "024", "025"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "023", "024", "025"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.
@@ -575,6 +575,10 @@ fn without(id: &str) -> Vec<Migration> {
     MIGRATIONS.iter().filter(|m| m.id != id).copied().collect()
 }
 
+fn without_all(ids: &[&str]) -> Vec<Migration> {
+    MIGRATIONS.iter().filter(|m| !ids.contains(&m.id)).copied().collect()
+}
+
 fn only(id: &str) -> Vec<Migration> {
     MIGRATIONS.iter().filter(|m| m.id == id).copied().collect()
 }
@@ -606,10 +610,6 @@ async fn incarnations(pool: &SqlitePool) -> Vec<(i64, String)> {
 
 fn widen_nuget(conn: &mut SqliteConnection) -> StepFuture<'_> {
     Box::pin(crate::adapters::sqlite::rebuild::widen_formats(conn, "nuget"))
-}
-
-fn widen_mcp(conn: &mut SqliteConnection) -> StepFuture<'_> {
-    Box::pin(crate::adapters::sqlite::rebuild::widen_formats(conn, "mcp"))
 }
 
 /// 024 after 025, on a database holding repositories, a deleted id and a
@@ -715,20 +715,55 @@ async fn migration_024_runs_alone_on_a_legacy_database_and_before_025() {
     assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
 }
 
+/// 023 alone on a database that predates 018 and 025, then again: the set
+/// gains `mcp`, the rows survive, a second application changes nothing and
+/// every pooled connection still enforces foreign keys.
+#[tokio::test]
+async fn migration_023_twice_is_a_noop_and_keeps_rows_and_cascades() {
+    let (_tmp, pool) = pool().await;
+    let pre_018: Vec<Migration> = MIGRATIONS.iter().filter(|m| m.id < "018").copied().collect();
+    run(&pool, &pre_018).await.unwrap();
+    insert_repository(&pool, "npm-hosted", "hosted", "npm").await.unwrap();
+    let before = rows(&pool).await;
+
+    assert_eq!(run(&pool, &only("023")).await.unwrap(), vec![("023", Outcome::Applied)]);
+    let ddl = repositories_ddl(&pool).await;
+    apply(&pool, &only("023")[0].step).await.unwrap();
+    assert_eq!(repositories_ddl(&pool).await, ddl, "a second run does not rebuild again");
+    assert!(admits(&pool).await.contains("mcp"));
+    assert_eq!(rows(&pool).await, before);
+    assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
+
+    insert_repository(&pool, "mirror", "proxy", "mcp").await.unwrap();
+    sqlx::query(
+        "INSERT INTO mcp_server_versions (repository_id, name, version, response_json, synced_at,
+             row_changed_at, permissions_sha256)
+         SELECT id, 'io.github.acme/x', '1.0.0', '{}', 't', 't', 'p' FROM repositories WHERE name = 'mirror'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("DELETE FROM repositories WHERE name = 'mirror'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(count(&pool, "SELECT COUNT(*) FROM mcp_server_versions").await, 0, "the rows cascade with the repository");
+}
+
 /// Whatever order the format migrations land in, the table ends admitting
 /// the union and keeps its incarnations; each applied twice is a no-op.
 #[tokio::test]
 async fn format_widenings_end_with_the_union_in_every_order() {
     type StepFn = fn(&mut SqliteConnection) -> StepFuture<'_>;
     let steps: [(&'static str, StepFn); 3] =
-        [("020", widen_nuget), ("023", widen_mcp), ("024", maven)];
+        [("020", widen_nuget), ("023", mcp), ("024", maven)];
     let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
     let mut want: BTreeSet<String> = Format::ALL.iter().map(|f| f.as_str().to_string()).collect();
     want.insert("nuget".to_string());
     want.insert("mcp".to_string());
     for order in orders {
         let (_tmp, pool) = pool().await;
-        run(&pool, &without("024")).await.unwrap();
+        run(&pool, &without_all(&["023", "024"])).await.unwrap();
         insert_repository(&pool, "keep", "hosted", "npm").await.unwrap();
         let kept = incarnations(&pool).await;
         let list: Vec<Migration> = order
@@ -757,14 +792,9 @@ fn widen_maven(conn: &mut SqliteConnection) -> StepFuture<'_> {
     Box::pin(crate::adapters::sqlite::rebuild::widen_formats(conn, "maven"))
 }
 
-/// 023 and 024 stand in for mcp and Maven, the helper's other users.
+/// 024 stands in for Maven, the helper's other user; 023 is the real mcp step.
 fn step(id: &'static str) -> Migration {
     match id {
-        "023" => Migration {
-            id,
-            sentinel: Sentinel::Unprovable,
-            step: Step::Rust(widen_mcp),
-        },
         "024" => Migration {
             id,
             sentinel: Sentinel::Unprovable,
@@ -964,7 +994,7 @@ async fn a_fully_migrated_database_admits_every_format_together() {
     }
     assert_eq!(
         admits(&pool).await,
-        set(["npm", "cargo", "oci", "go", "pypi", "maven", "nuget"])
+        set(["npm", "cargo", "oci", "go", "pypi", "maven", "nuget", "mcp"])
     );
     assert!(insert_repository(&pool, "deb", "hosted", "deb").await.is_err());
 }

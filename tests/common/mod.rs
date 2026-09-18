@@ -46,6 +46,7 @@ pub struct SpawnOpts {
     pub proxy: ProxyConfig,
     pub vuln: VulnScanConfig,
     pub policy: HashMap<String, PolicyConfig>,
+    pub mcp: HashMap<String, opencargo::config::McpConfig>,
     /// Replaces the policy engine's timing knobs after `build_state`.
     pub policy_tuning: Option<Tuning>,
     /// Puts the storage and the permission store behind switches.
@@ -63,6 +64,7 @@ impl Default for SpawnOpts {
             proxy: ProxyConfig::default(),
             vuln: VulnScanConfig::default(),
             policy: HashMap::new(),
+            mcp: HashMap::new(),
             policy_tuning: None,
             outage: None,
             sso: Default::default(),
@@ -111,6 +113,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         repositories: opts.repositories,
         vuln_scan: opts.vuln,
         policy: opts.policy,
+        mcp: opts.mcp,
         ..Default::default()
     }
 }
