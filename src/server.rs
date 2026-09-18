@@ -84,6 +84,7 @@ pub struct AppState {
 /// the binary reaches the adapter through the composition root rather than
 /// importing it.
 pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
+
     let db = crate::db::connect(&config.database.url).await?;
     migrate(&db).await
 }
@@ -106,17 +107,7 @@ pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
 pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
-    // Ensure storage directory exists
-    std::fs::create_dir_all(&config.server.storage_path)?;
-
-    // Ensure database directory exists
-    if let Some(path) = config.database.url.strip_prefix("sqlite:") {
-        let path = path.split('?').next().unwrap_or(path);
-        if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-
+    ensure_directories(config)?;
     let db = crate::db::connect(&config.database.url).await?;
     migrate(&db).await?;
     crate::db::kinds::check_repository_names(&db).await?;
@@ -132,33 +123,14 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let (users, tokens, permissions) = (stores.users(), stores.tokens(), stores.permissions());
 
-    let auth = Arc::new(AuthState {
-        static_tokens: config.auth.static_tokens.clone(),
-        anonymous_read: config.auth.anonymous_read,
-        users: users.clone(),
-        tokens: tokens.clone(),
-        login_rate_limiter: login_rate_limiter.clone(),
-        base_url: config.server.base_url.clone(),
-        registry_tokens: crate::registry::oci::token::TokenSigner::random(),
-    });
+    let auth = auth_state(config, &users, &tokens, &login_rate_limiter);
 
     ensure_admin_user(users.as_ref(), config).await?;
 
-    let connect_timeout_secs = parse_duration_secs(&config.proxy.connect_timeout);
-    let ttl = TtlConfig {
-        default_secs: parse_duration_secs(&config.proxy.default_ttl),
-        negative_secs: parse_duration_secs(&config.proxy.negative_cache_ttl),
-    };
-    let cache = proxy_cache_store(&db);
-    let proxy = ProxyEngine::new(
-        storage.clone(),
-        cache.clone(),
-        Timeouts::from_connect_secs(connect_timeout_secs),
-        ttl,
-    );
+    let cache = stores.proxy_cache();
+    let proxy = proxy_engine(config, storage.clone(), cache.clone());
     let upstream_auth = Arc::new(upstream_creds(&db, config).await?);
 
-    // Initialize Prometheus metrics
     let metrics_handle = telemetry::init_metrics();
 
     let webhooks = stores.webhooks();
@@ -166,7 +138,6 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let webhook_dispatcher = Arc::new(WebhookDispatcher::new(webhooks.clone()));
 
-    // Initialize vulnerability scanner
     let vuln_scanner = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
     let events = Arc::new(crate::events::EventBus::new());
@@ -177,14 +148,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         events.clone(),
         proxy.clone(),
     );
-    warn_policy_notes(&policy_notes);
-
-    info!(
-        storage_path = %config.server.storage_path,
-        base_url = %config.server.base_url,
-        repos = config.repositories.len(),
-        "Application state initialized"
-    );
+    report_ready(config, &policy_notes);
 
     Ok(AppState {
         db,
@@ -211,6 +175,57 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         events,
         policy,
     })
+}
+
+/// What the auth middleware needs, which is two stores and the login
+/// throttle it shares with the npm login route.
+fn auth_state(
+    config: &Config,
+    users: &Arc<dyn UserStore>,
+    tokens: &Arc<dyn TokenStore>,
+    login_rate_limiter: &Arc<RateLimiter>,
+) -> Arc<AuthState> {
+    Arc::new(AuthState {
+        static_tokens: config.auth.static_tokens.clone(),
+        anonymous_read: config.auth.anonymous_read,
+        users: users.clone(),
+        tokens: tokens.clone(),
+        login_rate_limiter: login_rate_limiter.clone(),
+        base_url: config.server.base_url.clone(),
+        registry_tokens: crate::registry::oci::token::TokenSigner::random(),
+    })
+}
+
+/// The two directories the server writes into: the blob store, and the one
+/// holding a SQLite file when that is where the database lives.
+fn ensure_directories(config: &Config) -> anyhow::Result<()> {
+    std::fs::create_dir_all(&config.server.storage_path)?;
+    if let Some(path) = config.database.url.strip_prefix("sqlite:") {
+        let path = path.split('?').next().unwrap_or(path);
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    Ok(())
+}
+
+/// The proxy engine over its two ports, with the configured timeouts.
+fn proxy_engine(
+    config: &Config,
+    storage: Arc<dyn StorageBackend>,
+    cache: Arc<dyn ProxyCacheStore>,
+) -> ProxyEngine {
+    let ttl = TtlConfig {
+        default_secs: parse_duration_secs(&config.proxy.default_ttl),
+        negative_secs: parse_duration_secs(&config.proxy.negative_cache_ttl),
+    };
+    let connect_timeout_secs = parse_duration_secs(&config.proxy.connect_timeout);
+    ProxyEngine::new(
+        storage,
+        cache,
+        Timeouts::from_connect_secs(connect_timeout_secs),
+        ttl,
+    )
 }
 
 /// Create the configured admin account on a fresh install, and warn on every
@@ -365,6 +380,17 @@ async fn seed_webhooks(
 }
 
 /// Recording is personal data: say which members do it, at startup.
+/// What booted, and every configuration note worth a warning about it.
+fn report_ready(config: &Config, notes: &crate::policy::startup::StartupNotes) {
+    info!(
+        storage_path = %config.server.storage_path,
+        base_url = %config.server.base_url,
+        repos = config.repositories.len(),
+        "Application state initialized"
+    );
+    warn_policy_notes(notes);
+}
+
 fn warn_policy_notes(notes: &crate::policy::startup::StartupNotes) {
     if !notes.recording.is_empty() {
         warn!(
