@@ -6,8 +6,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use super::{bind_ts, store_error};
-use crate::domain::{Subscription, Webhook};
+use super::{bind_ts, corrupt_row, read_ts, store_error};
+use crate::domain::{DomainError, Subscription, Webhook};
 use crate::error::StoreError;
 use crate::ports::webhooks::{NewWebhook, WebhookPatch, WebhookStore};
 
@@ -24,18 +24,24 @@ struct WebhookRow {
     updated_at: String,
 }
 
-impl From<WebhookRow> for Webhook {
-    fn from(row: WebhookRow) -> Self {
-        Webhook {
+impl TryFrom<WebhookRow> for Webhook {
+    type Error = DomainError;
+
+    fn try_from(row: WebhookRow) -> Result<Self, DomainError> {
+        Ok(Webhook {
+            events: Subscription::parse(&row.events),
+            active: row.active != 0,
+            created_at: read_ts(&row.url, "created_at", &row.created_at)?,
+            updated_at: read_ts(&row.url, "updated_at", &row.updated_at)?,
             id: row.id,
             url: row.url,
-            events: Subscription::parse(&row.events),
             secret: row.secret,
-            active: row.active != 0,
-            created_at: row.created_at,
-            updated_at: row.updated_at,
-        }
+        })
     }
+}
+
+fn decode(row: WebhookRow) -> Result<Webhook, StoreError> {
+    Webhook::try_from(row).map_err(corrupt_row)
 }
 
 pub struct SqliteWebhookStore {
@@ -54,7 +60,7 @@ impl SqliteWebhookStore {
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(store_error)?;
-        Ok(row.map(Webhook::from))
+        row.map(decode).transpose()
     }
 
     async fn rows(&self, predicate: &str) -> Result<Vec<Webhook>, StoreError> {
@@ -64,7 +70,7 @@ impl SqliteWebhookStore {
         .fetch_all(&self.pool)
         .await
         .map_err(store_error)?;
-        Ok(rows.into_iter().map(Webhook::from).collect())
+        rows.into_iter().map(decode).collect()
     }
 }
 
@@ -94,7 +100,7 @@ impl WebhookStore for SqliteWebhookStore {
         .fetch_one(&self.pool)
         .await
         .map_err(store_error)?;
-        Ok(row.into())
+        decode(row)
     }
 
     async fn update(

@@ -15,10 +15,10 @@ pub fn wire_config(config: Option<&RepoConfig>) -> Option<String> {
     config.map(RepoConfig::to_json)
 }
 
-/// The dashboard's panels still read raw tuples, so their timestamps are
-/// decoded here on the way out rather than at a row conversion; step 8c gives
-/// them typed rows and this goes with them. An unreadable column serves
-/// nothing rather than a second format.
+/// The audit log still reads raw rows, so its stamps are decoded here on the
+/// way out rather than at a row conversion; `AuditStore` gives them typed
+/// rows and this goes with them. An unreadable column serves nothing rather
+/// than a second format.
 pub fn wire_stored_ts(stored: &str) -> String {
     match crate::db::parse_ts(stored) {
         Some(at) => wire_ts(at),

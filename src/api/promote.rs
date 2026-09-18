@@ -16,6 +16,7 @@ use crate::error::{AppError, AppResult};
 use crate::ports::packages::NameMatch;
 use crate::registry::extract_package_name;
 use crate::server::AppState;
+use crate::wire::wire_stored_ts;
 
 // ---------------------------------------------------------------------------
 // Request types
@@ -436,7 +437,7 @@ async fn list_promotions_impl(
                 "from": details.get("from").and_then(|v| v.as_str()).unwrap_or(""),
                 "to": details.get("to").and_then(|v| v.as_str()).unwrap_or(""),
                 "promoted_by": e.username,
-                "promoted_at": e.created_at,
+                "promoted_at": wire_stored_ts(&e.created_at),
             })
         })
         .collect();

@@ -9,6 +9,7 @@ use serde_json::json;
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
+use crate::wire::wire_stored_ts;
 
 // ---------------------------------------------------------------------------
 // Query parameters
@@ -58,7 +59,7 @@ pub async fn list_audit(
                 "ip": e.ip,
                 "user_agent": e.user_agent,
                 "details_json": e.details_json,
-                "created_at": e.created_at,
+                "created_at": wire_stored_ts(&e.created_at),
             })
         })
         .collect();

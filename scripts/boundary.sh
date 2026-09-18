@@ -13,9 +13,9 @@ declare_row() { local IFS=$'\x1f'; rows+=("$*"); }
 # lines, so a max fed by a line count licenses one free violation. A raise is an edit to this
 # block, in the commit that needs it, with the reason on the line -- never a silent bump.
 declare_row db-calls       max  29 '\bdb::'                  plain src '*.rs' src/db src/adapters # 46 -> 29: every hosted leaf read is PackageStore's or OciStore's, so no format module calls the DAL to resolve
-declare_row pool-field     max  50 '\.db\b'                  strip src '*.rs' src/db src/adapters # 63 -> 50: Cx holds ports, so the thirteen `cx.state.db` sites and the resolver's temp-database fixture are gone. strip: `"...opencargo.db"` is a filename, not a pool
-declare_row stray-sql      max  78 'sqlx::query'             plain src '*.rs' src/db src/adapters # 81 -> 78: 0 in src/proxy/ and src/auth/; the tag listing and the hosted digest lookup are OciStore's. covers _as and _scalar
-declare_row pool-leak      max  45 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 47 -> 45: 0 in src/proxy/ (7a's Cx.proxy precondition), AuthState holds a UserStore and a TokenStore, and the packument, the seed and the repo validator take ports
+declare_row pool-field     max  45 '\.db\b'                  strip src '*.rs' src/db src/adapters # 50 -> 45: the dashboard's five panels read a port. strip: `"...opencargo.db"` is a filename, not a pool
+declare_row stray-sql      max  58 'sqlx::query'             plain src '*.rs' src/db src/adapters # 78 -> 58: 0 in api/dashboard.rs, the worst single file in the tree, now DashboardRead's. covers _as and _scalar
+declare_row pool-leak      max  43 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 45 -> 43: the dashboard names a read model instead of a pool
 declare_row context-bypass eq    0 'cx\.state\b'             plain src '*.rs'                     # eq, not max: Cx holds eleven ports and borrowed values, and AppState is projected onto them in one place. Word boundary, because `cx.state` used to be passed whole
 declare_row dialect-rs     max  13 'datetime\(|julianday\(|strftime\(|AUTOINCREMENT|INSERT OR ' plain src '*.rs' src/db src/adapters/sqlite # 21 -> 13: the cache predicates bind the caller's clock, and permissions.rs's AUTOINCREMENT comment went with its temp-DB fixture
 declare_row dialect-sql    max  49 "AUTOINCREMENT|CHECK\(|fts5|CREATE TRIGGER|datetime\('now'\)" plain 'src/db/migrations src/adapters/sqlite/migrations' '*.sql' # scoped, not eliminated: SQLite DDL belongs in a SQLite directory
@@ -25,8 +25,8 @@ declare_row adapter-import max   0 '(crate|opencargo)::adapters::' plain src '*.
 declare_row domain-paths   max   0 '(crate|opencargo)::(error|server|db|api|registry|proxy|storage|telemetry|auth|app|adapters)\b' plain src/domain '*.rs'
 declare_row domain-names   max   0 'AppError|AppResult|sqlx|axum|reqwest' plain src/domain '*.rs'
 declare_row tests-raw-sql  max  41 'sqlx::query|SqlitePool'  plain tests '*.rs' tests/common/contract.rs # ratchet-only (7.4); the contract suite is the one exclusion
-declare_row unit-tests     min 266 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 255 -> 266: the walk state machine, the resolver's statuses, the depth cap, the failing grant lookup and the three hosted OCI reads. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
-declare_row integ-tests    min 300 '#\[(tokio::)?test\]'     plain tests '*.rs' # 278 -> 300: proxy_cache_contract! and package_contract! against two adapters, the user and token timestamp surfaces, and npm's browse and empty-query arms
+declare_row unit-tests     min 269 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 266 -> 269: the two reach rules the panels used to splice into their SQL, and the query that asks the index nothing. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
+declare_row integ-tests    min 309 '#\[(tokio::)?test\]'     plain tests '*.rs' # 300 -> 309: dashboard_test.rs, the panels' first suite of their own
 
 # files <roots> <glob> [excluded paths...] -- the scope, one path per line
 files() {

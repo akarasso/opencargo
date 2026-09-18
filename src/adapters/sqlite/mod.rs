@@ -12,6 +12,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use crate::domain::DomainError;
 use crate::error::StoreError;
+use crate::ports::dashboard::DashboardRead;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
@@ -22,6 +23,7 @@ use crate::ports::tokens::TokenStore;
 use crate::ports::users::UserStore;
 use crate::ports::webhooks::WebhookStore;
 
+pub mod dashboard;
 pub mod migrate;
 pub mod multipart;
 pub mod oci;
@@ -59,6 +61,14 @@ pub(crate) fn read_ts(
         column,
         value: stored.to_string(),
     })
+}
+
+/// The rows of `packages` a caller without the run of the place may see,
+/// qualified by the alias its query gave the table (`""` when it gave none).
+/// Written once because the dashboard's panels and the search index apply the
+/// same rule, and two spellings of it would be two rules.
+pub(crate) fn public_packages(alias: &str) -> String {
+    format!("{alias}repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')")
 }
 
 /// An unreadable column is the store's failure to answer, not a refusal the
@@ -224,5 +234,9 @@ impl SqliteStores {
 
     pub fn oci(&self) -> Arc<dyn OciStore> {
         Arc::new(oci::SqliteOciStore::new(self.pool.clone()))
+    }
+
+    pub fn dashboard(&self) -> Arc<dyn DashboardRead> {
+        Arc::new(dashboard::SqliteDashboardRead::new(self.pool.clone()))
     }
 }

@@ -3,6 +3,7 @@
 //! A port names a capability and its vocabulary of refusals; the adapter
 //! behind it is chosen by the composition root and named nowhere else.
 
+pub mod dashboard;
 pub mod multipart;
 pub mod oci;
 pub mod packages;

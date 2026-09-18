@@ -11,7 +11,7 @@
 use async_trait::async_trait;
 use sqlx::{QueryBuilder, Sqlite, SqlitePool};
 
-use super::store_error;
+use super::{public_packages, store_error};
 use crate::db::PackageRow;
 use crate::domain::Package;
 use crate::error::StoreError;
@@ -19,9 +19,6 @@ use crate::ports::search::{SearchIndex, SearchQuery, SearchScope};
 
 const COLUMNS: &str =
     "id, repository_id, name, description, readme, license, created_at, updated_at";
-
-const PUBLIC_ONLY: &str =
-    "p.repository_id IN (SELECT id FROM repositories WHERE visibility = 'public')";
 
 pub struct SqliteSearchIndex {
     pool: SqlitePool,
@@ -41,7 +38,7 @@ fn scope_predicate(query: &mut QueryBuilder<'_, Sqlite>, scope: SearchScope) {
             query.push("p.repository_id = ").push_bind(repository);
         }
         SearchScope::PublicOnly => {
-            query.push(PUBLIC_ONLY);
+            query.push(public_packages("p."));
         }
         SearchScope::All => {
             query.push("1 = 1");

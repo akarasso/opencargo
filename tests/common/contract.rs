@@ -109,13 +109,6 @@ macro_rules! store_contract {
                 Utc.with_ymd_and_hms(2026, 9, 18, hour, 30, 0).unwrap()
             }
 
-            /// The stored stamp back as a value, whichever spelling the
-            /// adapter chose: the contract is about the instant, not about
-            /// one rendering of it.
-            fn stamped(raw: &str) -> DateTime<Utc> {
-                ::opencargo::db::parse_ts(raw).expect("a stored timestamp reads back")
-            }
-
             #[tokio::test]
             async fn a_registration_round_trips_through_the_store() {
                 let handles = $open().await;
@@ -165,8 +158,8 @@ macro_rules! store_contract {
                     )
                     .await
                     .unwrap();
-                assert_eq!(stamped(&created.created_at), at(9).trunc_subsecs(0));
-                assert_eq!(stamped(&created.updated_at), at(9).trunc_subsecs(0));
+                assert_eq!(created.created_at, at(9).trunc_subsecs(0));
+                assert_eq!(created.updated_at, at(9).trunc_subsecs(0));
 
                 let updated = store
                     .update(
@@ -179,8 +172,8 @@ macro_rules! store_contract {
                     )
                     .await
                     .unwrap();
-                assert_eq!(stamped(&updated.created_at), at(9).trunc_subsecs(0));
-                assert_eq!(stamped(&updated.updated_at), at(11).trunc_subsecs(0));
+                assert_eq!(updated.created_at, at(9).trunc_subsecs(0));
+                assert_eq!(updated.updated_at, at(11).trunc_subsecs(0));
             }
 
             #[tokio::test]

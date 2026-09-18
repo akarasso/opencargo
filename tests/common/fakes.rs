@@ -225,13 +225,6 @@ impl FakeDb {
     }
 }
 
-/// The fake's own stamp spelling, deliberately not the SQLite adapter's: a
-/// contract clause that only holds for one rendering is a clause about an
-/// adapter, not about the port.
-fn stamp(now: DateTime<Utc>) -> String {
-    now.to_rfc3339()
-}
-
 /// The guard every handle runs its work behind: one lock, and the queued
 /// refusal for its own port checked first.
 fn with<T>(
@@ -271,8 +264,8 @@ impl Webhooks {
             events: hook.events.clone(),
             secret: hook.secret.map(|secret| secret.to_string()),
             active: true,
-            created_at: stamp(now),
-            updated_at: stamp(now),
+            created_at: now,
+            updated_at: now,
         };
         state.webhooks.push(stored.clone());
         stored
@@ -320,7 +313,7 @@ impl WebhookStore for Webhooks {
             if let Some(active) = patch.active {
                 stored.active = active;
             }
-            stored.updated_at = stamp(now);
+            stored.updated_at = now;
             Ok(stored.clone())
         })
     }
