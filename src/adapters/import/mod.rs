@@ -3,3 +3,5 @@
 //! opencargo, and the one HTTP gate every source request goes through.
 
 pub mod cli;
+pub mod http;
+pub mod target;
