@@ -99,6 +99,7 @@ pub struct TestServer {
     pub lock: Option<opencargo::backup::lock::RestoreLock>,
     endpoint_drain: Duration,
     grace: Duration,
+    joined: bool,
 }
 
 impl TestServer {
@@ -107,7 +108,7 @@ impl TestServer {
         self.handle.abort();
         // A barrier, not a request: nothing the server owned outlives `stop`,
         // so the next door finds no descriptor of its still open.
-        (&mut self.handle).await.ok();
+        self.join().await;
         if let Some(lease) = self.lease.take() {
             lease.release().await;
         }
@@ -118,11 +119,18 @@ impl TestServer {
     /// `main` does on SIGTERM, without a signal.
     pub async fn drain(&mut self) {
         self.shutdown.drain(&self.srv, self.endpoint_drain, self.grace).await;
-        (&mut self.handle).await.ok();
+        self.join().await;
         if let Some(lease) = self.lease.take() {
             lease.release().await;
         }
         self.lock = None;
+    }
+
+    async fn join(&mut self) {
+        if !self.joined {
+            self.joined = true;
+            (&mut self.handle).await.ok();
+        }
     }
 }
 
@@ -324,6 +332,7 @@ async fn spawn_in(
         srv,
         shutdown,
         lock,
+        joined: false,
         endpoint_drain: config.server.endpoint_drain().expect("a valid endpoint_drain"),
         grace: config.server.shutdown_grace().expect("a valid shutdown_grace"),
     }
