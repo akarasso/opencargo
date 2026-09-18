@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test test-quick test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-nuget clean frontend release docker deploy undeploy logs publish lint fmt
 
 # Load .env if it exists
 -include .env
@@ -77,6 +77,9 @@ test-e2e-go: ## E2E go (client go requis, ou GO_BIN)
 
 test-e2e-docker: ## E2E docker CLI (client docker requis, ou DOCKER_BIN)
 	OPENCARGO_E2E_REQUIRE=1 cargo test --test docker_cli_e2e_test
+
+test-e2e-nuget: ## E2E dotnet (DOTNET_BIN, ou scripts/dotnet-in-docker)
+	DOTNET_BIN=$${DOTNET_BIN:-$(CURDIR)/scripts/dotnet-in-docker} OPENCARGO_E2E_REQUIRE=1 cargo test --test nuget_e2e_test dotnet
 
 lint: ## Lancer clippy
 	cargo clippy -- -D warnings

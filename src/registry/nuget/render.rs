@@ -68,7 +68,12 @@ impl Base {
         for t in ["RegistrationsBaseUrl", "RegistrationsBaseUrl/3.4.0", "RegistrationsBaseUrl/3.6.0"] {
             resources.push(json!({"@id": format!("{}/registration/", self.root), "@type": t}));
         }
-        for t in ["SearchQueryService", "SearchQueryService/3.5.0"] {
+        for t in [
+            "SearchQueryService",
+            "SearchQueryService/3.0.0-beta",
+            "SearchQueryService/3.0.0-rc",
+            "SearchQueryService/3.5.0",
+        ] {
             resources.push(json!({"@id": format!("{}/search", self.root), "@type": t}));
         }
         if self.hosted {
