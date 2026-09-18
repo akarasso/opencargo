@@ -56,6 +56,8 @@ pub struct SpawnOpts {
     pub public_url: Option<String>,
     /// Take the writer lease, on terms short enough for a test to outwait.
     pub lease: bool,
+    /// `[auth].static_tokens`.
+    pub static_tokens: Vec<String>,
 }
 
 impl Default for SpawnOpts {
@@ -71,6 +73,7 @@ impl Default for SpawnOpts {
             sso: Default::default(),
             public_url: None,
             lease: false,
+            static_tokens: vec![STATIC_TOKEN.to_string()],
         }
     }
 }
@@ -126,7 +129,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         },
         auth: AuthConfig {
             anonymous_read: opts.anonymous_read,
-            static_tokens: vec![STATIC_TOKEN.to_string()],
+            static_tokens: opts.static_tokens.clone(),
             sso: opts.sso.clone(),
             ..Default::default()
         },

@@ -279,14 +279,9 @@ impl Authenticate {
     }
 
     fn is_static(&self, raw: &str) -> bool {
-        self.static_tokens.iter().any(|st| {
-            st.len() == raw.len()
-                && st
-                    .bytes()
-                    .zip(raw.bytes())
-                    .fold(0u8, |acc, (a, b)| acc | (a ^ b))
-                    == 0
-        })
+        self.static_tokens
+            .iter()
+            .any(|st| constant_eq(st.as_bytes(), raw.as_bytes()))
     }
 
     /// A registry token re-checks the API token it was bought with and the
@@ -303,6 +298,16 @@ impl Authenticate {
             }
         }
         if claims.static_token {
+            let Some(key) = claims.static_key.as_deref() else {
+                return Ok(None);
+            };
+            let live = self
+                .static_tokens
+                .iter()
+                .any(|st| constant_eq(self.signer.fingerprint(st).as_bytes(), key.as_bytes()));
+            if !live {
+                return Ok(None);
+            }
             return Ok(Some(Authenticated {
                 user: Some(AuthUser::static_token(raw)),
                 claims: Some(claims),
@@ -345,6 +350,10 @@ impl Authenticate {
         let now = self.clock.now();
         Ok(stored.filter(|token| token.is_live(now)))
     }
+}
+
+fn constant_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
 }
 
 fn principal(user: AuthUser) -> Authenticated {

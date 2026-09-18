@@ -68,7 +68,21 @@ impl RegistryTokenSigner for TokenSigner {
         let claims: Claims = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
         (claims.exp > chrono::Utc::now().timestamp()).then_some(claims)
     }
+
+    fn fingerprint(&self, secret: &str) -> String {
+        let tag = self
+            .mac()
+            .chain_update(FINGERPRINT_LABEL)
+            .chain_update(secret.as_bytes())
+            .finalize()
+            .into_bytes();
+        tag.iter().map(|b| format!("{b:02x}")).collect()
+    }
 }
+
+/// Separates fingerprints from signed payloads under the one key: a payload
+/// is base64url and can never start with this byte string.
+const FINGERPRINT_LABEL: &[u8] = b"opencargo/static-token-fp\x00";
 
 fn fresh_key() -> Vec<u8> {
     let mut key = [0u8; 32];
@@ -114,6 +128,10 @@ pub async fn issue_token(
             .collect(),
         static_token: user.as_ref().is_some_and(|u| u.user_id.is_none()),
         api_token_id,
+        static_key: user
+            .as_ref()
+            .filter(|u| u.user_id.is_none())
+            .map(|u| state.registry_tokens.fingerprint(&u.token)),
     };
     tracing::info!(
         subject = claims.sub.as_deref().unwrap_or("anonymous"),
@@ -222,6 +240,7 @@ mod tests {
             scope: vec!["repository:r/app:pull".to_string()],
             static_token: false,
             api_token_id: None,
+            static_key: None,
         }
     }
 
@@ -239,6 +258,7 @@ mod tests {
             scope: Vec::new(),
             static_token: false,
             api_token_id: None,
+            static_key: None,
         });
         let verified = signer.verify(&anonymous).expect("valid");
         assert!(verified.sub.is_none() && !verified.static_token);
@@ -276,6 +296,19 @@ mod tests {
         let token = first.sign(&claims(i64::MAX));
         assert!(second.verify(&token).is_some());
         assert!(TokenSigner::random().verify(&token).is_none());
+    }
+
+    #[test]
+    fn fingerprints_are_keyed_and_separated_from_signatures() {
+        let signer = TokenSigner::random();
+        let fp = signer.fingerprint("s3cret");
+        assert_eq!(fp, signer.fingerprint("s3cret"));
+        assert_eq!(fp.len(), 64);
+        assert_ne!(fp, TokenSigner::random().fingerprint("s3cret"), "keyed");
+        assert_ne!(fp, signer.fingerprint("s3cret2"));
+        let plain = signer.mac().chain_update("s3cret").finalize().into_bytes();
+        let plain: String = plain.iter().map(|b| format!("{b:02x}")).collect();
+        assert_ne!(fp, plain, "the label separates it from a signature");
     }
 
     #[test]

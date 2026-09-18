@@ -279,6 +279,7 @@ async fn api_and_oci_tokens_refused_when_login_is_not_allowed() {
         scope: Vec::new(),
         static_token: false,
         api_token_id: None,
+        static_key: None,
     });
     assert_eq!(fx.who(&[bearer(&raw)], "s").await, Err(Refusal::Invalid));
     assert_eq!(fx.who(&[basic("dev", &raw)], "s").await, Err(Refusal::Invalid));
@@ -332,6 +333,7 @@ fn registry_for(fx: &Fx, sub: &str, api_token_id: Option<&str>) -> Presented {
         scope: Vec::new(),
         static_token: false,
         api_token_id: api_token_id.map(str::to_string),
+        static_key: None,
     });
     Presented {
         transport: Transport::Authorization,
@@ -416,4 +418,32 @@ async fn a_disabled_account_is_refused_on_every_scheme_and_a_store_fault_is_503(
     fx.store.identities().enable_user(dev.id).await.unwrap();
     fx.store.fail_next(PortId::Identities, StoreError::Unavailable);
     assert_eq!(fx.who(&[bearer(&raw)], "s").await, Err(Refusal::Unavailable));
+}
+
+fn static_registry(fx: &Fx, key: Option<String>) -> Presented {
+    let raw = fx.signer.sign(&Claims {
+        sub: Some("static-token".into()),
+        exp: i64::MAX,
+        scope: Vec::new(),
+        static_token: true,
+        api_token_id: None,
+        static_key: key,
+    });
+    Presented {
+        transport: Transport::Authorization,
+        credential: Credential::Registry(raw),
+    }
+}
+
+/// A registry token bought with a static config token lives only as long as
+/// that token stays in the config, and one minted without the fingerprint
+/// (before it existed) is refused rather than trusted.
+#[tokio::test]
+async fn a_static_registry_token_is_rechecked_against_the_config() {
+    let fx = fixture();
+    let live = fx.signer.fingerprint("static-secret");
+    assert_eq!(fx.who(&[static_registry(&fx, Some(live))], "a").await, Ok(Some("static-token".into())));
+    let removed = fx.signer.fingerprint("a-token-no-longer-configured");
+    assert_eq!(fx.who(&[static_registry(&fx, Some(removed))], "b").await, Err(Refusal::Invalid));
+    assert_eq!(fx.who(&[static_registry(&fx, None)], "c").await, Err(Refusal::Invalid));
 }

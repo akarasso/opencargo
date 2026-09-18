@@ -60,6 +60,10 @@ All notable changes to this project will be documented in this file.
   counted per account across Basic, `npm login` and the password change;
   token failures are counted per client address. `auth.trusted_proxies`
   names the proxies whose `X-Forwarded-For` is believed.
+- Registry tokens (`ocr_`) survive a restart: the signing key lives in the
+  database. Removing a token from `[auth].static_tokens` still revokes every
+  registry token bought with it; a static-token registry token minted before
+  this version is refused once and re-requested by the client.
 
 ## [0.1.0-rc.1] - 2026-09-17
 

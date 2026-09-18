@@ -4,24 +4,27 @@ use reqwest::{Client, Response, StatusCode};
 use serde_json::{json, Value};
 
 use common::{
-    basic_auth_header, create_user, hosted, push_blob, sha256_digest, spawn_server, SpawnOpts,
-    TestServer, STATIC_TOKEN,
+    basic_auth_header, create_user, hosted, push_blob, respawn, sha256_digest, spawn_server,
+    SpawnOpts, TestServer, STATIC_TOKEN,
 };
 use opencargo::config::{RepositoryFormat, Visibility};
 
 const USER: &str = "docker-user";
 const PASSWORD: &str = "docker-pass-123";
 
-async fn spawn(anonymous_read: bool) -> TestServer {
-    spawn_server(SpawnOpts {
+fn opts(anonymous_read: bool) -> SpawnOpts {
+    SpawnOpts {
         anonymous_read,
         repositories: vec![
             hosted("oci-public", RepositoryFormat::Oci, Visibility::Public),
             hosted("oci-private", RepositoryFormat::Oci, Visibility::Private),
         ],
         ..Default::default()
-    })
-    .await
+    }
+}
+
+async fn spawn(anonymous_read: bool) -> TestServer {
+    spawn_server(opts(anonymous_read)).await
 }
 
 fn realm(base_url: &str) -> String {
@@ -461,4 +464,79 @@ async fn a_private_manifest_challenge_carries_the_pull_scope() {
             realm(&closed.base_url)
         )
     );
+}
+
+/// A registry token bought with `authorization` at `/v2/token`.
+async fn registry_token(base_url: &str, authorization: &str) -> String {
+    let resp = Client::new()
+        .get(format!("{base_url}/v2/token?service=opencargo&scope=repository:oci-private/app:pull"))
+        .header("Authorization", authorization)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let body: Value = resp.json().await.unwrap();
+    body["token"].as_str().unwrap().to_string()
+}
+
+async fn pull_status(base_url: &str, token: &str) -> StatusCode {
+    Client::new()
+        .get(format!("{base_url}/v2/oci-private/app/manifests/1.0"))
+        .bearer_auth(token)
+        .send()
+        .await
+        .unwrap()
+        .status()
+}
+
+/// The signing key is the database's, not the process's: the same token,
+/// replayed over raw HTTP after a restart, still pulls.
+#[tokio::test]
+async fn registry_token_survives_a_restart() {
+    let server = spawn(false).await;
+    publisher(&server.base_url).await;
+    seed_image(&server.base_url, "oci-private/app").await;
+    let token = registry_token(&server.base_url, &basic_auth_header(USER, PASSWORD)).await;
+    assert_eq!(pull_status(&server.base_url, &token).await, StatusCode::OK);
+    let server = respawn(server, opts(false)).await;
+    assert_eq!(pull_status(&server.base_url, &token).await, StatusCode::OK);
+}
+
+/// Two states on one database verify each other's tokens.
+#[tokio::test]
+async fn registry_token_from_one_instance_verifies_on_another() {
+    let server = spawn(false).await;
+    publisher(&server.base_url).await;
+    let token = registry_token(&server.base_url, &basic_auth_header(USER, PASSWORD)).await;
+    let mut config = common::config_of(&server);
+    let other = common::build_state(&mut config).await.unwrap();
+    assert!(other.registry_tokens.verify(&token).is_some());
+}
+
+/// Deleting a static token from the config revokes every registry token
+/// bought with it, although the signing key survives the restart.
+#[tokio::test]
+async fn removing_a_static_token_invalidates_its_registry_tokens() {
+    let server = spawn(false).await;
+    seed_image(&server.base_url, "oci-private/app").await;
+    let token = registry_token(&server.base_url, &format!("Bearer {STATIC_TOKEN}")).await;
+    assert_eq!(pull_status(&server.base_url, &token).await, StatusCode::OK);
+    let server = respawn(
+        server,
+        SpawnOpts {
+            static_tokens: vec!["the-replacement".to_string()],
+            ..opts(false)
+        },
+    )
+    .await;
+    assert_eq!(pull_status(&server.base_url, &token).await, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn a_static_token_still_in_config_survives_a_restart() {
+    let server = spawn(false).await;
+    seed_image(&server.base_url, "oci-private/app").await;
+    let token = registry_token(&server.base_url, &format!("Bearer {STATIC_TOKEN}")).await;
+    let server = respawn(server, opts(false)).await;
+    assert_eq!(pull_status(&server.base_url, &token).await, StatusCode::OK);
 }
