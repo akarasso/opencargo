@@ -10,9 +10,8 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::middleware::AuthUser;
-use crate::db::PackageRow;
-use crate::domain::Package;
 use crate::error::AppResult;
+use crate::ports::search::{SearchQuery as Tokens, SearchScope};
 use crate::registry::resolve::collect;
 use crate::server::AppState;
 use crate::wire::wire_ts;
@@ -33,7 +32,7 @@ pub async fn search(
     Query(query): Query<SearchQuery>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response> {
-    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
     crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
 
@@ -84,11 +83,22 @@ pub async fn search_in_repo(
     text: &str,
     limit: i64,
 ) -> AppResult<Vec<Value>> {
-    let packages = find_packages(state, repo_id, text, limit).await?;
+    let Some(query) = browse_or_match(text) else {
+        return Ok(Vec::new());
+    };
+    let packages = state
+        .search
+        .search(
+            SearchScope::Repo(repo_id),
+            query.as_ref(),
+            limit.clamp(0, i64::from(u32::MAX)) as u32,
+        )
+        .await?;
+
     let mut objects = Vec::with_capacity(packages.len());
     for pkg in &packages {
-        let versions = crate::db::get_versions(&state.db, pkg.id).await?;
-        let dist_tags = crate::db::get_dist_tags(&state.db, pkg.id).await?;
+        let versions = state.packages.versions(pkg.id).await?;
+        let dist_tags = state.packages.dist_tags(pkg.id).await?;
         let latest = dist_tags
             .iter()
             .find(|dt| dt.tag == "latest")
@@ -106,52 +116,38 @@ pub async fn search_in_repo(
     Ok(objects)
 }
 
-/// FTS5 first, LIKE when the query has no text or FTS refuses it.
-async fn find_packages(
-    state: &AppState,
-    repo_id: i64,
-    text: &str,
-    limit: i64,
-) -> AppResult<Vec<Package>> {
-    if !text.is_empty() {
-        let fts_query = text
-            .split_whitespace()
-            .map(|word| format!("\"{}\"", word.replace('"', "")))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let fts = sqlx::query_as::<_, PackageRow>(
-            "SELECT p.* FROM packages p \
-             JOIN packages_fts fts ON p.id = fts.rowid \
-             WHERE p.repository_id = ?1 AND packages_fts MATCH ?2 \
-             ORDER BY rank \
-             LIMIT ?3",
-        )
-        .bind(repo_id)
-        .bind(&fts_query)
-        .bind(limit)
-        .fetch_all(&state.db)
-        .await;
-        if let Ok(rows) = fts {
-            return hydrate(rows);
-        }
+/// What the index is asked for, and the one case it is asked nothing.
+///
+/// No text at all is npm's *browse* — the call a client makes with no query,
+/// which lists the repository — so it is `Some(None)`. A text that sanitises
+/// away (`?q=%20`, `?q=%22`) matches nothing and never reaches the index,
+/// which is what its `LIKE '% %'` predecessor amounted to and what keeps FTS5
+/// from being handed an expression it refuses.
+fn browse_or_match(text: &str) -> Option<Option<Tokens>> {
+    if text.is_empty() {
+        return Some(None);
     }
-    let pattern = format!("%{text}%");
-    hydrate(
-        sqlx::query_as::<_, PackageRow>(
-            "SELECT * FROM packages WHERE repository_id = ?1 \
-             AND (name LIKE ?2 OR description LIKE ?2) LIMIT ?3",
-        )
-        .bind(repo_id)
-        .bind(&pattern)
-        .bind(limit)
-        .fetch_all(&state.db)
-        .await?,
-    )
+    Tokens::parse(text).map(Some)
 }
 
-fn hydrate(rows: Vec<PackageRow>) -> AppResult<Vec<Package>> {
-    Ok(rows
-        .into_iter()
-        .map(Package::try_from)
-        .collect::<Result<_, _>>()?)
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_text_browses_and_an_unmatchable_one_asks_nothing() {
+        assert!(browse_or_match("").is_some_and(|query| query.is_none()));
+        assert!(
+            browse_or_match("   ").is_none(),
+            "whitespace alone matches nothing"
+        );
+        assert!(
+            browse_or_match("\"").is_none(),
+            "a lone quote sanitises away"
+        );
+        assert_eq!(
+            browse_or_match("left-pad").unwrap().unwrap().tokens(),
+            ["left-pad".to_string()]
+        );
+    }
 }

@@ -76,7 +76,7 @@ async fn serve_manifest(
 ) -> AppResult<Response> {
     let r = OciRef::parse(params)?;
     let reference = parse_reference(param(params, "reference")?)?;
-    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
     crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
 
     let leaf = ManifestLeaf {
@@ -102,7 +102,7 @@ pub async fn put_manifest(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
     let reference = parse_reference(param(&params, "reference")?)?;
 
-    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
@@ -235,7 +235,7 @@ pub async fn delete_manifest(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
     let reference = parse_reference(param(&params, "reference")?)?;
 
-    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
     crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;

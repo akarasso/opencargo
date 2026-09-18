@@ -23,6 +23,9 @@ use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
 use crate::policy::PolicyEngine;
+use crate::ports::packages::PackageStore;
+use crate::ports::repositories::RepositoryStore;
+use crate::ports::search::SearchIndex;
 use crate::ports::webhooks::{NewWebhook, WebhookStore};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamAuth, UpstreamCreds};
 use crate::storage::StorageBackend;
@@ -56,6 +59,9 @@ pub struct AppState {
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
     pub webhooks: Arc<dyn WebhookStore>,
+    pub repos: Arc<dyn RepositoryStore>,
+    pub packages: Arc<dyn PackageStore>,
+    pub search: Arc<dyn SearchIndex>,
     pub vuln_scanner: Arc<VulnScanner>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
@@ -97,7 +103,10 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let db = crate::db::connect(&config.database.url).await?;
     migrate(&db).await?;
     crate::db::kinds::check_repository_names(&db).await?;
-    crate::db::init_repositories(&db, &config.repositories).await?;
+
+    let stores = crate::adapters::sqlite::SqliteStores::new(db.clone());
+    let repos = stores.repositories();
+    seed_repositories(repos.as_ref(), &config.repositories, Utc::now()).await?;
 
     let storage = crate::storage::filesystem(&config.server.storage_path);
 
@@ -193,7 +202,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     // Initialize Prometheus metrics
     let metrics_handle = telemetry::init_metrics();
 
-    let webhooks = crate::adapters::sqlite::SqliteStores::new(db.clone()).webhooks();
+    let webhooks = stores.webhooks();
     seed_webhooks(webhooks.as_ref(), &config.webhooks, Utc::now()).await?;
 
     let webhook_dispatcher = Arc::new(WebhookDispatcher::new(webhooks.clone()));
@@ -231,11 +240,59 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
         webhooks,
+        repos,
+        packages: stores.packages(),
+        search: stores.search(),
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,
         policy,
     })
+}
+
+/// The configured repositories, validated as an API write would validate
+/// them and then seeded: the config file starts a deployment, it does not own
+/// it afterwards.
+///
+/// The whole list is `pending`, so a group may name a member declared further
+/// down the file.
+async fn seed_repositories(
+    store: &dyn RepositoryStore,
+    configured: &[RepositoryConfig],
+    now: DateTime<Utc>,
+) -> anyhow::Result<()> {
+    let empty: Vec<String> = Vec::new();
+    let pending: Vec<crate::domain::Pending<'_>> = configured
+        .iter()
+        .map(|repo| crate::domain::Pending {
+            name: &repo.name,
+            kind: repo.repo_type,
+            format: repo.format,
+            members: repo.members.as_deref().unwrap_or(&empty),
+        })
+        .collect();
+    let specs: Vec<crate::domain::RepoSpec<'_>> = configured
+        .iter()
+        .map(|repo| crate::domain::RepoSpec {
+            name: &repo.name,
+            kind: repo.repo_type,
+            format: repo.format,
+            visibility: repo.visibility,
+            upstream: repo.upstream.as_deref(),
+            members: repo.members.as_deref().unwrap_or(&empty),
+        })
+        .collect();
+    // One at a time, validated against what is already stored: a group that
+    // names a member seeded earlier in this same pass must see its row, or a
+    // mutual membership would validate as two pending entries and be seeded.
+    for spec in &specs {
+        crate::db::kinds::validate_spec(store, spec, &pending)
+            .await
+            .map_err(|e| anyhow::anyhow!("repository {}: {e}", spec.name))?;
+        store.ensure_seeded(std::slice::from_ref(spec), now).await?;
+    }
+    info!("Repository seeding complete ({} configured)", specs.len());
+    Ok(())
 }
 
 /// The configured registrations, in the port's vocabulary: the config file

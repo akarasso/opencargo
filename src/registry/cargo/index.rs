@@ -29,7 +29,7 @@ pub async fn config_json(
     Path(repo_name): Path<String>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Cargo)?;
     let auth = auth.as_ref().map(|e| &e.0);
     if auth.is_some() {
@@ -73,7 +73,7 @@ pub async fn get_index_entry(
     if index_prefix(uri.path()) != Some(compute_prefix(name)) {
         return Err(AppError::NotFound(format!("crate not found: {name}")));
     }
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
     crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
 

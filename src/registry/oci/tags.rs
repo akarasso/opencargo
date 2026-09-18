@@ -33,7 +33,7 @@ pub async fn list_tags(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response> {
     let r = OciRef::parse(&params)?;
-    let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
     let auth = auth.as_ref().map(|e| &e.0);
     crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
 

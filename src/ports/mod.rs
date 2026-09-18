@@ -4,4 +4,7 @@
 //! behind it is chosen by the composition root and named nowhere else.
 
 pub mod multipart;
+pub mod packages;
+pub mod repositories;
+pub mod search;
 pub mod webhooks;

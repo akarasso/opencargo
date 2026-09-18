@@ -46,7 +46,7 @@ pub async fn get_package(
     let package_name = extract_package_name(&params);
     crate::domain::validate_npm_read_name(&package_name)?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
     crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
 
@@ -88,7 +88,7 @@ pub async fn download_tarball(
     crate::domain::validate_npm_read_name(&package_name)?;
     validate_tarball_filename(filename)?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
     crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
 

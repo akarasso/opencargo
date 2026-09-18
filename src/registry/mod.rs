@@ -11,6 +11,7 @@ use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
 use crate::domain::{Format, RepoKind, Repository, Visibility};
 use crate::error::{AppError, AppResult};
+use crate::ports::repositories::RepositoryStore;
 use crate::server::AppState;
 
 /// Extract the full package name from path parameters.
@@ -26,8 +27,9 @@ pub fn extract_package_name(params: &HashMap<String, String>) -> String {
 }
 
 /// Load a repository by name; a missing one is a 404 naming it.
-pub async fn load_repo(db: &sqlx::SqlitePool, name: &str) -> AppResult<Repository> {
-    crate::db::get_repository_by_name(db, name)
+pub async fn load_repo(repos: &dyn RepositoryStore, name: &str) -> AppResult<Repository> {
+    repos
+        .by_name(name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))
 }
@@ -136,7 +138,7 @@ pub async fn emit_package_event(
     use crate::events::Visibility;
 
     let is_public = matches!(
-        crate::db::get_repository_by_name(&state.db, repo_name).await,
+        state.repos.by_name(repo_name).await,
         Ok(Some(ref repo)) if repo.visibility == crate::domain::Visibility::Public
     );
 

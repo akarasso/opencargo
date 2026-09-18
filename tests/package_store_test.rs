@@ -1,9 +1,10 @@
-//! The `WebhookStore` contract, run twice: against the in-memory fake the
-//! unit tests build on, and against the SQLite adapter the server runs on.
+//! The `RepositoryStore` / `PackageStore` / `SearchIndex` contract, run
+//! twice: against the in-memory fake the unit tests build on, and against the
+//! SQLite adapter the server runs on.
 
 mod common;
 
-use common::contract::{store_contract, Handles, Ports};
+use common::contract::{package_contract, Handles, Ports};
 use common::fakes::FakeDb;
 use opencargo::adapters::sqlite::SqliteStores;
 use tempfile::TempDir;
@@ -33,5 +34,5 @@ async fn sqlite() -> Handles {
     Handles::new(ports, Box::new((tmp, stores)))
 }
 
-store_contract!(fake_db, fake);
-store_contract!(sqlite_adapter, sqlite);
+package_contract!(fake_db, fake);
+package_contract!(sqlite_adapter, sqlite);

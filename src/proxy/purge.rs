@@ -34,7 +34,7 @@ fn purge_members<'a>(
             ));
         }
         for name in group.members() {
-            let Some(member) = crate::db::get_repository_by_name(&state.db, &name).await? else {
+            let Some(member) = state.repos.by_name(&name).await? else {
                 warn!(group = %group.name, member = %name, "group member not found; skipping purge");
                 continue;
             };

@@ -199,56 +199,6 @@ pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
 }
 
 // ---------------------------------------------------------------------------
-// Repository seeding
-// ---------------------------------------------------------------------------
-
-/// Insert pre-configured repositories if they do not already exist; every
-/// entry is validated as an API write would be, with the whole list as
-/// `pending` so members may come later in the file.
-pub async fn init_repositories(
-    pool: &SqlitePool,
-    repos: &[crate::config::RepositoryConfig],
-) -> anyhow::Result<()> {
-    let pending: Vec<kinds::Pending<'_>> = repos
-        .iter()
-        .map(|r| kinds::Pending {
-            name: &r.name,
-            kind: r.repo_type,
-            format: r.format,
-            members: r.members.as_deref().unwrap_or_default(),
-        })
-        .collect();
-    for repo in repos {
-        let spec = kinds::RepoSpec {
-            name: &repo.name,
-            kind: repo.repo_type,
-            format: repo.format,
-            upstream: repo.upstream.as_deref(),
-            members: repo.members.as_deref().unwrap_or_default(),
-        };
-        kinds::validate_spec(pool, &spec, &pending)
-            .await
-            .map_err(|e| anyhow::anyhow!("repository {}: {e}", repo.name))?;
-
-        sqlx::query(
-            "INSERT OR IGNORE INTO repositories (name, repo_type, format, visibility, upstream_url, config_json)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        )
-        .bind(&repo.name)
-        .bind(repo.repo_type.as_str())
-        .bind(repo.format.as_str())
-        .bind(repo.visibility.as_str())
-        .bind(repo.upstream.as_deref())
-        .bind(spec.config().map(|c| c.to_json()))
-        .execute(pool)
-        .await?;
-    }
-
-    info!("Repository seeding complete ({} configured)", repos.len());
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
 // Query functions
 // ---------------------------------------------------------------------------
 

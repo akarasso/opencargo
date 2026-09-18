@@ -13,5 +13,7 @@ pub use kinds::{Format, RepoKind, Visibility};
 pub use names::{
     validate_npm_read_name, validate_oci_tag, validate_package_name, validate_version,
 };
-pub use repository::{DistTag, Package, RepoConfig, Repository, Version};
+pub use repository::{
+    DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version,
+};
 pub use webhook::{Subscription, Webhook};

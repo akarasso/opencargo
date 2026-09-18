@@ -12,10 +12,10 @@ declare_row() { local IFS=$'\x1f'; rows+=("$*"); }
 # Bounds are measured occurrences at 6c9747a, never lines: `\bdb::` is 232 occurrences over 231
 # lines, so a max fed by a line count licenses one free violation. A raise is an edit to this
 # block, in the commit that needs it, with the reason on the line -- never a silent bump.
-declare_row db-calls       max 159 '\bdb::'                  plain src '*.rs' src/db src/adapters # 171 -> 159: the webhook CRUD is a port
-declare_row pool-field     max 209 '\.db\b'                  strip src '*.rs' src/db src/adapters # 219 -> 209: the webhook handlers hold a store, not the pool. strip: `"...opencargo.db"` is a filename, not a pool
-declare_row stray-sql      max  96 'sqlx::query'             plain src '*.rs' src/db src/adapters # covers _as and _scalar
-declare_row pool-leak      max  70 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 73 -> 70: the webhook dispatcher holds a WebhookStore
+declare_row db-calls       max 103 '\bdb::'                  plain src '*.rs' src/db src/adapters # 159 -> 103: packages, repositories and search are ports
+declare_row pool-field     max 139 '\.db\b'                  strip src '*.rs' src/db src/adapters # 209 -> 139: publish, promote and the admin repo CRUD hold stores, not the pool. strip: `"...opencargo.db"` is a filename, not a pool
+declare_row stray-sql      max  92 'sqlx::query'             plain src '*.rs' src/db src/adapters # 96 -> 92: npm search and the repo delete count go through ports. covers _as and _scalar
+declare_row pool-leak      max  63 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 70 -> 63: the packument, the seed and the repo validator take ports
 declare_row context-bypass max  25 'cx\.state\b'             plain src '*.rs'                     # word boundary: `cx.state` is also passed whole
 declare_row dialect-rs     max  21 'datetime\(|julianday\(|strftime\(|AUTOINCREMENT|INSERT OR ' plain src '*.rs' src/db src/adapters/sqlite # 22 -> 21: go/mod.rs's rfc3339 comment went with its subject
 declare_row dialect-sql    max  49 "AUTOINCREMENT|CHECK\(|fts5|CREATE TRIGGER|datetime\('now'\)" plain 'src/db/migrations src/adapters/sqlite/migrations' '*.sql' # scoped, not eliminated: SQLite DDL belongs in a SQLite directory
@@ -25,8 +25,8 @@ declare_row adapter-import max   0 '(crate|opencargo)::adapters::' plain src '*.
 declare_row domain-paths   max   0 '(crate|opencargo)::(error|server|db|api|registry|proxy|storage|telemetry|auth|app|adapters)\b' plain src/domain '*.rs'
 declare_row domain-names   max   0 'AppError|AppResult|sqlx|axum|reqwest' plain src/domain '*.rs'
 declare_row tests-raw-sql  max  41 'sqlx::query|SqlitePool'  plain tests '*.rs' tests/common/contract.rs # ratchet-only (7.4); the contract suite is the one exclusion
-declare_row unit-tests     min 241 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 234 -> 241: the pilot's use case and its domain rule. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
-declare_row integ-tests    min 278 '#\[(tokio::)?test\]'     plain tests '*.rs' # 271 -> 278: store_contract!, seven clauses run against two adapters
+declare_row unit-tests     min 246 '#\[(tokio::)?test\]'     plain src '*.rs'                     # 241 -> 246: the publish and promote use cases, and the browse rule. Floors: the suite may be rebalanced, not shrunk (7.5 rule 3)
+declare_row integ-tests    min 292 '#\[(tokio::)?test\]'     plain tests '*.rs' # 278 -> 292: package_contract!'s twelve clauses against two adapters, and npm's browse and empty-query arms
 
 # files <roots> <glob> [excluded paths...] -- the scope, one path per line
 files() {

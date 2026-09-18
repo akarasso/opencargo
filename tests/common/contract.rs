@@ -10,19 +10,37 @@
 use std::any::Any;
 use std::sync::Arc;
 
+use opencargo::ports::packages::PackageStore;
+use opencargo::ports::repositories::RepositoryStore;
+use opencargo::ports::search::SearchIndex;
 use opencargo::ports::webhooks::WebhookStore;
 
 /// What an adapter hands the suite: its handles, plus whatever must outlive
 /// them — a temp directory, an open pool — which the suite never looks at.
 pub struct Handles {
     pub webhooks: Arc<dyn WebhookStore>,
+    pub repos: Arc<dyn RepositoryStore>,
+    pub packages: Arc<dyn PackageStore>,
+    pub search: Arc<dyn SearchIndex>,
     _keep: Box<dyn Any + Send>,
 }
 
+/// The handle set an adapter exposes, which is the same set on both sides of
+/// the boundary — that sameness is what lets one suite run against each.
+pub struct Ports {
+    pub webhooks: Arc<dyn WebhookStore>,
+    pub repos: Arc<dyn RepositoryStore>,
+    pub packages: Arc<dyn PackageStore>,
+    pub search: Arc<dyn SearchIndex>,
+}
+
 impl Handles {
-    pub fn new(webhooks: Arc<dyn WebhookStore>, keep: Box<dyn Any + Send>) -> Self {
+    pub fn new(ports: Ports, keep: Box<dyn Any + Send>) -> Self {
         Self {
-            webhooks,
+            webhooks: ports.webhooks,
+            repos: ports.repos,
+            packages: ports.packages,
+            search: ports.search,
             _keep: keep,
         }
     }
@@ -285,3 +303,481 @@ macro_rules! store_contract {
 
 #[allow(unused_imports)]
 pub(crate) use store_contract;
+
+/// `package_contract!(name, opener)`: what `RepositoryStore`, `PackageStore`
+/// and `SearchIndex` owe together.
+///
+/// Together, because they are one aggregate seen from three sides — a
+/// publish is not landed until the version is readable *and* findable, and a
+/// repository is not empty until its packages are gone. A per-port macro
+/// structurally cannot say that.
+#[allow(unused_macros)]
+macro_rules! package_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, SubsecRound, TimeZone, Utc};
+            use ::opencargo::domain::{Format, RepoKind, RepoSpec, Repository, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::packages::{NameMatch, NewRelease};
+            use ::opencargo::ports::search::{SearchQuery, SearchScope};
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 18, hour, 30, 0).unwrap()
+            }
+
+            fn spec<'a>(name: &'a str, visibility: Visibility) -> RepoSpec<'a> {
+                RepoSpec {
+                    name,
+                    kind: RepoKind::Hosted,
+                    format: Format::Npm,
+                    visibility,
+                    upstream: None,
+                    members: &[],
+                }
+            }
+
+            async fn hosted(handles: &Handles, name: &str, visibility: Visibility) -> Repository {
+                handles
+                    .repos
+                    .create(&spec(name, visibility), at(9))
+                    .await
+                    .unwrap()
+            }
+
+            fn release<'a>(
+                repository: i64,
+                package: &'a str,
+                version: &'a str,
+                tags: &'a [String],
+            ) -> NewRelease<'a> {
+                NewRelease {
+                    repository,
+                    package,
+                    match_name: NameMatch::Exact,
+                    description: Some("a package"),
+                    readme: None,
+                    version,
+                    metadata_json: "{}",
+                    checksum_sha1: None,
+                    checksum_sha256: Some("abc"),
+                    integrity: None,
+                    size: 4,
+                    tarball_path: "npm/r/p/p.tgz",
+                    dist_tags: tags,
+                    now: at(9),
+                }
+            }
+
+            #[tokio::test]
+            async fn a_repository_round_trips_and_lists_by_name() {
+                let handles = $open().await;
+                let created = hosted(&handles, "npm-hosted", Visibility::Private).await;
+
+                assert_eq!(created.name, "npm-hosted");
+                assert_eq!(created.visibility, Visibility::Private);
+                assert_eq!(created.kind().unwrap(), RepoKind::Hosted);
+                assert_eq!(
+                    handles.repos.by_name("npm-hosted").await.unwrap(),
+                    Some(created.clone())
+                );
+                assert!(
+                    handles.repos.by_name("NPM-HOSTED").await.unwrap().is_none(),
+                    "the name is a storage segment, so it is matched exactly"
+                );
+
+                hosted(&handles, "a-first", Visibility::Public).await;
+                let all = handles.repos.all().await.unwrap();
+                assert_eq!(
+                    all.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+                    ["a-first", "npm-hosted"]
+                );
+            }
+
+            /// Section 1.5's clause, on this aggregate too: the row carries
+            /// the timestamp the caller passed, never a column default.
+            #[tokio::test]
+            async fn a_row_carries_the_callers_clock() {
+                let handles = $open().await;
+                let created = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                assert_eq!(created.created_at, at(9).trunc_subsecs(0));
+                assert_eq!(created.updated_at, at(9).trunc_subsecs(0));
+
+                let landed = handles
+                    .packages
+                    .publish_version(&release(created.id, "left-pad", "1.0.0", &[]))
+                    .await
+                    .unwrap();
+                assert_eq!(landed.package.created_at, at(9).trunc_subsecs(0));
+                assert_eq!(landed.version.published_at, at(9).trunc_subsecs(0));
+            }
+
+            #[tokio::test]
+            async fn a_publish_lands_the_package_the_version_and_its_tags() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let tags = vec!["latest".to_string(), "next".to_string()];
+
+                let landed = handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "1.0.0", &tags))
+                    .await
+                    .unwrap();
+
+                assert_eq!(landed.package.name, "left-pad");
+                assert_eq!(landed.version.version, "1.0.0");
+                assert_eq!(landed.version.checksum_sha256.as_deref(), Some("abc"));
+                assert!(!landed.version.yanked);
+
+                let store = &handles.packages;
+                assert_eq!(
+                    store
+                        .package(repo.id, "left-pad", NameMatch::Exact)
+                        .await
+                        .unwrap(),
+                    Some(landed.package.clone())
+                );
+                assert_eq!(
+                    store.versions(landed.package.id).await.unwrap(),
+                    vec![landed.version.clone()]
+                );
+                let mut stored: Vec<String> = store
+                    .dist_tags(landed.package.id)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|tag| tag.tag)
+                    .collect();
+                stored.sort();
+                assert_eq!(stored, ["latest", "next"]);
+            }
+
+            /// The pre-insert read a caller does is an optimisation; this is
+            /// the arbiter, and it must not be a 500.
+            #[tokio::test]
+            async fn two_concurrent_publishes_of_one_version_yield_one_conflict() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let (left, right) = (handles.packages.clone(), handles.packages.clone());
+
+                let (first, second) = ::tokio::join!(
+                    async move {
+                        left.publish_version(&release(repo.id, "left-pad", "1.0.0", &[]))
+                            .await
+                    },
+                    async move {
+                        right
+                            .publish_version(&release(repo.id, "left-pad", "1.0.0", &[]))
+                            .await
+                    }
+                );
+
+                let outcomes = [first, second];
+                assert_eq!(
+                    outcomes.iter().filter(|out| out.is_ok()).count(),
+                    1,
+                    "exactly one of two racing publishes lands"
+                );
+                for out in &outcomes {
+                    match out {
+                        Ok(_) => {}
+                        Err(StoreError::Conflict) => {}
+                        Err(other) => panic!("a racing publish is a conflict, not {other:?}"),
+                    }
+                }
+            }
+
+            #[tokio::test]
+            async fn a_case_insensitive_lookup_finds_the_case_it_was_published_with() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "cargo-hosted", Visibility::Public).await;
+                handles
+                    .packages
+                    .publish_version(&release(repo.id, "Serde", "1.0.0", &[]))
+                    .await
+                    .unwrap();
+
+                let store = &handles.packages;
+                assert!(store
+                    .package(repo.id, "serde", NameMatch::Exact)
+                    .await
+                    .unwrap()
+                    .is_none());
+                assert_eq!(
+                    store
+                        .package(repo.id, "serde", NameMatch::Insensitive)
+                        .await
+                        .unwrap()
+                        .map(|package| package.name),
+                    Some("Serde".to_string()),
+                    "the row keeps the case it was published with"
+                );
+            }
+
+            /// A publish is not landed until it is findable: against SQLite
+            /// this only means anything because `007_fts5.sql` applies
+            /// strictly and the npm search has no `LIKE` fallback left.
+            #[tokio::test]
+            async fn a_published_package_is_findable_and_browsable() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                for name in ["left-pad", "right-pad"] {
+                    handles
+                        .packages
+                        .publish_version(&release(repo.id, name, "1.0.0", &[]))
+                        .await
+                        .unwrap();
+                }
+
+                let query = SearchQuery::parse("left-pad").unwrap();
+                let hits = handles
+                    .search
+                    .search(SearchScope::Repo(repo.id), Some(&query), 20)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    hits.first().map(|package| package.name.as_str()),
+                    Some("left-pad"),
+                    "the most relevant hit comes first"
+                );
+
+                let browsed = handles
+                    .search
+                    .search(SearchScope::Repo(repo.id), None, 20)
+                    .await
+                    .unwrap();
+                let mut names: Vec<&str> =
+                    browsed.iter().map(|package| package.name.as_str()).collect();
+                names.sort();
+                assert_eq!(
+                    names,
+                    ["left-pad", "right-pad"],
+                    "no query is a browse, never an empty answer"
+                );
+            }
+
+            #[tokio::test]
+            async fn a_public_only_search_never_reaches_a_private_repository() {
+                let handles = $open().await;
+                let public = hosted(&handles, "npm-public", Visibility::Public).await;
+                let private = hosted(&handles, "npm-private", Visibility::Private).await;
+                for repo in [public.id, private.id] {
+                    handles
+                        .packages
+                        .publish_version(&release(repo, "left-pad", "1.0.0", &[]))
+                        .await
+                        .unwrap();
+                }
+
+                let hits = handles
+                    .search
+                    .search(SearchScope::PublicOnly, None, 20)
+                    .await
+                    .unwrap();
+                assert_eq!(hits.len(), 1);
+                assert_eq!(hits[0].repository_id, public.id);
+
+                let everywhere = handles
+                    .search
+                    .search(SearchScope::All, None, 20)
+                    .await
+                    .unwrap();
+                assert_eq!(everywhere.len(), 2);
+            }
+
+            /// The cascade: a repository is not deletable while a package
+            /// remains, and the refusal leaves it exactly where it was.
+            #[tokio::test]
+            async fn a_repository_with_a_package_refuses_to_go() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "1.0.0", &[]))
+                    .await
+                    .unwrap();
+
+                assert!(matches!(
+                    handles.repos.delete_empty("npm-hosted").await.unwrap_err(),
+                    StoreError::Conflict
+                ));
+                assert_eq!(
+                    handles.repos.by_name("npm-hosted").await.unwrap(),
+                    Some(repo),
+                    "a refused delete changes nothing"
+                );
+            }
+
+            #[tokio::test]
+            async fn deleting_an_empty_repository_is_final_and_says_so_twice() {
+                let handles = $open().await;
+                hosted(&handles, "npm-hosted", Visibility::Public).await;
+
+                handles.repos.delete_empty("npm-hosted").await.unwrap();
+                assert!(handles.repos.by_name("npm-hosted").await.unwrap().is_none());
+                assert!(matches!(
+                    handles.repos.delete_empty("npm-hosted").await.unwrap_err(),
+                    StoreError::NotFound
+                ));
+            }
+
+            /// A promotion is the whole of it or none of it: the package row
+            /// in the target repository, the version, its inherited tags.
+            #[tokio::test]
+            async fn a_promotion_carries_the_version_and_the_tags_it_held() {
+                use ::opencargo::ports::packages::{Promotion, PromotionAudit};
+
+                let handles = $open().await;
+                let stage = hosted(&handles, "npm-stage", Visibility::Private).await;
+                let prod = hosted(&handles, "npm-prod", Visibility::Public).await;
+                let tags = vec!["latest".to_string()];
+                let landed = handles
+                    .packages
+                    .publish_version(&release(stage.id, "left-pad", "1.0.0", &tags))
+                    .await
+                    .unwrap();
+
+                let promoted = handles
+                    .packages
+                    .promote_metadata(&Promotion {
+                        source: &landed.version,
+                        target_repository: prod.id,
+                        package: "left-pad",
+                        description: Some("a package"),
+                        metadata_json: "{}",
+                        tarball_path: "npm/npm-prod/left-pad/p.tgz",
+                        dist_tags: &tags,
+                        audit: PromotionAudit {
+                            user_id: None,
+                            username: "alex",
+                            target: "left-pad@1.0.0",
+                            repository: "npm-prod",
+                            details_json: "{}",
+                        },
+                        now: at(11),
+                    })
+                    .await
+                    .unwrap();
+
+                let store = &handles.packages;
+                let target = store
+                    .package(prod.id, "left-pad", NameMatch::Exact)
+                    .await
+                    .unwrap()
+                    .expect("the target repository has the package row");
+                assert_eq!(promoted.package_id, target.id);
+                assert_eq!(promoted.tarball_path, "npm/npm-prod/left-pad/p.tgz");
+                assert_eq!(promoted.published_at, at(11).trunc_subsecs(0));
+
+                let inherited = store.dist_tags(target.id).await.unwrap();
+                assert_eq!(inherited.len(), 1);
+                assert_eq!(inherited[0].tag, "latest");
+                assert_eq!(inherited[0].version_id, promoted.id);
+
+                assert!(matches!(
+                    store
+                        .promote_metadata(&Promotion {
+                            source: &landed.version,
+                            target_repository: prod.id,
+                            package: "left-pad",
+                            description: None,
+                            metadata_json: "{}",
+                            tarball_path: "npm/npm-prod/left-pad/p.tgz",
+                            dist_tags: &[],
+                            audit: PromotionAudit {
+                                user_id: None,
+                                username: "alex",
+                                target: "left-pad@1.0.0",
+                                repository: "npm-prod",
+                                details_json: "{}",
+                            },
+                            now: at(12),
+                        })
+                        .await
+                        .unwrap_err(),
+                    StoreError::Conflict
+                ));
+            }
+
+            #[tokio::test]
+            async fn tags_metadata_and_yanking_touch_one_row_each() {
+                let handles = $open().await;
+                let repo = hosted(&handles, "npm-hosted", Visibility::Public).await;
+                let landed = handles
+                    .packages
+                    .publish_version(&release(repo.id, "left-pad", "1.0.0", &[]))
+                    .await
+                    .unwrap();
+                let store = &handles.packages;
+
+                store
+                    .set_dist_tag(landed.package.id, "latest", landed.version.id)
+                    .await
+                    .unwrap();
+                assert_eq!(store.dist_tags(landed.package.id).await.unwrap().len(), 1);
+                store
+                    .clear_dist_tag(landed.package.id, "latest")
+                    .await
+                    .unwrap();
+                assert!(store.dist_tags(landed.package.id).await.unwrap().is_empty());
+                assert!(matches!(
+                    store
+                        .clear_dist_tag(landed.package.id, "latest")
+                        .await
+                        .unwrap_err(),
+                    StoreError::NotFound
+                ));
+
+                store
+                    .set_metadata(landed.version.id, r#"{"deprecated":"use left-pad2"}"#)
+                    .await
+                    .unwrap();
+                store.set_yanked(landed.version.id, true).await.unwrap();
+                store
+                    .set_readme(landed.package.id, "# left-pad", at(11))
+                    .await
+                    .unwrap();
+
+                let reread = store
+                    .version(landed.package.id, "1.0.0")
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(reread.metadata_json, r#"{"deprecated":"use left-pad2"}"#);
+                assert!(reread.yanked);
+                let package = store
+                    .package(repo.id, "left-pad", NameMatch::Exact)
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(package.readme.as_deref(), Some("# left-pad"));
+                assert_eq!(package.updated_at, at(11).trunc_subsecs(0));
+            }
+
+            #[tokio::test]
+            async fn what_is_not_there_is_not_found() {
+                let handles = $open().await;
+                let store = &handles.packages;
+
+                assert!(store.versions(404).await.unwrap().is_empty());
+                assert!(store.version(404, "1.0.0").await.unwrap().is_none());
+                assert!(store.dist_tags(404).await.unwrap().is_empty());
+                assert!(matches!(
+                    store.set_metadata(404, "{}").await.unwrap_err(),
+                    StoreError::NotFound
+                ));
+                assert!(matches!(
+                    store.set_yanked(404, true).await.unwrap_err(),
+                    StoreError::NotFound
+                ));
+                assert!(matches!(
+                    store.set_readme(404, "#", at(9)).await.unwrap_err(),
+                    StoreError::NotFound
+                ));
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use package_contract;
