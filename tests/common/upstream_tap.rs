@@ -3,16 +3,23 @@ use std::sync::{Arc, Mutex};
 
 use axum::body::Body;
 use axum::extract::{Request, State};
-use axum::http::header::{CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
+use axum::http::header::{ACCEPT, CONNECTION, CONTENT_LENGTH, HOST, TRANSFER_ENCODING};
 use axum::http::{HeaderName, Method, Response, StatusCode};
 use axum::Router;
 
+/// Each request's path and the `Accept` it arrived with.
+pub type Accepted = Arc<Mutex<Vec<(String, Option<String>)>>>;
+
 /// A recording reverse proxy: every request lands in `hits` before it is
 /// forwarded; while `fail` is set, the tap answers 503 without forwarding.
+/// `accept`, when set, replaces the `Accept` every request carried, and
+/// `accepted` records the one each request arrived with.
 pub struct Tap {
     pub base_url: String,
     pub hits: Arc<Mutex<Vec<(Method, String)>>>,
     pub fail: Arc<AtomicBool>,
+    pub accept: Arc<Mutex<Option<String>>>,
+    pub accepted: Accepted,
 }
 
 impl Tap {
@@ -33,6 +40,8 @@ struct Relay {
     http: reqwest::Client,
     hits: Arc<Mutex<Vec<(Method, String)>>>,
     fail: Arc<AtomicBool>,
+    accept: Arc<Mutex<Option<String>>>,
+    accepted: Accepted,
 }
 
 pub async fn start(target: &str) -> Tap {
@@ -45,11 +54,15 @@ pub async fn start(target: &str) -> Tap {
         http: reqwest::Client::new(),
         hits: Arc::new(Mutex::new(Vec::new())),
         fail: Arc::new(AtomicBool::new(false)),
+        accept: Arc::new(Mutex::new(None)),
+        accepted: Arc::new(Mutex::new(Vec::new())),
     };
     let tap = Tap {
         base_url: format!("http://{addr}"),
         hits: relay.hits.clone(),
         fail: relay.fail.clone(),
+        accept: relay.accept.clone(),
+        accepted: relay.accepted.clone(),
     };
     let app = Router::new().fallback(forward).with_state(relay);
     tokio::spawn(async move {
@@ -74,6 +87,13 @@ async fn forward(State(relay): State<Relay>, req: Request) -> Response<Body> {
         .lock()
         .unwrap()
         .push((parts.method.clone(), path.clone()));
+    let arrived = parts
+        .headers
+        .get(ACCEPT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string);
+    relay.accepted.lock().unwrap().push((path.clone(), arrived));
+    let forced = relay.accept.lock().unwrap().clone();
     if relay.fail.load(Ordering::SeqCst) {
         return status_only(StatusCode::SERVICE_UNAVAILABLE);
     }
@@ -85,9 +105,12 @@ async fn forward(State(relay): State<Relay>, req: Request) -> Response<Body> {
         .http
         .request(parts.method, format!("{}{}", relay.target, path));
     for (name, value) in &parts.headers {
-        if *name != HOST && !is_hop_by_hop(name) {
+        if *name != HOST && !is_hop_by_hop(name) && !(forced.is_some() && *name == ACCEPT) {
             upstream = upstream.header(name, value);
         }
+    }
+    if let Some(accept) = forced {
+        upstream = upstream.header(ACCEPT, accept);
     }
     let resp = match upstream.body(body).send().await {
         Ok(resp) => resp,

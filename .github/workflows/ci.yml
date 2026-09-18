@@ -69,10 +69,18 @@ jobs:
       - name: Clippy (deny warnings)
         run: cargo clippy --all-targets --all-features -- -D warnings
 
-      # The real-client e2e suites shell out to `pnpm`, `cargo`, `go` and
-      # `docker`, resolved from PATH. Locally an absent client prints
-      # `skipped:`; OPENCARGO_E2E_REQUIRE=1 turns that into a failure so CI
-      # never silently skips a suite.
+      - name: Install PyPI clients
+        run: |
+          python3 -m venv "$RUNNER_TEMP/pypi-clients"
+          "$RUNNER_TEMP/pypi-clients/bin/python" -m pip install --require-hashes -r tests/pypi-clients.txt
+          for client in pip twine uv poetry; do
+            echo "${client^^}_BIN=$RUNNER_TEMP/pypi-clients/bin/$client" >> "$GITHUB_ENV"
+          done
+
+      # The real-client e2e suites shell out to `pnpm`, `cargo`, `go`,
+      # `docker` and the PyPI clients, resolved from PATH or `*_BIN`. Locally
+      # an absent client prints `skipped:`; OPENCARGO_E2E_REQUIRE=1 turns that
+      # into a failure so CI never silently skips a suite.
       - name: Run tests
         env:
           OPENCARGO_E2E_REQUIRE: '1'
