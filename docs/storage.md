@@ -67,9 +67,9 @@ are reaped by the same sweep.
 
 ## Commands
 
-The server must be stopped for `migrate` and `reclaim`; they refuse while a
-server listens on `[server].bind`. This guard does not see a server that is
-still starting.
+The server must be stopped for `migrate` and `reclaim`: they hold the
+writer lease for their whole run and refuse while a server holds it; a server
+starting meanwhile waits for them ([operations.md](operations.md)).
 
 - `opencargo storage check`: the readiness probe, then every operation the
   backend exercises on its own reserved tree, cleaned up. Run it before

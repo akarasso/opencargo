@@ -3,6 +3,20 @@ bind = "127.0.0.1:6789"
 base_url = "http://localhost:6789"
 storage_path = "./data/storage"
 
+lease_wait = "60s"
+lease_stale_after = "30s"
+lease_renew = "10s"
+shutdown_grace = "30s"
+endpoint_drain = "0s"
+
+[backup]
+enabled = false
+every = "24h"
+at = "03:00"
+keep = 7
+to = ""
+storage = false
+
 [storage]
 backend = "fs"
 

@@ -788,6 +788,11 @@ opencargo_cache_misses_total{repo}
 
 ## Deploiement
 
+Une instance par base : une seconde instance sur la meme base refuse de
+demarrer, et chaque mise a jour a une fenetre d'indisponibilite (`Recreate`).
+Sauvegardes (`opencargo backup`), restauration et bail d'ecriture :
+[docs/operations.md](docs/operations.md).
+
 ### Docker
 
 ```bash

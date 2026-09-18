@@ -832,3 +832,13 @@ async fn system_instance_admin_only() {
         assert!(!text.contains(leak), "{text} names {leak}");
     }
 }
+
+#[test]
+fn readme_has_no_multi_replica_claim() {
+    let readme = common::manifests::read(std::path::Path::new("README.md"));
+    assert!(!readme.contains("several replicas behind one load balancer"));
+    assert!(readme.contains("One instance per database"));
+    let example = common::manifests::read(std::path::Path::new("config.example.toml"));
+    let config: opencargo::config::Config = toml::from_str(&example).unwrap();
+    assert!(config.problems().is_empty(), "{:?}", config.problems());
+}

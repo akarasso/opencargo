@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- One instance per database: a writer lease taken before any migration, so a
+  second process on the same database refuses to start and names the holder.
+  `opencargo migrate`, `storage migrate` and `storage reclaim` take it too.
+  See `docs/operations.md`.
+- Graceful shutdown: `/health/ready` answers `503 draining`, WebSocket
+  clients get a close frame, in-flight requests finish within
+  `[server].shutdown_grace`.
+- `opencargo backup`, `backup --check` and `restore`, an in-process
+  `[backup]` schedule, an optional `[backup.sink]`, and a restore Job in
+  the Helm chart and `k8s/restore-job.yaml`.
+- `GET /api/v1/system/instance` and an Instance tile on the System page.
 - S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
   validated against MinIO, not yet against a hosted provider. Credentials
   come only from an allowlisted environment; TLS trusts the compiled-in
@@ -60,6 +71,13 @@ All notable changes to this project will be documented in this file.
   counted per account across Basic, `npm login` and the password change;
   token failures are counted per client address. `auth.trusted_proxies`
   names the proxies whose `X-Forwarded-For` is believed.
+- The Helm chart deploys with `strategy: Recreate`, puts `--config` before
+  the subcommand, refuses `replicaCount` above 1 and gives the lease wait a
+  startup probe budget; global flags are accepted after the subcommand.
+- A new `[server]` or `[backup]` key that fails validation stops `serve` and
+  `migrate`; `restore`, `backup` and `validate-config` report it and run.
+  `validate-config` reports every problem of the file it names.
+- Background sweeps and scheduled backups run only on the lease holder.
 - Registry tokens (`ocr_`) survive a restart: the signing key lives in the
   database. Removing a token from `[auth].static_tokens` still revokes every
   registry token bought with it; a static-token registry token minted before
