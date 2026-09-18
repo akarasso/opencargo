@@ -65,10 +65,30 @@ fn input_value(v: &Value) -> Option<String> {
         .or_else(|| v.get("isRequired").and_then(Value::as_bool).unwrap_or(false).then(|| format!("${{{name}}}")))
 }
 
+/// An argument has no environment name of its own, so a secret one borrows
+/// its flag or hint, upper-cased into a variable.
+fn argument_var(a: &Value) -> String {
+    let raw = text(a, "name").or_else(|| text(a, "valueHint")).unwrap_or_default();
+    let name: String = raw
+        .trim_start_matches('-')
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c.to_ascii_uppercase() } else { '_' })
+        .collect();
+    if name.is_empty() {
+        "SECRET".into()
+    } else {
+        name
+    }
+}
+
 fn arguments(list: &[Value]) -> Vec<String> {
     let mut out = Vec::new();
     for a in list {
-        let value = text(a, "value").or_else(|| text(a, "default")).or_else(|| text(a, "valueHint"));
+        let value = if a.get("isSecret").and_then(Value::as_bool).unwrap_or(false) {
+            Some(format!("${{{}}}", argument_var(a)))
+        } else {
+            text(a, "value").or_else(|| text(a, "default")).or_else(|| text(a, "valueHint"))
+        };
         match text(a, "type").as_deref() {
             Some("named") => {
                 out.extend(text(a, "name"));
@@ -412,6 +432,18 @@ mod tests {
         assert!(!out.to_string().contains("hunter2"));
         assert_eq!(out["mcpServers"]["billing"], json!({"type": "http", "url": "https://mcp.billing.internal/mcp",
             "headers": {"X-Acme-Tenant": "platform"}}));
+    }
+
+    #[test]
+    fn a_secret_argument_is_a_variable_in_every_file_that_carries_the_argv() {
+        let rows = keys(vec![server(json!({"name": "io.github.acme/keyed", "packages": [{"registryType": "npm",
+            "identifier": "@acme/keyed", "version": "2.0.0", "transport": {"type": "stdio"},
+            "packageArguments": [{"type": "named", "name": "--api-key", "isSecret": true, "default": "sk-live-abc"}]}]}))]);
+        let config = McpJson.render(&rows, &base(true));
+        assert_eq!(config["mcpServers"]["keyed"]["args"].as_array().unwrap().last().unwrap(), "${API_KEY}");
+        assert!(!config.to_string().contains("sk-live-abc"));
+        let managed = ManagedSettings.render(&rows, &base(true));
+        assert!(!managed.to_string().contains("sk-live-abc"));
     }
 
     #[test]
