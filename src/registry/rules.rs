@@ -100,14 +100,14 @@ impl FormatRules for OciRules {
     }
 }
 
-/// `None` for a format whose rules ship with its own step.
+/// Every format has its rules; `Option` keeps the table total.
 pub fn rules(format: Format) -> Option<&'static dyn FormatRules> {
     match format {
         Format::Npm => Some(&NpmRules),
         Format::Cargo => Some(&CargoRules),
         Format::Go => Some(&GoRules),
         Format::Oci => Some(&OciRules),
-        Format::Pypi => None,
+        Format::Pypi => Some(&super::pypi::names::PypiRules),
     }
 }
 
@@ -165,7 +165,9 @@ mod tests {
     }
 
     #[test]
-    fn a_format_without_rules_refuses() {
-        assert!(rules_of(Format::Pypi).is_err());
+    fn every_format_has_its_rules() {
+        for format in Format::ALL {
+            assert!(rules_of(format).is_ok(), "{format:?}");
+        }
     }
 }
