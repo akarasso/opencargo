@@ -11,9 +11,11 @@ use bytes::Bytes;
 use serde_json::json;
 use tracing::info;
 
+use crate::app::publish::{Artifact, PublishVersion};
 use crate::auth::middleware::AuthUser;
 use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
+use crate::ports::packages::NameMatch;
 use crate::server::AppState;
 
 const MAX_BODY_BYTES: usize = 100 * 1024 * 1024;
@@ -44,7 +46,7 @@ pub async fn publish_module(
     crate::domain::validate_package_name("go", module_name)?;
     crate::domain::validate_version(version_str)?;
 
-    let repo = crate::registry::load_repo(&state.db, repo_name).await?;
+    let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_can_write(&*state.permissions, &repo, &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Go)?;
@@ -98,44 +100,49 @@ async fn store_version(
     zip_data: Bytes,
     go_mod_content: &str,
 ) -> AppResult<i64> {
-    let db = &state.db;
-    let package = match crate::db::get_package(db, repo.id, module_name).await? {
-        Some(p) => p,
-        None => {
-            let description = format!("Go module {module_name}");
-            crate::db::create_package(db, repo.id, module_name, Some(&description)).await?;
-            crate::db::get_package(db, repo.id, module_name)
-                .await?
-                .ok_or_else(|| {
-                    AppError::Internal(format!("failed to create package: {module_name}"))
-                })?
-        }
-    };
-    if crate::db::get_version(db, package.id, version_str)
+    // Read before write: the store's conflict is the safety net for the race,
+    // but without this a duplicate publish would overwrite the zip of the
+    // version it is about to be refused for.
+    if let Some(package) = state
+        .packages
+        .package(repo.id, module_name, NameMatch::Exact)
         .await?
-        .is_some()
     {
-        return Err(AppError::Conflict(format!(
-            "version {version_str} already exists for {module_name}"
-        )));
+        if state
+            .packages
+            .version(package.id, version_str)
+            .await?
+            .is_some()
+        {
+            return Err(AppError::Conflict(format!(
+                "version {version_str} already exists for {module_name}"
+            )));
+        }
     }
 
+    let description = format!("Go module {module_name}");
     let storage_path = format!("go/{}/{module_name}/{version_str}.zip", repo.name);
-    let size = zip_data.len() as i64;
-    state.storage.put(&storage_path, zip_data).await?;
-    let version_id = crate::db::create_version(
-        db,
-        package.id,
-        version_str,
-        go_mod_content,
-        None,
-        None,
-        None,
-        size,
-        &storage_path,
-    )
-    .await?;
-    Ok(version_id)
+    let landed = PublishVersion::new(state.packages.clone(), state.storage.clone())
+        .run(
+            Artifact {
+                repository: repo.id,
+                package: module_name,
+                match_name: NameMatch::Exact,
+                description: Some(&description),
+                readme: None,
+                version: version_str,
+                metadata_json: go_mod_content,
+                checksum_sha1: None,
+                checksum_sha256: None,
+                integrity: None,
+                storage_path: &storage_path,
+                dist_tags: &[],
+                bytes: zip_data,
+            },
+            chrono::Utc::now(),
+        )
+        .await?;
+    Ok(landed.version.id)
 }
 
 /// The first `go.mod` in the archive (`{module}@{version}/go.mod` by

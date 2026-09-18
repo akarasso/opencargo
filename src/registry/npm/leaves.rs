@@ -3,6 +3,7 @@ use serde_json::Value;
 use crate::domain::Format;
 use crate::error::{AppError, AppResult};
 use crate::policy::{self, Source};
+use crate::ports::packages::NameMatch;
 use crate::proxy::Payload;
 use crate::registry::resolve::{CacheRepo, Cx, Leaf, Outcome, Upstream};
 
@@ -22,7 +23,9 @@ impl Leaf for PackumentLeaf {
     type Out = Packument;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Packument>> {
-        let built = hosted_packument(&cx.state.db, member, &self.name, self.abbreviated).await?;
+        let built =
+            hosted_packument(cx.state.packages.as_ref(), member, &self.name, self.abbreviated)
+                .await?;
         Ok(match built {
             Outcome::Found(json) => Outcome::Found(Packument { json, stale: false }),
             Outcome::NotFound => Outcome::NotFound,
@@ -116,12 +119,15 @@ impl Leaf for DistTagsLeaf {
     type Out = Value;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> AppResult<Outcome<Value>> {
-        let db = &cx.state.db;
-        let Some(package) = crate::db::get_package(db, member.0.id, &self.name).await? else {
+        let packages = cx.state.packages.as_ref();
+        let found = packages
+            .package(member.0.id, &self.name, NameMatch::Exact)
+            .await?;
+        let Some(package) = found else {
             return Ok(Outcome::NotFound);
         };
-        let versions = crate::db::get_versions(db, package.id).await?;
-        let tags = dist_tags_map(db, package.id, &versions).await?;
+        let versions = packages.versions(package.id).await?;
+        let tags = dist_tags_map(packages, package.id, &versions).await?;
         Ok(Outcome::Found(serde_json::to_value(tags)?))
     }
 

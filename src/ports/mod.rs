@@ -4,8 +4,11 @@
 //! behind it is chosen by the composition root and named nowhere else.
 
 pub mod multipart;
+pub mod packages;
 pub mod permissions;
 pub mod proxy_cache;
+pub mod repositories;
+pub mod search;
 pub mod tokens;
 pub mod users;
 pub mod webhooks;

@@ -80,6 +80,36 @@ impl Repository {
     }
 }
 
+/// A repository as an operator described it: what a create, an update's
+/// merged view and the config seed all validate before anything is written.
+///
+/// `visibility` is a field rather than a second argument because the command
+/// already exists -- the same rule section 2.2 states for `now`.
+pub struct RepoSpec<'a> {
+    pub name: &'a str,
+    pub kind: RepoKind,
+    pub format: Format,
+    pub visibility: Visibility,
+    pub upstream: Option<&'a str>,
+    pub members: &'a [String],
+}
+
+/// A config entry the seed has not inserted yet: members may be listed later
+/// in the file, so validation sees the whole list.
+pub struct Pending<'a> {
+    pub name: &'a str,
+    pub kind: RepoKind,
+    pub format: Format,
+    pub members: &'a [String],
+}
+
+impl RepoSpec<'_> {
+    /// The `config` document: the member list for a group, nothing otherwise.
+    pub fn config(&self) -> Option<RepoConfig> {
+        (self.kind == RepoKind::Group).then(|| RepoConfig::of_members(self.members))
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Package {
     pub id: i64,

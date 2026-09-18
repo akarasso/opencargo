@@ -20,6 +20,6 @@ pub use permission::{allows, can_admin, effective_rights, RepoAction, Rights, Ri
 pub use proxy::{
     CacheEntry, CacheEntryId, CachePolicy, Classified, NewEntry, RepoId, Transfer, Ttl, UrlSource,
 };
-pub use repository::{DistTag, Package, RepoConfig, Repository, Version};
+pub use repository::{DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version};
 pub use user::{ApiToken, User};
 pub use webhook::{Subscription, Webhook};

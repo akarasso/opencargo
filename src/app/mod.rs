@@ -5,4 +5,6 @@
 //! calls, what is atomic and what is recorded; the driving adapter above it
 //! parses, calls one of these, and encodes the answer.
 
+pub mod promote;
+pub mod publish;
 pub mod webhooks;

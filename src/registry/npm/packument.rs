@@ -1,10 +1,10 @@
 use std::collections::HashMap;
 
 use serde_json::{json, Value};
-use sqlx::SqlitePool;
 
 use crate::domain::Version;
 use crate::error::AppResult;
+use crate::ports::packages::{NameMatch, PackageStore};
 use crate::registry::resolve::{CacheRepo, Outcome};
 use crate::wire::wire_ts;
 
@@ -17,16 +17,19 @@ pub struct Packument {
 /// Build the packument of a hosted member from its own rows; tarball URLs
 /// still carry the member name and are rewritten by the handler.
 pub async fn hosted_packument(
-    db: &SqlitePool,
+    packages: &dyn PackageStore,
     member: CacheRepo<'_>,
     package_name: &str,
     abbreviated: bool,
 ) -> AppResult<Outcome<Value>> {
-    let Some(package) = crate::db::get_package(db, member.0.id, package_name).await? else {
+    let found = packages
+        .package(member.0.id, package_name, NameMatch::Exact)
+        .await?;
+    let Some(package) = found else {
         return Ok(Outcome::NotFound);
     };
-    let versions = crate::db::get_versions(db, package.id).await?;
-    let dist_tags_map = dist_tags_map(db, package.id, &versions).await?;
+    let versions = packages.versions(package.id).await?;
+    let dist_tags_map = dist_tags_map(packages, package.id, &versions).await?;
 
     let mut versions_map: HashMap<String, Value> = HashMap::new();
     let mut time_map: HashMap<String, String> = HashMap::new();
@@ -53,11 +56,11 @@ pub async fn hosted_packument(
 
 /// `tag -> version` from the `dist_tags` rows of a hosted package.
 pub async fn dist_tags_map(
-    db: &SqlitePool,
+    packages: &dyn PackageStore,
     package_id: i64,
     versions: &[Version],
 ) -> AppResult<HashMap<String, String>> {
-    let dist_tags = crate::db::get_dist_tags(db, package_id).await?;
+    let dist_tags = packages.dist_tags(package_id).await?;
     Ok(dist_tags
         .iter()
         .filter_map(|dt| {

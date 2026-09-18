@@ -9,10 +9,11 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 use tracing::info;
 
+use crate::app::promote::{is_conflict, PromoteVersion, Promoter, Request};
 use crate::auth::middleware::AuthUser;
-use crate::domain::can_admin;
-use crate::domain::{RepoKind, Visibility};
+use crate::domain::{can_admin, RepoKind, Repository, Visibility};
 use crate::error::{AppError, AppResult};
+use crate::ports::packages::NameMatch;
 use crate::registry::extract_package_name;
 use crate::server::AppState;
 
@@ -54,6 +55,229 @@ fn rewrite_tarball_url(
     }
 
     serde_json::to_string(&meta).unwrap_or_else(|_| metadata_json.to_string())
+}
+
+/// A path the target version owns: the layout is `{format}/{repo}/{...}`, so
+/// only the repository segment changes.
+fn target_path(source: &str, to_repo: &str) -> String {
+    let parts: Vec<&str> = source.splitn(3, '/').collect();
+    match parts.len() {
+        3 => format!("{}/{to_repo}/{}", parts[0], parts[2]),
+        _ => format!("{to_repo}/{source}"),
+    }
+}
+
+/// The tags the source version holds; the promoted one inherits exactly
+/// those, in the same transaction as the version itself.
+async fn inherited_tags(
+    state: &AppState,
+    package: i64,
+    version: i64,
+) -> AppResult<Vec<String>> {
+    Ok(state
+        .packages
+        .dist_tags(package)
+        .await?
+        .into_iter()
+        .filter(|tag| tag.version_id == version)
+        .map(|tag| tag.tag)
+        .collect())
+}
+
+async fn refuse_existing(
+    state: &AppState,
+    to_repo: &Repository,
+    name: &str,
+    version: &str,
+) -> AppResult<()> {
+    let Some(package) = state
+        .packages
+        .package(to_repo.id, name, NameMatch::Exact)
+        .await?
+    else {
+        return Ok(());
+    };
+    match state.packages.version(package.id, version).await? {
+        Some(_) => Err(AppError::Conflict(format!(
+            "version '{version}' already exists in repository '{}'",
+            to_repo.name
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Both repositories, refusing anything a promotion cannot move between: a
+/// missing one, a non-hosted one, or a pair that does not share a format.
+async fn hosted_pair(
+    state: &AppState,
+    body: &PromoteRequest,
+) -> AppResult<(Repository, Repository)> {
+    let from = state.repos.by_name(&body.from).await?.ok_or_else(|| {
+        AppError::NotFound(format!("source repository not found: {}", body.from))
+    })?;
+    let to = state.repos.by_name(&body.to).await?.ok_or_else(|| {
+        AppError::NotFound(format!("target repository not found: {}", body.to))
+    })?;
+
+    for (repo, side) in [(&from, "source"), (&to, "target")] {
+        if repo.kind()? != RepoKind::Hosted {
+            return Err(AppError::BadRequest(format!(
+                "{side} repository '{}' is not a hosted repository",
+                repo.name
+            )));
+        }
+    }
+
+    let (from_format, to_format) = (from.fmt()?, to.fmt()?);
+    if from_format != to_format {
+        return Err(AppError::BadRequest(format!(
+            "cannot promote across formats: source is '{}', target is '{}'",
+            from_format.as_str(),
+            to_format.as_str()
+        )));
+    }
+    Ok((from, to))
+}
+
+/// Steps 3 to 7: find the source version, refuse one the target already
+/// holds, and hand the copy plus its metadata transaction to the use case.
+async fn move_version(
+    state: &AppState,
+    body: &PromoteRequest,
+    by: &AuthUser,
+    repos: (&Repository, &Repository),
+    what: (&str, &str),
+) -> AppResult<()> {
+    let (from_repo, to_repo) = repos;
+    let (name, version) = what;
+
+    let from_package = state
+        .packages
+        .package(from_repo.id, name, NameMatch::Exact)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "package '{name}' not found in repository '{}'",
+                from_repo.name
+            ))
+        })?;
+    let from_version = state
+        .packages
+        .version(from_package.id, version)
+        .await?
+        .ok_or_else(|| {
+            AppError::NotFound(format!(
+                "version '{version}' of package '{name}' not found in repository '{}'",
+                from_repo.name
+            ))
+        })?;
+
+    // Refused before anything is copied; the store's own conflict is the
+    // safety net for the race.
+    refuse_existing(state, to_repo, name, version).await?;
+
+    // The target version owns its artifact. Sharing the source path let the
+    // cleanup GC, deleting the older pre-release source file, make the
+    // promoted production artifact undownloadable — silent data loss.
+    let target_tarball_path = target_path(&from_version.tarball_path, &to_repo.name);
+    let metadata_json = rewrite_tarball_url(
+        &from_version.metadata_json,
+        &state.base_url,
+        &body.from,
+        &body.to,
+    );
+    let inherited = inherited_tags(state, from_package.id, from_version.id).await?;
+    let details = json!({ "from": body.from, "to": body.to });
+
+    PromoteVersion::new(state.packages.clone(), state.storage.clone())
+        .run(
+            Request {
+                source: &from_version,
+                target: to_repo,
+                package: name,
+                description: from_package.description.as_deref(),
+                metadata_json: &metadata_json,
+                target_path: &target_tarball_path,
+                dist_tags: &inherited,
+                details_json: &details.to_string(),
+            },
+            Promoter {
+                user_id: by.user_id,
+                username: &by.username,
+            },
+            chrono::Utc::now(),
+        )
+        .await
+        .map_err(|err| {
+            if is_conflict(&err) {
+                AppError::Conflict(format!(
+                    "version '{version}' already exists in repository '{}'",
+                    to_repo.name
+                ))
+            } else {
+                err.into()
+            }
+        })?;
+    Ok(())
+}
+
+/// The webhook, the real-time event and the audit mirror, after the commit.
+///
+/// The source repository's name rides along only when that repository is
+/// itself public: promoting private -> public must not disclose the staging
+/// repository to anonymous or merely authenticated subscribers, who would
+/// otherwise learn a name they have no read access to. Admins get it from the
+/// audit entry.
+async fn announce(
+    state: &AppState,
+    body: &PromoteRequest,
+    by: &AuthUser,
+    what: (&str, &str),
+    target: &str,
+) {
+    let (name, version) = what;
+    state
+        .webhook_dispatcher
+        .dispatch(
+            "package.promoted",
+            &json!({
+                "package": name,
+                "version": version,
+                "from": body.from,
+                "to": body.to,
+                "promoted_by": by.username,
+            }),
+        )
+        .await;
+
+    let from_is_public = matches!(
+        state.repos.by_name(&body.from).await,
+        Ok(Some(ref r)) if r.visibility == Visibility::Public
+    );
+    let mut payload = json!({
+        "package": name,
+        "version": version,
+        "to": body.to,
+        "repository": body.to,
+        "promoted_by": by.username,
+    });
+    if from_is_public {
+        payload["from"] = json!(body.from);
+    }
+    crate::registry::emit_package_event(state, "package.promoted", &body.to, payload).await;
+
+    // Mirrored on the bus so the admin audit view updates live: the entry
+    // itself is written inside the promotion's transaction, not through
+    // `record_audit`.
+    state.events.emit(
+        "audit.entry",
+        crate::events::Visibility::Admin,
+        json!({
+            "username": by.username,
+            "action": "package.promote",
+            "target": target,
+        }),
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -115,197 +339,12 @@ async fn promote_impl(
     };
 
     // 2. Validate both repos exist and are hosted with the same format
-    let from_repo = crate::db::get_repository_by_name(&state.db, &body.from)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("source repository not found: {}", body.from))
-        })?;
+    let (from_repo, to_repo) = hosted_pair(&state, &body).await?;
 
-    let to_repo = crate::db::get_repository_by_name(&state.db, &body.to)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!("target repository not found: {}", body.to))
-        })?;
+    let target_str = format!("{name}@{version}");
+    move_version(&state, &body, &auth_user, (&from_repo, &to_repo), (&name, &version)).await?;
 
-    if from_repo.kind()? != RepoKind::Hosted {
-        return Err(AppError::BadRequest(format!(
-            "source repository '{}' is not a hosted repository",
-            body.from
-        )));
-    }
-
-    if to_repo.kind()? != RepoKind::Hosted {
-        return Err(AppError::BadRequest(format!(
-            "target repository '{}' is not a hosted repository",
-            body.to
-        )));
-    }
-
-    let (from_format, to_format) = (from_repo.fmt()?, to_repo.fmt()?);
-    if from_format != to_format {
-        return Err(AppError::BadRequest(format!(
-            "cannot promote across formats: source is '{}', target is '{}'",
-            from_format.as_str(),
-            to_format.as_str()
-        )));
-    }
-
-    // 3. Look up the package+version in the source repo
-    let from_package = crate::db::get_package(&state.db, from_repo.id, &name)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "package '{}' not found in repository '{}'",
-                name, body.from
-            ))
-        })?;
-
-    let from_version = crate::db::get_version(&state.db, from_package.id, &version)
-        .await?
-        .ok_or_else(|| {
-            AppError::NotFound(format!(
-                "version '{}' of package '{}' not found in repository '{}'",
-                version, name, body.from
-            ))
-        })?;
-
-    // 4. Create the package in the target repo if it doesn't exist
-    let to_package = match crate::db::get_package(&state.db, to_repo.id, &name).await? {
-        Some(p) => p,
-        None => {
-            let _id = crate::db::create_package(
-                &state.db,
-                to_repo.id,
-                &name,
-                from_package.description.as_deref(),
-            )
-            .await?;
-            crate::db::get_package(&state.db, to_repo.id, &name)
-                .await?
-                .ok_or_else(|| {
-                    AppError::Internal(format!(
-                        "failed to create package '{}' in target repo",
-                        name
-                    ))
-                })?
-        }
-    };
-
-    // 5. Check the version doesn't already exist in target (409 Conflict)
-    if crate::db::get_version(&state.db, to_package.id, &version)
-        .await?
-        .is_some()
-    {
-        return Err(AppError::Conflict(format!(
-            "version '{}' already exists in repository '{}'",
-            version, body.to
-        )));
-    }
-
-    // 6. Copy the tarball to a path OWNED by the target version. The previous
-    // code shared the source path, so the cleanup GC deleting the (older,
-    // pre-release) source file made the PROMOTED prod artifact undownloadable —
-    // silent data loss. Storage layout is "{format}/{repo}/{...}"; swap the repo
-    // segment for the target repo.
-    let target_tarball_path = {
-        let parts: Vec<&str> = from_version.tarball_path.splitn(3, '/').collect();
-        if parts.len() == 3 {
-            format!("{}/{}/{}", parts[0], to_repo.name, parts[2])
-        } else {
-            format!("{}/{}", to_repo.name, from_version.tarball_path)
-        }
-    };
-    if target_tarball_path != from_version.tarball_path {
-        let data = state.storage.get(&from_version.tarball_path).await?;
-        state.storage.put(&target_tarball_path, data).await?;
-    }
-
-    // 7. Rewrite the dist.tarball URL to point to the target repo
-    let metadata_json =
-        rewrite_tarball_url(&from_version.metadata_json, &state.base_url, &body.from, &body.to);
-
-    let new_version_id = crate::db::create_version(
-        &state.db,
-        to_package.id,
-        &version,
-        &metadata_json,
-        from_version.checksum_sha1.as_deref(),
-        from_version.checksum_sha256.as_deref(),
-        from_version.integrity.as_deref(),
-        from_version.size,
-        &target_tarball_path,
-    )
-    .await?;
-
-    // 8. Copy dist-tags from the source version
-    let from_dist_tags = crate::db::get_dist_tags(&state.db, from_package.id).await?;
-    for dt in &from_dist_tags {
-        if dt.version_id == from_version.id {
-            crate::db::set_dist_tag(&state.db, to_package.id, &dt.tag, new_version_id).await?;
-        }
-    }
-
-    // 9. Create an audit log entry
-    let details = json!({
-        "from": body.from,
-        "to": body.to,
-    });
-    let target_str = format!("{}@{}", name, version);
-
-    crate::db::create_audit_entry(
-        &state.db,
-        auth_user.user_id,
-        Some(&auth_user.username),
-        "package.promote",
-        Some(&target_str),
-        Some(&body.to),
-        None,
-        None,
-        Some(&details.to_string()),
-    )
-    .await?;
-
-    // Dispatch webhook for package.promoted
-    state.webhook_dispatcher.dispatch("package.promoted", &json!({
-        "package": name,
-        "version": version,
-        "from": body.from,
-        "to": body.to,
-        "promoted_by": auth_user.username,
-    })).await;
-
-    // Real-time event, scoped by destination repo visibility. The source repo
-    // name is only included when that repo is itself public: promoting
-    // private → public must not disclose the private staging repo's name to
-    // anonymous/authenticated subscribers (admins get it via audit.entry).
-    let from_is_public = matches!(
-        crate::db::get_repository_by_name(&state.db, &body.from).await,
-        Ok(Some(ref r)) if r.visibility == Visibility::Public
-    );
-    let mut event_payload = json!({
-        "package": name,
-        "version": version,
-        "to": body.to,
-        "repository": body.to,
-        "promoted_by": auth_user.username,
-    });
-    if from_is_public {
-        event_payload["from"] = json!(body.from);
-    }
-    crate::registry::emit_package_event(&state, "package.promoted", &body.to, event_payload)
-        .await;
-
-    // Also mirror the audit entry on the bus so the admin audit view updates
-    // live (the entry above is written directly, not through record_audit).
-    state.events.emit(
-        "audit.entry",
-        crate::events::Visibility::Admin,
-        json!({
-            "username": auth_user.username,
-            "action": "package.promote",
-            "target": target_str,
-        }),
-    );
+    announce(&state, &body, &auth_user, (&name, &version), &target_str).await;
 
     info!(
         package = %name,

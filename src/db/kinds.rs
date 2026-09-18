@@ -4,33 +4,17 @@ use std::pin::Pin;
 
 use sqlx::SqlitePool;
 
-use crate::domain::{Format, RepoConfig, RepoKind, Repository};
+use crate::domain::{Pending, RepoKind, RepoSpec, Repository};
 use crate::error::{AppError, AppResult};
+use crate::ports::repositories::RepositoryStore;
 use crate::registry::resolve::MAX_GROUP_DEPTH;
 
-pub struct RepoSpec<'a> {
-    pub name: &'a str,
-    pub kind: RepoKind,
-    pub format: Format,
-    pub upstream: Option<&'a str>,
-    pub members: &'a [String],
+trait SpecRules {
+    fn refuse_upstream(&self) -> AppResult<()>;
+    fn refuse_members(&self) -> AppResult<()>;
 }
 
-/// A config entry the seed has not inserted yet: members may be listed
-/// later in the file, so validation sees the whole list.
-pub struct Pending<'a> {
-    pub name: &'a str,
-    pub kind: RepoKind,
-    pub format: Format,
-    pub members: &'a [String],
-}
-
-impl RepoSpec<'_> {
-    /// The `config` document: the member list for a group, nothing otherwise.
-    pub fn config(&self) -> Option<RepoConfig> {
-        (self.kind == RepoKind::Group).then(|| RepoConfig::of_members(self.members))
-    }
-
+impl SpecRules for RepoSpec<'_> {
     fn refuse_upstream(&self) -> AppResult<()> {
         match self.upstream {
             Some(_) => Err(AppError::BadRequest(format!(
@@ -75,7 +59,7 @@ fn validate_name(name: &str) -> AppResult<()> {
 /// being seeded), of the same format, neither the group itself nor reaching
 /// it, and the whole stack at most `MAX_GROUP_DEPTH` groups deep.
 pub async fn validate_spec(
-    pool: &SqlitePool,
+    repos: &dyn RepositoryStore,
     spec: &RepoSpec<'_>,
     pending: &[Pending<'_>],
 ) -> AppResult<()> {
@@ -101,13 +85,13 @@ pub async fn validate_spec(
         }
         RepoKind::Group => {
             spec.refuse_upstream()?;
-            validate_members(pool, spec, pending).await
+            validate_members(repos, spec, pending).await
         }
     }
 }
 
 async fn validate_members(
-    pool: &SqlitePool,
+    repos: &dyn RepositoryStore,
     spec: &RepoSpec<'_>,
     pending: &[Pending<'_>],
 ) -> AppResult<()> {
@@ -118,15 +102,15 @@ async fn validate_members(
     }
     let mut deepest = 0;
     for member in spec.members {
-        deepest = deepest.max(nesting(pool, member, pending, &mut HashSet::new()).await?);
+        deepest = deepest.max(nesting(repos, member, pending, &mut HashSet::new()).await?);
         if member == spec.name {
             return Err(AppError::BadRequest(format!(
                 "group '{member}' cannot be its own member"
             )));
         }
-        let format = match super::get_repository_by_name(pool, member).await? {
+        let format = match repos.by_name(member).await? {
             Some(row) => {
-                if reaches(pool, &row, spec.name, &mut HashSet::new()).await? {
+                if reaches(repos, &row, spec.name, &mut HashSet::new()).await? {
                     return Err(AppError::BadRequest(format!(
                         "group member '{member}' already contains '{}'",
                         spec.name
@@ -163,7 +147,7 @@ async fn validate_members(
 /// the seed's `INSERT OR IGNORE` does; a cycle counts once, `reaches`
 /// refuses it.
 fn nesting<'a>(
-    pool: &'a SqlitePool,
+    repos: &'a dyn RepositoryStore,
     name: &'a str,
     pending: &'a [Pending<'a>],
     seen: &'a mut HashSet<String>,
@@ -172,7 +156,7 @@ fn nesting<'a>(
         if !seen.insert(name.to_string()) {
             return Ok(0);
         }
-        let members = match super::get_repository_by_name(pool, name).await? {
+        let members = match repos.by_name(name).await? {
             Some(row) if row.kind()? == RepoKind::Group => row.members(),
             Some(_) => return Ok(0),
             None => match pending.iter().find(|p| p.name == name) {
@@ -182,7 +166,7 @@ fn nesting<'a>(
         };
         let mut deepest = 0;
         for member in &members {
-            deepest = deepest.max(nesting(pool, member, pending, seen).await?);
+            deepest = deepest.max(nesting(repos, member, pending, seen).await?);
         }
         Ok(deepest + 1)
     })
@@ -191,7 +175,7 @@ fn nesting<'a>(
 /// Whether `target` is reachable through `group`'s members; `seen` bounds the
 /// walk over pre-upgrade cycles.
 fn reaches<'a>(
-    pool: &'a SqlitePool,
+    repos: &'a dyn RepositoryStore,
     group: &'a Repository,
     target: &'a str,
     seen: &'a mut HashSet<i64>,
@@ -204,10 +188,10 @@ fn reaches<'a>(
             if name == target {
                 return Ok(true);
             }
-            let Some(member) = super::get_repository_by_name(pool, &name).await? else {
+            let Some(member) = repos.by_name(&name).await? else {
                 continue;
             };
-            if member.kind()? == RepoKind::Group && reaches(pool, &member, target, seen).await? {
+            if member.kind()? == RepoKind::Group && reaches(repos, &member, target, seen).await? {
                 return Ok(true);
             }
         }

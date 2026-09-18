@@ -8,9 +8,10 @@ use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::api::{require_admin, require_auth};
-use crate::db::kinds::{validate_spec, RepoSpec};
-use crate::domain::{Format, RepoConfig, RepoKind, Repository, Visibility};
-use crate::error::{AppError, AppResult};
+use crate::db::kinds::validate_spec;
+use crate::domain::{Format, RepoConfig, RepoKind, RepoSpec, Repository, Visibility};
+use crate::error::{AppError, AppResult, StoreError};
+use crate::ports::repositories::RepoPatch;
 use crate::proxy::purge::purge_repository;
 use crate::server::AppState;
 use crate::wire::{wire_config, wire_ts};
@@ -66,10 +67,7 @@ pub async fn create_repository(
     }
     let visibility: Visibility = body.visibility.parse()?;
 
-    if crate::db::get_repository_by_name(&state.db, &body.name)
-        .await?
-        .is_some()
-    {
+    if state.repos.by_name(&body.name).await?.is_some() {
         return Err(AppError::Conflict(format!(
             "repository already exists: {}",
             body.name
@@ -81,25 +79,13 @@ pub async fn create_repository(
         name: &body.name,
         kind,
         format,
+        visibility,
         upstream: non_empty(body.upstream.as_deref()),
         members: &members,
     };
-    validate_spec(&state.db, &spec, &[]).await?;
+    validate_spec(state.repos.as_ref(), &spec, &[]).await?;
 
-    crate::db::create_repository(
-        &state.db,
-        &body.name,
-        kind,
-        format,
-        visibility,
-        spec.upstream,
-        spec.config().as_ref(),
-    )
-    .await?;
-
-    let repo = crate::db::get_repository_by_name(&state.db, &body.name)
-        .await?
-        .ok_or_else(|| AppError::Internal("failed to fetch created repository".to_string()))?;
+    let repo = state.repos.create(&spec, chrono::Utc::now()).await?;
 
     crate::api::record_audit(&state, &caller, "repo.create", Some(&repo.name)).await;
     emit_repositories_changed(&state);
@@ -153,10 +139,11 @@ pub async fn update_repository(
         name: &repo.name,
         kind: repo.kind()?,
         format: repo.fmt()?,
+        visibility: visibility.unwrap_or(repo.visibility),
         upstream: upstream_patch.or(repo.upstream_url.as_deref()),
         members: &members,
     };
-    validate_spec(&state.db, &spec, &[]).await?;
+    validate_spec(state.repos.as_ref(), &spec, &[]).await?;
     if upstream_patch.is_some_and(|u| Some(u) != repo.upstream_url.as_deref()) {
         purge_repository(&state, &repo).await?;
     }
@@ -165,16 +152,18 @@ pub async fn update_repository(
         .members
         .is_some()
         .then(|| RepoConfig::of_members(&members));
-    crate::db::update_repository(
-        &state.db,
-        &name,
-        visibility,
-        upstream_patch,
-        config.as_ref(),
-    )
-    .await?;
-
-    let updated = load_repo(&state, &name).await?;
+    let updated = state
+        .repos
+        .update(
+            &name,
+            &RepoPatch {
+                visibility,
+                upstream: upstream_patch,
+                config: config.as_ref(),
+            },
+            chrono::Utc::now(),
+        )
+        .await?;
 
     crate::api::record_audit(&state, &caller, "repo.update", Some(&name)).await;
     emit_repositories_changed(&state);
@@ -196,17 +185,6 @@ pub async fn delete_repository(
 
     let repo = load_repo(&state, &name).await?;
 
-    let pkg_count: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM packages WHERE repository_id = ?1")
-            .bind(repo.id)
-            .fetch_one(&state.db)
-            .await?;
-    if pkg_count > 0 {
-        return Err(AppError::Conflict(format!(
-            "repository '{name}' is not empty ({pkg_count} package(s)); delete its packages first"
-        )));
-    }
-
     let holders = groups_containing(&state, &name).await?;
     if !holders.is_empty() {
         return Err(AppError::Conflict(format!(
@@ -215,10 +193,23 @@ pub async fn delete_repository(
         )));
     }
 
-    if repo.kind()? == RepoKind::Proxy {
+    let kind = repo.kind()?;
+    state
+        .repos
+        .delete_empty(&name)
+        .await
+        .map_err(|err| match err {
+            StoreError::Conflict => AppError::Conflict(format!(
+                "repository '{name}' is not empty; delete its packages first"
+            )),
+            other => other.into(),
+        })?;
+
+    // The cached files go after the commit and outside it: a store method
+    // touches nothing but the database, and a refused delete purges nothing.
+    if kind == RepoKind::Proxy {
         purge_repository(&state, &repo).await?;
     }
-    crate::db::delete_repository(&state.db, &name).await?;
 
     crate::api::record_audit(&state, &caller, "repo.delete", Some(&name)).await;
     emit_repositories_changed(&state);
@@ -258,7 +249,9 @@ async fn read_json<T: serde::de::DeserializeOwned>(
 }
 
 async fn load_repo(state: &AppState, name: &str) -> AppResult<Repository> {
-    crate::db::get_repository_by_name(&state.db, name)
+    state
+        .repos
+        .by_name(name)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("repository not found: {name}")))
 }
@@ -270,7 +263,7 @@ fn non_empty(upstream: Option<&str>) -> Option<&str> {
 
 /// Names of the groups listing `name` as a member.
 async fn groups_containing(state: &AppState, name: &str) -> AppResult<Vec<String>> {
-    let repos = crate::db::get_all_repositories(&state.db).await?;
+    let repos = state.repos.all().await?;
     let mut holders = Vec::new();
     for repo in repos {
         if repo.kind()? == RepoKind::Group && repo.members().iter().any(|m| m == name) {
