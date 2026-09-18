@@ -24,6 +24,7 @@ use super::source::verdaccio::Verdaccio;
 use super::target::{HttpTargetAdmin, LaneConfig, TargetLane};
 use crate::adapters::sqlite::import_journal::SqliteImportJournal;
 use crate::adapters::system::SystemClock;
+use crate::app::import::permissions::{self, ProposePermissions};
 use crate::app::import::plan::PlanRules;
 use crate::app::import::report::{self, Report};
 use crate::app::import::run::{Finished, RunImport, RunOpts};
@@ -43,6 +44,19 @@ pub enum Import {
     Report(ReportArgs),
     /// Delete a state file: the only command that does
     Forget(StateArgs),
+    /// Map the source's user rights onto the target; writes only with --apply
+    Permissions(PermissionsArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct PermissionsArgs {
+    #[arg(long)]
+    pub state: PathBuf,
+    /// Create the users and grants, with OPENCARGO_IMPORT_TARGET_ADMIN_TOKEN
+    #[arg(long)]
+    pub apply: bool,
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
@@ -528,6 +542,44 @@ pub async fn execute(cmd: Import, env: Env<'_>, cancel: impl Future<Output = ()>
             a.json |= r.json;
             match compose(&a, env, journal, &r.state, false) {
                 Ok(c) => run_composed(c, cancel).await,
+                Err(e) => fail(e),
+            }
+        }
+        Import::Permissions(p) => {
+            let journal = match open_existing(&p.state).await {
+                Ok(j) => Arc::new(j),
+                Err(ran) => return ran,
+            };
+            let header = match journal.header().await {
+                Ok(Some(h)) => h,
+                Ok(None) => return fail("the state file holds no run: run an import first"),
+                Err(e) => return fail(e),
+            };
+            let a: RunArgs = match serde_json::from_str(&header.opts_json) {
+                Ok(a) => a,
+                Err(e) => return fail(format!("the state file's options are unreadable: {e}")),
+            };
+            let c = match compose(&a, env, journal.clone(), &p.state, false) {
+                Ok(c) => c,
+                Err(e) => return fail(e),
+            };
+            let propose = ProposePermissions {
+                source: c.import.source.as_ref(),
+                admin: c.import.admin.as_ref(),
+                rules: &c.opts.plan,
+            };
+            match propose.run(p.apply).await {
+                Ok(proposal) => {
+                    if let Err(e) = journal.record("permissions", true, &[], &proposal.gaps, &None, true).await {
+                        return fail(e);
+                    }
+                    let stdout = if p.json {
+                        serde_json::to_string_pretty(&proposal).unwrap_or_default() + "\n"
+                    } else {
+                        permissions::render(&proposal, p.apply)
+                    };
+                    Ran { code: EXIT_CLEAN, stdout }
+                }
                 Err(e) => fail(e),
             }
         }

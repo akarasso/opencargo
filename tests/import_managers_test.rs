@@ -332,3 +332,94 @@ async fn go_present_without_a_checksum_skips_with_a_note() {
     assert_eq!(again.count("skipped"), 1);
     assert_eq!(kinds(&again), ["SkippedUnverifiable"]);
 }
+
+async fn nexus_with_security() -> FakeManager {
+    let src = FakeManager::nexus(vec![Repo::hosted("npm-internal", Content::Npm(vec![Pkg::new("a", &["1.0.0"])]))], 50).await;
+    src.answer(
+        "/service/rest/v1/security/users",
+        json!([
+            { "userId": "alice", "source": "default", "roles": ["publishers"] },
+            { "userId": "bob", "source": "default", "roles": ["readers"] },
+            { "userId": "ldap-carol", "source": "LDAP", "roles": ["readers"] }
+        ]),
+    );
+    src.answer(
+        "/service/rest/v1/security/roles",
+        json!([
+            { "id": "publishers", "privileges": ["nx-repository-view-npm-npm-internal-add"], "roles": ["readers"] },
+            { "id": "readers", "privileges": ["nx-repository-view-npm-npm-internal-read"], "roles": [] }
+        ]),
+    );
+    src
+}
+
+async fn users_rights(t: &TestServer, user: &str) -> Value {
+    get_json(&format!("{}/api/v1/users/{user}/permissions", t.base_url)).await.1
+}
+
+#[tokio::test]
+async fn permissions_plan_is_printed_and_apply_writes_them() {
+    let src = nexus_with_security().await;
+    let t = target(&[("npm", RepositoryFormat::Npm)]).await;
+    let imp = Importer::new().env("OPENCARGO_IMPORT_TARGET_ADMIN_TOKEN", STATIC_TOKEN);
+    let run = imp.run(&["--source", "nexus", "--from", &src.from(), "--to", &t.base_url, "--map", "npm-internal=npm"]).await;
+    assert_eq!(run.code, 0, "{}", run.stdout);
+
+    let proposed = imp.sub("permissions", &[]).await;
+    assert_eq!(proposed.code, 0, "{}", proposed.stdout);
+    assert!(proposed.stdout.contains("alice -> user alice -> npm -> read+write"), "{}", proposed.stdout);
+    assert!(proposed.stdout.contains("bob -> user bob -> npm -> read"), "{}", proposed.stdout);
+    let (status, _) = get(&format!("{}/api/v1/users/alice", t.base_url)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "nothing is written without --apply");
+
+    let applied = imp.sub("permissions", &["--apply"]).await;
+    assert_eq!(applied.code, 0, "{}", applied.stdout);
+    assert!(applied.stdout.contains("created user alice"), "{}", applied.stdout);
+    let alice = users_rights(&t, "alice").await.to_string();
+    assert!(alice.contains("\"can_write\":true") && alice.contains("\"npm\""), "{alice}");
+    let bob = users_rights(&t, "bob").await.to_string();
+    assert!(bob.contains("\"can_write\":false"), "{bob}");
+}
+
+#[tokio::test]
+async fn apply_never_writes_a_generated_password() {
+    let src = nexus_with_security().await;
+    let t = target(&[("npm", RepositoryFormat::Npm)]).await;
+    let imp = Importer::new().env("OPENCARGO_IMPORT_TARGET_ADMIN_TOKEN", STATIC_TOKEN);
+    imp.run(&["--source", "nexus", "--from", &src.from(), "--to", &t.base_url, "--map", "npm-internal=npm"]).await;
+    let applied = imp.sub("permissions", &["--apply", "--json"]).await;
+    assert_eq!(applied.code, 0, "{}", applied.stdout);
+    assert!(!applied.stdout.contains("password\""), "{}", applied.stdout);
+    let report = imp.sub("report", &["--json"]).await;
+    assert!(!report.stdout.to_lowercase().contains("\"password\""), "{}", report.stdout);
+}
+
+#[tokio::test]
+async fn unmapped_principals_are_gaps() {
+    let src = nexus_with_security().await;
+    let t = target(&[("npm", RepositoryFormat::Npm)]).await;
+    let imp = Importer::new();
+    imp.run(&["--source", "nexus", "--from", &src.from(), "--to", &t.base_url, "--map", "npm-internal=npm"]).await;
+    let proposed = imp.sub("permissions", &[]).await;
+    assert!(proposed.stdout.contains("PermissionNotMapped: external user ldap-carol"), "{}", proposed.stdout);
+    let report = imp.sub("report", &[]).await;
+    assert_eq!(report.code, 0, "an unmapped principal is informational: {}", report.stdout);
+    assert!(report.stdout.contains("PermissionNotMapped"), "{}", report.stdout);
+}
+
+#[tokio::test]
+async fn artifactory_permission_targets_map_users_and_name_groups() {
+    let src = FakeManager::artifactory(vec![Repo::hosted("npm-local", Content::Npm(vec![Pkg::new("a", &["1.0.0"])]))], 1000, true).await;
+    src.answer("/api/v2/security/permissions", json!([{ "name": "deployers" }]));
+    src.answer(
+        "/api/v2/security/permissions/deployers",
+        json!({ "name": "deployers", "repo": { "repositories": ["npm-local"],
+            "actions": { "users": { "dave": ["read", "write"] }, "groups": { "devs": ["read"] } } } }),
+    );
+    let t = target(&[("npm", RepositoryFormat::Npm)]).await;
+    let imp = Importer::new();
+    imp.run(&["--source", "artifactory", "--from", &src.from(), "--to", &t.base_url, "--target-repo", "npm"]).await;
+    let proposed = imp.sub("permissions", &[]).await;
+    assert!(proposed.stdout.contains("dave -> user dave -> npm -> read+write"), "{}", proposed.stdout);
+    assert!(proposed.stdout.contains("group devs"), "{}", proposed.stdout);
+}

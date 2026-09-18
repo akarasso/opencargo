@@ -122,6 +122,12 @@ pub struct Inner {
     pub base: Mutex<String>,
     /// Artifactory only: whether `/api/npm/` answers.
     pub npm_api: bool,
+    /// Fixed JSON answers by path, checked before anything else.
+    pub canned: Mutex<Vec<(String, Value)>>,
+}
+
+fn canned(s: &Inner, path: &str) -> Option<Response> {
+    s.canned.lock().unwrap().iter().find(|(p, _)| p == path).map(|(_, v)| Json(v.clone()).into_response())
 }
 
 #[derive(Clone)]
@@ -139,6 +145,10 @@ impl FakeManager {
         format!("{}/", self.url)
     }
 
+    pub fn answer(&self, path: &str, body: Value) {
+        self.inner.canned.lock().unwrap().push((path.to_string(), body));
+    }
+
     async fn start(repos: Vec<Repo>, page: usize, npm_api: bool, router: fn(Arc<Inner>) -> axum::Router) -> Self {
         let inner = Arc::new(Inner {
             repos: Mutex::new(repos),
@@ -146,6 +156,7 @@ impl FakeManager {
             log: Log::default(),
             base: Mutex::new(String::new()),
             npm_api,
+            canned: Mutex::new(Vec::new()),
         });
         let url = serve(router(inner.clone())).await;
         *inner.base.lock().unwrap() = url.clone();
@@ -295,6 +306,9 @@ async fn nexus(State(s): State<Arc<Inner>>, req: Request) -> Response {
     let query: Vec<(String, String)> =
         url::form_urlencoded::parse(req.uri().query().unwrap_or("").as_bytes()).into_owned().collect();
     let q = |k: &str| query.iter().find(|(key, _)| key == k).map(|(_, v)| v.clone());
+    if let Some(r) = canned(&s, &path) {
+        return r;
+    }
     match path.as_str() {
         "/service/rest/v1/status" => {
             return ([("server", "Nexus/3.70.1-02 (OSS)")], Json(json!({}))).into_response();
@@ -378,6 +392,9 @@ async fn artifactory(State(s): State<Arc<Inner>>, req: Request) -> Response {
     let path = decode(req.uri().path());
     let base = s.base.lock().unwrap().clone();
     let repos = s.repos.lock().unwrap().clone();
+    if let Some(r) = canned(&s, &path) {
+        return r;
+    }
     match path.as_str() {
         "/api/system/version" => return Json(json!({ "version": "7.104.5" })).into_response(),
         "/api/repositories" => {

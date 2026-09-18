@@ -14,7 +14,7 @@ use crate::adapters::import::http::{FetchError, Gate, Req};
 use crate::adapters::import::sink::npm_url;
 use crate::domain::import::GapKind;
 use crate::ports::import::{
-    redact, Coord, Cursor, Digests, Discovered, Gap, Item, Origin, PkgExtra, Probe, Source, SourceError,
+    redact, Coord, Cursor, Digests, Discovered, Gap, Item, Origin, PkgExtra, Principal, Probe, Source, SourceError,
     SourceFilter, SourceFormat, VersionExtra,
 };
 use crate::registry::go::escape::unescape;
@@ -100,6 +100,38 @@ impl Source for Artifactory {
             authenticated_as: None,
             capabilities: Vec::new(),
         })
+    }
+
+    /// Permission targets: a user's actions on each repository a target
+    /// names; groups and targets over every repository are not mapped.
+    async fn principals(&self) -> Result<Vec<Principal>, SourceError> {
+        let list = self.gate.get_json(self.url("api/v2/security/permissions")?).await?;
+        let mut out = Vec::new();
+        for t in list.as_array().into_iter().flatten() {
+            let Some(name) = s(t, "name") else { continue };
+            let target = self.gate.get_json(self.url(&format!("api/v2/security/permissions/{name}"))?).await?;
+            let Some(repo) = target.get("repo") else { continue };
+            let repos: Vec<String> = repo
+                .get("repositories")
+                .and_then(|r| r.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.as_str().map(String::from))
+                .collect();
+            for (kind, key) in [("user", "users"), ("group", "groups")] {
+                let Some(who) = repo.pointer(&format!("/actions/{key}")).and_then(|w| w.as_object()) else { continue };
+                for (principal, actions) in who {
+                    let acts: Vec<&str> = actions.as_array().into_iter().flatten().filter_map(|a| a.as_str()).collect();
+                    let publish = acts.iter().any(|a| matches!(*a, "write" | "deploy" | "manage"));
+                    let read = publish || acts.contains(&"read");
+                    for r in &repos {
+                        let kind = if r.starts_with("ANY") { "rule over every repository" } else { kind };
+                        out.push(Principal { name: principal.clone(), kind: kind.into(), repo: r.clone(), read, publish });
+                    }
+                }
+            }
+        }
+        Ok(out)
     }
 
     async fn streams(&self, f: &SourceFilter) -> Result<Vec<String>, SourceError> {

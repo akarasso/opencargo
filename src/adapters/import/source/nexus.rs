@@ -16,7 +16,7 @@ use crate::adapters::import::http::{FetchError, Gate, Req};
 use crate::adapters::import::sink::npm_url;
 use crate::domain::import::GapKind;
 use crate::ports::import::{
-    redact, Coord, Cursor, Digests, Discovered, Gap, Item, Origin, PkgExtra, Probe, Source, SourceError,
+    redact, Coord, Cursor, Digests, Discovered, Gap, Item, Origin, PkgExtra, Principal, Probe, Source, SourceError,
     SourceFilter, SourceFormat, VersionExtra,
 };
 
@@ -84,6 +84,73 @@ impl Source for Nexus {
             .map(|v| v.split_whitespace().next().unwrap_or(v).to_string());
         self.repositories().await?;
         Ok(Probe { product: "nexus".into(), version, authenticated_as: None, capabilities: Vec::new() })
+    }
+
+    /// Users and their roles' repository-view privileges,
+    /// `nx-repository-view-{format}-{repo}-{action}`; a role granting a
+    /// role is followed, an external user (LDAP, SAML, ...) is not mapped.
+    async fn principals(&self) -> Result<Vec<Principal>, SourceError> {
+        let users = self.gate.get_json(self.url("service/rest/v1/security/users")?).await?;
+        let roles = self.gate.get_json(self.url("service/rest/v1/security/roles")?).await?;
+        let roles: BTreeMap<String, Value> = roles
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|r| Some((s(r, "id")?, r.clone())))
+            .collect();
+        let repos: Vec<(String, String)> = self
+            .repositories()
+            .await?
+            .iter()
+            .filter_map(|r| Some((s(r, "name")?, s(r, "format")?)))
+            .collect();
+        let mut out = Vec::new();
+        for u in users.as_array().into_iter().flatten() {
+            let Some(name) = s(u, "userId") else { continue };
+            let external = s(u, "source").is_some_and(|src| src != "default");
+            let mut privileges = BTreeSet::new();
+            let mut stack: Vec<String> = u
+                .get("roles")
+                .and_then(|r| r.as_array())
+                .into_iter()
+                .flatten()
+                .filter_map(|r| r.as_str().map(String::from))
+                .collect();
+            let mut seen = BTreeSet::new();
+            while let Some(role) = stack.pop() {
+                if !seen.insert(role.clone()) {
+                    continue;
+                }
+                let Some(r) = roles.get(&role) else { continue };
+                for p in r.get("privileges").and_then(|p| p.as_array()).into_iter().flatten().filter_map(|p| p.as_str()) {
+                    privileges.insert(p.to_string());
+                }
+                for sub in r.get("roles").and_then(|p| p.as_array()).into_iter().flatten().filter_map(|p| p.as_str()) {
+                    stack.push(sub.to_string());
+                }
+            }
+            for (repo, format) in &repos {
+                let prefix = format!("nx-repository-view-{format}-{repo}-");
+                let wild = format!("nx-repository-view-{format}-*-");
+                let actions: Vec<&str> = privileges
+                    .iter()
+                    .filter_map(|p| p.strip_prefix(&prefix).or_else(|| p.strip_prefix(&wild)))
+                    .collect();
+                if actions.is_empty() {
+                    continue;
+                }
+                let publish = actions.iter().any(|a| matches!(*a, "add" | "edit" | "*"));
+                let read = publish || actions.iter().any(|a| matches!(*a, "read" | "browse"));
+                out.push(Principal {
+                    name: name.clone(),
+                    kind: if external { "external user".into() } else { "user".into() },
+                    repo: repo.clone(),
+                    read,
+                    publish,
+                });
+            }
+        }
+        Ok(out)
     }
 
     async fn streams(&self, f: &SourceFilter) -> Result<Vec<String>, SourceError> {
