@@ -12,10 +12,10 @@ declare_row() { local IFS=$'\x1f'; rows+=("$*"); }
 # Bounds are measured occurrences at 6c9747a, never lines: `\bdb::` is 232 occurrences over 231
 # lines, so a max fed by a line count licenses one free violation. A raise is an edit to this
 # block, in the commit that needs it, with the reason on the line -- never a silent bump.
-declare_row db-calls       max 232 '\bdb::'                  plain src '*.rs' src/db src/adapters
+declare_row db-calls       max 227 '\bdb::'                  plain src '*.rs' src/db src/adapters # 232 -> 227: db::migrate and its five call sites are gone
 declare_row pool-field     max 219 '\.db\b'                  strip src '*.rs' src/db src/adapters # strip: `"...opencargo.db"` is a filename, not a pool
 declare_row stray-sql      max  96 'sqlx::query'             plain src '*.rs' src/db src/adapters # covers _as and _scalar
-declare_row pool-leak      max  72 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters
+declare_row pool-leak      max  73 'SqlitePool|Pool<Sqlite>' plain src '*.rs' src/db src/adapters # 72 -> 73: server::migrate, the composition root's one migration entry point, is how the temp-DB fixtures reach the adapter without importing it
 declare_row context-bypass max  25 'cx\.state\b'             plain src '*.rs'                     # word boundary: `cx.state` is also passed whole
 declare_row dialect-rs     max  22 'datetime\(|julianday\(|strftime\(|AUTOINCREMENT|INSERT OR ' plain src '*.rs' src/db src/adapters/sqlite
 declare_row dialect-sql    max  49 "AUTOINCREMENT|CHECK\(|fts5|CREATE TRIGGER|datetime\('now'\)" plain 'src/db/migrations src/adapters/sqlite/migrations' '*.sql' # scoped, not eliminated: SQLite DDL belongs in a SQLite directory
@@ -71,6 +71,66 @@ check() {
   printf '%-4s %-14s %4d occurrences (%s %s)%s\n' "$verdict" "$name" "$n" "$cmp" "$bound" "$hint"
 }
 
+# Ids are keys: a shipped migration may never be renamed, deleted or edited, or installs that
+# already ran it run it again. The README beside the files records the SHA-256 of every file
+# present and leaves every allocated-but-absent id checksum-less, which is legal until its file
+# lands. Anything else -- a file with no row, a file under an allocated id that never recorded a
+# checksum, a changed checksum -- is the failure this check exists for.
+MIGRATIONS=src/adapters/sqlite/migrations
+
+trim() {
+  local v=$1
+  v=${v#"${v%%[![:space:]]*}"}
+  printf '%s' "${v%"${v##*[![:space:]]}"}"
+}
+
+check_migrations() {
+  local readme=$MIGRATIONS/README.md id file sha actual f listed=() n=0
+  if [ ! -f "$readme" ]; then
+    printf 'FAIL %-14s %s is missing: every migration id is allocated there\n' migrations "$readme"
+    fail=1
+    return
+  fi
+  while IFS='|' read -r _ id file _ sha _; do
+    id=$(trim "$id")
+    file=$(trim "$file")
+    sha=$(trim "$sha")
+    if [ "$sha" = - ]; then
+      if compgen -G "$MIGRATIONS/${id}_*.sql" >/dev/null; then
+        printf 'FAIL %-14s %s has a file but no checksum in the README\n' migrations "$id"
+        fail=1
+      fi
+      continue
+    fi
+    listed+=("$file")
+    if [ ! -f "$MIGRATIONS/$file" ]; then
+      printf 'FAIL %-14s %s is recorded but absent: a shipped file is never renamed or deleted\n' migrations "$file"
+      fail=1
+      continue
+    fi
+    actual=$(sha256sum "$MIGRATIONS/$file" | cut -d" " -f1)
+    if [ "$actual" != "$sha" ]; then
+      printf 'FAIL %-14s %s changed: take the next free id instead of editing a shipped file\n' migrations "$file"
+      fail=1
+      continue
+    fi
+    n=$((n + 1))
+  done < <(grep -E "^\| *[0-9]{3} *\|" "$readme")
+  for f in "$MIGRATIONS"/*.sql; do
+    f=$(basename "$f")
+    case " ${listed[*]-} " in
+    *" $f "*) ;;
+    *)
+      printf 'FAIL %-14s %s is not in the README allocation table\n' migrations "$f"
+      fail=1
+      ;;
+    esac
+  done
+  if [ "$fail" -eq 0 ]; then
+    printf '%-4s %-14s %4d files pinned by checksum\n' ok migrations "$n"
+  fi
+}
+
 # An empty scope and a pattern that matches nothing are the two ways a ratcheted row reaches 0.
 self_test() {
   local mode n
@@ -86,6 +146,7 @@ self_test() {
 }
 
 self_test
+check_migrations
 for row in "${rows[@]}"; do
   IFS=$'\x1f' read -r -a fields <<<"$row"
   check "${fields[@]}"

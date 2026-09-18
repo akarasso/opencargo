@@ -207,7 +207,7 @@ impl Fx {
         let tmp = tempfile::TempDir::new().unwrap();
         let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
         let pool = SqlitePool::connect(&url).await.unwrap();
-        crate::db::migrate(&pool).await.unwrap();
+        crate::server::migrate(&pool).await.unwrap();
         let fake: Shared = Arc::new(Mutex::new(FakeState {
             body: b"hello upstream".to_vec(),
             ..Default::default()

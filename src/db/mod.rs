@@ -89,57 +89,6 @@ pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     Ok(pool)
 }
 
-/// Run the embedded SQL migrations.
-pub async fn migrate(pool: &SqlitePool) -> anyhow::Result<()> {
-    let sql = include_str!("migrations/001_initial.sql");
-    sqlx::raw_sql(sql).execute(pool).await?;
-
-    let sql2 = include_str!("migrations/002_proxy_cache.sql");
-    sqlx::raw_sql(sql2).execute(pool).await?;
-
-    let sql3 = include_str!("migrations/003_auth.sql");
-    sqlx::raw_sql(sql3).execute(pool).await?;
-
-    let sql4 = include_str!("migrations/004_cargo.sql");
-    // ALTER TABLE may fail if column already exists; ignore the error.
-    let _ = sqlx::raw_sql(sql4).execute(pool).await;
-
-    let sql5 = include_str!("migrations/005_must_change_password.sql");
-    // ALTER TABLE may fail if column already exists; ignore the error.
-    let _ = sqlx::raw_sql(sql5).execute(pool).await;
-
-    let sql6 = include_str!("migrations/006_oci.sql");
-    sqlx::raw_sql(sql6).execute(pool).await?;
-
-    let sql7 = include_str!("migrations/007_fts5.sql");
-    // FTS5 might not be available on all SQLite builds; ignore the error.
-    let _ = sqlx::raw_sql(sql7).execute(pool).await;
-
-    let sql8 = include_str!("migrations/008_deps.sql");
-    sqlx::raw_sql(sql8).execute(pool).await?;
-
-    let sql9 = include_str!("migrations/009_vulns.sql");
-    sqlx::raw_sql(sql9).execute(pool).await?;
-
-    let sql10 = include_str!("migrations/010_dynamic_config.sql");
-    sqlx::raw_sql(sql10).execute(pool).await?;
-
-    let sql11 = include_str!("migrations/011_download_counts.sql");
-    sqlx::raw_sql(sql11).execute(pool).await?;
-
-    let sql12 = include_str!("migrations/012_oci_manifest_blobs.sql");
-    sqlx::raw_sql(sql12).execute(pool).await?;
-
-    let sql13 = include_str!("migrations/013_proxy_cache_entries.sql");
-    sqlx::raw_sql(sql13).execute(pool).await?;
-
-    let sql14 = include_str!("migrations/014_policy.sql");
-    sqlx::raw_sql(sql14).execute(pool).await?;
-
-    info!("Database migrations applied");
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Repository seeding
 // ---------------------------------------------------------------------------
@@ -1172,8 +1121,8 @@ pub(crate) mod testing {
         let tmp = tempfile::TempDir::new().unwrap();
         let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
         let pool = super::connect(&url).await.unwrap();
-        super::migrate(&pool).await.unwrap();
-        super::migrate(&pool).await.unwrap();
+        crate::server::migrate(&pool).await.unwrap();
+        crate::server::migrate(&pool).await.unwrap();
         (tmp, pool)
     }
 }

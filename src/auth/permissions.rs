@@ -83,7 +83,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("failed to create temp dir");
         let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
         let pool = SqlitePool::connect(&url).await.expect("connect failed");
-        crate::db::migrate(&pool).await.expect("migrate failed");
+        crate::server::migrate(&pool).await.expect("migrate failed");
         sqlx::query(
             "INSERT INTO users (username, password_hash, role) VALUES
              ('alice', 'x', 'reader'), ('bob', 'x', 'publisher')",

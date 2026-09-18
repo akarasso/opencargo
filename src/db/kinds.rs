@@ -370,38 +370,17 @@ mod tests {
         }
     }
 
-    /// The values quoted inside `CHECK(<column> IN (...))` of the migration.
-    fn check_values(column: &str) -> Vec<String> {
-        let sql = include_str!("migrations/001_initial.sql");
-        let line = sql
-            .lines()
-            .find(|l| l.contains(&format!("CHECK({column} IN (")))
-            .expect("CHECK constraint present");
-        let list = line
-            .split("IN (")
-            .nth(1)
-            .unwrap()
-            .split(')')
-            .next()
-            .unwrap();
-        list.split(',')
-            .map(|v| v.trim().trim_matches('\'').to_string())
-            .collect()
-    }
-
+    /// That these values are the ones the `repo_type` and `format` CHECKs admit
+    /// is asserted by the SQLite adapter against a migrated database
+    /// (`adapters/sqlite/migrate_tests.rs`): the dialect is the adapter's to
+    /// know, and reading a migration file from here would only prove that two
+    /// texts agree.
     #[test]
-    fn roundtrip_matches_check_constraints() {
-        let kinds: Vec<String> = RepoKind::ALL
-            .iter()
-            .map(|k| k.as_str().to_string())
-            .collect();
-        assert_eq!(kinds, check_values("repo_type"));
+    fn values_round_trip_and_predicates_hold() {
         for kind in RepoKind::ALL {
             assert_eq!(kind.as_str().parse::<RepoKind>().unwrap(), kind);
         }
 
-        let formats: Vec<String> = Format::ALL.iter().map(|f| f.as_str().to_string()).collect();
-        assert_eq!(formats, check_values("format"));
         for format in Format::ALL {
             assert_eq!(format.as_str().parse::<Format>().unwrap(), format);
             for kind in RepoKind::ALL {

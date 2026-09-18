@@ -233,7 +233,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let url = format!("sqlite:{}?mode=rwc", tmp.path().join("test.db").display());
         let pool = SqlitePool::connect(&url).await.unwrap();
-        crate::db::migrate(&pool).await.unwrap();
+        crate::server::migrate(&pool).await.unwrap();
         sqlx::query(
             "INSERT INTO repositories (name, repo_type, format, upstream_url) VALUES
              ('npmrepo','hosted','npm',NULL), ('gorepo','hosted','go',NULL),

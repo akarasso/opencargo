@@ -60,6 +60,22 @@ pub struct AppState {
     pub policy: PolicyEngine,
 }
 
+/// Migrate a database and nothing else: the `opencargo migrate` subcommand, so
+/// the binary reaches the adapter through the composition root rather than
+/// importing it.
+pub async fn run_migrations(config: &Config) -> anyhow::Result<()> {
+    let db = crate::db::connect(&config.database.url).await?;
+    migrate(&db).await
+}
+
+/// Bring an open pool's schema up to date. The composition root is the only
+/// place that names the SQLite adapter, so everything else — the server, the
+/// subcommand, the temp-database fixtures — comes through here.
+pub async fn migrate(db: &SqlitePool) -> anyhow::Result<()> {
+    crate::adapters::sqlite::migrate::run_all(db).await?;
+    Ok(())
+}
+
 pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
@@ -75,7 +91,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     }
 
     let db = crate::db::connect(&config.database.url).await?;
-    crate::db::migrate(&db).await?;
+    migrate(&db).await?;
     crate::db::kinds::check_repository_names(&db).await?;
     crate::db::init_repositories(&db, &config.repositories).await?;
 

@@ -4,7 +4,7 @@ use tracing::info;
 
 use axum::ServiceExt as _;
 use tower::ServiceExt as _;
-use opencargo::{config, db, server};
+use opencargo::{config, server};
 
 #[derive(Parser)]
 #[command(name = "opencargo", version, about = "Lightweight universal package registry")]
@@ -130,8 +130,7 @@ async fn main() -> anyhow::Result<()> {
             println!("Config is valid.");
         }
         Commands::Migrate => {
-            let pool = db::connect(&cfg.database.url).await?;
-            db::migrate(&pool).await?;
+            server::run_migrations(&cfg).await?;
             println!("Migrations applied successfully.");
         }
     }

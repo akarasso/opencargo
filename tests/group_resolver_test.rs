@@ -724,7 +724,7 @@ async fn migrate_013_twice_is_noop() {
     let tmp = tempfile::TempDir::new().unwrap();
     let url = format!("sqlite:{}?mode=rwc", tmp.path().join("m.db").display());
     let pool = opencargo::db::connect(&url).await.unwrap();
-    opencargo::db::migrate(&pool).await.unwrap();
+    opencargo::server::migrate(&pool).await.unwrap();
 
     sqlx::query(
         "INSERT INTO repositories (name, repo_type, format, upstream_url)
@@ -741,7 +741,7 @@ async fn migrate_013_twice_is_noop() {
     .await
     .unwrap();
 
-    opencargo::db::migrate(&pool).await.unwrap();
+    opencargo::server::migrate(&pool).await.unwrap();
 
     assert_eq!(
         count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await,
