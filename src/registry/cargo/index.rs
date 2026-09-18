@@ -33,7 +33,7 @@ pub async fn config_json(
     crate::registry::ensure_format(&repo, Format::Cargo)?;
     let auth = auth.as_ref().map(|e| &e.0);
     if auth.is_some() {
-        crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+        crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
     }
     let cx = Cx {
         state: &state,
@@ -75,7 +75,7 @@ pub async fn get_index_entry(
     }
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
     let cx = Cx {
         state: &state,

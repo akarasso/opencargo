@@ -4,13 +4,17 @@ use axum::{
     response::IntoResponse,
     Json,
 };
+use chrono::Utc;
 use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::{record_audit, require_admin, require_admin_or_self, require_auth};
 use crate::auth::users as auth_users;
+use crate::domain::User;
 use crate::error::{AppError, AppResult};
+use crate::ports::users::{NewUser, UserPatch};
 use crate::server::AppState;
+use crate::wire::wire_ts;
 
 // ---------------------------------------------------------------------------
 // Request / response types
@@ -49,19 +53,8 @@ pub async fn list_users(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    let users = crate::db::list_users(&state.db).await?;
-    let result: Vec<serde_json::Value> = users
-        .iter()
-        .map(|u| {
-            json!({
-                "username": u.username,
-                "email": u.email,
-                "role": u.role,
-                "created_at": u.created_at,
-                "updated_at": u.updated_at,
-            })
-        })
-        .collect();
+    let users = state.users.all().await?;
+    let result: Vec<serde_json::Value> = users.iter().map(described).collect();
 
     Ok(Json(json!(result)))
 }
@@ -83,10 +76,7 @@ pub async fn create_user(
     };
 
     // Check that user does not already exist
-    if crate::db::get_user_by_username(&state.db, &body.username)
-        .await?
-        .is_some()
-    {
+    if state.users.by_name(&body.username).await?.is_some() {
         return Err(AppError::Conflict(format!(
             "user already exists: {}",
             body.username
@@ -104,18 +94,18 @@ pub async fn create_user(
         .await
         .map_err(|e| AppError::Internal(format!("failed to hash password: {e}")))?;
 
-    crate::db::create_user(
-        &state.db,
-        &body.username,
-        body.email.as_deref(),
-        &password_hash,
-        role,
-    )
-    .await?;
-
-    let user = crate::db::get_user_by_username(&state.db, &body.username)
-        .await?
-        .ok_or_else(|| AppError::Internal("failed to fetch created user".to_string()))?;
+    let user = state
+        .users
+        .create(
+            &NewUser {
+                username: &body.username,
+                email: body.email.as_deref(),
+                password_hash: &password_hash,
+                role,
+            },
+            Utc::now(),
+        )
+        .await?;
 
     record_audit(&state, &caller, "user.create", Some(&body.username)).await;
 
@@ -130,7 +120,7 @@ pub async fn create_user(
             "email": user.email,
             "role": user.role,
             "password": raw_password,
-            "created_at": user.created_at,
+            "created_at": wire_ts(user.created_at),
         })),
     ))
 }
@@ -144,17 +134,9 @@ pub async fn get_user(
     let caller = require_auth(&request)?;
     require_admin_or_self(&caller, &username)?;
 
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))?;
+    let user = load_user(&state, &username).await?;
 
-    Ok(Json(json!({
-        "username": user.username,
-        "email": user.email,
-        "role": user.role,
-        "created_at": user.created_at,
-        "updated_at": user.updated_at,
-    })))
+    Ok(Json(described(&user)))
 }
 
 /// PUT /api/v1/users/{username} — update user (admin or self)
@@ -173,13 +155,7 @@ pub async fn update_user(
         serde_json::from_slice(&bytes)?
     };
 
-    // Check user exists
-    if crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::NotFound(format!("user not found: {username}")));
-    }
+    load_user(&state, &username).await?;
 
     // Only admins can change roles
     if body.role.is_some() && caller.role != "admin" {
@@ -203,18 +179,19 @@ pub async fn update_user(
         None => None,
     };
 
-    crate::db::update_user(
-        &state.db,
-        &username,
-        body.email.as_deref(),
-        password_hash.as_deref(),
-        body.role.as_deref(),
-    )
-    .await?;
-
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::Internal("failed to fetch updated user".to_string()))?;
+    let user = state
+        .users
+        .update(
+            &username,
+            &UserPatch {
+                email: body.email.as_deref(),
+                password_hash: password_hash.as_deref(),
+                role: body.role.as_deref(),
+                ..UserPatch::default()
+            },
+            Utc::now(),
+        )
+        .await?;
 
     record_audit(&state, &caller, "user.update", Some(&username)).await;
     if body.role.is_some() {
@@ -227,13 +204,7 @@ pub async fn update_user(
         );
     }
 
-    Ok(Json(json!({
-        "username": user.username,
-        "email": user.email,
-        "role": user.role,
-        "created_at": user.created_at,
-        "updated_at": user.updated_at,
-    })))
+    Ok(Json(described(&user)))
 }
 
 /// DELETE /api/v1/users/{username} — delete user (admin only)
@@ -245,14 +216,8 @@ pub async fn delete_user(
     let caller = require_auth(&request)?;
     require_admin(&caller)?;
 
-    if crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .is_none()
-    {
-        return Err(AppError::NotFound(format!("user not found: {username}")));
-    }
-
-    crate::db::delete_user(&state.db, &username).await?;
+    load_user(&state, &username).await?;
+    state.users.delete(&username).await?;
 
     record_audit(&state, &caller, "user.delete", Some(&username)).await;
 
@@ -275,9 +240,7 @@ pub async fn change_password(
         serde_json::from_slice(&bytes)?
     };
 
-    let user = crate::db::get_user_by_username(&state.db, &username)
-        .await?
-        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))?;
+    let user = load_user(&state, &username).await?;
 
     // Non-admin callers must provide their current password
     if caller.role != "admin" {
@@ -296,8 +259,39 @@ pub async fn change_password(
         .await
         .map_err(|e| AppError::Internal(format!("failed to hash password: {e}")))?;
 
-    crate::db::update_user(&state.db, &username, None, Some(&new_hash), None).await?;
-    crate::db::set_must_change_password(&state.db, user.id, false).await?;
+    state
+        .users
+        .update(
+            &username,
+            &UserPatch {
+                password_hash: Some(&new_hash),
+                must_change_password: Some(false),
+                ..UserPatch::default()
+            },
+            Utc::now(),
+        )
+        .await?;
 
     Ok(Json(json!({"ok": true})))
+}
+
+/// The account, or the 404 naming it.
+async fn load_user(state: &AppState, username: &str) -> AppResult<User> {
+    state
+        .users
+        .by_name(username)
+        .await?
+        .ok_or_else(|| AppError::NotFound(format!("user not found: {username}")))
+}
+
+/// How an account reaches a client: never its hash, and its timestamps as
+/// RFC 3339 rather than in the store's spelling.
+fn described(user: &User) -> serde_json::Value {
+    json!({
+        "username": user.username,
+        "email": user.email,
+        "role": user.role,
+        "created_at": wire_ts(user.created_at),
+        "updated_at": wire_ts(user.updated_at),
+    })
 }

@@ -10,7 +10,7 @@ use serde_json::{json, Value};
 use tracing::info;
 
 use crate::auth::middleware::AuthUser;
-use crate::auth::permissions::can_admin;
+use crate::domain::can_admin;
 use crate::domain::{RepoKind, Visibility};
 use crate::error::{AppError, AppResult};
 use crate::registry::extract_package_name;

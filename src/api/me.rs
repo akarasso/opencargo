@@ -16,7 +16,7 @@ use axum::{extract::State, response::IntoResponse, Json};
 use serde_json::json;
 
 use crate::auth::middleware::AuthUser;
-use crate::domain::Visibility;
+use crate::domain::{effective_rights, Visibility};
 use crate::error::AppResult;
 use crate::server::AppState;
 
@@ -54,30 +54,15 @@ pub async fn my_permissions(
 
     let mut permissions = Vec::with_capacity(repos.len());
     for repo in &repos {
-        let (can_read, can_write, can_delete, can_admin, source) = if user.role == "admin" {
-            (true, true, true, true, "admin")
-        } else if let Some(grant) = match user.user_id {
-            Some(uid) => crate::db::get_user_permission(&state.db, uid, repo.id).await?,
+        let grant = match user.user_id {
+            Some(uid) => state.permissions.rights(uid, repo.id).await?,
             None => None,
-        } {
-            (
-                grant.can_read != 0,
-                grant.can_write != 0,
-                grant.can_delete != 0,
-                grant.can_admin != 0,
-                "grant",
-            )
-        } else {
-            match user.role.as_str() {
-                "publisher" => (true, true, false, false, "role"),
-                "reader" => (true, false, false, false, "role"),
-                _ => (false, false, false, false, "role"),
-            }
         };
+        let (rights, source) = effective_rights(&user.role, grant);
 
         // Skip repos the caller cannot even read: their existence stays hidden
         // unless the repo is public.
-        if !can_read && repo.visibility != Visibility::Public {
+        if !rights.read && repo.visibility != Visibility::Public {
             continue;
         }
 
@@ -86,11 +71,11 @@ pub async fn my_permissions(
             "type": repo.repo_type,
             "format": repo.format,
             "visibility": repo.visibility,
-            "can_read": can_read,
-            "can_write": can_write,
-            "can_delete": can_delete,
-            "can_admin": can_admin,
-            "source": source,
+            "can_read": rights.read,
+            "can_write": rights.write,
+            "can_delete": rights.delete,
+            "can_admin": rights.admin,
+            "source": source.as_str(),
         }));
     }
 

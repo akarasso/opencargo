@@ -11,6 +11,7 @@ use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
 use crate::domain::{Format, RepoKind, Repository, Visibility};
 use crate::error::{AppError, AppResult};
+use crate::ports::permissions::PermissionStore;
 use crate::server::AppState;
 
 /// Extract the full package name from path parameters.
@@ -44,7 +45,7 @@ pub async fn load_repo(db: &sqlx::SqlitePool, name: &str) -> AppResult<Repositor
 /// This closes the gap where read handlers served private repositories to
 /// anyone, because `check_repo_permission` was only ever called for writes.
 pub async fn ensure_can_read(
-    db: &sqlx::SqlitePool,
+    perms: &dyn PermissionStore,
     repo: &Repository,
     auth_user: Option<&AuthUser>,
 ) -> AppResult<()> {
@@ -53,7 +54,7 @@ pub async fn ensure_can_read(
     }
     match auth_user {
         Some(user) => {
-            if check_repo_permission(db, user.user_id, &user.role, repo.id, "read").await? {
+            if check_repo_permission(perms, user.user_id, &user.role, repo.id, "read").await? {
                 Ok(())
             } else {
                 Err(AppError::Forbidden(format!(
@@ -73,11 +74,11 @@ pub async fn ensure_can_read(
 /// tell the caller that their role — typically the default `reader` — lacks
 /// write, which made "I generated a token but can't publish" hard to diagnose.
 pub async fn ensure_can_write(
-    db: &sqlx::SqlitePool,
+    perms: &dyn PermissionStore,
     repo: &Repository,
     auth_user: &AuthUser,
 ) -> AppResult<()> {
-    if check_repo_permission(db, auth_user.user_id, &auth_user.role, repo.id, "write").await? {
+    if check_repo_permission(perms, auth_user.user_id, &auth_user.role, repo.id, "write").await? {
         Ok(())
     } else {
         Err(AppError::Forbidden(format!(

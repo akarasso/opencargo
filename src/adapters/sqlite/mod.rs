@@ -6,11 +6,18 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
+use crate::domain::DomainError;
 use crate::error::StoreError;
+use crate::ports::permissions::PermissionStore;
+use crate::ports::tokens::TokenStore;
+use crate::ports::users::UserStore;
 use crate::ports::webhooks::WebhookStore;
 
 pub mod migrate;
 pub mod multipart;
+pub mod permissions;
+pub mod tokens;
+pub mod users;
 pub mod webhooks;
 
 /// This adapter's stored timestamp: UTC, second precision.
@@ -22,6 +29,28 @@ pub mod webhooks;
 /// default ever fires and the row carries the caller's clock.
 pub(crate) fn bind_ts(at: DateTime<Utc>) -> String {
     at.format("%Y-%m-%d %H:%M:%S").to_string()
+}
+
+/// `bind_ts`'s inverse, and the only place a stored timestamp is read: a
+/// column the schema was supposed to constrain coming back unreadable names
+/// itself rather than falling back to a value nobody wrote.
+pub(crate) fn read_ts(
+    subject: &str,
+    column: &'static str,
+    stored: &str,
+) -> Result<DateTime<Utc>, DomainError> {
+    crate::db::parse_ts(stored).ok_or_else(|| DomainError::CorruptColumn {
+        repo: subject.to_string(),
+        column,
+        value: stored.to_string(),
+    })
+}
+
+/// An unreadable column is the store's failure to answer, not a refusal the
+/// caller can act on: it reaches the client as a 500 and the column reaches
+/// the log.
+pub(crate) fn corrupt_row(err: DomainError) -> StoreError {
+    StoreError::Other(Box::new(err))
 }
 
 /// The driver's failures in the store's vocabulary, for every store here.
@@ -68,5 +97,17 @@ impl SqliteStores {
 
     pub fn webhooks(&self) -> Arc<dyn WebhookStore> {
         Arc::new(webhooks::SqliteWebhookStore::new(self.pool.clone()))
+    }
+
+    pub fn users(&self) -> Arc<dyn UserStore> {
+        Arc::new(users::SqliteUserStore::new(self.pool.clone()))
+    }
+
+    pub fn tokens(&self) -> Arc<dyn TokenStore> {
+        Arc::new(tokens::SqliteTokenStore::new(self.pool.clone()))
+    }
+
+    pub fn permissions(&self) -> Arc<dyn PermissionStore> {
+        Arc::new(permissions::SqlitePermissionStore::new(self.pool.clone()))
     }
 }

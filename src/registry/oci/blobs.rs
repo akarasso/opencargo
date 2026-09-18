@@ -40,7 +40,7 @@ async fn serve_blob(
     let r = OciRef::parse(params)?;
     let digest = parse_digest(param(params, "digest")?)?;
     let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
     let leaf = BlobLeaf {
         name: r.name,
@@ -65,7 +65,7 @@ pub async fn delete_blob(
     let digest = parse_digest(param(&params, "digest")?)?;
 
     let repo = crate::registry::load_repo(&state.db, &r.repo).await?;
-    crate::registry::ensure_can_write(&state.db, &repo, &auth_user).await?;
+    crate::registry::ensure_can_write(&*state.permissions, &repo, &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
 

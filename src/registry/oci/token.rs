@@ -98,10 +98,10 @@ pub async fn issue_token(
     }
     let api_token_id = match user.as_ref().and(bearer_value(&headers)) {
         Some(raw) if !raw.starts_with("ocr_") => {
-            crate::auth::middleware::live_api_token(&state.auth.db, raw)
+            crate::auth::middleware::live_api_token(&state.auth, raw)
                 .await
                 .map_err(|e| {
-                    tracing::warn!(error = %e, "database error during token endpoint authentication");
+                    tracing::warn!(error = %e, "store error during token endpoint authentication");
                     AppError::ServiceUnavailable("authentication temporarily unavailable, try again".to_string()).into_response()
                 })?
                 .map(|t| t.id)

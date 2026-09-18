@@ -210,7 +210,7 @@ async fn walk_members<'a, L: Leaf + 'a>(
             warn!(group = %group.name, member = %name, "group member repository not found, skipping");
             continue;
         };
-        match super::ensure_can_read(&cx.state.db, &member, cx.auth).await {
+        match super::ensure_can_read(&*cx.state.permissions, &member, cx.auth).await {
             Ok(()) => {}
             Err(AppError::Unauthorized(_) | AppError::Forbidden(_)) => continue,
             Err(e) => return Err(e),

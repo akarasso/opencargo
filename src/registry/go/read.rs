@@ -37,7 +37,7 @@ async fn open(
 ) -> AppResult<Repository> {
     validate_escaped_module(module)?;
     let repo = crate::registry::load_repo(&state.db, repo_name).await?;
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
     Ok(repo)
 }
 

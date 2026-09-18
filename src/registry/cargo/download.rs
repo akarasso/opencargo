@@ -20,7 +20,7 @@ pub async fn download_crate(
     crate::domain::validate_version(&version)?;
     let repo = crate::registry::load_repo(&state.db, &repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.db, &repo, auth).await?;
+    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
 
     let cx = Cx {
         state: &state,
