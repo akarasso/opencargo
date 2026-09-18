@@ -107,6 +107,7 @@ mod tests {
             requires_python: None,
             yanked: Yanked::No,
             core_metadata: None,
+            upload_time: None,
         };
         Arc::new(UpstreamPage {
             files: vec![file; files],

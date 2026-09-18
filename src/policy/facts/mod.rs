@@ -74,6 +74,16 @@ pub(crate) async fn gather(shared: &Shared, cfg: &PolicyConfig, p: Pending) -> R
             facts.date_source = source;
             (digest, version, at)
         }
+        Source::Pypi { digest, uploaded } => {
+            let at = uploaded.as_deref().and_then(parse_time);
+            facts.date_source = match (&cfg.min_release_age, at) {
+                (None, _) => "none",
+                (Some(_), Some(_)) => "page",
+                (Some(_), None) => "failed",
+            };
+            let at = cfg.min_release_age.as_ref().and(at);
+            (digest, version, at)
+        }
         Source::Oci {
             body,
             served,
@@ -310,6 +320,14 @@ mod tests {
                 Some("bb"),
             ),
             (Format::Go, Source::Go { digest: None }, None),
+            (
+                Format::Pypi,
+                Source::Pypi {
+                    digest: Some("dd".into()),
+                    uploaded: None,
+                },
+                Some("dd"),
+            ),
             (
                 Format::Oci,
                 Source::Oci {

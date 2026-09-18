@@ -4,7 +4,8 @@
 
 use std::sync::Arc;
 
-use crate::domain::{CacheRepo, Outcome};
+use crate::domain::{CacheRepo, Format, Outcome};
+use crate::policy::{self, Source};
 use crate::ports::pypi::{PypiFile, PypiFileStore};
 use crate::proxy::Payload;
 use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
@@ -112,7 +113,7 @@ fn proxied_page(project: &str, page: &UpstreamPage, hosts: &[String]) -> Page {
             yanked: f.yanked.clone(),
             core_metadata: f.core_metadata.clone(),
             size: None,
-            upload_time: None,
+            upload_time: f.upload_time.clone(),
         })
         .collect();
     let mut versions: Vec<String> = files
@@ -228,6 +229,7 @@ impl Leaf for FileLeaf<'_> {
         let Some(listed) = servable(&page, &self.project, &hosts).find(|f| f.filename == self.filename) else {
             return Ok(Outcome::NotFound);
         };
+        let recorded = (!self.metadata).then(|| (listed.sha256.clone(), listed.upload_time.clone()));
         let (filename, url, sha256) = if self.metadata {
             let Some(sha256) = listed.core_metadata.clone() else {
                 return Ok(Outcome::Found(Served::Absent));
@@ -247,7 +249,16 @@ impl Leaf for FileLeaf<'_> {
             allow_private: up.dl_allow_private,
         };
         let served = match cx.proxy.fetch(&PypiStrategy, up, member, &artifact).await {
-            Ok(Outcome::Found(cached)) => Served::Payload(cached.into_payload()),
+            Ok(Outcome::Found(cached)) => {
+                if let Some((digest, uploaded)) = recorded {
+                    let version = parse_filename(&self.filename).ok().map(|f| f.version.normalized());
+                    policy::record(cx, member, up, Format::Pypi, &self.project, version, || Source::Pypi {
+                        digest,
+                        uploaded,
+                    });
+                }
+                Served::Payload(cached.into_payload())
+            }
             Ok(Outcome::NotFound) => Served::Absent,
             Err(err) => match ResolveError::from(err) {
                 ResolveError::Upstream(why) => Served::Unavailable(why),

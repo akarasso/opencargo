@@ -71,7 +71,8 @@ impl Format {
             Format::Npm => Some("npm"),
             Format::Cargo => Some("crates.io"),
             Format::Go => Some("Go"),
-            Format::Oci | Format::Pypi => None,
+            Format::Pypi => Some("PyPI"),
+            Format::Oci => None,
         }
     }
 
@@ -146,6 +147,7 @@ mod tests {
         }
         assert_eq!(Format::Cargo.osv_ecosystem(), Some("crates.io"));
         assert_eq!(Format::Oci.osv_ecosystem(), None);
+        assert_eq!(Format::Pypi.osv_ecosystem(), Some("PyPI"));
 
         for visibility in Visibility::ALL {
             assert_eq!(

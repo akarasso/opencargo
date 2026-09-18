@@ -14,6 +14,8 @@ pub struct UpstreamFile {
     pub requires_python: Option<String>,
     pub yanked: Yanked,
     pub core_metadata: Option<Option<String>>,
+    /// PEP 700, JSON pages only.
+    pub upload_time: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -185,6 +187,7 @@ pub fn parse_html(body: &str, page: &url::Url) -> UpstreamPage {
                 None => Yanked::No,
             },
             core_metadata,
+            upload_time: None,
         });
     }
     UpstreamPage { files }
@@ -229,6 +232,7 @@ pub fn parse_json(body: &[u8], page: &url::Url) -> Option<UpstreamPage> {
                 _ => Yanked::No,
             },
             core_metadata: json_metadata(f.get("core-metadata")).or_else(|| json_metadata(f.get("dist-info-metadata"))),
+            upload_time: f.get("upload-time").and_then(Value::as_str).map(str::to_string),
         });
     }
     Some(UpstreamPage { files })
@@ -268,7 +272,7 @@ mod tests {
         let json = br#"{"meta":{"api-version":"1.1"},"name":"demo","files":[
             {"filename":"a-1.0.tar.gz","url":"a-1.0.tar.gz","hashes":{"sha256":"AA"},"yanked":false},
             {"filename":"a-1.0-py3-none-any.whl","url":"https://x/a.whl","hashes":{},"dist-info-metadata":{"sha256":"BB"},"yanked":"why"},
-            {"filename":"a-2.0-py3-none-any.whl","url":"/f/a2.whl","hashes":{"sha256":"cc"},"core-metadata":true,"requires-python":">=3"}
+            {"filename":"a-2.0-py3-none-any.whl","url":"/f/a2.whl","hashes":{"sha256":"cc"},"core-metadata":true,"requires-python":">=3","upload-time":"2026-01-02T03:04:05.000000Z"}
         ]}"#;
         let p = parse_json(json, &page()).unwrap();
         assert_eq!(p.files[0].sha256.as_deref(), Some("aa"));
@@ -278,6 +282,7 @@ mod tests {
         assert_eq!(p.files[1].yanked, Yanked::Yes(Some("why".into())));
         assert_eq!(p.files[2].core_metadata, Some(None));
         assert_eq!(p.files[2].url.as_str(), "https://mirror.example/f/a2.whl");
+        assert_eq!(p.files[2].upload_time.as_deref(), Some("2026-01-02T03:04:05.000000Z"));
         assert!(parse_json(b"not json", &page()).is_none());
     }
 }
