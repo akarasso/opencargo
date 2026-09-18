@@ -173,7 +173,14 @@ fn config(sources: &[(&str, &str)], credentials: Option<(&str, &str)>) -> String
     )
 }
 
-fn consumer(dir: &Path, references: &[(&str, &str)]) {
+fn sdk_framework(csproj: &Path) -> String {
+    let text = std::fs::read_to_string(csproj).unwrap();
+    let start = text.find("<TargetFramework>").unwrap() + "<TargetFramework>".len();
+    let end = text[start..].find('<').unwrap();
+    text[start..start + end].to_string()
+}
+
+fn consumer(dir: &Path, tfm: &str, references: &[(&str, &str)]) {
     std::fs::create_dir_all(dir).unwrap();
     let items: String = references
         .iter()
@@ -183,7 +190,7 @@ fn consumer(dir: &Path, references: &[(&str, &str)]) {
         dir.join("App.csproj"),
         format!(
             r#"<Project Sdk="Microsoft.NET.Sdk">
-  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>net8.0</TargetFramework></PropertyGroup>
+  <PropertyGroup><OutputType>Exe</OutputType><TargetFramework>{tfm}</TargetFramework></PropertyGroup>
   <ItemGroup>{items}</ItemGroup>
 </Project>"#
         ),
@@ -264,6 +271,7 @@ async fn roundtrip(bin: String) {
 
     let (ok, out) = env.run(&["new", "classlib", "-n", "Greeter", "-o", "greeter"], work).await;
     assert!(ok, "{out}");
+    let tfm = sdk_framework(&work.join("greeter/Greeter.csproj"));
     for v in ["1.0.0", "1.1.0"] {
         let prop = format!("-p:PackageVersion={v}");
         let (ok, out) = env.run(&["pack", "greeter", "-c", "Release", "-o", "out", &prop], work).await;
@@ -293,7 +301,7 @@ async fn roundtrip(bin: String) {
     println!("NUGET-R3-3: dotnet nuget push without -k, Basic credentials configured: ok={ok}\n{out}");
     assert!(ok, "Basic credentials alone push: {out}");
 
-    consumer(&work.join("app"), &[("Greeter", "1.0.0"), ("Upstream.Dep", "1.0.0")]);
+    consumer(&work.join("app"), &tfm, &[("Greeter", "1.0.0"), ("Upstream.Dep", "1.0.0")]);
     let (ok, out) = env.run(&["restore", "app"], work).await;
     assert!(ok, "restore through the group, a hosted and a proxied package: {out}");
     assert!(upstream.count("/catalog/") > 0, "the proxied package was verified against its catalog leaf");
@@ -301,7 +309,7 @@ async fn roundtrip(bin: String) {
     assert!(ok && out.contains("1.1.0"), "outdated: {out}");
 
     upstream.switch(|s| s.wrong_hash = true);
-    consumer(&work.join("tampered"), &[("Tampered.Dep", "1.0.0")]);
+    consumer(&work.join("tampered"), &tfm, &[("Tampered.Dep", "1.0.0")]);
     let (ok, out) = env.run(&["restore", "tampered"], work).await;
     assert!(!ok, "a package whose catalog leaf disagrees is refused: {out}");
     upstream.switch(|s| s.wrong_hash = false);
@@ -327,7 +335,7 @@ async fn roundtrip(bin: String) {
     let anon = outside.path().join("anon");
     std::fs::create_dir_all(&anon).unwrap();
     std::fs::write(anon.join("nuget.config"), config(&[("oc", &group_src)], None)).unwrap();
-    consumer(&anon.join("app"), &[("Greeter", "1.1.0")]);
+    consumer(&anon.join("app"), &tfm, &[("Greeter", "1.1.0")]);
     std::fs::remove_dir_all(&env.packages).ok();
     let (ok, out) = env.run(&["restore", "app", "--no-cache"], &anon).await;
     assert!(!ok, "an anonymous restore of a private group fails: {out}");
