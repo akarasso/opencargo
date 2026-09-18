@@ -453,15 +453,30 @@ async fn write_suppressed_counts(tx: &mut Tx, version_id: i64, live: &[i64]) -> 
     Ok(())
 }
 
-async fn refresh_repository_counts(tx: &mut Tx, repository: i64, now: DateTime<Utc>) -> Result<(), sqlx::Error> {
-    let versions: Vec<i64> = sqlx::query_scalar("SELECT DISTINCT version_id FROM mcp_finding_counts WHERE repository_id = ?1
-        UNION SELECT v.id FROM mcp_server_versions v WHERE v.findings_high + v.findings_medium > 0")
+/// One repository's suppressed counts, rebuilt in two statements: a
+/// per-version `refresh()` here would re-walk every mirrored record under
+/// the single writer lock.
+async fn refresh_repository_counts(tx: &mut Tx, repository: i64) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM mcp_finding_counts WHERE repository_id = ?1")
         .bind(repository)
-        .fetch_all(&mut **tx)
+        .execute(&mut **tx)
         .await?;
-    for id in versions {
-        refresh(tx, id, now).await?;
-    }
+    sqlx::query(
+        "INSERT INTO mcp_finding_counts (repository_id, version_id, high, medium)
+         SELECT ?1, t.version_id,
+                COALESCE(SUM(t.kept AND t.confidence = 'high'), 0),
+                COALESCE(SUM(t.kept AND t.confidence = 'medium'), 0)
+         FROM (SELECT s.version_id AS version_id, f.confidence AS confidence,
+                      NOT EXISTS (SELECT 1 FROM mcp_suppressions sp WHERE sp.repository_id = ?1
+                                    AND sp.pattern = f.pattern AND (sp.tool = '' OR sp.tool = f.tool)) AS kept
+               FROM mcp_findings f JOIN mcp_surfaces s ON s.id = f.subject_id
+               WHERE f.subject_kind = 'surface') t
+         GROUP BY t.version_id
+         HAVING SUM(NOT t.kept) > 0",
+    )
+    .bind(repository)
+    .execute(&mut **tx)
+    .await?;
     Ok(())
 }
 
@@ -855,7 +870,7 @@ impl McpStore for SqliteMcpStore {
                     .bind(bind_ts(now))
                     .fetch_one(&mut *tx)
                     .await?;
-                    refresh_repository_counts(&mut tx, repository, now).await?;
+                    refresh_repository_counts(&mut tx, repository).await?;
                     Ok(Ok(id))
                 }
                 .await;
@@ -865,7 +880,7 @@ impl McpStore for SqliteMcpStore {
         .await
     }
 
-    async fn delete_suppression(&self, repository: i64, id: i64, now: DateTime<Utc>) -> Result<(), StoreError> {
+    async fn delete_suppression(&self, repository: i64, id: i64, _now: DateTime<Utc>) -> Result<(), StoreError> {
         immediate(&self.pool, |mut tx| {
             Box::pin(async move {
                 let done = async {
@@ -877,7 +892,7 @@ impl McpStore for SqliteMcpStore {
                     if gone.rows_affected() == 0 {
                         return Ok(Err(StoreError::NotFound));
                     }
-                    refresh_repository_counts(&mut tx, repository, now).await?;
+                    refresh_repository_counts(&mut tx, repository).await?;
                     Ok(Ok(()))
                 }
                 .await;
@@ -918,7 +933,7 @@ impl McpStore for SqliteMcpStore {
                         added |= done.rows_affected() > 0;
                     }
                     if added {
-                        refresh_repository_counts(&mut tx, repository, now).await?;
+                        refresh_repository_counts(&mut tx, repository).await?;
                     }
                     Ok(Ok(()))
                 }
