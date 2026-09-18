@@ -533,6 +533,22 @@ async fn removing_a_static_token_invalidates_its_registry_tokens() {
 }
 
 #[tokio::test]
+async fn a_static_derived_registry_token_cannot_buy_another() {
+    let server = spawn(false).await;
+    seed_image(&server.base_url, "oci-private/app").await;
+    let first = registry_token(&server.base_url, &format!("Bearer {STATIC_TOKEN}")).await;
+    let scope = "&scope=repository:oci-private/app:pull";
+    for authorization in [
+        format!("Bearer {first}"),
+        basic_auth_header("static-token", &first),
+    ] {
+        let resp = token_response(&server.base_url, Some(&authorization), scope).await;
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{authorization}");
+    }
+    assert_eq!(pull_status(&server.base_url, &first).await, StatusCode::OK);
+}
+
+#[tokio::test]
 async fn a_static_token_still_in_config_survives_a_restart() {
     let server = spawn(false).await;
     seed_image(&server.base_url, "oci-private/app").await;
