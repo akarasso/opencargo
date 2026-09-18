@@ -6,6 +6,7 @@ pub mod permissions;
 pub mod policy;
 pub mod promote;
 pub mod repositories;
+pub mod storage;
 pub mod tokens;
 pub mod users;
 pub mod vulns;

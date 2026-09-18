@@ -2251,6 +2251,16 @@ macro_rules! reclaim_contract {
                 let keys = vec!["k".to_string()];
                 assert_eq!(h.reclaim.pin(&prefix, &keys, at(3)).await.unwrap(), Pinned::Retired);
             }
+
+            #[tokio::test]
+            async fn backlog_counts_candidates_and_prefixes() {
+                let h = $open().await;
+                assert_eq!(h.reclaim.backlog().await.unwrap(), ::opencargo::ports::reclaim::Backlog::default());
+                h.reclaim.enqueue(&["a".to_string(), "b".to_string(), "a".to_string()], at(1)).await.unwrap();
+                h.reclaim.enqueue_prefix("p", at(1)).await.unwrap();
+                let backlog = h.reclaim.backlog().await.unwrap();
+                assert_eq!((backlog.candidates, backlog.prefixes), (3, 1));
+            }
         }
     };
 }

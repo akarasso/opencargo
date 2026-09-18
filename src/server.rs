@@ -98,6 +98,7 @@ pub struct AppState {
     pub oci: Arc<dyn OciStore>,
     pub reclaim: Arc<dyn ReclaimStore>,
     pub referenced: Arc<dyn ReferencedKeys>,
+    pub multipart: Arc<dyn MultipartLedger>,
     pub audit: Arc<dyn AuditStore>,
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
@@ -499,6 +500,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         oci: stores.oci(),
         reclaim: stores.reclaim(),
         referenced: stores.referenced(),
+        multipart: stores.multipart(),
         audit: stores.audit(),
         deps: stores.dependencies(),
         vulns: stores.vulns(),
@@ -830,6 +832,7 @@ pub fn build_router(state: AppState) -> Router {
             post(crate::api::webhooks::test_webhook),
         )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
+        .route("/api/v1/system/storage", get(crate::api::storage::storage_status))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),

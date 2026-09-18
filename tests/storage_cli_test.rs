@@ -191,3 +191,39 @@ async fn reclaim_prefix_without_repository_row() {
     assert_eq!(report.reclaimed, 1, "{report:?}");
     assert_eq!(stored_keys(&server).await, vec!["npm/goner/kept.tgz".to_string()]);
 }
+
+/// The status names the adapter and the declared identity, and never where
+/// the store points; only an admin reads it.
+#[tokio::test]
+async fn storage_status_names_the_backend_and_no_location() {
+    let server = spawn_server(opts()).await;
+    let client = reqwest::Client::new();
+    let resp = client
+        .get(format!("{}/api/v1/system/storage", server.base_url))
+        .bearer_auth(common::STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+    let want = if common::storage_is_s3() { "s3" } else { "fs" };
+    assert_eq!(body["backend"], want);
+    assert_eq!(body["identity"], "artifacts");
+    assert_eq!(body["ready"], true);
+    assert_eq!(body["multipart_in_flight"], 0);
+    assert_eq!(body["reclaim_candidates"], 0);
+    let storage_path = server.tmp.path().to_string_lossy().into_owned();
+    for secret in [storage_path.as_str(), "opencargo-test", "127.0.0.1:19000", &server.storage.s3.prefix] {
+        if !secret.is_empty() {
+            assert!(!text.contains(secret), "{text} names {secret}");
+        }
+    }
+
+    let anonymous = client
+        .get(format!("{}/api/v1/system/storage", server.base_url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}

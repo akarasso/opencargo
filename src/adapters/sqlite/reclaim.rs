@@ -15,7 +15,9 @@ use sqlx::SqlitePool;
 use super::{bind_ts, immediate, store_error, Tx};
 use crate::domain::layout;
 use crate::error::StoreError;
-use crate::ports::reclaim::{Candidate, Claim, ClaimToken, Pinned, PinToken, ReclaimStore, Renewal};
+use crate::ports::reclaim::{
+    Backlog, Candidate, Claim, ClaimToken, Pinned, PinToken, ReclaimStore, Renewal,
+};
 use crate::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 
 /// Every key a committed row references, `p = 1` for a key that protects
@@ -495,6 +497,19 @@ impl ReclaimStore for SqliteReclaimStore {
             })
         })
         .await
+    }
+
+    async fn backlog(&self) -> Result<Backlog, StoreError> {
+        let (candidates, prefixes): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(prefix), 0) FROM reclaim_candidates",
+        )
+        .fetch_one(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(Backlog {
+            candidates: candidates.unsigned_abs(),
+            prefixes: prefixes.unsigned_abs(),
+        })
     }
 
     async fn prune_pins(

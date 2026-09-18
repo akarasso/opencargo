@@ -319,3 +319,13 @@ export interface WsEvent {
   role?: string;
   anonymous?: boolean;
 }
+
+/** `GET /api/v1/system/storage`: the adapter and its health, never where it points. */
+export interface StorageStatus {
+  backend: 'fs' | 's3';
+  identity: string;
+  ready: boolean;
+  multipart_in_flight: number;
+  reclaim_candidates: number;
+  reclaim_prefixes: number;
+}

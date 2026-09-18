@@ -54,6 +54,14 @@ pub struct Candidate {
     pub prefix: bool,
 }
 
+/// What waits for reclamation, for the storage status.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Backlog {
+    pub candidates: u64,
+    /// Of which whole prefixes.
+    pub prefixes: u64,
+}
+
 #[async_trait]
 pub trait ReclaimStore: Send + Sync {
     /// One transaction for every key of one placement. A generation is
@@ -107,6 +115,8 @@ pub trait ReclaimStore: Send + Sync {
 
     /// Drops the retired mark of a prefix whose final listing was empty.
     async fn forget_retired(&self, prefix: &str) -> Result<(), StoreError>;
+
+    async fn backlog(&self) -> Result<Backlog, StoreError>;
 
     /// Deletes pins expired for longer than `grace`, at most `limit`.
     async fn prune_pins(

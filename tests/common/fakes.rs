@@ -41,7 +41,7 @@ use opencargo::ports::permissions::{PermissionStore, RepoRights};
 use opencargo::domain::layout;
 use opencargo::ports::proxy_cache::ProxyCacheStore;
 use opencargo::ports::reclaim::{
-    Candidate, Claim, ClaimToken, PinToken, Pinned, ReclaimStore, Renewal,
+    Backlog, Candidate, Claim, ClaimToken, PinToken, Pinned, ReclaimStore, Renewal,
 };
 use opencargo::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
@@ -2677,6 +2677,16 @@ impl ReclaimStore for Reclaim {
                 r.retired.retain(|i| *i != incarnation);
             }
             Ok(())
+        })
+    }
+
+    async fn backlog(&self) -> Result<Backlog, StoreError> {
+        self.with(|state| {
+            let candidates = &state.reclaim.candidates;
+            Ok(Backlog {
+                candidates: candidates.len() as u64,
+                prefixes: candidates.iter().filter(|c| c.prefix).count() as u64,
+            })
         })
     }
 
