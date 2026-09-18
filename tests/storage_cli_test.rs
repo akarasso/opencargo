@@ -80,6 +80,7 @@ fn target_config(server: &TestServer) -> Config {
         target.storage = StorageConfig::default();
         target.server.storage_path = server.tmp.path().join("migrated").to_string_lossy().into_owned();
     }
+    target.storage.id = Some("migrated".to_string());
     target
 }
 
@@ -91,6 +92,11 @@ async fn migrate_then_every_format_serves_from_the_target() {
     let layer = push_image(&client, &server.base_url).await;
     let source = common::config_of(&server);
     let target = target_config(&server);
+
+    let mut same_identity = target_config(&server);
+    same_identity.storage.id = None;
+    let refused = server::storage_migrate(&source, &same_identity, false).await;
+    assert!(refused.unwrap_err().to_string().contains("storage.id"), "two stores without an id share one ledger scope");
 
     let refused = server::storage_migrate(&source, &target, false).await;
     assert!(refused.unwrap_err().to_string().contains("stop it"), "a running server refuses migrate");

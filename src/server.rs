@@ -243,6 +243,9 @@ pub async fn storage_migrate(
 ) -> anyhow::Result<crate::app::storage_ops::MigrateReport> {
     config.validate()?;
     target.validate()?;
+    let identities: Vec<String> = config.store_identities().into_iter().chain(target.store_identities()).collect();
+    crate::config::refuse_duplicate_identities(identities.iter().map(String::as_str))
+        .map_err(|e| anyhow::anyhow!("{e}: set a distinct `storage.id` in the target config"))?;
     refuse_running_server(config).await?;
     let stores = connect_stores(config).await?;
     let clock: Arc<dyn Clock> = Arc::new(crate::adapters::system::SystemClock);
