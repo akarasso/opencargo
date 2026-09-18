@@ -44,6 +44,12 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommand,
     },
+    /// Copy another registry into this one's hosted repositories, and report
+    /// what could not be copied
+    Import {
+        #[command(subcommand)]
+        command: opencargo::adapters::import::cli::Import,
+    },
     /// Operate on MCP mirrors against the configured database, then exit
     Mcp {
         #[command(subcommand)]
@@ -149,6 +155,16 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
+    if let Some(Commands::Import { command }) = cli.command {
+        let env = |k: &str| std::env::var(k).ok();
+        let interrupted = async {
+            let _ = tokio::signal::ctrl_c().await;
+        };
+        let ran = opencargo::adapters::import::cli::execute(command, &env, interrupted).await;
+        print!("{}", ran.stdout);
+        std::process::exit(i32::from(ran.code));
+    }
+
     let mut cfg = config::load_config(cli.config.as_deref())?;
     if let Some(base_url) = cli.base_url {
         cfg.server.base_url = base_url.trim_end_matches('/').to_string();
@@ -239,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
                 println!("{name}: {report}");
             }
         }
+        Commands::Import { .. } => unreachable!("dispatched before the config is loaded"),
     }
 
     Ok(())

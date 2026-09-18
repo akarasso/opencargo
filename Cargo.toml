@@ -78,7 +78,7 @@ uuid = { version = "1", features = ["v4", "serde"] }
 dirs = "6"
 
 # HTTP client (proxy upstream)
-reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls-webpki-roots-no-provider"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls-webpki-roots-no-provider"] }
 
 # Object storage: named only under src/adapters/s3/ (boundary row object-store).
 object_store = { version = "0.14", default-features = false, features = ["aws"] }

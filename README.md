@@ -131,8 +131,9 @@ engine, in audit mode first**: rules versioned with your code
 internal packages are not judged like public ones. The first deliverable is a
 weekly report of *what would have been blocked*, before anything is actually
 blocked. Governance of MCP servers and agent skills is the second layer and
-landed in preview (see above); next are migration importers from Nexus /
-Artifactory / Verdaccio / GitHub Packages.
+landed in preview (see above), as did migration importers from Nexus /
+Artifactory / Verdaccio / GitHub Packages (`opencargo import`, see
+[docs/import.md](docs/import.md)).
 
 The registry, audit mode and OIDC SSO are and will stay MIT. Organisation-level
 enforcement (quarantine, approvals, audit exports, compliance reports)
@@ -550,6 +551,9 @@ group whose proxy member fronts another instance; locally they print
   payloads and Prometheus metrics.
 - [docs/mcp.md](docs/mcp.md): MCP servers and agent skills — the mirror, the
   approvals, the scan and the client files.
+- [docs/import.md](docs/import.md): `opencargo import`, copying Nexus,
+  Artifactory, Verdaccio, GitHub Packages or any OCI registry into opencargo,
+  and the gap report.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).

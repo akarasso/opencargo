@@ -47,6 +47,7 @@ pub mod deps;
 pub mod maven;
 pub mod mcp;
 pub mod identities;
+pub mod import_journal;
 pub mod migrate;
 pub mod multipart;
 pub mod nuget;

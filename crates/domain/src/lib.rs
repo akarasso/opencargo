@@ -7,6 +7,7 @@ pub mod events;
 pub mod format_rules;
 pub mod governance;
 pub mod identity;
+pub mod import;
 pub mod kinds;
 pub mod layout;
 pub mod names;
