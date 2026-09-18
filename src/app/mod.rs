@@ -43,6 +43,7 @@
 pub mod audit;
 pub mod authenticate;
 pub mod events;
+pub mod maven;
 pub mod oci;
 pub mod permissions;
 pub mod place;

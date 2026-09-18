@@ -19,6 +19,8 @@ use tracing::{info, warn};
 
 use crate::adapters::sqlite::SqliteStores;
 use crate::app::events::Announce;
+use crate::app::maven::deposit::MavenDeposits;
+use crate::app::maven::versions::MavenVersions;
 use crate::app::place::Placer;
 use crate::app::promote::PromoteVersion;
 use crate::app::publish::PublishVersion;
@@ -40,6 +42,7 @@ use crate::ports::dashboard::DashboardRead;
 use crate::ports::deps::DependencyStore;
 use crate::ports::events::Events;
 use crate::ports::ids::Ids;
+use crate::ports::maven::MavenFileStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
@@ -93,6 +96,7 @@ pub struct AppState {
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
     pub oci: Arc<dyn OciStore>,
+    pub maven: Arc<dyn MavenFileStore>,
     pub reclaim: Arc<dyn ReclaimStore>,
     pub referenced: Arc<dyn ReferencedKeys>,
     pub audit: Arc<dyn AuditStore>,
@@ -148,6 +152,27 @@ impl AppState {
             self.repos.clone(),
             self.storage.clone(),
             self.placer(),
+        )
+    }
+
+    /// Maven's versions rows, announced through the shared publish tail.
+    pub fn maven_versions(&self) -> Arc<MavenVersions> {
+        Arc::new(MavenVersions::new(
+            self.maven.clone(),
+            self.packages.clone(),
+            self.repos.clone(),
+            self.storage.clone(),
+            Arc::new(self.publish_tail()),
+            crate::registry::maven::pom::metadata_json,
+        ))
+    }
+
+    pub fn maven_deposits(&self) -> MavenDeposits {
+        MavenDeposits::new(
+            self.repos.clone(),
+            self.storage.clone(),
+            self.placer(),
+            self.maven_versions(),
         )
     }
 
@@ -334,6 +359,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         packages: stores.packages(),
         search: stores.search(),
         oci: stores.oci(),
+        maven: stores.maven(),
         reclaim: stores.reclaim(),
         referenced: stores.referenced(),
         audit: stores.audit(),
@@ -377,6 +403,7 @@ fn auth_state(
                 base_url: config.server.base_url.clone(),
             }),
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
+            Arc::new(crate::registry::maven::auth_rules::MavenRouteRules),
         ],
         trusted_proxies: config.auth.trusted_proxies.clone(),
     })
@@ -771,6 +798,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::cargo::routes::routes())
         .merge(crate::registry::go::routes::routes())
         .merge(crate::registry::oci::routes::routes())
+        .merge(crate::registry::maven::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
         .merge(dashboard_routes)

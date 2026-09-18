@@ -1,7 +1,7 @@
 use serde_json::Value;
 
-/// Dependency name/version pairs of a published version: npm and cargo store
-/// JSON metadata, Go stores the raw go.mod.
+/// Dependency name/version pairs of a published version: npm, cargo and
+/// Maven store JSON metadata, Go stores the raw go.mod.
 pub fn extract_dependencies(metadata: &str, ecosystem: &str) -> Vec<(String, String)> {
     if ecosystem == "Go" {
         return parse_go_mod(metadata);
@@ -12,6 +12,7 @@ pub fn extract_dependencies(metadata: &str, ecosystem: &str) -> Vec<(String, Str
     match ecosystem {
         "npm" => npm_dependencies(&meta),
         "crates.io" => cargo_dependencies(&meta),
+        "Maven" => npm_dependencies(&meta),
         _ => Vec::new(),
     }
 }
@@ -166,6 +167,14 @@ mod tests {
                 ("golang.org/x/text".to_string(), "v0.3.7".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn maven_dependencies_are_the_pom_map() {
+        let meta = r#"{"groupId": "g", "dependencies": {"com.x:y": "2.1", "a:b": "[1.0,2.0)"}}"#;
+        let mut deps = extract_dependencies(meta, "Maven");
+        deps.sort();
+        assert!(deps.contains(&("com.x:y".to_string(), "2.1".to_string())), "{deps:?}");
     }
 
     #[test]
