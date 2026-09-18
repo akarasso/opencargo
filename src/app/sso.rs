@@ -672,32 +672,46 @@ impl Sso {
             .by_id(user_id)
             .await?
             .ok_or(SsoError::Refused(SsoRefusal::Disabled))?;
-        if self.identities.login_state(user.id).await?.disabled {
+        let key = key.key();
+        if !self
+            .providers
+            .iter()
+            .any(|p| p.profile().authority == key.authority)
+        {
             return Err(SsoRefusal::Disabled.into());
         }
         let now = self.clock.now();
         let id = self.ids.token_id();
         let (token, hash) = credentials::generate_token(TOKEN_PREFIX);
         let expires_at = now + self.settings.session_ttl;
-        self.tokens
-            .create(
+        let issued = self
+            .identities
+            .issue_session(
                 &NewToken {
                     id: &id,
                     user_id: user.id,
-                    name: &format!("sso:{}", key.provider),
+                    name: &format!("sso:{}", key.authority.provider),
                     prefix: &token[..16],
                     token_hash: &hash,
                     expires_at: Some(expires_at),
                 },
+                &key,
                 now,
             )
-            .await?;
-        if let Err(e) = self.identities.mark_provenance(&id, &key.key()).await {
-            let _ = self.tokens.delete(&id).await;
-            return Err(e.into());
-        }
-        self.record(Some(&user), "sso.login", Some(&key.provider), None, meta)
             .await;
+        match issued {
+            Ok(()) => {}
+            Err(StoreError::NotFound) => return Err(SsoRefusal::Disabled.into()),
+            Err(e) => return Err(e.into()),
+        }
+        self.record(
+            Some(&user),
+            "sso.login",
+            Some(&key.authority.provider),
+            None,
+            meta,
+        )
+        .await;
         Ok(Session {
             token,
             username: user.username,

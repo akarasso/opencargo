@@ -12,6 +12,7 @@ use crate::error::StoreError;
 use crate::ports::handoffs::{Consumption, LoginHandoffStore, NewHandoff};
 use crate::ports::identities::{Admission, DisabledBy, IdentityLink, IdentityStore};
 use crate::ports::secrets::ServerSecretStore;
+use crate::ports::tokens::NewToken;
 use crate::ports::users::NewUser;
 
 const LINK_COLUMNS: &str =
@@ -353,6 +354,41 @@ async fn migrate_authority_in(tx: &mut Tx, from: &Authority, to: &Authority) -> 
     Ok(Ok(()))
 }
 
+async fn issue_session_in(
+    tx: &mut Tx,
+    token: &NewToken<'_>,
+    key: &IdentityKey,
+    now: DateTime<Utc>,
+) -> Step<()> {
+    let live: bool = sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM sso_identities WHERE provider = ?1 AND issuer = ?2
+         AND subject = ?3 AND user_id = ?4 AND disabled = 0)
+         AND NOT EXISTS (SELECT 1 FROM sso_user_states WHERE user_id = ?4)",
+    )
+    .bind(&key.authority.provider)
+    .bind(&key.authority.issuer)
+    .bind(&key.subject)
+    .bind(token.user_id)
+    .fetch_one(&mut **tx)
+    .await?;
+    if !live {
+        return Ok(Err(StoreError::NotFound));
+    }
+    if let Err(e) = super::tokens::insert_in(tx, token, now).await? {
+        return Ok(Err(e));
+    }
+    sqlx::query(
+        "INSERT INTO sso_token_provenance (token_id, provider, issuer, subject) VALUES (?1, ?2, ?3, ?4)",
+    )
+    .bind(token.id)
+    .bind(&key.authority.provider)
+    .bind(&key.authority.issuer)
+    .bind(&key.subject)
+    .execute(&mut **tx)
+    .await?;
+    Ok(Ok(()))
+}
+
 async fn record_probe_in(
     tx: &mut Tx,
     a: &Authority,
@@ -571,18 +607,19 @@ impl IdentityStore for SqliteIdentityStore {
             .collect())
     }
 
-    async fn mark_provenance(&self, token_id: &str, key: &IdentityKey) -> Result<(), StoreError> {
-        sqlx::query(
-            "INSERT INTO sso_token_provenance (token_id, provider, issuer, subject) VALUES (?1, ?2, ?3, ?4)",
-        )
-        .bind(token_id)
-        .bind(&key.authority.provider)
-        .bind(&key.authority.issuer)
-        .bind(&key.subject)
-        .execute(&self.pool)
+    async fn issue_session(
+        &self,
+        token: &NewToken<'_>,
+        key: &IdentityKey,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        immediate(&self.pool, |mut tx| {
+            Box::pin(async move {
+                let done = issue_session_in(&mut tx, token, key, now).await;
+                (tx, done)
+            })
+        })
         .await
-        .map_err(store_error)?;
-        Ok(())
     }
 
     async fn provenance(&self, token_id: &str) -> Result<Option<IdentityKey>, StoreError> {

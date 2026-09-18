@@ -619,3 +619,58 @@ async fn logout_revokes_the_sso_session_and_names_the_end_session_url() {
     assert_eq!(end.as_deref(), Some("https://idp.example/logout"));
     assert!(fx.store.tokens().by_id(&stored.id).await.unwrap().is_none());
 }
+
+fn alice_key() -> IdentityKey {
+    IdentityKey {
+        authority: Authority::new("corp", ISSUER),
+        subject: "alice".into(),
+    }
+}
+
+async fn assert_no_session_for_alice(fx: &Fx, exchanged: SsoResult<Session>) {
+    assert!(matches!(
+        exchanged,
+        Err(SsoError::Refused(SsoRefusal::Disabled))
+    ));
+    let alice = fx.store.users().by_name("alice").await.unwrap().unwrap();
+    assert!(fx
+        .store
+        .tokens()
+        .of_user(alice.id)
+        .await
+        .unwrap()
+        .is_empty());
+}
+
+#[tokio::test]
+async fn a_link_disabled_between_callback_and_exchange_refuses_the_exchange() {
+    let fx = fixture();
+    let (landed, cookie) = fx.land().await.unwrap();
+    fx.sso.disable_link(&alice_key()).await.unwrap();
+    let exchanged = fx
+        .sso
+        .exchange(&code_of(&landed), Some(&cookie), Meta::default())
+        .await;
+    assert_no_session_for_alice(&fx, exchanged).await;
+}
+
+#[tokio::test]
+async fn a_provider_retired_with_a_pending_handoff_refuses_the_exchange() {
+    let fx = fixture();
+    let (landed, cookie) = fx.land().await.unwrap();
+    reconcile_providers(
+        fx.store.identities().as_ref(),
+        &Declared {
+            active: &[],
+            retired: &[Authority::new("corp", ISSUER)],
+            migrated: &[],
+        },
+    )
+    .await
+    .unwrap();
+    let exchanged = fx
+        .sso
+        .exchange(&code_of(&landed), Some(&cookie), Meta::default())
+        .await;
+    assert_no_session_for_alice(&fx, exchanged).await;
+}

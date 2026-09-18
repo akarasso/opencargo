@@ -128,6 +128,34 @@ macro_rules! sso_contract {
             }
 
             #[tokio::test]
+            async fn a_session_is_issued_only_under_a_live_link_of_an_enabled_account() {
+                let h = $open().await;
+                let (a, b) = (key("corp", "alice"), key("corp", "bob"));
+                let alice = provision(&h, "alice", &a).await;
+                let bob = provision(&h, "bob", &b).await;
+                refused(&h, bob, "foreign", &a).await;
+                refused(&h, alice, "unlinked", &key("corp", "nobody")).await;
+                token(&h, alice, "live", Some(&a)).await;
+                assert_eq!(
+                    h.identities.provenance("live").await.unwrap(),
+                    Some(a.clone())
+                );
+                h.identities
+                    .disable_user(alice, DisabledBy::Admin, at(0))
+                    .await
+                    .unwrap();
+                refused(&h, alice, "user-off", &a).await;
+                h.identities.enable_user(alice).await.unwrap();
+                h.identities.disable_link(&a).await.unwrap();
+                refused(&h, alice, "link-off", &a).await;
+                h.identities
+                    .revoke_authority(&authority("corp"))
+                    .await
+                    .unwrap();
+                refused(&h, bob, "retired", &b).await;
+            }
+
+            #[tokio::test]
             async fn concurrent_secret_initialisations_agree() {
                 let h = $open().await;
                 let calls = (0u8..8).map(|i| {
@@ -401,25 +429,41 @@ async fn provision(h: &SsoHandles, name: &str, key: &IdentityKey) -> i64 {
         .id
 }
 
+fn new_token<'a>(user: i64, id: &'a str, prefix: &'a str) -> NewToken<'a> {
+    NewToken {
+        id,
+        user_id: user,
+        name: id,
+        prefix,
+        token_hash: "h",
+        expires_at: None,
+    }
+}
+
 async fn token(h: &SsoHandles, user: i64, id: &str, from: Option<&IdentityKey>) -> String {
-    h.tokens
-        .create(
-            &NewToken {
-                id,
-                user_id: user,
-                name: id,
-                prefix: &format!("{id:0>16}"),
-                token_hash: "h",
-                expires_at: None,
-            },
-            at(0),
-        )
-        .await
-        .unwrap();
-    if let Some(key) = from {
-        h.identities.mark_provenance(id, key).await.unwrap();
+    let prefix = format!("{id:0>16}");
+    let token = new_token(user, id, &prefix);
+    match from {
+        Some(key) => h
+            .identities
+            .issue_session(&token, key, at(0))
+            .await
+            .unwrap(),
+        None => {
+            h.tokens.create(&token, at(0)).await.unwrap();
+        }
     }
     id.to_string()
+}
+
+async fn refused(h: &SsoHandles, user: i64, id: &str, key: &IdentityKey) {
+    let prefix = format!("{id:0>16}");
+    let got = h
+        .identities
+        .issue_session(&new_token(user, id, &prefix), key, at(0))
+        .await;
+    assert!(matches!(got, Err(StoreError::NotFound)), "{id}: {got:?}");
+    assert!(h.tokens.by_id(id).await.unwrap().is_none(), "{id}");
 }
 
 sso_contract!(fake_db, fake);

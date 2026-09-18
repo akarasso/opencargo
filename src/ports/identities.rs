@@ -10,6 +10,7 @@ use chrono::{DateTime, Utc};
 use crate::domain::identity::{Authority, IdentityKey, LoginState, Outage};
 use crate::domain::{Rights, User};
 use crate::error::StoreError;
+use crate::ports::tokens::NewToken;
 use crate::ports::users::NewUser;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -115,8 +116,17 @@ pub trait IdentityStore: Send + Sync {
 
     async fn authorities(&self) -> Result<Vec<Authority>, StoreError>;
 
-    /// Records which identity a token was issued under.
-    async fn mark_provenance(&self, token_id: &str, key: &IdentityKey) -> Result<(), StoreError>;
+    /// Records a token issued under `key` with its provenance, in the same
+    /// transaction that checks the link is live and its account enabled, so
+    /// a revocation either precedes it and refuses it or follows it and
+    /// reaches it. `NotFound` unless the link is live, belongs to the
+    /// token's account and that account is enabled.
+    async fn issue_session(
+        &self,
+        token: &NewToken<'_>,
+        key: &IdentityKey,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError>;
 
     async fn provenance(&self, token_id: &str) -> Result<Option<IdentityKey>, StoreError>;
 

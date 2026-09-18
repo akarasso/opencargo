@@ -2827,15 +2827,43 @@ impl IdentityStore for Identities {
         })
     }
 
-    async fn mark_provenance(&self, token_id: &str, key: &IdentityKey) -> Result<(), StoreError> {
+    async fn issue_session(
+        &self,
+        token: &NewToken<'_>,
+        key: &IdentityKey,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
         with(&self.0, PortId::Identities, |state| {
-            if !state.tokens.iter().any(|t| t.id == token_id) {
+            let live = state
+                .sso
+                .links
+                .iter()
+                .any(|(l, _)| &l.key == key && l.user_id == token.user_id && !l.disabled);
+            let enabled = !state
+                .sso
+                .disabled_users
+                .iter()
+                .any(|(u, _)| *u == token.user_id);
+            if !live || !enabled {
                 return Err(StoreError::NotFound);
             }
+            if state.tokens.iter().any(|t| t.id == token.id) {
+                return Err(StoreError::Conflict);
+            }
+            state.tokens.push(ApiToken {
+                id: token.id.to_string(),
+                user_id: token.user_id,
+                name: token.name.to_string(),
+                prefix: token.prefix.to_string(),
+                token_hash: token.token_hash.to_string(),
+                expires_at: token.expires_at,
+                last_used_at: None,
+                created_at: now,
+            });
             state
                 .sso
                 .provenance
-                .push((token_id.to_string(), key.clone()));
+                .push((token.id.to_string(), key.clone()));
             Ok(())
         })
     }
