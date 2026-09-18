@@ -131,9 +131,8 @@ fn compare_label(a: &str, b: &str) -> Ordering {
 /// Precedence ignores build metadata, as NuGet's does.
 impl Ord for NuGetVersion {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.numbers
-            .cmp(&other.numbers)
-            .then_with(|| match (self.is_prerelease(), other.is_prerelease()) {
+        self.numbers.cmp(&other.numbers).then_with(|| {
+            match (self.is_prerelease(), other.is_prerelease()) {
                 (false, false) => Ordering::Equal,
                 (false, true) => Ordering::Greater,
                 (true, false) => Ordering::Less,
@@ -146,7 +145,8 @@ impl Ord for NuGetVersion {
                     }
                     self.release.len().cmp(&other.release.len())
                 }
-            })
+            }
+        })
     }
 }
 
@@ -186,14 +186,26 @@ mod tests {
         for spelling in ["1.0", "1.0.0.0", "1.0.0+abc", "01.0.0", "1.0.0"] {
             assert_eq!(key(spelling), "1.0.0", "{spelling}");
         }
-        assert_eq!(NuGetVersion::parse("1.0.0-RC+Git").unwrap().full(), "1.0.0-RC+Git");
+        assert_eq!(
+            NuGetVersion::parse("1.0.0-RC+Git").unwrap().full(),
+            "1.0.0-RC+Git"
+        );
     }
 
     #[test]
     fn malformed_versions_are_refused() {
         for bad in [
-            "", "1", "1.2.3.4.5", "a.b", "1.0.0-", "1.0.0-a..b", "1.0.0+", "1.0.0-a_b", " 1.0",
-            "1.0/..", "1.-1.0",
+            "",
+            "1",
+            "1.2.3.4.5",
+            "a.b",
+            "1.0.0-",
+            "1.0.0-a..b",
+            "1.0.0+",
+            "1.0.0-a_b",
+            " 1.0",
+            "1.0/..",
+            "1.-1.0",
         ] {
             assert!(NuGetVersion::parse(bad).is_err(), "{bad:?}");
         }
@@ -204,7 +216,10 @@ mod tests {
         let v = |s| NuGetVersion::parse(s).unwrap();
         assert!(v("1.0.0") > v("1.0.0-rc.1"));
         assert!(v("1.0.0-rc.10") > v("1.0.0-rc.9"));
-        assert!(v("1.0.0-alpha") < v("1.0.0-Beta"), "labels compare case-insensitively");
+        assert!(
+            v("1.0.0-alpha") < v("1.0.0-Beta"),
+            "labels compare case-insensitively"
+        );
         assert!(v("1.0.0-1") < v("1.0.0-a"));
         assert!(v("1.0.0.1") > v("1.0.0"));
         assert!(v("1.0.0-rc") < v("1.0.0-rc.1"));

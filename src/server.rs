@@ -373,6 +373,7 @@ fn auth_state(
                 base_url: config.server.base_url.clone(),
             }),
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
+            Arc::new(crate::registry::nuget::auth_rules::NugetRouteRules),
         ],
         trusted_proxies: config.auth.trusted_proxies.clone(),
     })

@@ -117,7 +117,11 @@ fn open_element(n: &mut Nuspec, path: &[String], e: &BytesStart<'_>) -> Result<(
             include: attr(e, b"include")?,
         };
         if path.len() == 3 {
-            match n.dependency_groups.iter_mut().find(|g| g.target_framework.is_none()) {
+            match n
+                .dependency_groups
+                .iter_mut()
+                .find(|g| g.target_framework.is_none())
+            {
                 Some(g) => g.dependencies.push(dep),
                 None => n.dependency_groups.push(DependencyGroup {
                     target_framework: None,
@@ -274,7 +278,8 @@ pub(crate) mod tests {
         let options = zip::write::SimpleFileOptions::default();
         zip.start_file(format!("{id}.nuspec"), options).unwrap();
         zip.write_all(nuspec_xml(id, version).as_bytes()).unwrap();
-        zip.start_file(format!("lib/net8.0/{id}.dll"), options).unwrap();
+        zip.start_file(format!("lib/net8.0/{id}.dll"), options)
+            .unwrap();
         zip.write_all(b"MZ").unwrap();
         for path in extra {
             zip.start_file(*path, options).unwrap();
@@ -293,11 +298,23 @@ pub(crate) mod tests {
         assert_eq!(n.description.as_deref(), Some("A <b>test</b> package"));
         assert_eq!(n.license_expression.as_deref(), Some("MIT"));
         assert_eq!(n.min_client_version.as_deref(), Some("2.12"));
-        assert_eq!(n.package_types, vec![PackageType { name: "Dependency".into(), version: None }]);
+        assert_eq!(
+            n.package_types,
+            vec![PackageType {
+                name: "Dependency".into(),
+                version: None
+            }]
+        );
         assert_eq!(n.dependency_groups.len(), 2);
-        assert_eq!(n.dependency_groups[0].target_framework.as_deref(), Some("net8.0"));
+        assert_eq!(
+            n.dependency_groups[0].target_framework.as_deref(),
+            Some("net8.0")
+        );
         assert_eq!(n.dependency_groups[0].dependencies[0].id, "Newtonsoft.Json");
-        assert_eq!(n.dependency_groups[0].dependencies[0].range.as_deref(), Some("[13.0.1, )"));
+        assert_eq!(
+            n.dependency_groups[0].dependencies[0].range.as_deref(),
+            Some("[13.0.1, )")
+        );
         assert!(n.dependency_groups[1].dependencies.is_empty());
     }
 
@@ -305,9 +322,13 @@ pub(crate) mod tests {
     fn a_nuspec_expands_no_entity() {
         let dtd = r#"<?xml version="1.0"?><!DOCTYPE package [<!ENTITY x "boom">]><package><metadata><id>&x;</id><version>1.0.0</version></metadata></package>"#;
         assert!(parse(dtd.as_bytes()).is_err());
-        let undeclared = r#"<package><metadata><id>&x;</id><version>1.0.0</version></metadata></package>"#;
+        let undeclared =
+            r#"<package><metadata><id>&x;</id><version>1.0.0</version></metadata></package>"#;
         assert!(parse(undeclared.as_bytes()).is_err());
-        let big = format!("<package>{}</package>", " ".repeat(MAX_NUSPEC_BYTES as usize));
+        let big = format!(
+            "<package>{}</package>",
+            " ".repeat(MAX_NUSPEC_BYTES as usize)
+        );
         assert!(parse(big.as_bytes()).is_err());
         assert!(parse(b"<package><metadata><id>a</id></metadata></package>").is_err());
     }
@@ -318,7 +339,12 @@ pub(crate) mod tests {
         let (raw, n) = from_package(&bytes).unwrap();
         assert_eq!(n.id, "My.Lib");
         assert!(String::from_utf8(raw).unwrap().contains("<id>My.Lib</id>"));
-        assert!(entries(&bytes).unwrap().contains(&"tools/install.ps1".to_string()));
-        assert!(matches!(from_package(b"not a zip"), Err(NuspecError::Package(_))));
+        assert!(entries(&bytes)
+            .unwrap()
+            .contains(&"tools/install.ps1".to_string()));
+        assert!(matches!(
+            from_package(b"not a zip"),
+            Err(NuspecError::Package(_))
+        ));
     }
 }

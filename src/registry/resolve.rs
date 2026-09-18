@@ -5,7 +5,7 @@ use tracing::warn;
 
 use crate::auth::middleware::AuthUser;
 use crate::domain::{
-    CacheRepo, DomainError, Miss, Outcome, RepoKind, Repository, UrlRepo, Visit, Walk,
+    Action, CacheRepo, DomainError, Miss, Resource, Outcome, RepoKind, Repository, UrlRepo, Visit, Walk,
     MAX_GROUP_DEPTH,
 };
 use crate::error::{AppError, StoreError};
@@ -290,6 +290,48 @@ async fn walk_members<'a, L: Leaf + 'a>(
             continue;
         }
         walk(cx, &member, leaf, depth + 1, w).await?;
+    }
+    Ok(())
+}
+
+/// For an anonymous caller only: `Forbidden(read)` when any member the
+/// group would walk is unreadable to them, whatever the member order and
+/// whether or not the package exists. Reads the configuration only, never
+/// an upstream or a package store. An authenticated caller is not probed:
+/// the walk skips an unreadable member silently.
+pub async fn probe_access(cx: &Cx<'_>, repo: &Repository) -> Result<(), ResolveError> {
+    if cx.auth.is_some() {
+        return Ok(());
+    }
+    let mut seen = vec![repo.id];
+    let mut level = vec![repo.clone()];
+    for _ in 0..=MAX_GROUP_DEPTH {
+        let mut next = Vec::new();
+        for group in level.iter().filter(|r| r.kind().ok() == Some(RepoKind::Group)) {
+            for name in group.members() {
+                let Some(member) = cx.repos.by_name(&name).await? else {
+                    continue;
+                };
+                if seen.contains(&member.id) {
+                    continue;
+                }
+                seen.push(member.id);
+                if !readable(cx, &member).await? {
+                    return Err(ResolveError::Domain(DomainError::Forbidden(Action {
+                        verb: "read",
+                        on: Resource {
+                            kind: "repository",
+                            id: cx.url.0.to_string(),
+                        },
+                    })));
+                }
+                next.push(member);
+            }
+        }
+        if next.is_empty() {
+            break;
+        }
+        level = next;
     }
     Ok(())
 }

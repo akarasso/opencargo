@@ -72,7 +72,17 @@ mod tests {
             assert!(is_valid_id(good), "{good}");
         }
         let long = "a".repeat(101);
-        for bad in ["", ".a", "a.", "a..b", "a/b", "a b", "../x", "é", long.as_str()] {
+        for bad in [
+            "",
+            ".a",
+            "a.",
+            "a..b",
+            "a/b",
+            "a b",
+            "../x",
+            "é",
+            long.as_str(),
+        ] {
             assert!(!is_valid_id(bad), "{bad:?}");
         }
     }
