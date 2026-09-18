@@ -695,3 +695,7 @@ impl ReferencedKeys for SqliteReferencedKeys {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "serializable_tests.rs"]
+mod serializable_tests;

@@ -62,6 +62,48 @@ pub struct Backlog {
     pub prefixes: u64,
 }
 
+/// The methods that must run under a serializable execution, both sides of
+/// the pin/claim race under the same isolation (ha-profiles §5.3, C-11):
+/// every method that spends a `PinToken` by compare-and-set, and every
+/// method that writes a table `ReferencedKeys` reads. SQLite gets it from
+/// `BEGIN IMMEDIATE`; another dialect owes it an option of its own, and
+/// `READ COMMITTED` without a lock is refused for these.
+///
+/// The inventory is a fact of the contract, not of an adapter: a test of
+/// each adapter fails when one of its methods writes a referenced table and
+/// is not here.
+pub const SERIALIZABLE: &[&str] = &[
+    "ReclaimStore::pin",
+    "ReclaimStore::claim",
+    "ReclaimStore::enqueue",
+    "ReclaimStore::enqueue_prefix",
+    "PackageStore::publish_version",
+    "PackageStore::promote_metadata",
+    "PackageStore::set_metadata",
+    "PackageStore::set_yanked",
+    "PackageStore::delete_version",
+    "ProxyCacheStore::upsert",
+    "ProxyCacheStore::touch",
+    "ProxyCacheStore::quarantined",
+    "ProxyCacheStore::delete",
+    "ProxyCacheStore::delete_for_repo",
+    "OciStore::put_manifest",
+    "OciStore::delete_manifest",
+    "OciStore::delete_blob",
+    "OciStore::start_upload",
+    "OciStore::claim_segment",
+    "OciStore::begin_complete",
+    "OciStore::release_complete",
+    "OciStore::finish_upload",
+    "OciStore::reap_uploads",
+    "MavenFileStore::change",
+    "MavenFileStore::refuse",
+    "PypiFileStore::publish_file",
+    "PypiFileStore::set_release_yanked",
+    "PypiFileStore::delete_release",
+    "PypiFileStore::delete_project_files",
+];
+
 /// Who this installation is, which restore epoch its generations are minted
 /// under, and how far the high-water mark it wrote has gone.
 #[derive(Debug, Clone, PartialEq, Eq)]
