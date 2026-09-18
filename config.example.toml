@@ -22,6 +22,9 @@ username = "admin"
 # the OPENCARGO_ADMIN_PASSWORD environment variable.
 password = "admin"
 
+[auth.sso]
+password_mode = "enabled"
+
 [proxy]
 default_ttl = "24h"
 negative_cache_ttl = "1h"

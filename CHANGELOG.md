@@ -4,6 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+- Single sign-on through OpenID Connect (Google, Entra ID, GitLab, any
+  provider): accounts created or linked on first login, groups mapped to
+  roles and grants at every login, credentials revoked with the provider or
+  the account, and `password_mode` to retire local passwords. See
+  `docs/sso.md`.
+- Registry token signing keys survive a restart (`server_secrets`).
+- An admin can disable and re-enable an account; its SSO credentials are
+  revoked at once and every credential it holds is refused.
+
 ### Changed
 - A credential that does not verify is refused with 401 on every route,
   including an invalid or revoked Bearer on a public repository, which used
