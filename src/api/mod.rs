@@ -3,6 +3,7 @@ pub mod auth_sso;
 pub mod dashboard;
 pub mod deps;
 pub mod maven;
+pub mod mcp;
 pub mod me;
 pub mod permissions;
 pub mod policy;

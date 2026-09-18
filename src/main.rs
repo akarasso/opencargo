@@ -44,6 +44,22 @@ enum Commands {
         #[command(subcommand)]
         command: StorageCommand,
     },
+    /// Operate on MCP mirrors against the configured database, then exit
+    Mcp {
+        #[command(subcommand)]
+        command: McpCommand,
+    },
+}
+
+#[derive(clap::Subcommand)]
+enum McpCommand {
+    /// Sync one mirror, or every mirror
+    Sync {
+        #[arg(long)]
+        repo: Option<String>,
+        #[arg(long)]
+        full: bool,
+    },
 }
 
 #[derive(clap::Subcommand)]
@@ -174,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
                 cfg.cleanup.clone(),
                 app_state.reconcilers(),
             ));
+            tokio::spawn(app_state.sync_supervisor()?.run());
             tokio::spawn(opencargo::telemetry::cleanup::start_reconcile_task(
                 app_state.reconcilers(),
                 app_state.clock.clone(),
@@ -215,6 +232,13 @@ async fn main() -> anyhow::Result<()> {
             println!("Migrations applied successfully.");
         }
         Commands::Storage { command } => storage(&cfg, command).await?,
+        Commands::Mcp {
+            command: McpCommand::Sync { repo, full },
+        } => {
+            for (name, report) in server::mcp_sync(&cfg, repo.as_deref(), full).await? {
+                println!("{name}: {report}");
+            }
+        }
     }
 
     Ok(())

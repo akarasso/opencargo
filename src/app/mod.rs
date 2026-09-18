@@ -44,6 +44,7 @@ pub mod audit;
 pub mod authenticate;
 pub mod events;
 pub mod maven;
+pub mod mcp;
 pub mod nuget;
 pub mod login_gate;
 pub mod oci;

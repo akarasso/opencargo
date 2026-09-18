@@ -461,6 +461,32 @@ async fn refresh_repository_counts(tx: &mut Tx, repository: i64, now: DateTime<U
     Ok(())
 }
 
+/// Rows a human wrote, which a repository deletion must not take: hosted
+/// records and skills. Synced rows go with the repository.
+pub(crate) async fn hosted_rows(tx: &mut Tx, repository: i64) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM mcp_server_versions WHERE repository_id = ?1 AND hosted = 1)
+              + (SELECT COUNT(*) FROM mcp_skills WHERE repository_id = ?1)",
+    )
+    .bind(repository)
+    .fetch_one(&mut **tx)
+    .await
+}
+
+/// The findings no foreign key takes with a repository's rows.
+pub(crate) async fn forget_findings(tx: &mut Tx, repository: i64) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "DELETE FROM mcp_findings WHERE (subject_kind = 'surface' AND subject_id IN
+             (SELECT s.id FROM mcp_surfaces s JOIN mcp_server_versions v ON v.id = s.version_id
+              WHERE v.repository_id = ?1))
+            OR (subject_kind = 'skill' AND subject_id IN (SELECT id FROM mcp_skills WHERE repository_id = ?1))",
+    )
+    .bind(repository)
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
 async fn upsert_record(tx: &mut Tx, r: &RecordWrite) -> Result<Upserted, sqlx::Error> {
     let before: Option<(i64, String)> = sqlx::query_as(
         "SELECT id, response_json FROM mcp_server_versions WHERE repository_id = ?1 AND name = ?2 AND version = ?3",
@@ -911,14 +937,10 @@ impl McpStore for SqliteMcpStore {
     }
 
     async fn hosted_count(&self, repository: i64) -> Result<i64, StoreError> {
-        sqlx::query_scalar(
-            "SELECT (SELECT COUNT(*) FROM mcp_server_versions WHERE repository_id = ?1 AND hosted = 1)
-                  + (SELECT COUNT(*) FROM mcp_skills WHERE repository_id = ?1)",
-        )
-        .bind(repository)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(store_error)
+        let mut conn = self.pool.begin().await.map_err(store_error)?;
+        let n = hosted_rows(&mut conn, repository).await.map_err(store_error)?;
+        conn.rollback().await.map_err(store_error)?;
+        Ok(n)
     }
 
     async fn purge(&self, repository: i64) -> Result<u64, StoreError> {

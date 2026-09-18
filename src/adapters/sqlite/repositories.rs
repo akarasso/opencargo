@@ -159,7 +159,8 @@ async fn retire_row(
             .bind(repo)
             .fetch_one(&mut **tx)
             .await?;
-    if packages > 0 || maven > 0 {
+    let mcp = super::mcp::hosted_rows(tx, repo).await?;
+    if packages > 0 || maven > 0 || mcp > 0 {
         return Ok(Err(StoreError::Conflict));
     }
     match holders(tx, name).await? {
@@ -178,6 +179,7 @@ async fn retire_row(
         .bind(repo)
         .execute(&mut **tx)
         .await?;
+    super::mcp::forget_findings(tx, repo).await?;
     sqlx::query("DELETE FROM repositories WHERE id = ?1")
         .bind(repo)
         .execute(&mut **tx)

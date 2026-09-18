@@ -127,6 +127,9 @@ pub struct AppState {
     pub mcp: Arc<dyn crate::ports::mcp::McpStore>,
     /// `[mcp.*]` by repository name; a repository with none takes the defaults.
     pub mcp_settings: Arc<HashMap<String, crate::config::McpConfig>>,
+    pub mcp_feed: Arc<dyn crate::ports::mcp_feed::RegistryFeed>,
+    /// Each mirror's sync child and run lock; the binary's supervisor fills it.
+    pub mcp_sync: Arc<crate::app::mcp::supervisor::SyncHandles>,
     pub vuln_scanner: Arc<dyn VulnFeed>,
     pub vuln_scan_config: crate::config::VulnScanConfig,
     /// Real-time event bus feeding the `/api/v1/events/ws` WebSocket.
@@ -221,6 +224,32 @@ impl AppState {
             self.audit.clone(),
             self.events.clone(),
         )
+    }
+
+    pub fn sync_mirror(&self) -> crate::app::mcp::sync::SyncMirror {
+        crate::app::mcp::sync::SyncMirror::new(
+            self.mcp.clone(),
+            self.mcp_feed.clone(),
+            self.clock.clone(),
+            crate::registry::mcp::ingest::translate,
+        )
+    }
+
+    /// The supervisor the binary spawns: a child per mirror, each on its
+    /// configured interval.
+    pub fn sync_supervisor(&self) -> anyhow::Result<crate::app::mcp::supervisor::SyncSupervisor> {
+        let mut intervals = HashMap::new();
+        for (name, cfg) in self.mcp_settings.iter() {
+            let every = crate::config::parse_chrono_duration(&cfg.sync_interval)?.to_std()?;
+            intervals.insert(name.clone(), every.max(std::time::Duration::from_secs(60)));
+        }
+        Ok(crate::app::mcp::supervisor::SyncSupervisor::new(
+            self.mcp_sync.clone(),
+            self.repos.clone(),
+            Arc::new(self.sync_mirror()),
+            self.events.clone(),
+            intervals,
+        ))
     }
 
     /// The only deleter of shared keys, over this state's stores.
@@ -353,6 +382,32 @@ pub async fn storage_reclaim(
             .await?),
         None => Ok(reclaim.run(now).await),
     }
+}
+
+/// `opencargo mcp sync`: one run of one mirror or of every mirror, each
+/// answered with its report or its error.
+pub async fn mcp_sync(config: &Config, repo: Option<&str>, full: bool) -> anyhow::Result<Vec<(String, String)>> {
+    let state = build_state(config).await?;
+    let sync = state.sync_mirror();
+    let mut out = Vec::new();
+    for r in state.repos.all().await? {
+        let mirror = r.fmt().ok() == Some(crate::domain::Format::Mcp) && r.kind().ok() == Some(crate::domain::RepoKind::Proxy);
+        if !mirror || repo.is_some_and(|n| n != r.name) {
+            continue;
+        }
+        let Some(upstream) = r.upstream_url.clone() else {
+            continue;
+        };
+        let line = match crate::app::mcp::supervisor::run_locked(&state.mcp_sync, &sync, r.id, &upstream, full).await {
+            Ok(report) => serde_json::to_string(&report)?,
+            Err(e) => format!("failed: {e}"),
+        };
+        out.push((r.name, line));
+    }
+    if let Some(name) = repo {
+        anyhow::ensure!(!out.is_empty(), "{name} is not an MCP mirror");
+    }
+    Ok(out)
 }
 
 /// A database URL turned into ports: the pool, migrated, with every store
@@ -606,6 +661,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         dashboard: stores.dashboard(),
         mcp,
         mcp_settings: Arc::new(config.mcp.clone()),
+        mcp_feed: Arc::new(crate::adapters::mcp_http::HttpRegistryFeed::new()?),
+        mcp_sync: Arc::default(),
         vuln_scanner,
         vuln_scan_config: config.vuln_scan.clone(),
         events,
@@ -1254,6 +1311,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
         .route("/api/v1/system/storage", get(crate::api::storage::storage_status))
         .route("/api/v1/maven/{repo}/decide", post(crate::api::maven::decide))
+        .route("/api/v1/mcp/{repo}/sync", post(crate::api::mcp::sync))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),

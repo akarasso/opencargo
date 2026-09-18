@@ -101,6 +101,11 @@ pub fn record_write(repository: i64, envelope: &Value, hosted: bool, now: DateTi
     })
 }
 
+/// A synced envelope, for the sync use case: a refusal is a reason.
+pub fn translate(repository: i64, envelope: &Value, now: DateTime<Utc>) -> Result<RecordWrite, String> {
+    record_write(repository, envelope, false, now).map_err(|e| e.to_string())
+}
+
 /// The record inside a stored envelope.
 pub fn detail_of(envelope_json: &str) -> AppResult<ServerDetail> {
     let envelope: Value = serde_json::from_str(envelope_json)?;
