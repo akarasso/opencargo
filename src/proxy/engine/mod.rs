@@ -22,7 +22,7 @@ use crate::storage::StorageBackend;
 use super::auth::{send_with_auth, TokenCache};
 use super::singleflight::Singleflight;
 use super::strategy::{
-    CacheKey, CachePolicy, Classified, DigestAlgorithm, Ttl, UpstreamStrategy, UrlSource,
+    CacheKey, CachePolicy, Classified, DigestAlgorithm, DigestSource, Ttl, UpstreamStrategy, UrlSource,
 };
 
 pub use payload::{cache_path, Cached, IntoPayload, Payload, Src, CACHE_SEGMENT};
@@ -254,6 +254,17 @@ impl ProxyEngine {
         if counted {
             crate::telemetry::record_cache_miss(&member.0.name);
         }
+        if let Some(announced) = announced(s, a) {
+            if self
+                .cache
+                .quarantined(member.0.id, key.kind, &key.key, &announced, pass.now)
+                .await?
+            {
+                return Err(AppError::BadGateway(
+                    "upstream body is quarantined under its announced digest".into(),
+                ));
+            }
+        }
         let reply = self
             .exchange(s, up, member, a, stale.as_ref(), pass)
             .await;
@@ -415,6 +426,18 @@ impl ProxyEngine {
                 Some(_) => Ok(Outcome::NotFound),
                 None => Err(AppError::BadGateway(why)),
             },
+            Ok(Reply::Rejected(why)) => {
+                if let Some(announced) = announced(s, a) {
+                    self.cache
+                        .quarantine(member.0.id, key.kind, &key.key, &announced, &why, pass.now)
+                        .await?;
+                }
+                if pass.miss == Miss::Ignore {
+                    warn!(key = %key.key, error = %why, "refresh rejected; cache left as is");
+                    return Ok(Outcome::NotFound);
+                }
+                Err(AppError::BadGateway(why))
+            }
             Err(e) if pass.miss == Miss::Ignore => {
                 warn!(key = %key.key, error = %e, "refresh failed; cache left as is");
                 Ok(Outcome::NotFound)
@@ -678,6 +701,20 @@ impl ProxyEngine {
     fn ttl(&self, policy: CachePolicy) -> Option<Duration> {
         self.ttl_secs(policy).map(Duration::from_secs)
     }
+}
+
+/// The digests the upstream announced before any request, as one key: a
+/// quarantine holds while they do not change.
+fn announced<S: UpstreamStrategy>(s: &S, a: &S::Artifact) -> Option<String> {
+    let expected = s.expected_digests(a, &HeaderMap::new());
+    let mut known: Vec<String> = expected
+        .entries()
+        .iter()
+        .filter(|d| d.source == DigestSource::Known)
+        .map(|d| format!("{:?}:{}", d.algorithm, d.value).to_ascii_lowercase())
+        .collect();
+    known.sort();
+    (!known.is_empty()).then(|| known.join(","))
 }
 
 #[cfg(test)]

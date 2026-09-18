@@ -1740,3 +1740,71 @@ async fn me_policy_shows_only_own_rows() {
     let (status, _) = get_json(&me, None).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 }
+
+#[tokio::test]
+async fn pypi_row_dates_from_the_page_and_squats_on_the_normalized_name() {
+    use common::pypi::{basic, upload, wheel, wheel_name};
+    let up = spawn_server(SpawnOpts {
+        repositories: vec![hosted("py-up", RepositoryFormat::Pypi, Visibility::Public)],
+        ..Default::default()
+    })
+    .await;
+    let client = Client::new();
+    let resp = upload(
+        &client,
+        &up.base_url,
+        "py-up",
+        &basic("__token__", STATIC_TOKEN),
+        &wheel_name("Reqeusts", "1.0"),
+        &wheel("Reqeusts", "1.0", None),
+    )
+    .await;
+    assert_eq!(resp.status(), StatusCode::OK);
+    let a = spawn_server(SpawnOpts {
+        repositories: vec![proxy_with(
+            "pypi-proxy",
+            RepositoryFormat::Pypi,
+            &format!("{}/py-up/simple", up.base_url),
+            ProxyOpts {
+                dl_allow_private: true,
+                ..Default::default()
+            },
+        )],
+        policy: policy(
+            "pypi-proxy",
+            PolicyConfig {
+                min_release_age: Some("48h".parse().unwrap()),
+                typosquat: true,
+                ..Default::default()
+            },
+        ),
+        ..Default::default()
+    })
+    .await;
+    let page: Value = client
+        .get(format!("{}/pypi-proxy/simple/reqeusts/", a.base_url))
+        .header("Accept", "application/vnd.pypi.simple.v1+json")
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let uploaded = page["files"][0]["upload-time"].as_str().unwrap().to_string();
+    get_ok(&format!("{}/pypi-proxy/files/reqeusts/reqeusts-1.0-py3-none-any.whl", a.base_url), None).await;
+    get_ok(&format!("{}/pypi-proxy/files/reqeusts/reqeusts-1.0-py3-none-any.whl.metadata", a.base_url), None).await;
+    let rows = wait_for_policy_rows(&a, 1).await;
+    let row = &rows[0];
+    assert_eq!((row.format.as_str(), row.name.as_str()), ("pypi", "reqeusts"));
+    assert_eq!(row.version.as_deref(), Some("1.0"));
+    assert_eq!(row.date_source, "page", "dated by the page the file was listed on");
+    let published = chrono::DateTime::parse_from_rfc3339(row.published_at.as_deref().unwrap()).unwrap();
+    assert_eq!(published, chrono::DateTime::parse_from_rfc3339(&uploaded).unwrap());
+    assert!(row.digest.is_some());
+    let verdicts = policy_verdicts(&a).await;
+    assert_eq!(verdict_of(&verdicts, row.id, "min_release_age").0, "would_block");
+    let (verdict, reason) = verdict_of(&verdicts, row.id, "typosquat");
+    assert_eq!(verdict, "would_block", "{reason}");
+    assert!(reason.contains("requests"), "{reason}");
+    assert_eq!(policy_rows(&a).await.len(), 1, "a .metadata records nothing");
+}

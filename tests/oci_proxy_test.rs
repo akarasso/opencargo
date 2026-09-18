@@ -994,7 +994,9 @@ async fn blob_digest_mismatch_is_502_nothing_stored() {
     ))
     .await;
     assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
-    assert!(cache_rows(&a).await.is_empty(), "no row");
+    let rows = cache_rows(&a).await;
+    assert!(rows.iter().all(|row| row.0 == "quarantine"), "only the quarantine: {rows:?}");
+    assert_eq!(rows.len(), 1);
     assert!(cache_files(&a).await.is_empty(), "no file, no part left behind");
 }
 

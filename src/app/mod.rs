@@ -47,6 +47,7 @@ pub mod oci;
 pub mod permissions;
 pub mod place;
 pub mod promote;
+pub mod pypi;
 pub mod publish;
 pub mod publish_tail;
 pub mod reclaim;

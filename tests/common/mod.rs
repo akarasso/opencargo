@@ -8,6 +8,7 @@ pub mod contract;
 pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;
+pub mod pypi;
 pub mod upstream_tap;
 
 use std::collections::HashMap;
@@ -437,6 +438,7 @@ pub struct ProxyOpts {
     pub dl_allow_private: bool,
     pub upstream_auth: Option<UpstreamAuth>,
     pub token_realms: Vec<String>,
+    pub file_hosts: Vec<String>,
 }
 
 pub fn hosted(name: &str, fmt: RepositoryFormat, vis: Visibility) -> RepositoryConfig {
@@ -468,6 +470,7 @@ pub fn proxy_with(
         upstream_auth: opts.upstream_auth,
         token_realms: opts.token_realms,
         dl_allow_private: opts.dl_allow_private,
+        file_hosts: opts.file_hosts,
         ..Default::default()
     }
 }

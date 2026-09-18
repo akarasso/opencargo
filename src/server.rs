@@ -22,6 +22,7 @@ use crate::app::events::Announce;
 use crate::app::place::Placer;
 use crate::app::promote::PromoteVersion;
 use crate::app::publish::PublishVersion;
+use crate::app::pypi::PublishPypiFile;
 use crate::app::publish_tail::{PublishGate, PublishTail};
 use crate::app::reclaim::{ReclaimOrphans, ReclaimPolicy};
 use crate::ports::multipart::MultipartLedger;
@@ -46,6 +47,7 @@ use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
+use crate::ports::pypi::PypiFileStore;
 use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::SearchIndex;
 use crate::ports::tokens::{NewToken, TokenStore};
@@ -68,6 +70,8 @@ use crate::telemetry::webhooks::WebhookDispatcher;
 /// a deliberate hard cap rather than `DefaultBodyLimit::disable()` — switching
 /// storage to streaming (P1) is the follow-up that lets this grow safely.
 const MAX_BODY_BYTES: usize = 1024 * 1024 * 1024;
+
+const ARCHIVE_PERMITS: usize = 4;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -96,6 +100,11 @@ pub struct AppState {
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
     pub oci: Arc<dyn OciStore>,
+    pub pypi: Arc<dyn PypiFileStore>,
+    /// Bounds the archives inspected at once; inspection is CPU on a blocking thread.
+    pub archive_permits: Arc<tokio::sync::Semaphore>,
+    /// Parsed upstream PyPI pages, shared by the leaves and the policy facts.
+    pub pypi_pages: Arc<crate::registry::pypi::memo::PageMemo>,
     pub reclaim: Arc<dyn ReclaimStore>,
     pub referenced: Arc<dyn ReferencedKeys>,
     pub multipart: Arc<dyn MultipartLedger>,
@@ -144,6 +153,10 @@ impl AppState {
 
     pub fn publish_version(&self) -> PublishVersion {
         PublishVersion::new(self.packages.clone(), self.repos.clone(), self.placer())
+    }
+
+    pub fn publish_pypi_file(&self) -> PublishPypiFile {
+        PublishPypiFile::new(self.pypi.clone(), self.repos.clone(), self.placer())
     }
 
     pub fn promote_version(&self) -> PromoteVersion {
@@ -501,6 +514,9 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         packages: stores.packages(),
         search: stores.search(),
         oci: stores.oci(),
+        pypi: stores.pypi(),
+        archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
+        pypi_pages: Arc::new(crate::registry::pypi::memo::PageMemo::default()),
         reclaim: stores.reclaim(),
         referenced: stores.referenced(),
         multipart: stores.multipart(),
@@ -545,6 +561,7 @@ fn auth_state(
                 base_url: config.server.base_url.clone(),
             }),
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
+            Arc::new(crate::registry::pypi::auth_rules::PypiRouteRules),
         ],
         trusted_proxies: config.auth.trusted_proxies.clone(),
     })
@@ -935,6 +952,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::npm::routes::routes())
         .merge(crate::registry::cargo::routes::routes())
         .merge(crate::registry::go::routes::routes())
+        .merge(crate::registry::pypi::routes::routes())
         .merge(crate::registry::oci::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.
@@ -1243,6 +1261,7 @@ fn load_upstream_creds(
                 auth: repo.upstream_auth.clone(),
                 token_realms,
                 dl_allow_private: repo.dl_allow_private,
+                file_hosts: repo.file_hosts.clone(),
             },
         );
     }

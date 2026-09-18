@@ -102,6 +102,7 @@ pub fn shipped(format: Format) -> Option<&'static Lists> {
     static NPM: OnceLock<Lists> = OnceLock::new();
     static CRATES: OnceLock<Lists> = OnceLock::new();
     static GO: OnceLock<Lists> = OnceLock::new();
+    static PYPI: OnceLock<Lists> = OnceLock::new();
     Some(match format {
         Format::Npm => NPM.get_or_init(|| {
             Lists::parse(
@@ -121,7 +122,13 @@ pub fn shipped(format: Format) -> Option<&'static Lists> {
                 include_str!("../lists/known/go.txt"),
             )
         }),
-        Format::Oci | Format::Pypi => return None,
+        Format::Pypi => PYPI.get_or_init(|| {
+            Lists::parse(
+                include_str!("../lists/pypi.txt"),
+                include_str!("../lists/known/pypi.txt"),
+            )
+        }),
+        Format::Oci => return None,
     })
 }
 

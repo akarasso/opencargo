@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "025"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "025"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "025"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.
@@ -555,4 +555,31 @@ async fn oci_upload_progress_applies_on_fresh_and_legacy() {
     assert_eq!(got, want);
     assert!(got.contains("lease_token") && got.contains("received"));
     assert_eq!(count(&fresh, "SELECT COUNT(*) FROM oci_upload_segments").await, 0);
+}
+
+async fn apply_in(order: &[&str]) -> (TempDir, SqlitePool) {
+    let (tmp, pool) = pool().await;
+    legacy_migrate(&pool).await;
+    insert_repository(&pool, "py", "hosted", "pypi").await.unwrap();
+    for id in order {
+        sqlx::raw_sql(file_of(id)).execute(&pool).await.unwrap();
+    }
+    (tmp, pool)
+}
+
+/// 019 alone on a database that predates it, twice, and on either side of
+/// 025: the same objects whichever shipped first (A1 C2).
+#[tokio::test]
+async fn migration_019_is_order_independent_of_025_and_idempotent() {
+    let (_alone_tmp, alone) = apply_in(&["019", "019"]).await;
+    assert!(objects(&alone).await.contains(&"table pypi_files".to_string()));
+    let ran = run_all(&alone).await.unwrap();
+    assert!(outcomes(&ran, Outcome::Adopted).contains(&"019"), "its sentinel is there");
+
+    let (_a_tmp, before) = apply_in(&["025", "019"]).await;
+    let (_b_tmp, after) = apply_in(&["019", "025"]).await;
+    assert_eq!(objects(&before).await, objects(&after).await);
+    let prefixes = "SELECT COUNT(*) FROM storage_prefixes WHERE prefix = 'pypi/py'";
+    assert_eq!(count(&before, prefixes).await, 1);
+    assert_eq!(count(&after, prefixes).await, 1);
 }

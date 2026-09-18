@@ -2267,3 +2267,296 @@ macro_rules! reclaim_contract {
 
 #[allow(unused_imports)]
 pub(crate) use reclaim_contract;
+
+/// What `pypi_contract!` needs: port 15 and the ports its rows answer to.
+pub struct PypiHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub pypi: Arc<dyn opencargo::ports::pypi::PypiFileStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+    pub referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+    _keep: Box<dyn Any + Send>,
+}
+
+impl PypiHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        pypi: Arc<dyn opencargo::ports::pypi::PypiFileStore>,
+        reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+        referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            pypi,
+            reclaim,
+            referenced,
+            _keep: keep,
+        }
+    }
+}
+
+/// `pypi_contract!(name, opener)`: port 15 answers alike on every adapter,
+/// and the keys its rows reference are the ones port 22 refuses to claim and
+/// port 23 lists.
+#[allow(unused_macros)]
+macro_rules! pypi_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, TimeZone, Utc};
+            use ::futures_util::TryStreamExt;
+            use ::opencargo::domain::{layout, Format, RepoKind, RepoSpec, Repository, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::pypi::{NewPypiFile, Published};
+            use ::opencargo::ports::reclaim::{Claim, PinToken, Pinned};
+            use ::std::time::Duration;
+
+            const GRACE: Duration = Duration::from_secs(3600);
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 18, hour, 0, 0).unwrap()
+            }
+
+            async fn repo(h: &PypiHandles, name: &str) -> (Repository, String) {
+                let repo = h
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            name,
+                            kind: RepoKind::Hosted,
+                            format: Format::Pypi,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                let incarnation = h.repos.incarnation(repo.id).await.unwrap().unwrap();
+                (repo, layout::incarnation_prefix(&incarnation))
+            }
+
+            async fn pins(h: &PypiHandles, prefix: &str, filename: &str, metadata: bool) -> Vec<PinToken> {
+                let mut keys = vec![format!("{prefix}/demo/ab/{filename}")];
+                if metadata {
+                    keys.push(format!("{prefix}/demo/cd/{filename}.metadata"));
+                }
+                match h.reclaim.pin(prefix, &keys, at(9)).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("{prefix} is live"),
+                }
+            }
+
+            fn file<'a>(repo: i64, version: &'a str, filename: &'a str, pins: &'a [PinToken]) -> NewPypiFile<'a> {
+                NewPypiFile {
+                    repository: repo,
+                    project: "demo",
+                    summary: Some("a demo"),
+                    version,
+                    metadata_json: "{}",
+                    filename,
+                    packagetype: "bdist_wheel",
+                    sha256: "ab",
+                    size: 3,
+                    metadata_sha256: (pins.len() > 1).then_some("cd"),
+                    requires_python: Some(">=3.8"),
+                    pins,
+                    now: at(2),
+                }
+            }
+
+            async fn publish(h: &PypiHandles, repo: i64, prefix: &str, version: &str, filename: &str) -> Published {
+                let tokens = pins(h, prefix, filename, true).await;
+                h.pypi.publish_file(&file(repo, version, filename, &tokens)).await.unwrap()
+            }
+
+            async fn listed(h: &PypiHandles) -> Vec<String> {
+                h.referenced
+                    .referenced(GRACE, at(5))
+                    .map_ok(|r| r.key)
+                    .try_collect()
+                    .await
+                    .unwrap()
+            }
+
+            #[tokio::test]
+            async fn a_file_lands_its_release_and_records_the_keys_it_was_given() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let tokens = pins(&h, &prefix, "demo-1.0-py3-none-any.whl", true).await;
+                let first = h
+                    .pypi
+                    .publish_file(&file(r.id, "1", "demo-1.0-py3-none-any.whl", &tokens))
+                    .await
+                    .unwrap();
+                assert!(first.version_created);
+                assert_eq!(first.file.key, tokens[0].physical_key);
+                assert_eq!(first.file.metadata_key.as_deref(), Some(tokens[1].physical_key.as_str()));
+                assert_eq!(first.file.uploaded_at, at(2), "the caller's clock, read back as given");
+                assert_eq!((first.file.project.as_str(), first.file.version.as_str()), ("demo", "1"));
+                let second = publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await;
+                assert!(!second.version_created, "one release, two files");
+                assert_eq!(second.file.version_id, first.file.version_id);
+                let files = h.pypi.project_files(r.id, "demo").await.unwrap();
+                assert_eq!(
+                    files.iter().map(|f| f.filename.as_str()).collect::<Vec<_>>(),
+                    ["demo-1.0-py3-none-any.whl", "demo-1.0.tar.gz"]
+                );
+                assert_eq!(h.pypi.list_projects(r.id).await.unwrap(), ["demo"]);
+                let found = h.pypi.file_by_name(r.id, "demo-1.0.tar.gz").await.unwrap().unwrap();
+                assert_eq!(found, second.file);
+                assert!(h.pypi.file_by_name(r.id, "nope-1.0.tar.gz").await.unwrap().is_none());
+            }
+
+            #[tokio::test]
+            async fn a_second_file_of_one_name_is_a_conflict_that_writes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await;
+                let tokens = pins(&h, &prefix, "demo-1.0.tar.gz", false).await;
+                let refused = h.pypi.publish_file(&file(r.id, "2", "demo-1.0.tar.gz", &tokens)).await;
+                assert!(matches!(refused, Err(StoreError::Conflict)), "{refused:?}");
+                let files = h.pypi.project_files(r.id, "demo").await.unwrap();
+                assert_eq!(files.len(), 1);
+                assert_eq!(files[0].version, "1", "the refused file created no release");
+            }
+
+            #[tokio::test]
+            async fn two_concurrent_publishes_of_one_filename_yield_one_conflict() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let a = pins(&h, &prefix, "demo-1.0.tar.gz", false).await;
+                let b = pins(&h, &prefix, "demo-1.0.tar.gz", false).await;
+                let (fa, fb) = (file(r.id, "1", "demo-1.0.tar.gz", &a), file(r.id, "1", "demo-1.0.tar.gz", &b));
+                let (x, y) = ::tokio::join!(h.pypi.publish_file(&fa), h.pypi.publish_file(&fb));
+                let outcomes = [x, y];
+                assert_eq!(outcomes.iter().filter(|o| o.is_ok()).count(), 1);
+                assert_eq!(
+                    outcomes.iter().filter(|o| matches!(o, Err(StoreError::Conflict))).count(),
+                    1,
+                    "{outcomes:?}"
+                );
+            }
+
+            #[tokio::test]
+            async fn a_revoked_pin_is_superseded_and_writes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let keys = [format!("{prefix}/demo/ab/w.whl"), format!("{prefix}/demo/cd/w.whl.metadata")];
+                let Pinned::Tokens(tokens) = h.reclaim.pin(&prefix, &keys, at(2)).await.unwrap() else {
+                    panic!("{prefix} is live")
+                };
+                h.reclaim.enqueue(std::slice::from_ref(&tokens[1].physical_key), at(1)).await.unwrap();
+                assert!(matches!(
+                    h.reclaim.claim(&tokens[1].physical_key, GRACE, at(5), at(6)).await.unwrap(),
+                    Claim::Claimed(_)
+                ));
+                let refused = h
+                    .pypi
+                    .publish_file(&file(r.id, "1", "demo-1.0-py3-none-any.whl", &tokens))
+                    .await;
+                match refused {
+                    Err(StoreError::Superseded(keys)) => assert_eq!(keys, vec![tokens[1].physical_key.clone()]),
+                    other => panic!("{other:?}"),
+                }
+                assert!(h.pypi.project_files(r.id, "demo").await.unwrap().is_empty());
+                assert!(h.pypi.list_projects(r.id).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_yank_moves_the_release_and_every_file_together() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await;
+                publish(&h, r.id, &prefix, "1", "demo-1.0-py3-none-any.whl").await;
+                publish(&h, r.id, &prefix, "2", "demo-2.0.tar.gz").await;
+                h.pypi.set_release_yanked(r.id, "demo", "1", Some("broken"), true, at(3)).await.unwrap();
+                let files = h.pypi.project_files(r.id, "demo").await.unwrap();
+                for f in &files {
+                    let yanked = f.version == "1";
+                    assert_eq!(f.yanked, yanked, "{}", f.filename);
+                    assert_eq!(f.yanked_reason.as_deref(), yanked.then_some("broken"));
+                }
+                h.pypi.set_release_yanked(r.id, "demo", "1", None, false, at(4)).await.unwrap();
+                assert!(h
+                    .pypi
+                    .project_files(r.id, "demo")
+                    .await
+                    .unwrap()
+                    .iter()
+                    .all(|f| !f.yanked && f.yanked_reason.is_none()));
+                assert!(matches!(
+                    h.pypi.set_release_yanked(r.id, "demo", "9", None, true, at(4)).await,
+                    Err(StoreError::NotFound)
+                ));
+            }
+
+            #[tokio::test]
+            async fn a_key_this_port_references_metadata_included_is_referenced_for_claim_and_listed() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let landed = publish(&h, r.id, &prefix, "1", "demo-1.0-py3-none-any.whl").await.file;
+                let metadata = landed.metadata_key.clone().unwrap();
+                let listing = listed(&h).await;
+                for key in [&landed.key, &metadata] {
+                    assert!(listing.contains(key), "{key} listed");
+                    h.reclaim.enqueue(std::slice::from_ref(key), at(1)).await.unwrap();
+                    assert_eq!(
+                        h.reclaim.claim(key, GRACE, at(5), at(6)).await.unwrap(),
+                        Claim::Referenced,
+                        "{key}"
+                    );
+                }
+            }
+
+            #[tokio::test]
+            async fn deleting_a_release_enqueues_every_key_it_held_and_deletes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                let wheel = publish(&h, r.id, &prefix, "1", "demo-1.0-py3-none-any.whl").await.file;
+                let sdist = publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await.file;
+                let kept = publish(&h, r.id, &prefix, "2", "demo-2.0.tar.gz").await.file;
+                let mut want = vec![
+                    wheel.key.clone(),
+                    wheel.metadata_key.clone().unwrap(),
+                    sdist.key.clone(),
+                    sdist.metadata_key.clone().unwrap(),
+                ];
+                want.sort();
+                let released = h.pypi.delete_release(r.id, "demo", "1", at(3)).await.unwrap();
+                assert_eq!(released, want);
+                assert!(matches!(
+                    h.pypi.delete_release(r.id, "demo", "1", at(3)).await,
+                    Err(StoreError::NotFound)
+                ));
+                let mut due: Vec<String> =
+                    h.reclaim.due(GRACE, at(5), 50).await.unwrap().into_iter().map(|c| c.key).collect();
+                due.sort();
+                assert_eq!(due, want, "enqueued in the delete's own transaction");
+                for key in &want {
+                    assert!(
+                        matches!(h.reclaim.claim(key, GRACE, at(5), at(6)).await.unwrap(), Claim::Claimed(_)),
+                        "{key}"
+                    );
+                }
+                assert_eq!(h.pypi.project_files(r.id, "demo").await.unwrap(), vec![kept.clone()]);
+                let rest = h.pypi.delete_project_files(r.id, "demo", at(3)).await.unwrap();
+                assert!(rest.contains(&kept.key) && rest.contains(kept.metadata_key.as_ref().unwrap()));
+                assert!(h.pypi.list_projects(r.id).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_repository_holding_files_refuses_to_retire() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "py").await;
+                publish(&h, r.id, &prefix, "1", "demo-1.0.tar.gz").await;
+                assert!(matches!(h.repos.retire("py", at(3)).await, Err(StoreError::Conflict)));
+                assert_eq!(h.pypi.list_projects(r.id).await.unwrap(), ["demo"]);
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use pypi_contract;

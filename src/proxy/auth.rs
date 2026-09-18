@@ -50,6 +50,9 @@ pub struct UpstreamCreds {
     pub auth: Option<UpstreamAuth>,
     pub token_realms: Vec<Url>,
     pub dl_allow_private: bool,
+    /// Hosts an upstream's content may point downloads at; empty is the
+    /// format's default.
+    pub file_hosts: Vec<String>,
 }
 
 /// Where a proxy member's credentials come from.

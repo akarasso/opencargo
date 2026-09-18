@@ -1,7 +1,8 @@
 Name lists for the typosquat rule (src/policy/rules/typosquat.rs), regenerated
 by scripts/toplists.sh; each file's first line records its source and fetch
 date. Names are normalised as policy::distance::normalize does (lowercase,
-`_` as `-`, Go major suffixes stripped), deduplicated and sorted.
+`_` as `-`, Go major suffixes stripped, PyPI names as PEP 503 spells them),
+deduplicated and sorted.
 
 npm.txt          The `topDownload` export of the npm package `npm-high-impact`
                  (Titus Wormer, https://github.com/wooorm/npm-high-impact),
@@ -20,8 +21,12 @@ go.txt           https://packages.ecosyste.ms, registry `proxy.golang.org`,
                  major-suffix normalisation. Licence: CC BY-SA 4.0
                  (https://ecosyste.ms, "Data licensed under CC BY-SA 4.0").
 
+pypi.txt         https://packages.ecosyste.ms, registry `pypi.org`, sorted by
+                 downloads, first 5 000. Licence: CC BY-SA 4.0, attribution
+                 as above.
+
 known/*.txt      https://packages.ecosyste.ms, registries `npmjs.org`,
-                 `crates.io` and `proxy.golang.org`, sorted by dependent
+                 `crates.io`, `proxy.golang.org` and `pypi.org`, sorted by dependent
                  packages, ranks 1-20 000: names the rule never compares.
                  Licence: CC BY-SA 4.0, attribution as above.
 

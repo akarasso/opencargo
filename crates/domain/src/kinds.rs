@@ -71,15 +71,13 @@ impl Format {
             Format::Npm => Some("npm"),
             Format::Cargo => Some("crates.io"),
             Format::Go => Some("Go"),
-            Format::Oci | Format::Pypi => None,
+            Format::Pypi => Some("PyPI"),
+            Format::Oci => None,
         }
     }
 
-    pub const fn supports_kind(self, kind: RepoKind) -> bool {
-        !matches!(
-            (self, kind),
-            (Format::Pypi, RepoKind::Proxy | RepoKind::Group)
-        )
+    pub const fn supports_kind(self, _kind: RepoKind) -> bool {
+        true
     }
 }
 
@@ -144,12 +142,12 @@ mod tests {
         for format in Format::ALL {
             assert_eq!(format.as_str().parse::<Format>().unwrap(), format);
             for kind in RepoKind::ALL {
-                let expected = format != Format::Pypi || kind == RepoKind::Hosted;
-                assert_eq!(format.supports_kind(kind), expected, "{format:?}/{kind:?}");
+                assert!(format.supports_kind(kind), "{format:?}/{kind:?}");
             }
         }
         assert_eq!(Format::Cargo.osv_ecosystem(), Some("crates.io"));
         assert_eq!(Format::Oci.osv_ecosystem(), None);
+        assert_eq!(Format::Pypi.osv_ecosystem(), Some("PyPI"));
 
         for visibility in Visibility::ALL {
             assert_eq!(

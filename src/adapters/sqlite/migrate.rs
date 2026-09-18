@@ -139,6 +139,7 @@ pub const MIGRATIONS: &[Migration] = &[
         "018_oci_upload_progress.sql",
         Sentinel::Object("idx_oci_uploads_touched")
     ),
+    sql_migration!("019", "019_pypi.sql", Sentinel::Object("idx_pypi_files_package")),
     sql_migration!(
         "025",
         "025_reclaim.sql",

@@ -371,6 +371,9 @@ pub struct RepositoryConfig {
     /// Let an upstream-chosen download URL point at a private IP literal.
     #[serde(default)]
     pub dl_allow_private: bool,
+    /// Hosts a PyPI upstream's pages may point file downloads at.
+    #[serde(default)]
+    pub file_hosts: Vec<String>,
 }
 
 /// Aliases kept so existing config and test code keep compiling; the types
