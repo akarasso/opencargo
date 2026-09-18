@@ -89,7 +89,8 @@ async fn main() -> anyhow::Result<()> {
 
             tokio::spawn(opencargo::app::sweep_storage::start_storage_sweep(
                 opencargo::app::sweep_storage::SweepStorage::new(app_state.storage.clone())
-                    .reclaiming(app_state.reclaim_orphans()),
+                    .reclaiming(app_state.reclaim_orphans())
+                    .reaping_uploads(app_state.oci.clone()),
                 app_state.clock.clone(),
             ));
 

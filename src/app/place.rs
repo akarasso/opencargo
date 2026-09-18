@@ -28,6 +28,13 @@ pub enum Source {
     Copy(String),
     /// A private object this call wrote; moved into place, not copied.
     Draft(String),
+    /// Private objects that stay readable while the call runs, streamed one
+    /// after the other. A generation already holding `size` bytes is a
+    /// reused one, whose content the key names: it is not written again.
+    Segments { keys: Vec<String>, size: u64 },
+    /// A key a committed row already holds: pinned so the commit is fenced,
+    /// never written.
+    Existing,
 }
 
 #[derive(Debug, Clone)]
@@ -103,37 +110,75 @@ impl Placer {
         }
     }
 
-    async fn write(&self, source: &Source, to: &str) -> Result<(), StorageError> {
+    /// Whether this call wrote `to`: a skipped or existing entry is not its
+    /// residue.
+    async fn write(&self, source: &Source, to: &str) -> Result<bool, StorageError> {
         match source {
-            Source::Bytes(bytes) => self.storage.put(to, bytes.clone()).await,
-            Source::Copy(from) => self.storage.copy_object(from, to).await,
-            Source::Draft(draft) => self.storage.relocate(draft, to).await,
+            Source::Bytes(bytes) => self.storage.put(to, bytes.clone()).await.map(|()| true),
+            Source::Copy(from) => self.storage.copy_object(from, to).await.map(|()| true),
+            Source::Draft(draft) => self.storage.relocate(draft, to).await.map(|()| true),
+            Source::Segments { keys, size } => {
+                if self.storage.stat(to).await?.is_some_and(|m| m.size == *size) {
+                    return Ok(false);
+                }
+                self.concat(keys, to).await.map(|()| true)
+            }
+            Source::Existing => Ok(false),
         }
+    }
+
+    /// What a draft's generation committed, the size a replay checks.
+    async fn size_of(&self, source: &Source, key: &str) -> Option<u64> {
+        match source {
+            Source::Draft(_) => self.storage.stat(key).await.ok().flatten().map(|m| m.size),
+            _ => None,
+        }
+    }
+
+    async fn concat(&self, keys: &[String], to: &str) -> Result<(), StorageError> {
+        use tokio::io::AsyncReadExt;
+        let mut writer = self.storage.writer(to).await?;
+        let mut buf = vec![0u8; 1 << 20];
+        for key in keys {
+            let mut body = self.storage.read_stream(key).await?.body;
+            loop {
+                let n = body.read(&mut buf).await.map_err(|_| StorageError::Unavailable)?;
+                if n == 0 {
+                    break;
+                }
+                writer.reserve(n).await?;
+                writer.write(Bytes::copy_from_slice(&buf[..n])).await?;
+            }
+        }
+        writer.commit().await?;
+        Ok(())
     }
 
     /// T3: a source that survives is read again; a draft that was moved is
     /// copied back from the revoked generation only when `stat` shows it
-    /// whole; otherwise the entry cannot be replayed.
+    /// whole; otherwise (`None`) the entry cannot be replayed.
     async fn rewrite(
         &self,
         source: &Source,
         revoked: &str,
         size: Option<u64>,
         to: &str,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<bool>, StorageError> {
         match source {
-            Source::Bytes(_) | Source::Copy(_) => self.write(source, to).await.map(|()| true),
+            Source::Bytes(_) | Source::Copy(_) | Source::Segments { .. } | Source::Existing => {
+                self.write(source, to).await.map(Some)
+            }
             Source::Draft(_) => {
                 let whole = match (self.storage.stat(revoked).await?, size) {
                     (Some(meta), Some(size)) => meta.size == size,
                     _ => false,
                 };
                 if !whole {
-                    return Ok(false);
+                    return Ok(None);
                 }
                 match self.storage.copy_object(revoked, to).await {
-                    Ok(()) => Ok(true),
-                    Err(StorageError::NotFound) => Ok(false),
+                    Ok(()) => Ok(Some(true)),
+                    Err(StorageError::NotFound) => Ok(None),
                     Err(e) => Err(e),
                 }
             }
@@ -167,12 +212,15 @@ impl Placer {
         let mut written: Vec<String> = Vec::new();
         let mut sizes: Vec<Option<u64>> = vec![None; entries.len()];
         for (i, (entry, token)) in entries.iter().zip(&tokens).enumerate() {
-            if let Err(e) = self.write(&entry.source, &token.physical_key).await {
-                self.enqueue(&written, now).await;
-                return Err(e.into());
+            match self.write(&entry.source, &token.physical_key).await {
+                Ok(true) => written.push(token.physical_key.clone()),
+                Ok(false) => {}
+                Err(e) => {
+                    self.enqueue(&written, now).await;
+                    return Err(e.into());
+                }
             }
-            written.push(token.physical_key.clone());
-            sizes[i] = self.storage.stat(&token.physical_key).await.ok().flatten().map(|m| m.size);
+            sizes[i] = self.size_of(&entry.source, &token.physical_key).await;
         }
 
         for attempt in 0..ATTEMPTS {
@@ -196,12 +244,14 @@ impl Placer {
                             .rewrite(&entries[i].source, &tokens[i].physical_key, sizes[i], &token.physical_key)
                             .await;
                         match replayed {
-                            Ok(true) => {
-                                written.push(token.physical_key.clone());
-                                sizes[i] = self.storage.stat(&token.physical_key).await.ok().flatten().map(|m| m.size);
+                            Ok(Some(wrote)) => {
+                                if wrote {
+                                    written.push(token.physical_key.clone());
+                                }
+                                sizes[i] = self.size_of(&entries[i].source, &token.physical_key).await;
                                 tokens[i] = token;
                             }
-                            Ok(false) => {
+                            Ok(None) => {
                                 let mut residue = unreferenced(&written, &revoked);
                                 residue.push(token.physical_key.clone());
                                 self.enqueue(&residue, now).await;

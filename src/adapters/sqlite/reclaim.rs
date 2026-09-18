@@ -25,14 +25,11 @@ pub(crate) const REFERENCED: &str = "
     UNION ALL
     SELECT storage_path, 0 FROM proxy_cache_entries WHERE storage_path IS NOT NULL
     UNION ALL
-    SELECT 'oci/' || r.name || '/_blobs/sha256/' || replace(b.digest, 'sha256:', ''), 0
-        FROM oci_blobs b JOIN repositories r ON r.id = b.repository_id
+    SELECT storage_key, 0 FROM oci_blobs WHERE storage_key IS NOT NULL
     UNION ALL
-    SELECT 'oci/' || r.name || '/' || m.name || '/manifests/' || m.name || '/sha256/'
-           || replace(m.digest, 'sha256:', ''), 0
-        FROM oci_manifests m JOIN repositories r ON r.id = m.repository_id
+    SELECT storage_key, 0 FROM oci_manifests WHERE storage_key IS NOT NULL
     UNION ALL
-    SELECT 'oci/_uploads/' || id, 1 FROM oci_uploads";
+    SELECT COALESCE(segment_prefix, 'oci/_uploads/' || id), 1 FROM oci_uploads";
 
 /// `?1` is referenced, or (for a prefix) something under it is, or a
 /// protecting key covers it.

@@ -1134,9 +1134,12 @@ pub struct TailHandles {
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
     pub oci: Arc<dyn OciStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
     /// The repository an image's rows hang off; `OciStore` keys on it and
     /// carries no release of its own.
     pub repository: i64,
+    /// Its incarnation prefix, the root of every key its pins name.
+    pub prefix: String,
     /// A published version both the graph and the scan record hang off: the
     /// schema declares those foreign keys, so the suite states what it needs
     /// through `PackageStore` rather than writing orphan rows.
@@ -1158,7 +1161,9 @@ pub struct TailPorts {
     pub deps: Arc<dyn DependencyStore>,
     pub vulns: Arc<dyn VulnStore>,
     pub oci: Arc<dyn OciStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
     pub repository: i64,
+    pub prefix: String,
     pub release: Release,
 }
 
@@ -1170,7 +1175,9 @@ impl TailHandles {
             deps: ports.deps,
             vulns: ports.vulns,
             oci: ports.oci,
+            reclaim: ports.reclaim,
             repository: ports.repository,
+            prefix: ports.prefix,
             release: ports.release,
             _keep: keep,
         }
@@ -1196,7 +1203,12 @@ macro_rules! cascade_contract {
             use ::opencargo::domain::{RuleVerdict, ScanResult, Verdict, VulnDetail};
             use ::opencargo::ports::audit::NewAuditEntry;
             use ::opencargo::ports::deps::NewDependency;
-            use ::opencargo::ports::oci::{NewManifest, Orphaned};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::oci::{
+                BeginComplete, Finished, LeaseToken, NewBlob, NewManifest, Orphaned, Segment,
+                SegmentClaim,
+            };
+            use ::opencargo::ports::reclaim::{PinToken, Pinned};
             use ::opencargo::ports::policy::{NewResolution, ReportFilter};
 
             fn at(hour: u32) -> DateTime<Utc> {
@@ -1450,122 +1462,303 @@ macro_rules! cascade_contract {
                 assert!(handles.deps.of_version(handles.release.version + 1).await.unwrap().is_empty());
             }
 
-            fn manifest<'a>(
-                repository: i64,
-                digest: &'a str,
-                blobs: &'a [String],
-                tag: Option<&'a str>,
-            ) -> NewManifest<'a> {
-                NewManifest {
-                    repository,
-                    name: "app",
-                    digest,
-                    content_type: "application/vnd.oci.image.manifest.v1+json",
-                    size: 2,
-                    blobs,
-                    tag,
+            const LEASE: ::std::time::Duration = ::std::time::Duration::from_secs(60);
+
+            async fn pins(handles: &TailHandles, keys: &[&str]) -> Vec<PinToken> {
+                let keys: Vec<String> = keys.iter().map(|k| format!("{}/{k}", handles.prefix)).collect();
+                match handles.reclaim.pin(&handles.prefix, &keys, at(23)).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("the repository is live"),
                 }
+            }
+
+            fn new_blob(repository: i64, digest: &str) -> NewBlob<'_> {
+                NewBlob {
+                    repository,
+                    digest,
+                    size: 5,
+                    content_type: "application/octet-stream",
+                }
+            }
+
+            async fn session(handles: &TailHandles, id: &str) -> LeaseToken {
+                let prefix = format!("{}/_uploads/{id}", handles.prefix);
+                handles.oci.start_upload(id, handles.repository, "app", &prefix, at(8)).await.unwrap();
+                match handles.oci.begin_complete(id, at(8), LEASE).await.unwrap() {
+                    BeginComplete::Lease(lease) => lease,
+                    other => panic!("a fresh session is free: {other:?}"),
+                }
+            }
+
+            /// A blob as a completed upload records it: its row names the
+            /// pinned key.
+            async fn blob(handles: &TailHandles, digest: &str) -> String {
+                let lease = session(handles, digest).await;
+                let pin = pins(handles, &[digest]).await.remove(0);
+                let finished = handles
+                    .oci
+                    .finish_upload(digest, &lease, &pin, new_blob(handles.repository, digest), at(8))
+                    .await
+                    .unwrap();
+                assert_eq!(finished, Finished::Recorded(pin.physical_key.clone()));
+                pin.physical_key
+            }
+
+            async fn put(handles: &TailHandles, digest: &str, blobs: &[String], tag: Option<&str>) -> Result<String, StoreError> {
+                let mut keys = vec![digest];
+                keys.extend(blobs.iter().map(String::as_str));
+                let mut tokens = pins(handles, &keys).await;
+                let pin = tokens.remove(0);
+                let pinned: Vec<(String, PinToken)> = blobs.iter().cloned().zip(tokens).collect();
+                handles
+                    .oci
+                    .put_manifest(
+                        NewManifest {
+                            repository: handles.repository,
+                            name: "app",
+                            digest,
+                            content_type: "application/vnd.oci.image.manifest.v1+json",
+                            size: 2,
+                            pin: &pin,
+                            blobs: &pinned,
+                            children: &[],
+                            tag,
+                        },
+                        at(9),
+                    )
+                    .await
+                    .map(|()| pin.physical_key)
+            }
+
+            async fn queued(handles: &TailHandles) -> Vec<String> {
+                let mut keys: Vec<String> = handles
+                    .reclaim
+                    .due(::std::time::Duration::ZERO, at(23), 100)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.key)
+                    .collect();
+                keys.sort();
+                keys
             }
 
             /// The orphan set is the point of the method: a layer another
             /// manifest still lists is not in it, and a layer nothing lists
-            /// any more is — reported, never deleted from storage, because
-            /// the store may not touch a file.
+            /// any more is — its key enqueued with the manifest's, in the
+            /// same transaction, and nothing deleted (M2).
             #[tokio::test]
-            async fn a_manifest_delete_reports_only_the_layers_it_orphaned() {
+            async fn a_manifest_delete_enqueues_only_the_layers_it_orphaned() {
                 let handles = $open().await;
                 let repo = handles.repository;
                 let (shared, only) = ("sha256:cc".to_string(), "sha256:bb".to_string());
-                handles
-                    .oci
-                    .put_manifest(manifest(repo, "sha256:aa", &[only.clone(), shared.clone()], Some("v1")))
-                    .await
-                    .unwrap();
-                handles
-                    .oci
-                    .put_manifest(manifest(repo, "sha256:dd", std::slice::from_ref(&shared), Some("v2")))
-                    .await
-                    .unwrap();
+                let only_key = blob(&handles, &only).await;
+                blob(&handles, &shared).await;
+                let manifest_key = put(&handles, "sha256:aa", &[only.clone(), shared.clone()], Some("v1")).await.unwrap();
+                put(&handles, "sha256:dd", std::slice::from_ref(&shared), Some("v2")).await.unwrap();
+                assert!(queued(&handles).await.is_empty());
 
                 let orphaned = handles
                     .oci
-                    .delete_manifest(repo, "app", "sha256:aa")
+                    .delete_manifest(repo, "app", "sha256:aa", at(10))
                     .await
                     .unwrap()
                     .expect("the manifest was there");
 
-                assert_eq!(orphaned, Orphaned { blob_digests: vec![only] });
+                assert_eq!(orphaned, Orphaned { blob_digests: vec![only.clone()] });
+                let mut want = vec![manifest_key, only_key];
+                want.sort();
+                assert_eq!(queued(&handles).await, want);
                 assert!(handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().is_none());
+                assert!(handles.oci.blob(repo, &only).await.unwrap().is_none());
                 assert!(handles.oci.digest_for_ref(repo, "app", "v1").await.unwrap().is_none());
                 assert_eq!(handles.oci.blob_references(repo, &shared).await.unwrap(), 1);
                 assert_eq!(handles.oci.tags(repo, "app").await.unwrap(), vec!["v2".to_string()]);
             }
 
-            /// Nothing to delete is `None`, not an empty orphan set: the
-            /// layer above turns one into a 404 and the other into a 202.
+            /// Nothing to delete is `None`, not an empty orphan set, and it
+            /// enqueues nothing.
             #[tokio::test]
             async fn deleting_an_unknown_manifest_reports_nothing() {
                 let handles = $open().await;
                 assert!(handles
                     .oci
-                    .delete_manifest(handles.repository, "app", "sha256:aa")
+                    .delete_manifest(handles.repository, "app", "sha256:aa", at(10))
                     .await
                     .unwrap()
                     .is_none());
+                assert!(queued(&handles).await.is_empty());
             }
 
             /// A re-push replaces the link rows wholesale, so a layer the new
-            /// manifest no longer lists stops being referenced — otherwise a
-            /// dropped layer would be undeletable for ever.
+            /// manifest no longer lists stops being referenced.
             #[tokio::test]
             async fn a_re_push_replaces_the_layers_and_moves_the_tag() {
                 let handles = $open().await;
                 let repo = handles.repository;
                 let (old, new) = ("sha256:bb".to_string(), "sha256:cc".to_string());
-                handles
-                    .oci
-                    .put_manifest(manifest(repo, "sha256:aa", std::slice::from_ref(&old), Some("v1")))
-                    .await
-                    .unwrap();
-                handles
-                    .oci
-                    .put_manifest(manifest(repo, "sha256:aa", std::slice::from_ref(&new), Some("v1")))
-                    .await
-                    .unwrap();
+                blob(&handles, &old).await;
+                blob(&handles, &new).await;
+                put(&handles, "sha256:aa", std::slice::from_ref(&old), Some("v1")).await.unwrap();
+                put(&handles, "sha256:aa", std::slice::from_ref(&new), Some("v1")).await.unwrap();
 
                 assert_eq!(handles.oci.blob_references(repo, &old).await.unwrap(), 0);
                 assert_eq!(handles.oci.blob_references(repo, &new).await.unwrap(), 1);
                 assert_eq!(handles.oci.tags(repo, "app").await.unwrap(), vec!["v1".to_string()]);
             }
 
-            /// The ledger is what tells a chunk which repository it belongs
-            /// to, and a completed upload closes it in the same breath as it
-            /// records the blob.
+            /// A pin is not proof of existence: a manifest listing a blob
+            /// with no row writes nothing (N4), and neither does one whose
+            /// pin was revoked (M1).
             #[tokio::test]
-            async fn an_upload_is_owned_until_it_completes() {
+            async fn put_manifest_with_an_unknown_blob_or_a_revoked_pin_writes_nothing() {
                 let handles = $open().await;
                 let repo = handles.repository;
-                handles.oci.start_upload("u1", repo, "app").await.unwrap();
-                assert_eq!(handles.oci.upload_owner("u1").await.unwrap(), Some(repo));
+                let unknown = put(&handles, "sha256:aa", &["sha256:bb".to_string()], Some("v1")).await;
+                assert!(matches!(unknown, Err(StoreError::NotFound)), "{unknown:?}");
+                assert!(handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().is_none());
 
-                handles
+                let pin = pins(&handles, &["sha256:aa"]).await.remove(0);
+                handles.reclaim.enqueue(std::slice::from_ref(&pin.physical_key), at(1)).await.unwrap();
+                let late = at(23) + ::chrono::Duration::days(2);
+                handles.reclaim.claim(&pin.physical_key, ::std::time::Duration::from_secs(1), late, late).await.unwrap();
+                let revoked = handles
                     .oci
-                    .complete_upload(
-                        "u1",
-                        ::opencargo::ports::oci::NewBlob {
+                    .put_manifest(
+                        NewManifest {
                             repository: repo,
-                            digest: "sha256:bb",
-                            size: 5,
-                            content_type: "application/octet-stream",
+                            name: "app",
+                            digest: "sha256:aa",
+                            content_type: "application/json",
+                            size: 2,
+                            pin: &pin,
+                            blobs: &[],
+                            children: &[],
+                            tag: Some("v1"),
                         },
+                        at(9),
                     )
-                    .await
-                    .unwrap();
+                    .await;
+                assert!(matches!(revoked, Err(StoreError::Superseded(ref k)) if *k == vec![pin.physical_key.clone()]), "{revoked:?}");
+                assert!(handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().is_none());
+                assert!(handles.oci.digest_for_ref(repo, "app", "v1").await.unwrap().is_none());
+            }
 
-                assert!(handles.oci.upload_owner("u1").await.unwrap().is_none());
-                assert_eq!(handles.oci.blob(repo, "sha256:bb").await.unwrap().unwrap().size, 5);
-                assert!(handles.oci.delete_blob(repo, "sha256:bb").await.unwrap());
-                assert!(!handles.oci.delete_blob(repo, "sha256:bb").await.unwrap());
+            /// Chunks claim their offset by compare-and-set: one winner per
+            /// offset, none while a completion holds the lease, and a cap.
+            #[tokio::test]
+            async fn a_segment_offset_has_one_winner() {
+                let handles = $open().await;
+                let prefix = format!("{}/_uploads/u1", handles.prefix);
+                handles.oci.start_upload("u1", handles.repository, "app", &prefix, at(8)).await.unwrap();
+                let seg = |start: u64, n: &str| Segment { start, len: 3, key: format!("{prefix}/{start:020}-{n}") };
+                assert_eq!(handles.oci.claim_segment("u1", &seg(0, "a"), 2, at(8)).await.unwrap(), SegmentClaim::Won);
+                assert_eq!(handles.oci.claim_segment("u1", &seg(0, "b"), 2, at(8)).await.unwrap(), SegmentClaim::Lost);
+                assert_eq!(handles.oci.claim_segment("u1", &seg(3, "c"), 2, at(8)).await.unwrap(), SegmentClaim::Won);
+                assert_eq!(handles.oci.claim_segment("u1", &seg(6, "d"), 2, at(8)).await.unwrap(), SegmentClaim::TooManySegments);
+                assert_eq!(handles.oci.claim_segment("nope", &seg(0, "e"), 2, at(8)).await.unwrap(), SegmentClaim::Lost);
+                let session = handles.oci.upload("u1").await.unwrap().unwrap();
+                assert_eq!((session.received, session.segments, session.prefix.as_str()), (6, 2, prefix.as_str()));
+                assert_eq!(handles.oci.segments("u1").await.unwrap(), vec![seg(0, "a"), seg(3, "c")]);
+
+                let BeginComplete::Lease(_) = handles.oci.begin_complete("u1", at(9), LEASE).await.unwrap() else {
+                    panic!("free");
+                };
+                assert_eq!(handles.oci.claim_segment("u1", &seg(6, "f"), 9, at(9)).await.unwrap(), SegmentClaim::Lost);
+            }
+
+            /// The lease is dated: held while live, taken over once expired
+            /// with a fresh token, released only by its own token.
+            #[tokio::test]
+            async fn completion_claim_survives_a_crash() {
+                let handles = $open().await;
+                let first = session(&handles, "u1").await;
+                assert_eq!(handles.oci.begin_complete("u1", at(8), LEASE).await.unwrap(), BeginComplete::Held);
+                let BeginComplete::Lease(second) = handles.oci.begin_complete("u1", at(9), LEASE).await.unwrap() else {
+                    panic!("an expired lease is taken over");
+                };
+                assert_ne!(first, second);
+                handles.oci.release_complete("u1", &first).await.unwrap();
+                assert_eq!(handles.oci.begin_complete("u1", at(9), LEASE).await.unwrap(), BeginComplete::Held);
+                handles.oci.release_complete("u1", &second).await.unwrap();
+                assert!(matches!(handles.oci.begin_complete("u1", at(9), LEASE).await.unwrap(), BeginComplete::Lease(_)));
+                assert_eq!(handles.oci.begin_complete("nope", at(9), LEASE).await.unwrap(), BeginComplete::Unknown);
+            }
+
+            /// `Superseded(Lease)` and `Superseded(Pin)`: either writes
+            /// nothing, the session and its row untouched.
+            #[tokio::test]
+            async fn finish_upload_with_a_lost_lease_or_a_revoked_pin_writes_nothing() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                let stale = session(&handles, "u1").await;
+                let BeginComplete::Lease(live) = handles.oci.begin_complete("u1", at(10), LEASE).await.unwrap() else {
+                    panic!("expired");
+                };
+                let pin = pins(&handles, &["sha256:bb"]).await.remove(0);
+                let lost = handles.oci.finish_upload("u1", &stale, &pin, new_blob(repo, "sha256:bb"), at(10)).await.unwrap();
+                assert_eq!(lost, Finished::LeaseLost);
+                assert!(handles.oci.blob(repo, "sha256:bb").await.unwrap().is_none());
+
+                handles.reclaim.enqueue(std::slice::from_ref(&pin.physical_key), at(1)).await.unwrap();
+                let late = at(23) + ::chrono::Duration::days(2);
+                handles.reclaim.claim(&pin.physical_key, ::std::time::Duration::from_secs(1), late, late).await.unwrap();
+                let revoked = handles.oci.finish_upload("u1", &live, &pin, new_blob(repo, "sha256:bb"), at(10)).await;
+                assert!(matches!(revoked, Err(StoreError::Superseded(_))), "{revoked:?}");
+                assert!(handles.oci.blob(repo, "sha256:bb").await.unwrap().is_none());
+                assert!(handles.oci.upload("u1").await.unwrap().is_some());
+            }
+
+            /// Two completions of one digest: the second keeps the recorded
+            /// key and its own generation is enqueued (N9). The session goes
+            /// with its segments either way.
+            #[tokio::test]
+            async fn a_second_completion_keeps_the_recorded_key_and_enqueues_its_own() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                let first = blob(&handles, "sha256:bb").await;
+                let lease = session(&handles, "u2").await;
+                let fresh = pins(&handles, &["other"]).await.remove(0);
+                let finished = handles.oci.finish_upload("u2", &lease, &fresh, new_blob(repo, "sha256:bb"), at(9)).await.unwrap();
+                assert_eq!(finished, Finished::Recorded(first.clone()));
+                assert_eq!(handles.oci.blob(repo, "sha256:bb").await.unwrap().unwrap().key, first);
+                assert_eq!(queued(&handles).await, vec![fresh.physical_key]);
+                assert!(handles.oci.upload("u2").await.unwrap().is_none());
+            }
+
+            /// A listed blob refuses deletion; an unlisted one goes and its
+            /// key is enqueued.
+            #[tokio::test]
+            async fn a_blob_delete_enqueues_its_key() {
+                let handles = $open().await;
+                let repo = handles.repository;
+                let key = blob(&handles, "sha256:bb").await;
+                put(&handles, "sha256:aa", &["sha256:bb".to_string()], None).await.unwrap();
+                assert!(matches!(handles.oci.delete_blob(repo, "sha256:bb", at(10)).await, Err(StoreError::Conflict)));
+                let manifest_key = handles.oci.manifest(repo, "app", "sha256:aa").await.unwrap().unwrap().key;
+                handles.oci.delete_manifest(repo, "app", "sha256:aa", at(10)).await.unwrap();
+                assert_eq!(queued(&handles).await.len(), 2);
+                let loose = blob(&handles, "sha256:cc").await;
+                assert!(handles.oci.delete_blob(repo, "sha256:cc", at(10)).await.unwrap());
+                assert!(!handles.oci.delete_blob(repo, "sha256:cc", at(10)).await.unwrap());
+                let mut want = vec![key, manifest_key, loose];
+                want.sort();
+                assert_eq!(queued(&handles).await, want);
+            }
+
+            /// Idle sessions without a live lease are reaped, their rows gone
+            /// and their prefixes enqueued; a completing one stays.
+            #[tokio::test]
+            async fn idle_sessions_are_reaped_and_their_prefixes_enqueued() {
+                let handles = $open().await;
+                let prefix = format!("{}/_uploads/idle", handles.prefix);
+                handles.oci.start_upload("idle", handles.repository, "app", &prefix, at(1)).await.unwrap();
+                session(&handles, "busy").await;
+                let idle = ::std::time::Duration::from_secs(1800);
+                assert_eq!(handles.oci.reap_uploads(idle, at(8), 10).await.unwrap(), 1);
+                assert!(handles.oci.upload("idle").await.unwrap().is_none());
+                assert!(handles.oci.upload("busy").await.unwrap().is_some());
+                assert_eq!(queued(&handles).await, vec![prefix]);
             }
         }
     };
@@ -1883,13 +2076,14 @@ macro_rules! reclaim_contract {
             #[tokio::test]
             async fn segments_of_a_slow_session_are_never_claimable() {
                 let h = $open().await;
-                let (r, _) = repo(&h, "r").await;
-                h.oci.start_upload("u1", r.id, "app").await.unwrap();
-                let segment = "oci/_uploads/u1/00000000000000000000".to_string();
+                let (r, prefix) = repo(&h, "r").await;
+                let session = layout::upload_prefix(&prefix, "u1");
+                h.oci.start_upload("u1", r.id, "app", &session, at(1)).await.unwrap();
+                let segment = layout::segment_key(&session, 0, "n");
                 h.reclaim.enqueue(std::slice::from_ref(&segment), at(1)).await.unwrap();
                 assert_eq!(claim(&h, &segment, 20).await, Claim::Referenced);
                 let refs: Vec<_> = h.referenced.referenced(GRACE, at(20)).try_collect().await.unwrap();
-                assert!(refs.iter().any(|r| r.key == "oci/_uploads/u1" && r.prefix));
+                assert!(refs.iter().any(|r| r.key == session && r.prefix));
             }
 
             #[tokio::test]

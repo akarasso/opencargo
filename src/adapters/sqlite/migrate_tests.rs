@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "025"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "025"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "025"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.
@@ -483,4 +483,76 @@ async fn migration_025_allocates_incarnations_and_legacy_prefixes_once() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted).last(), Some(&"025"), "its sentinel is there");
+}
+
+fn file_of(id: &str) -> &'static str {
+    let Step::Sql(sql) = MIGRATIONS.iter().find(|m| m.id == id).unwrap().step else {
+        unreachable!("{id} is a file")
+    };
+    sql
+}
+
+async fn seed_legacy_oci(pool: &SqlitePool) {
+    insert_repository(pool, "oci-hosted", "hosted", "oci").await.unwrap();
+    for sql in [
+        "INSERT INTO oci_blobs (repository_id, digest, size) VALUES (1, 'sha256:bb', 3)",
+        "INSERT INTO oci_manifests (repository_id, name, digest, content_type, size)
+         VALUES (1, 'team/app', 'sha256:aa', 'application/json', 2)",
+        "INSERT INTO oci_uploads (id, repository_id, name) VALUES ('u1', 1, 'team/app')",
+    ] {
+        sqlx::query(sql).execute(pool).await.unwrap();
+    }
+}
+
+async fn assert_backfilled(pool: &SqlitePool) {
+    let blob: String = sqlx::query_scalar("SELECT storage_key FROM oci_blobs")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(blob, "oci/oci-hosted/_blobs/sha256/bb", "the key reads derived today");
+    let manifest: String = sqlx::query_scalar("SELECT storage_key FROM oci_manifests")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(manifest, "oci/oci-hosted/team/app/manifests/team/app/sha256/aa");
+    let legacy_uploads = "SELECT COUNT(*) FROM oci_uploads WHERE received IS NULL AND segment_prefix IS NULL";
+    assert_eq!(count(pool, legacy_uploads).await, 1, "an upload started before 018 stays legacy");
+    let legacy: Vec<String> =
+        sqlx::query_scalar("SELECT prefix FROM storage_prefixes WHERE legacy = 1 ORDER BY prefix")
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    assert_eq!(legacy, ["_proxy_cache/oci-hosted", "oci/oci-hosted"]);
+}
+
+/// 018 on an adopted 014 database, alone and on either side of 025: every OCI
+/// row gains the key it is read from today, and nothing moves.
+#[tokio::test]
+async fn migration_018_backfills_physical_keys_and_legacy_prefixes() {
+    for first in ["018", "025"] {
+        let (_tmp, pool) = pool().await;
+        legacy_migrate(&pool).await;
+        seed_legacy_oci(&pool).await;
+        sqlx::raw_sql(file_of(first)).execute(&pool).await.unwrap();
+        let ran = run_all(&pool).await.unwrap();
+        assert!(outcomes(&ran, Outcome::Adopted).contains(&first), "{first} is adopted");
+        assert_backfilled(&pool).await;
+        assert!(run_all(&pool).await.unwrap().is_empty());
+    }
+}
+
+/// A fresh database and a 014 one end with the same upload progress columns.
+#[tokio::test]
+async fn oci_upload_progress_applies_on_fresh_and_legacy() {
+    let (_fresh_tmp, fresh) = pool().await;
+    run_all(&fresh).await.unwrap();
+    let (_legacy_tmp, legacy) = pool().await;
+    legacy_migrate(&legacy).await;
+    run_all(&legacy).await.unwrap();
+    let columns = "SELECT group_concat(name) FROM pragma_table_info('oci_uploads')";
+    let got: String = sqlx::query_scalar(columns).fetch_one(&fresh).await.unwrap();
+    let want: String = sqlx::query_scalar(columns).fetch_one(&legacy).await.unwrap();
+    assert_eq!(got, want);
+    assert!(got.contains("lease_token") && got.contains("received"));
+    assert_eq!(count(&fresh, "SELECT COUNT(*) FROM oci_upload_segments").await, 0);
 }

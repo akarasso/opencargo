@@ -36,7 +36,7 @@ checksum in the same commit.
 | 015 | 015_fts_rebuild.sql | ports-and-adapters.md 8a | b90a86c09e6b6c263cd75735e2ebe253eb1d15a73266be08bb5b9fd7db18aaf5 |
 | 016 | - | (free, slack) | - |
 | 017 | 017_storage_multipart.sql | s3.md (storage_multipart) | d33bf7772baee4f379535f7983837a5c56e0f707211e3e4cbf00b359efe0f6d2 |
-| 018 | - | s3.md (oci_upload_progress) | - |
+| 018 | 018_oci_upload_progress.sql | s3.md S4 (oci_upload_progress, physical keys on OCI rows) | de0ec789fca377873106f27a2b88af5517e797d28dd38aaf7840277371bba44a |
 | 019 | - | pypi.md (pypi_files) | - |
 | 020 | - | nuget.md (nuget_format + its Step::Rust rebuild) | - |
 | 021 | - | sso.md (sso) | - |

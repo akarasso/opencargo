@@ -26,6 +26,28 @@ pub fn draft_key(repo_prefix: &str, nonce: &str) -> String {
     format!("{repo_prefix}/_drafts/{nonce}")
 }
 
+/// Where an OCI blob of an incarnation lives: shared by every image of the
+/// repository, keyed by its sha256 alone.
+pub fn oci_blob_key(repo_prefix: &str, sha256: &str) -> String {
+    hosted_key(repo_prefix, "_blobs", sha256, "blob")
+}
+
+/// Where an OCI manifest of one image lives.
+pub fn oci_manifest_key(repo_prefix: &str, image: &str, sha256: &str) -> String {
+    hosted_key(repo_prefix, image, sha256, "manifest")
+}
+
+/// The private tree of one OCI upload session: every segment lies under it.
+pub fn upload_prefix(repo_prefix: &str, upload: &str) -> String {
+    format!("{repo_prefix}/_uploads/{upload}")
+}
+
+/// One segment of an upload session, named by the offset it starts at and a
+/// nonce, so two writers of one offset never share a key.
+pub fn segment_key(upload_prefix: &str, start: u64, nonce: &str) -> String {
+    format!("{upload_prefix}/{start:020}-{nonce}")
+}
+
 /// The last segment of a key: the file name a new key keeps.
 pub fn file_name(key: &str) -> &str {
     key.rsplit('/').next().unwrap_or(key)
@@ -73,6 +95,9 @@ mod tests {
         assert_eq!(logical_key("r/i/p/f.tgz~g1"), "r/i/p/f.tgz");
         assert_eq!(logical_key("npm/r/p/f.tgz"), "npm/r/p/f.tgz");
         assert_eq!(incarnation_prefix("i"), "r/i");
+        assert_eq!(oci_blob_key("r/i", "ab"), "r/i/_blobs/ab/blob");
+        assert_eq!(oci_manifest_key("r/i", "team/app", "ab"), "r/i/team/app/ab/manifest");
+        assert_eq!(segment_key(&upload_prefix("r/i", "u"), 5, "n"), "r/i/_uploads/u/00000000000000000005-n");
         assert_eq!(
             name_keyed_prefixes("npm", "web"),
             vec!["npm/web".to_string(), "_proxy_cache/web".to_string()]

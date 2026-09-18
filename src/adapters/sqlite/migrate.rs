@@ -135,6 +135,11 @@ pub const MIGRATIONS: &[Migration] = &[
         Sentinel::Object("idx_storage_multipart_touched")
     ),
     sql_migration!(
+        "018",
+        "018_oci_upload_progress.sql",
+        Sentinel::Object("idx_oci_uploads_touched")
+    ),
+    sql_migration!(
         "025",
         "025_reclaim.sql",
         Sentinel::Object("idx_reclaim_candidates_enqueued")

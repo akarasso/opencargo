@@ -26,7 +26,10 @@ use opencargo::domain::{
 use opencargo::error::StoreError;
 use opencargo::ports::audit::{AuditEntry, AuditStore, NewAuditEntry};
 use opencargo::ports::deps::{Dependency, DependencyStore, Dependent, NewDependency};
-use opencargo::ports::oci::{Blob, Manifest, NewBlob, NewManifest, OciStore, Orphaned};
+use opencargo::ports::oci::{
+    BeginComplete, Blob, Finished, LeaseToken, Manifest, NewBlob, NewManifest, OciStore, Orphaned,
+    Segment, SegmentClaim, UploadSession,
+};
 use opencargo::ports::packages::{
     NameMatch, NewRelease, PackageStore, Promotion, Release, StalePrerelease,
 };
@@ -82,6 +85,7 @@ struct BlobRow {
     digest: String,
     size: i64,
     content_type: Option<String>,
+    key: String,
 }
 
 /// One layer a manifest lists, the row a blob's orphanhood is decided from.
@@ -97,6 +101,12 @@ struct LinkRow {
 struct UploadRow {
     id: String,
     repository_id: i64,
+    /// `None` with `received` for a session started before upload progress.
+    prefix: Option<String>,
+    received: Option<u64>,
+    segments: u32,
+    touched: DateTime<Utc>,
+    lease: Option<(String, DateTime<Utc>)>,
 }
 
 /// One stored manifest of an image.
@@ -107,6 +117,7 @@ struct ManifestRow {
     digest: String,
     content_type: String,
     size: i64,
+    key: String,
 }
 
 /// One tag, which is a name for a manifest digest.
@@ -163,6 +174,7 @@ struct State {
     oci_tags: Vec<TagRow>,
     oci_links: Vec<LinkRow>,
     oci_uploads: Vec<UploadRow>,
+    oci_segments: Vec<(String, Segment)>,
     reclaim: ReclaimState,
     next_id: i64,
     next_cache_id: i64,
@@ -247,6 +259,20 @@ impl FakeDb {
             digest: digest.to_string(),
             size,
             content_type: content_type.map(str::to_string),
+            key: format!("oci/{repository}/_blobs/{digest}"),
+        });
+    }
+
+    /// A session as a server that predates upload progress left it.
+    pub fn add_legacy_upload(&self, id: &str, repository: i64) {
+        self.0.lock().unwrap().oci_uploads.push(UploadRow {
+            id: id.to_string(),
+            repository_id: repository,
+            prefix: None,
+            received: None,
+            segments: 0,
+            touched: DateTime::UNIX_EPOCH,
+            lease: None,
         });
     }
 
@@ -264,6 +290,7 @@ impl FakeDb {
             digest: digest.to_string(),
             content_type: content_type.to_string(),
             size,
+            key: format!("oci/{repository}/{name}/manifests/{digest}"),
         });
     }
 
@@ -1467,6 +1494,10 @@ impl ProxyCacheStore for ProxyCache {
 
 struct Oci(Arc<Mutex<State>>);
 
+fn after(now: DateTime<Utc>, ttl: Duration) -> DateTime<Utc> {
+    now + chrono::Duration::from_std(ttl).unwrap_or(chrono::Duration::MAX)
+}
+
 #[async_trait]
 impl OciStore for Oci {
     async fn blob(&self, repository: i64, digest: &str) -> Result<Option<Blob>, StoreError> {
@@ -1478,6 +1509,7 @@ impl OciStore for Oci {
                 .map(|row| Blob {
                     size: row.size,
                     content_type: row.content_type.clone(),
+                    key: row.key.clone(),
                 }))
         })
     }
@@ -1498,6 +1530,7 @@ impl OciStore for Oci {
                 .map(|row| Manifest {
                     content_type: row.content_type.clone(),
                     size: row.size,
+                    key: row.key.clone(),
                 }))
         })
     }
@@ -1532,8 +1565,31 @@ impl OciStore for Oci {
         })
     }
 
-    async fn put_manifest(&self, m: NewManifest<'_>) -> Result<(), StoreError> {
+    async fn put_manifest(&self, m: NewManifest<'_>, now: DateTime<Utc>) -> Result<(), StoreError> {
         with(&self.0, PortId::Oci, |state| {
+            let mut pins = vec![m.pin.clone()];
+            pins.extend(m.blobs.iter().map(|(_, pin)| pin.clone()));
+            state.reclaim.live_pins(&pins)?;
+            let unknown = m.blobs.iter().any(|(digest, _)| {
+                !state
+                    .oci_blobs
+                    .iter()
+                    .any(|row| row.repository_id == m.repository && row.digest == *digest)
+            });
+            if unknown {
+                return Err(StoreError::NotFound);
+            }
+            state.reclaim.spend(&pins);
+            let previous = state
+                .oci_manifests
+                .iter()
+                .find(|row| {
+                    row.repository_id == m.repository && row.name == m.name && row.digest == m.digest
+                })
+                .map(|row| row.key.clone());
+            if let Some(previous) = previous.filter(|k| *k != m.pin.physical_key) {
+                state.reclaim.enqueue(&previous, false, now);
+            }
             state.oci_manifests.retain(|row| {
                 !(row.repository_id == m.repository
                     && row.name == m.name
@@ -1545,16 +1601,25 @@ impl OciStore for Oci {
                 digest: m.digest.to_string(),
                 content_type: m.content_type.to_string(),
                 size: m.size,
+                key: m.pin.physical_key.clone(),
             });
             state.oci_links.retain(|row| {
                 !(row.repository_id == m.repository && row.manifest_digest == m.digest)
             });
-            for blob in m.blobs {
-                state.oci_links.push(LinkRow {
-                    repository_id: m.repository,
-                    manifest_digest: m.digest.to_string(),
-                    blob_digest: blob.clone(),
+            let linked = m.blobs.iter().map(|(d, _)| d).chain(m.children.iter());
+            for blob in linked {
+                let present = state.oci_links.iter().any(|row| {
+                    row.repository_id == m.repository
+                        && row.manifest_digest == m.digest
+                        && row.blob_digest == *blob
                 });
+                if !present {
+                    state.oci_links.push(LinkRow {
+                        repository_id: m.repository,
+                        manifest_digest: m.digest.to_string(),
+                        blob_digest: blob.clone(),
+                    });
+                }
             }
             if let Some(tag) = m.tag {
                 state.oci_tags.retain(|row| {
@@ -1576,88 +1641,58 @@ impl OciStore for Oci {
         repository: i64,
         name: &str,
         digest: &str,
+        now: DateTime<Utc>,
     ) -> Result<Option<Orphaned>, StoreError> {
         with(&self.0, PortId::Oci, |state| {
-            let before = state.oci_manifests.len();
-            state.oci_manifests.retain(|row| {
-                !(row.repository_id == repository && row.name == name && row.digest == digest)
-            });
-            if state.oci_manifests.len() == before {
+            let Some(at) = state.oci_manifests.iter().position(|row| {
+                row.repository_id == repository && row.name == name && row.digest == digest
+            }) else {
                 return Ok(None);
-            }
+            };
+            let gone = state.oci_manifests.remove(at);
+            let mut released = vec![gone.key];
             state.oci_tags.retain(|row| {
                 !(row.repository_id == repository
                     && row.name == name
                     && row.manifest_digest == digest)
             });
-            let linked: Vec<String> = state
-                .oci_links
+            let still_listed = state
+                .oci_manifests
                 .iter()
-                .filter(|row| row.repository_id == repository && row.manifest_digest == digest)
-                .map(|row| row.blob_digest.clone())
-                .collect();
-            state
-                .oci_links
-                .retain(|row| !(row.repository_id == repository && row.manifest_digest == digest));
-
+                .any(|row| row.repository_id == repository && row.digest == digest);
             let mut blob_digests = Vec::new();
-            for blob in linked {
-                let still = state
+            if !still_listed {
+                let linked: Vec<String> = state
                     .oci_links
                     .iter()
-                    .any(|row| row.repository_id == repository && row.blob_digest == blob);
-                if !still {
-                    state
+                    .filter(|row| row.repository_id == repository && row.manifest_digest == digest)
+                    .map(|row| row.blob_digest.clone())
+                    .collect();
+                state.oci_links.retain(|row| {
+                    !(row.repository_id == repository && row.manifest_digest == digest)
+                });
+                for blob in linked {
+                    let still = state
+                        .oci_links
+                        .iter()
+                        .any(|row| row.repository_id == repository && row.blob_digest == blob);
+                    if still {
+                        continue;
+                    }
+                    if let Some(at) = state
                         .oci_blobs
-                        .retain(|row| !(row.repository_id == repository && row.digest == blob));
-                    blob_digests.push(blob);
+                        .iter()
+                        .position(|row| row.repository_id == repository && row.digest == blob)
+                    {
+                        released.push(state.oci_blobs.remove(at).key);
+                        blob_digests.push(blob);
+                    }
                 }
             }
-            Ok(Some(Orphaned { blob_digests }))
-        })
-    }
-
-    async fn start_upload(
-        &self,
-        id: &str,
-        repository: i64,
-        _name: &str,
-    ) -> Result<(), StoreError> {
-        with(&self.0, PortId::Oci, |state| {
-            state.oci_uploads.push(UploadRow {
-                id: id.to_string(),
-                repository_id: repository,
-            });
-            Ok(())
-        })
-    }
-
-    async fn upload_owner(&self, id: &str) -> Result<Option<i64>, StoreError> {
-        with(&self.0, PortId::Oci, |state| {
-            Ok(state
-                .oci_uploads
-                .iter()
-                .find(|row| row.id == id)
-                .map(|row| row.repository_id))
-        })
-    }
-
-    async fn complete_upload(&self, id: &str, blob: NewBlob<'_>) -> Result<(), StoreError> {
-        with(&self.0, PortId::Oci, |state| {
-            let known = state
-                .oci_blobs
-                .iter()
-                .any(|row| row.repository_id == blob.repository && row.digest == blob.digest);
-            if !known {
-                state.oci_blobs.push(BlobRow {
-                    repository_id: blob.repository,
-                    digest: blob.digest.to_string(),
-                    size: blob.size,
-                    content_type: Some(blob.content_type.to_string()),
-                });
+            for key in &released {
+                state.reclaim.enqueue(key, false, now);
             }
-            state.oci_uploads.retain(|row| row.id != id);
-            Ok(())
+            Ok(Some(Orphaned { blob_digests }))
         })
     }
 
@@ -1671,15 +1706,225 @@ impl OciStore for Oci {
         })
     }
 
-    async fn delete_blob(&self, repository: i64, digest: &str) -> Result<bool, StoreError> {
+    async fn delete_blob(
+        &self,
+        repository: i64,
+        digest: &str,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError> {
         with(&self.0, PortId::Oci, |state| {
-            let before = state.oci_blobs.len();
-            state
+            let listed = state
+                .oci_links
+                .iter()
+                .any(|row| row.repository_id == repository && row.blob_digest == digest);
+            if listed {
+                return Err(StoreError::Conflict);
+            }
+            let Some(at) = state
                 .oci_blobs
-                .retain(|row| !(row.repository_id == repository && row.digest == digest));
-            Ok(state.oci_blobs.len() != before)
+                .iter()
+                .position(|row| row.repository_id == repository && row.digest == digest)
+            else {
+                return Ok(false);
+            };
+            let gone = state.oci_blobs.remove(at);
+            state.reclaim.enqueue(&gone.key, false, now);
+            Ok(true)
         })
     }
+
+    async fn start_upload(
+        &self,
+        id: &str,
+        repository: i64,
+        _name: &str,
+        prefix: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            if state.oci_uploads.iter().any(|row| row.id == id) {
+                return Err(StoreError::Conflict);
+            }
+            state.oci_uploads.push(UploadRow {
+                id: id.to_string(),
+                repository_id: repository,
+                prefix: Some(prefix.to_string()),
+                received: Some(0),
+                segments: 0,
+                touched: now,
+                lease: None,
+            });
+            Ok(())
+        })
+    }
+
+    async fn upload(&self, id: &str) -> Result<Option<UploadSession>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            Ok(state.oci_uploads.iter().find(|row| row.id == id).and_then(|row| {
+                Some(UploadSession {
+                    repository: row.repository_id,
+                    prefix: row.prefix.clone()?,
+                    received: row.received?,
+                    segments: row.segments,
+                })
+            }))
+        })
+    }
+
+    async fn claim_segment(
+        &self,
+        id: &str,
+        segment: &Segment,
+        max_segments: u32,
+        now: DateTime<Utc>,
+    ) -> Result<SegmentClaim, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let Some(row) = state.oci_uploads.iter_mut().find(|row| row.id == id) else {
+                return Ok(SegmentClaim::Lost);
+            };
+            let completing = row.lease.as_ref().is_some_and(|(_, until)| *until > now);
+            if completing || row.received != Some(segment.start) {
+                return Ok(SegmentClaim::Lost);
+            }
+            if row.segments >= max_segments {
+                return Ok(SegmentClaim::TooManySegments);
+            }
+            row.received = Some(segment.start + segment.len);
+            row.segments += 1;
+            row.touched = now;
+            state.oci_segments.push((id.to_string(), segment.clone()));
+            Ok(SegmentClaim::Won)
+        })
+    }
+
+    async fn segments(&self, id: &str) -> Result<Vec<Segment>, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let mut segments: Vec<Segment> = state
+                .oci_segments
+                .iter()
+                .filter(|(upload, _)| upload == id)
+                .map(|(_, s)| s.clone())
+                .collect();
+            segments.sort_by_key(|s| s.start);
+            Ok(segments)
+        })
+    }
+
+    async fn begin_complete(
+        &self,
+        id: &str,
+        now: DateTime<Utc>,
+        ttl: Duration,
+    ) -> Result<BeginComplete, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let Some(row) = state
+                .oci_uploads
+                .iter_mut()
+                .find(|row| row.id == id && row.received.is_some())
+            else {
+                return Ok(BeginComplete::Unknown);
+            };
+            if row.lease.as_ref().is_some_and(|(_, until)| *until > now) {
+                return Ok(BeginComplete::Held);
+            }
+            let token = uuid::Uuid::new_v4().to_string();
+            row.lease = Some((token.clone(), after(now, ttl)));
+            row.touched = now;
+            Ok(BeginComplete::Lease(LeaseToken(token)))
+        })
+    }
+
+    async fn release_complete(&self, id: &str, lease: &LeaseToken) -> Result<(), StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            if let Some(row) = state.oci_uploads.iter_mut().find(|row| {
+                row.id == id && row.lease.as_ref().is_some_and(|(t, _)| *t == lease.0)
+            }) {
+                row.lease = None;
+            }
+            Ok(())
+        })
+    }
+
+    async fn finish_upload(
+        &self,
+        id: &str,
+        lease: &LeaseToken,
+        pin: &PinToken,
+        blob: NewBlob<'_>,
+        now: DateTime<Utc>,
+    ) -> Result<Finished, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let held = state.oci_uploads.iter().any(|row| {
+                row.id == id && row.lease.as_ref().is_some_and(|(t, _)| *t == lease.0)
+            });
+            if !held {
+                return Ok(Finished::LeaseLost);
+            }
+            state.reclaim.live_pins(std::slice::from_ref(pin))?;
+            state.reclaim.spend(std::slice::from_ref(pin));
+            let existing = state
+                .oci_blobs
+                .iter()
+                .find(|row| row.repository_id == blob.repository && row.digest == blob.digest)
+                .map(|row| row.key.clone());
+            let recorded = match existing {
+                Some(key) => {
+                    if key != pin.physical_key {
+                        state.reclaim.enqueue(&pin.physical_key, false, now);
+                    }
+                    key
+                }
+                None => {
+                    state.oci_blobs.push(BlobRow {
+                        repository_id: blob.repository,
+                        digest: blob.digest.to_string(),
+                        size: blob.size,
+                        content_type: Some(blob.content_type.to_string()),
+                        key: pin.physical_key.clone(),
+                    });
+                    pin.physical_key.clone()
+                }
+            };
+            state.oci_segments.retain(|(upload, _)| upload != id);
+            state.oci_uploads.retain(|row| row.id != id);
+            Ok(Finished::Recorded(recorded))
+        })
+    }
+
+    async fn reap_uploads(
+        &self,
+        idle: Duration,
+        now: DateTime<Utc>,
+        limit: u32,
+    ) -> Result<u64, StoreError> {
+        with(&self.0, PortId::Oci, |state| {
+            let cut = cutoff(idle, now);
+            let mut dead: Vec<(String, String)> = state
+                .oci_uploads
+                .iter()
+                .filter(|row| {
+                    row.received.is_none()
+                        || (row.touched <= cut
+                            && row.lease.as_ref().is_none_or(|(_, until)| *until <= now))
+                })
+                .map(|row| (row.id.clone(), upload_prefix(row)))
+                .collect();
+            dead.sort();
+            dead.truncate(limit as usize);
+            for (id, prefix) in &dead {
+                state.oci_segments.retain(|(upload, _)| upload != id);
+                state.oci_uploads.retain(|row| row.id != *id);
+                state.reclaim.enqueue(prefix, true, now);
+            }
+            Ok(dead.len() as u64)
+        })
+    }
+}
+
+fn upload_prefix(row: &UploadRow) -> String {
+    row.prefix
+        .clone()
+        .unwrap_or_else(|| format!("oci/_uploads/{}", row.id))
 }
 
 struct Audit(Arc<Mutex<State>>);
@@ -2201,13 +2446,6 @@ fn cutoff(grace: Duration, now: DateTime<Utc>) -> DateTime<Utc> {
 /// What committed rows reference, the list the SQLite adapter's predicate
 /// yields: a key, and whether it covers everything under it.
 fn row_references(state: &State) -> Vec<(String, bool)> {
-    let name = |id: i64| {
-        state
-            .repositories
-            .iter()
-            .find(|r| r.id == id)
-            .map(|r| r.name.clone())
-    };
     let mut refs: Vec<(String, bool)> = Vec::new();
     refs.extend(state.versions.iter().map(|v| (v.tarball_path.clone(), false)));
     refs.extend(
@@ -2217,25 +2455,9 @@ fn row_references(state: &State) -> Vec<(String, bool)> {
             .filter_map(|e| e.storage_path.clone())
             .map(|k| (k, false)),
     );
-    for b in &state.oci_blobs {
-        if let Some(repo) = name(b.repository_id) {
-            let hex = b.digest.trim_start_matches("sha256:");
-            refs.push((format!("oci/{repo}/_blobs/sha256/{hex}"), false));
-        }
-    }
-    for m in &state.oci_manifests {
-        if let Some(repo) = name(m.repository_id) {
-            let hex = m.digest.trim_start_matches("sha256:");
-            let image = &m.name;
-            refs.push((format!("oci/{repo}/{image}/manifests/{image}/sha256/{hex}"), false));
-        }
-    }
-    refs.extend(
-        state
-            .oci_uploads
-            .iter()
-            .map(|u| (format!("oci/_uploads/{}", u.id), true)),
-    );
+    refs.extend(state.oci_blobs.iter().map(|b| (b.key.clone(), false)));
+    refs.extend(state.oci_manifests.iter().map(|m| (m.key.clone(), false)));
+    refs.extend(state.oci_uploads.iter().map(|u| (upload_prefix(u), true)));
     refs
 }
 

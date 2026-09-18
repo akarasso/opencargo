@@ -3,37 +3,19 @@ use std::collections::HashMap;
 use axum::{
     body::Bytes,
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
 use tracing::info;
 
-use crate::app::oci::{AssembledBlob, CompleteUpload};
+use crate::app::oci::{AppendChunk, CompleteUpload, Completion, OciWriteError};
 use crate::auth::middleware::AuthUser;
-use crate::domain::{Format, Repository};
+use crate::domain::{layout, Format, Repository};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 
-use super::{param, paths, sha256_digest, OciRef};
-
-/// Every chunk of an upload is its own object, keyed by the offset it
-/// starts at, so a chunk is never rewritten and the upload never re-read.
-fn segments_prefix(upload_uuid: &str) -> String {
-    format!("oci/_uploads/{upload_uuid}")
-}
-
-async fn segments(state: &AppState, upload_uuid: &str) -> AppResult<Vec<(String, u64)>> {
-    use futures_util::TryStreamExt;
-    let mut found: Vec<(String, u64)> = state
-        .storage
-        .list(&segments_prefix(upload_uuid))
-        .map_ok(|meta| (meta.key, meta.size))
-        .try_collect()
-        .await?;
-    found.sort();
-    Ok(found)
-}
+use super::{oci_error, param, parse_digest, OciRef};
 
 /// The hosted OCI repository `r` names, once the caller may write to it.
 async fn writable_repo(
@@ -51,19 +33,93 @@ async fn writable_repo(
     Ok((repo, auth_user))
 }
 
-/// An upload id is only usable from the repository it was started in.
-async fn owned_upload(state: &AppState, repo: &Repository, upload_uuid: &str) -> AppResult<()> {
-    let owner = state
-        .oci
-        .upload_owner(upload_uuid)
+/// The incarnation prefix every new key of `repo` lies under.
+pub(super) async fn repo_prefix(state: &AppState, repo: &Repository) -> AppResult<String> {
+    let incarnation = state
+        .repos
+        .incarnation(repo.id)
         .await?
-        .ok_or_else(|| AppError::NotFound(format!("upload not found: {upload_uuid}")))?;
-    if owner != repo.id {
-        return Err(AppError::Forbidden(
-            "upload does not belong to this repository".to_string(),
-        ));
+        .ok_or_else(|| AppError::NotFound(format!("repository not found: {}", repo.name)))?;
+    Ok(layout::incarnation_prefix(&incarnation))
+}
+
+fn location(r: &OciRef, upload: &str) -> String {
+    format!("/v2/{}/blobs/uploads/{}", r.image_name(), upload)
+}
+
+fn progress(r: &OciRef, upload: &str, received: u64, status: StatusCode) -> Response {
+    (
+        status,
+        [
+            ("Location", location(r, upload)),
+            ("Docker-Upload-UUID", upload.to_string()),
+            ("Content-Length", "0".to_string()),
+            ("Range", format!("0-{}", received.saturating_sub(1))),
+        ],
+    )
+        .into_response()
+}
+
+/// An unknown id and an id started in another repository are the same 404:
+/// a foreign id reveals nothing.
+fn unknown_upload(upload: &str) -> Response {
+    oci_error(
+        StatusCode::NOT_FOUND,
+        "BLOB_UPLOAD_UNKNOWN",
+        &format!("upload not found: {upload}"),
+    )
+}
+
+/// `Content-Range: <start>-<end>`, the offset a chunk claims to start at.
+fn chunk_start(headers: &HeaderMap) -> Result<Option<u64>, ()> {
+    let Some(value) = headers.get("content-range") else {
+        return Ok(None);
+    };
+    let value = value.to_str().map_err(|_| ())?;
+    let value = value.strip_prefix("bytes ").unwrap_or(value);
+    let (start, end) = value.split_once('-').ok_or(())?;
+    let start: u64 = start.trim().parse().map_err(|_| ())?;
+    let end: u64 = end.trim().parse().map_err(|_| ())?;
+    if end < start {
+        return Err(());
     }
-    Ok(())
+    Ok(Some(start))
+}
+
+fn chunk_error(r: &OciRef, upload: &str, err: OciWriteError) -> AppResult<Response> {
+    Ok(match err {
+        OciWriteError::NotFound => unknown_upload(upload),
+        OciWriteError::OutOfRange { received } => {
+            let mut response = oci_error(
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "BLOB_UPLOAD_INVALID",
+                &format!("the chunk must start at {received}"),
+            );
+            if let Ok(value) = format!("0-{}", received.saturating_sub(1)).parse() {
+                response.headers_mut().insert("Range", value);
+            }
+            if let Ok(value) = location(r, upload).parse() {
+                response.headers_mut().insert("Location", value);
+            }
+            response
+        }
+        OciWriteError::TooManySegments => oci_error(
+            StatusCode::PAYLOAD_TOO_LARGE,
+            "SIZE_INVALID",
+            "too many chunks in one upload",
+        ),
+        OciWriteError::DigestMismatch { computed } => oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            &format!("digest mismatch: computed {computed}"),
+        ),
+        OciWriteError::Empty => oci_error(
+            StatusCode::BAD_REQUEST,
+            "BLOB_UPLOAD_INVALID",
+            "no blob data provided",
+        ),
+        other => return Err(other.into()),
+    })
 }
 
 pub async fn start_upload(
@@ -75,47 +131,62 @@ pub async fn start_upload(
     let (repo, _) = writable_repo(&state, &r, auth).await?;
 
     let upload_id = state.ids.upload_id();
-    state.oci.start_upload(&upload_id, repo.id, &r.name).await?;
+    let prefix = layout::upload_prefix(&repo_prefix(&state, &repo).await?, &upload_id);
+    state
+        .oci
+        .start_upload(&upload_id, repo.id, &r.name, &prefix, state.clock.now())
+        .await?;
 
-    let location = format!("/v2/{}/blobs/uploads/{}", r.image_name(), upload_id);
-    Ok((
-        StatusCode::ACCEPTED,
-        [
-            ("Location", location),
-            ("Docker-Upload-UUID", upload_id),
-            ("Content-Length", "0".to_string()),
-        ],
-    )
-        .into_response())
+    let min_chunk = state.storage.upload_plan().min_chunk_bytes;
+    let mut response = progress(&r, &upload_id, 0, StatusCode::ACCEPTED);
+    if let Ok(value) = min_chunk.to_string().parse() {
+        response.headers_mut().insert("OCI-Chunk-Min-Length", value);
+    }
+    Ok(response)
+}
+
+/// `GET` on an upload: where it stands, for a client resuming it.
+pub async fn upload_status(
+    State(state): State<AppState>,
+    Path(params): Path<HashMap<String, String>>,
+    auth: Option<axum::Extension<AuthUser>>,
+) -> AppResult<Response> {
+    let r = OciRef::parse(&params)?;
+    let upload = param(&params, "uuid")?;
+    let (repo, _) = writable_repo(&state, &r, auth).await?;
+    match state.oci.upload(upload).await? {
+        Some(session) if session.repository == repo.id => {
+            Ok(progress(&r, upload, session.received, StatusCode::NO_CONTENT))
+        }
+        _ => Ok(unknown_upload(upload)),
+    }
 }
 
 pub async fn upload_chunk(
     State(state): State<AppState>,
     Path(params): Path<HashMap<String, String>>,
+    headers: HeaderMap,
     auth: Option<axum::Extension<AuthUser>>,
     body: Bytes,
 ) -> AppResult<Response> {
     let r = OciRef::parse(&params)?;
-    let upload_uuid = param(&params, "uuid")?;
+    let upload = param(&params, "uuid")?;
     let (repo, _) = writable_repo(&state, &r, auth).await?;
-    owned_upload(&state, &repo, upload_uuid).await?;
+    let Ok(start) = chunk_start(&headers) else {
+        return Ok(oci_error(
+            StatusCode::RANGE_NOT_SATISFIABLE,
+            "BLOB_UPLOAD_INVALID",
+            "invalid Content-Range",
+        ));
+    };
 
-    let received: u64 = segments(&state, upload_uuid).await?.iter().map(|(_, n)| n).sum();
-    let total_len = received + body.len() as u64;
-    let segment = format!("{}/{received:020}", segments_prefix(upload_uuid));
-    state.storage.put(&segment, body).await?;
-
-    let location = format!("/v2/{}/blobs/uploads/{}", r.image_name(), upload_uuid);
-    Ok((
-        StatusCode::ACCEPTED,
-        [
-            ("Location", location),
-            ("Docker-Upload-UUID", upload_uuid.to_string()),
-            ("Content-Length", "0".to_string()),
-            ("Range", format!("0-{}", total_len.saturating_sub(1))),
-        ],
-    )
-        .into_response())
+    let appended = AppendChunk::new(state.oci.clone(), state.storage.clone())
+        .run(upload, repo.id, start, body, state.clock.now())
+        .await;
+    match appended {
+        Ok(received) => Ok(progress(&r, upload, received, StatusCode::ACCEPTED)),
+        Err(err) => chunk_error(&r, upload, err),
+    }
 }
 
 #[derive(Deserialize)]
@@ -131,59 +202,42 @@ pub async fn complete_upload(
     body: Bytes,
 ) -> AppResult<Response> {
     let r = OciRef::parse(&params)?;
-    let upload_uuid = param(&params, "uuid")?;
+    let upload = param(&params, "uuid")?;
     let (repo, _) = writable_repo(&state, &r, auth).await?;
-    owned_upload(&state, &repo, upload_uuid).await?;
+    let Ok(digest) = parse_digest(&query.digest) else {
+        return Ok(oci_error(
+            StatusCode::BAD_REQUEST,
+            "DIGEST_INVALID",
+            &format!("invalid digest: '{}'", query.digest),
+        ));
+    };
+    let prefix = repo_prefix(&state, &repo).await?;
 
-    let parts = segments(&state, upload_uuid).await?;
-    let blob_data = assemble_blob(&state, &parts, body).await?;
-    if blob_data.is_empty() {
-        return Err(AppError::BadRequest("no blob data provided".to_string()));
+    let completed = CompleteUpload::new(state.oci.clone(), state.storage.clone(), state.placer())
+        .run(
+            Completion {
+                upload,
+                repository: repo.id,
+                repo_prefix: &prefix,
+                digest: &digest,
+                content_type: "application/octet-stream",
+                body,
+            },
+            state.clock.now(),
+        )
+        .await;
+    if let Err(err) = completed {
+        return chunk_error(&r, upload, err);
     }
-    let computed_digest = sha256_digest(&blob_data);
-    if computed_digest != query.digest {
-        return Err(AppError::BadRequest(format!(
-            "digest mismatch: expected {}, computed {}",
-            query.digest, computed_digest
-        )));
-    }
-
-    CompleteUpload::new(state.oci.clone(), state.storage.clone())
-        .run(AssembledBlob {
-            upload: upload_uuid,
-            repository: repo.id,
-            digest: &query.digest,
-            content_type: "application/octet-stream",
-            path: &paths::blob_path(&repo.name, &query.digest),
-            segments: parts.into_iter().map(|(key, _)| key).collect(),
-            bytes: blob_data.clone(),
-        })
-        .await?;
-    info!(digest = %query.digest, size = blob_data.len(), image = %r.image_name(), "OCI blob uploaded");
+    info!(digest = %digest, image = %r.image_name(), "OCI blob uploaded");
 
     Ok((
         StatusCode::CREATED,
         [
-            ("Docker-Content-Digest", query.digest.clone()),
+            ("Docker-Content-Digest", digest.clone()),
             ("Content-Length", "0".to_string()),
-            (
-                "Location",
-                format!("/v2/{}/blobs/{}", r.image_name(), query.digest),
-            ),
+            ("Location", format!("/v2/{}/blobs/{}", r.image_name(), digest)),
         ],
     )
         .into_response())
-}
-
-/// The chunks PATCHed so far, in offset order, followed by the PUT body.
-async fn assemble_blob(state: &AppState, parts: &[(String, u64)], body: Bytes) -> AppResult<Bytes> {
-    if parts.is_empty() {
-        return Ok(body);
-    }
-    let mut combined = Vec::new();
-    for (key, _) in parts {
-        combined.extend_from_slice(&state.storage.get(key).await?);
-    }
-    combined.extend_from_slice(&body);
-    Ok(Bytes::from(combined))
 }

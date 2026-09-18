@@ -10,7 +10,8 @@ mod common;
 use chrono::Utc;
 use common::contract::{cascade_contract, sqlite_with_repository, Release, TailHandles, TailPorts};
 use common::fakes::FakeDb;
-use opencargo::domain::{Format, RepoKind, RepoSpec, Visibility};
+use opencargo::domain::{layout, Format, RepoKind, RepoSpec, Visibility};
+use opencargo::ports::repositories::RepositoryStore;
 use opencargo::ports::packages::{NameMatch, NewRelease};
 use tempfile::TempDir;
 
@@ -35,6 +36,10 @@ fn release(repository: i64) -> NewRelease<'static> {
         pins: &[],
         now: Utc::now(),
     }
+}
+
+async fn prefix(repos: &dyn RepositoryStore, repository: i64) -> String {
+    layout::incarnation_prefix(&repos.incarnation(repository).await.unwrap().unwrap())
 }
 
 async fn fake() -> TailHandles {
@@ -66,7 +71,9 @@ async fn fake() -> TailHandles {
             deps: db.dependencies(),
             vulns: db.vulns(),
             oci: db.oci(),
+            reclaim: db.reclaim(),
             repository,
+            prefix: prefix(db.repositories().as_ref(), repository).await,
             release: Release {
                 package: landed.package.id,
                 version: landed.version.id,
@@ -98,7 +105,9 @@ async fn sqlite() -> TailHandles {
             deps: stores.dependencies(),
             vulns: stores.vulns(),
             oci: stores.oci(),
+            reclaim: stores.reclaim(),
             repository,
+            prefix: prefix(stores.repositories().as_ref(), repository).await,
             release: Release {
                 package: landed.package.id,
                 version: landed.version.id,

@@ -1,5 +1,5 @@
 use axum::{
-    routing::{get, head, post, put},
+    routing::{get, head, post},
     Router,
 };
 
@@ -8,7 +8,7 @@ use super::blobs::{delete_blob, get_blob, head_blob};
 use super::manifests::{delete_manifest, get_manifest, head_manifest, put_manifest};
 use super::tags::list_tags;
 use super::token::issue_token;
-use super::uploads::{complete_upload, start_upload, upload_chunk};
+use super::uploads::{complete_upload, start_upload, upload_chunk, upload_status};
 use crate::server::AppState;
 
 pub fn routes() -> Router<AppState> {
@@ -21,7 +21,7 @@ pub fn routes() -> Router<AppState> {
         .route("/v2/{repo}/{name}/blobs/uploads/", post(start_upload))
         .route(
             "/v2/{repo}/{name}/blobs/uploads/{uuid}",
-            put(complete_upload).patch(upload_chunk),
+            get(upload_status).put(complete_upload).patch(upload_chunk),
         )
         .route(
             "/v2/{repo}/{name}/manifests/{reference}",

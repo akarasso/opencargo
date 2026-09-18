@@ -2,7 +2,6 @@ pub mod auth_rules;
 pub mod blobs;
 pub mod leaves;
 pub mod manifests;
-pub mod paths;
 pub mod refs;
 pub mod routes;
 pub mod routing;
@@ -81,6 +80,15 @@ impl OciRef {
     }
 }
 
+
+/// The OCI distribution error body: `{"errors": [{code, message}]}`.
+pub(crate) fn oci_error(status: StatusCode, code: &str, message: &str) -> Response {
+    (
+        status,
+        Json(json!({"errors": [{"code": code, "message": message, "detail": null}]})),
+    )
+        .into_response()
+}
 
 /// Serve a resolved blob or manifest; `Docker-Content-Digest` is whatever the
 /// leaf derived from the content, never the client's reference.
