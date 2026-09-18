@@ -26,7 +26,7 @@ use crate::app::publish_tail::{PublishGate, PublishTail};
 use crate::app::reclaim::{ReclaimOrphans, ReclaimPolicy};
 use crate::ports::reclaim::ReclaimStore;
 use crate::ports::referenced::ReferencedKeys;
-use crate::app::authenticate::{Authenticate, AuthenticateDeps, OpenGate, Refusal};
+use crate::app::authenticate::{Authenticate, AuthenticateDeps, Refusal};
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::ports::secrets::ServerSecretStore;
 use crate::ports::signing::RegistryTokenSigner;
@@ -280,7 +280,8 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     let registry_tokens: Arc<dyn RegistryTokenSigner> = Arc::new(
         crate::registry::oci::token::TokenSigner::from_store(secrets.as_ref()).await?,
     );
-    let auth = auth_state(config, &users, &tokens, &registry_tokens);
+    let identities = stores.identities();
+    let auth = auth_state(config, &users, &tokens, &registry_tokens, &identities)?;
 
     ensure_admin_user(users.as_ref(), config).await?;
 
@@ -352,7 +353,13 @@ fn auth_state(
     users: &Arc<dyn UserStore>,
     tokens: &Arc<dyn TokenStore>,
     signer: &Arc<dyn RegistryTokenSigner>,
-) -> Arc<AuthState> {
+    identities: &Arc<dyn crate::ports::identities::IdentityStore>,
+) -> anyhow::Result<Arc<AuthState>> {
+    let gate = crate::app::login_gate::PolicyGate::new(
+        identities.clone(),
+        gate_policy(&config.auth.sso)?,
+        Some(config.auth.admin.username.clone()),
+    );
     let authenticate = Authenticate::new(AuthenticateDeps {
         static_tokens: config.auth.static_tokens.clone(),
         token_prefix: config.auth.token_prefix.clone(),
@@ -361,10 +368,10 @@ fn auth_state(
         signer: signer.clone(),
         login_limiter: Arc::new(RateLimiter::new(5, 60)),
         token_limiter: Arc::new(RateLimiter::new(30, 60)),
-        gate: Arc::new(OpenGate),
+        gate: Arc::new(gate),
         clock: Arc::new(crate::adapters::system::SystemClock),
     });
-    Arc::new(AuthState {
+    Ok(Arc::new(AuthState {
         anonymous_read: config.auth.anonymous_read,
         authenticate: Arc::new(authenticate),
         routes: vec![
@@ -374,6 +381,24 @@ fn auth_state(
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
         ],
         trusted_proxies: config.auth.trusted_proxies.clone(),
+    }))
+}
+
+/// The password mode and the reauthentication bounds, refused at startup
+/// when they do not parse.
+pub fn gate_policy(sso: &crate::config::SsoConfig) -> anyhow::Result<crate::domain::identity::GatePolicy> {
+    use crate::config::parse_duration;
+    let password_mode = crate::domain::identity::PasswordMode::parse(&sso.password_mode)
+        .ok_or_else(|| anyhow::anyhow!("auth.sso.password_mode: {:?} is not enabled, admins_only or disabled", sso.password_mode))?;
+    let reauth_after = if sso.reauth_after.trim().is_empty() {
+        None
+    } else {
+        Some(parse_duration(&sso.reauth_after)?)
+    };
+    Ok(crate::domain::identity::GatePolicy {
+        password_mode,
+        reauth_after,
+        grace_max: parse_duration(&sso.reauth_grace_max)?,
     })
 }
 

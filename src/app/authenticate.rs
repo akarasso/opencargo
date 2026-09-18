@@ -106,17 +106,15 @@ pub struct Authenticated {
 }
 
 /// Whether a verified credential may still act, evaluated after every
-/// verification. The open gate is today's rule; SSO brings its own.
+/// verification whatever its scheme; a store that cannot answer is a 503.
+#[async_trait::async_trait]
 pub trait LoginGate: Send + Sync {
-    fn login_allowed(&self, user: &User, kind: CredentialKind, now: DateTime<Utc>) -> bool;
-}
-
-pub struct OpenGate;
-
-impl LoginGate for OpenGate {
-    fn login_allowed(&self, _user: &User, _kind: CredentialKind, _now: DateTime<Utc>) -> bool {
-        true
-    }
+    async fn login_allowed(
+        &self,
+        user: &User,
+        kind: CredentialKind,
+        now: DateTime<Utc>,
+    ) -> Result<bool, StoreError>;
 }
 
 pub struct Authenticate {
@@ -236,7 +234,7 @@ impl Authenticate {
             self.login_limiter.record_failure(&key);
             return Err(Refusal::Invalid);
         };
-        if !self.allowed(&user, CredentialKind::Password) {
+        if !self.allowed(&user, CredentialKind::Password).await? {
             return Err(Refusal::Invalid);
         }
         Ok(AuthUser::from_user(user, "", None))
@@ -251,8 +249,8 @@ impl Authenticate {
         Refusal::Invalid
     }
 
-    fn allowed(&self, user: &User, kind: CredentialKind) -> bool {
-        self.gate.login_allowed(user, kind, self.clock.now())
+    async fn allowed(&self, user: &User, kind: CredentialKind) -> Result<bool, StoreError> {
+        self.gate.login_allowed(user, kind, self.clock.now()).await
     }
 
     /// A static config token or a stored API token, `None` when it is
@@ -267,7 +265,7 @@ impl Authenticate {
         let Some(user) = self.users.by_id(stored.user_id).await? else {
             return Ok(None);
         };
-        if !self.allowed(&user, CredentialKind::ApiToken) {
+        if !self.allowed(&user, CredentialKind::ApiToken).await? {
             return Ok(None);
         }
         let _ = self.tokens.touch(&stored.id, self.clock.now()).await;
@@ -313,7 +311,7 @@ impl Authenticate {
         let Some(user) = self.users.by_name(&username).await? else {
             return Ok(None);
         };
-        if !self.allowed(&user, CredentialKind::RegistryToken) {
+        if !self.allowed(&user, CredentialKind::RegistryToken).await? {
             return Ok(None);
         }
         Ok(Some(Authenticated {
