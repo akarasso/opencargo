@@ -123,6 +123,7 @@ impl Resolver {
             policy: &self.policy,
             creds: &self.creds,
             auth,
+            anonymous_read: true,
             url: UrlRepo(url),
             base_url: &self.base_url,
         }

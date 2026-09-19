@@ -11,11 +11,10 @@ pub mod rules;
 
 use std::collections::HashMap;
 
+use crate::app::authorize::Authorize;
 use crate::auth::middleware::AuthUser;
-use crate::auth::permissions::check_repo_permission;
-use crate::domain::{Format, RepoKind, Repository, UrlRepo, Visibility};
+use crate::domain::{Format, RepoAction, RepoKind, Repository, UrlRepo};
 use crate::error::{AppError, AppResult};
-use crate::ports::permissions::PermissionStore;
 use crate::ports::repositories::RepositoryStore;
 use crate::registry::resolve::Cx;
 use crate::server::AppState;
@@ -48,6 +47,7 @@ pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Reposit
         policy: &state.policy,
         creds: state.upstream_auth.as_ref(),
         auth,
+        anonymous_read: state.auth.anonymous_read,
         url: UrlRepo(&repo.name),
         base_url: &state.base_url,
     }
@@ -63,38 +63,21 @@ pub async fn load_repo(repos: &dyn RepositoryStore, name: &str) -> AppResult<Rep
 
 /// Enforce read access on a repository before serving any of its content.
 ///
-/// - **Public** repositories are readable by anyone. Anonymous access still
-///   depends on the global `anonymous_read` gate, which the auth middleware
-///   enforces before the request reaches the handler.
-/// - **Private** repositories require an authenticated caller that holds the
-///   `read` permission on the repo (admin role, a matching `user_permissions`
-///   grant, or the reader/publisher role default).
-///
-/// This closes the gap where read handlers served private repositories to
-/// anyone, because `check_repo_permission` was only ever called for writes.
+/// The decision is `Authorize`'s: the ladder, then the presented credential's
+/// scope, then the verdict that tells a 401 (nothing presented) from a 403
+/// (what was presented is not enough).
 pub async fn ensure_can_read(
-    perms: &dyn PermissionStore,
+    authz: &Authorize<'_>,
     repo: &Repository,
     auth_user: Option<&AuthUser>,
 ) -> AppResult<()> {
-    if repo.visibility == Visibility::Public {
-        return Ok(());
-    }
-    match auth_user {
-        Some(user) => {
-            if check_repo_permission(perms, user.user_id, &user.role, repo.id, "read").await? {
-                Ok(())
-            } else {
-                Err(AppError::Forbidden(format!(
-                    "read access denied on repository '{}'",
-                    repo.name
-                )))
-            }
-        }
-        None => Err(AppError::Unauthorized(
-            "authentication required to read this repository".to_string(),
-        )),
-    }
+    authz
+        .repository(auth_user, repo, RepoAction::Read)
+        .await
+        .into_result(
+            || format!("read access denied on repository '{}'", repo.name),
+            "authentication required to read this repository",
+        )
 }
 
 /// Enforce write (publish) access on a repository, with an actionable error
@@ -102,20 +85,36 @@ pub async fn ensure_can_read(
 /// tell the caller that their role — typically the default `reader` — lacks
 /// write, which made "I generated a token but can't publish" hard to diagnose.
 pub async fn ensure_can_write(
-    perms: &dyn PermissionStore,
+    authz: &Authorize<'_>,
     repo: &Repository,
     auth_user: &AuthUser,
 ) -> AppResult<()> {
-    if check_repo_permission(perms, auth_user.user_id, &auth_user.role, repo.id, "write").await? {
-        Ok(())
-    } else {
-        Err(AppError::Forbidden(format!(
-            "write access denied on repository '{}': your role is '{}'. Publishing requires \
-             the 'publisher' or 'admin' role, or an explicit write permission on this \
-             repository granted by an admin.",
-            repo.name, auth_user.role
-        )))
-    }
+    ensure_action(authz, repo, auth_user, RepoAction::Write).await
+}
+
+/// The verb a route really asks for. Deletion of content asks for `delete`,
+/// which the ladder never asked for before scopes: a token allowed to publish
+/// is not thereby allowed to remove.
+pub async fn ensure_action(
+    authz: &Authorize<'_>,
+    repo: &Repository,
+    auth_user: &AuthUser,
+    action: RepoAction,
+) -> AppResult<()> {
+    authz
+        .repository(Some(auth_user), repo, action)
+        .await
+        .into_result(
+            || {
+                format!(
+                    "write access denied on repository '{}': your role is '{}'. Publishing \
+                     requires the 'publisher' or 'admin' role, or an explicit write permission \
+                     on this repository granted by an admin.",
+                    repo.name, auth_user.role
+                )
+            },
+            "authentication required to write to this repository",
+        )
 }
 
 /// Ensure the repository's declared format matches the protocol being used.

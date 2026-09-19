@@ -44,12 +44,12 @@ async fn version_of(
 /// repository the caller cannot read must be indistinguishable from a package
 /// that does not exist, so the denial maps to the same 404 as the name lookup.
 async fn ensure_readable_or_not_found(
-    perms: &dyn crate::ports::permissions::PermissionStore,
+    authz: &crate::app::authorize::Authorize<'_>,
     repo: &crate::domain::Repository,
     auth_user: Option<&AuthUser>,
     name: &str,
 ) -> AppResult<()> {
-    crate::registry::ensure_can_read(perms, repo, auth_user)
+    crate::registry::ensure_can_read(authz, repo, auth_user)
         .await
         .map_err(|_| AppError::NotFound(format!("package not found: {name}")))
 }
@@ -93,7 +93,7 @@ async fn get_vulns_impl(
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
 
     let repo = load_repository(&state, pkg.repository_id).await?;
-    ensure_readable_or_not_found(&*state.permissions, &repo, auth_user.as_ref(), &name).await?;
+    ensure_readable_or_not_found(&state.authorize(), &repo, auth_user.as_ref(), &name).await?;
 
     let version = version_of(&state, pkg.id, &name, &version_str).await?;
     let scan = state.vulns.latest(version.id).await?;
@@ -161,7 +161,7 @@ async fn rescan_impl(
         .ok_or_else(|| AppError::NotFound(format!("package not found: {name}")))?;
 
     let repo = load_repository(&state, pkg.repository_id).await?;
-    ensure_readable_or_not_found(&*state.permissions, &repo, auth_user.as_ref(), &name).await?;
+    ensure_readable_or_not_found(&state.authorize(), &repo, auth_user.as_ref(), &name).await?;
 
     // Rescan destroys the stored scan results and triggers outbound OSV
     // queries, so it requires write access on the repo, like publish. The
@@ -170,7 +170,7 @@ async fn rescan_impl(
     let caller = auth_user
         .as_ref()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    crate::registry::ensure_can_write(&*state.permissions, &repo, caller).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, caller).await?;
 
     let version = version_of(&state, pkg.id, &name, &version_str).await?;
 

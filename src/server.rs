@@ -143,6 +143,16 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// The one authority on what a caller may do, built per request from the
+    /// two stores it reads and the anonymous-read setting.
+    pub fn authorize(&self) -> crate::app::authorize::Authorize<'_> {
+        crate::app::authorize::Authorize {
+            perms: &*self.permissions,
+            repos: &*self.repos,
+            anonymous_read: self.auth.anonymous_read,
+        }
+    }
+
     /// The gate every publish passes before its first write.
     pub fn publish_gate(&self) -> PublishGate {
         PublishGate::new(self.vuln_scanner.clone(), self.vuln_scan_config.clone())
