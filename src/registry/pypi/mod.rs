@@ -11,7 +11,6 @@ pub mod routes;
 pub mod simple;
 pub mod upload;
 pub mod upstream;
-pub mod version;
 
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};

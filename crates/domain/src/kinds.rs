@@ -116,8 +116,8 @@ impl Format {
         match self {
             // SemVer: everything after the first hyphen is the pre-release.
             Format::Npm | Format::Cargo | Format::Nuget => version.contains('-'),
-            // PEP 440: a, b, rc and dev segments, with or without separators.
-            Format::Pypi => pep440_prerelease(version),
+            Format::Pypi => crate::pep440::Pep440::parse(version)
+                .is_some_and(|parsed| parsed.is_prerelease()),
             Format::Go
             | Format::Maven
             | Format::Oci
@@ -125,29 +125,6 @@ impl Format {
             | Format::Raw => false,
         }
     }
-}
-
-/// PEP 440 spells a pre-release `1.0a1`, `1.0.b2`, `1.0-rc1` or `1.0.dev3`,
-/// and accepts `alpha`, `beta`, `c`, `pre` and `preview` as aliases. A `post`
-/// release is not one, and the local segment after `+` is not read: `1.0+abc1`
-/// is a final release built somewhere.
-fn pep440_prerelease(version: &str) -> bool {
-    const MARKERS: [&str; 9] = ["alpha", "beta", "preview", "pre", "rc", "dev", "a", "b", "c"];
-    let lower = version.to_ascii_lowercase();
-    let public = lower.split('+').next().unwrap_or_default();
-    for (at, _) in public.char_indices().filter(|(_, c)| c.is_ascii_alphabetic()) {
-        let tail = &public[at..];
-        for marker in MARKERS {
-            let Some(after) = tail.strip_prefix(marker) else {
-                continue;
-            };
-            let after = after.trim_start_matches(['-', '_', '.']);
-            if after.is_empty() || after.starts_with(|c: char| c.is_ascii_digit()) {
-                return true;
-            }
-        }
-    }
-    false
 }
 
 impl FromStr for Format {

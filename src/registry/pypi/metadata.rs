@@ -7,7 +7,7 @@ use crate::domain::DomainError;
 use crate::registry::archive::{self, ArchiveError, Budget};
 
 use super::names::{normalize, Filename, Kind};
-use super::version::Pep440;
+use crate::domain::Pep440;
 
 const BUDGET: Budget = Budget {
     max_members: 100_000,
