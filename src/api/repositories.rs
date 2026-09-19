@@ -175,7 +175,8 @@ pub async fn purge_cache(
     if repo.fmt()? == crate::domain::Format::Mcp && repo.kind()? == crate::domain::RepoKind::Proxy {
         state.mcp.purge(repo.id).await?;
     }
-    purge_repository(&state.proxy, state.repos.as_ref(), &repo).await?;
+    let purged = purge_repository(&state.proxy, state.repos.as_ref(), &repo).await?;
+    crate::app::search::forget(state.cached.as_ref(), &purged).await?;
 
     crate::api::record_audit(&state, &caller, "repo.purge_cache", Some(&name)).await;
 

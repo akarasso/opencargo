@@ -17,7 +17,8 @@ use bytes::Bytes;
 use serde_json::Value;
 use tokio::sync::Semaphore;
 
-use crate::domain::{CacheRepo, Outcome};
+use crate::app::search;
+use crate::domain::{CacheRepo, Format, Outcome, Sighting};
 use crate::proxy::strategy::{
     CacheKey, CachePolicy, DigestAlgorithm, DigestSource, ExpectedDigests, RedirectRule, Transfer,
     Ttl, UpstreamStrategy, UrlSource, MAX_METADATA_BYTES,
@@ -202,6 +203,20 @@ async fn document(
     up: &Upstream,
     a: &NugetArtifact,
 ) -> Result<Outcome<Arc<Value>>, ResolveError> {
+    Ok(match exchanged_document(cx, member, up, a).await? {
+        Outcome::Found((value, _)) => Outcome::Found(value),
+        Outcome::NotFound => Outcome::NotFound,
+    })
+}
+
+/// `document`, with what the engine did to get it: the registration is the
+/// one caller that writes on a sighting and so must stay off the warm path.
+async fn exchanged_document(
+    cx: &Cx<'_>,
+    member: CacheRepo<'_>,
+    up: &Upstream,
+    a: &NugetArtifact,
+) -> Result<Outcome<(Arc<Value>, bool)>, ResolveError> {
     let engine = cx.proxy;
     let Outcome::Found(cached) = engine.fetch(&NugetUpstream::of(up), up, member, a).await? else {
         return Ok(Outcome::NotFound);
@@ -221,7 +236,7 @@ async fn document(
         }
         None => parse().await?,
     };
-    Ok(Outcome::Found(value))
+    Ok(Outcome::Found((value, cached.exchanged)))
 }
 
 /// The resources a service index announces.
@@ -289,7 +304,8 @@ async fn catalog_entries(
 ) -> Result<Outcome<Vec<(Entry, Option<String>)>>, ResolveError> {
     let base = resources(cx, member, up).await?.registration.ok_or_else(|| missing("registration"))?;
     let url = under(&base, &[id, "index.json"])?;
-    let Outcome::Found(index) = document(cx, member, up, &NugetArtifact::Registration { url }).await? else {
+    let found = exchanged_document(cx, member, up, &NugetArtifact::Registration { url }).await?;
+    let Outcome::Found((index, exchanged)) = found else {
         return Ok(Outcome::NotFound);
     };
     let mut out = Vec::new();
@@ -314,7 +330,32 @@ async fn catalog_entries(
             }
         }
     }
+    remember(cx, member, exchanged, id, &out).await;
     Ok(Outcome::Found(out))
+}
+
+/// A registration's own words about the package: NuGet is the other format
+/// whose document carries a description, and its newest version is the one
+/// its entries sort last.
+async fn remember(
+    cx: &Cx<'_>,
+    member: CacheRepo<'_>,
+    exchanged: bool,
+    id: &str,
+    found: &[(Entry, Option<String>)],
+) {
+    let newest = found
+        .iter()
+        .map(|(entry, _)| entry)
+        .max_by(|a, b| super::version::compare_keys(&a.key, &b.key));
+    let seen = Sighting {
+        repository_id: member.0.id,
+        format: Format::Nuget,
+        name: id,
+        description: newest.and_then(|entry| entry.nuspec.description.as_deref()),
+        latest_version: newest.map(|entry| entry.version.as_str()),
+    };
+    search::remember(cx.cached, exchanged, &seen, Utc::now()).await;
 }
 
 /// A `packageHash` as lowercase hex, when its algorithm is SHA512.

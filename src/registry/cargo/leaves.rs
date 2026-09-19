@@ -1,6 +1,8 @@
+use chrono::Utc;
 use serde_json::{json, Value};
 
-use crate::domain::{CacheRepo, Format, Outcome};
+use crate::app::search;
+use crate::domain::{CacheRepo, Format, Outcome, Sighting};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
 use crate::proxy::{IntoPayload, Payload, ProxyEngine};
@@ -56,7 +58,7 @@ impl Leaf for IndexLeaf {
         member: CacheRepo<'_>,
         up: &Upstream,
     ) -> Result<Outcome<IndexLines>, ResolveError> {
-        fetch_index_lines(cx.proxy, up, member, &self.name).await
+        fetch_index_lines(cx, up, member, &self.name).await
     }
 }
 
@@ -100,7 +102,7 @@ impl Leaf for CrateLeaf {
     ) -> Result<Outcome<Payload>, ResolveError> {
         let engine = cx.proxy;
         let dl = fetch_dl_template(engine, up, member).await?;
-        let Outcome::Found(index) = fetch_index_lines(engine, up, member, &self.name).await? else {
+        let Outcome::Found(index) = fetch_index_lines(cx, up, member, &self.name).await? else {
             return Ok(Outcome::NotFound);
         };
         let Some(cksum) = checksum_of(&index.lines, &self.version) else {
@@ -123,11 +125,12 @@ impl Leaf for CrateLeaf {
 }
 
 async fn fetch_index_lines(
-    engine: &ProxyEngine,
+    cx: &Cx<'_>,
     up: &Upstream,
     member: CacheRepo<'_>,
     name: &str,
 ) -> Result<Outcome<IndexLines>, ResolveError> {
+    let engine = cx.proxy;
     let artifact = CargoArtifact::Index {
         name: name.to_string(),
     };
@@ -137,15 +140,36 @@ async fn fetch_index_lines(
     let bytes = engine.bytes(&cached).await?;
     let text = std::str::from_utf8(&bytes)
         .map_err(|e| ResolveError::Upstream(format!("invalid index from upstream: {e}")))?;
-    let lines = text
+    let lines: Vec<String> = text
         .lines()
         .filter(|l| !l.trim().is_empty())
         .map(String::from)
         .collect();
+    remember(cx, member, cached.exchanged, &lines, name).await;
     Ok(Outcome::Found(IndexLines {
         lines,
         stale: cached.stale,
     }))
+}
+
+/// A crate's index carries no description, and its newest version is its last
+/// line -- the order crates.io publishes in.
+async fn remember(
+    cx: &Cx<'_>,
+    member: CacheRepo<'_>,
+    exchanged: bool,
+    lines: &[String],
+    name: &str,
+) {
+    let latest = lines.last().and_then(|line| line_field(line, "vers"));
+    let seen = Sighting {
+        repository_id: member.0.id,
+        format: Format::Cargo,
+        name,
+        description: None,
+        latest_version: latest.as_deref(),
+    };
+    search::remember(cx.cached, exchanged, &seen, Utc::now()).await;
 }
 
 /// The upstream's `dl` template; an index without `config.json` is broken.

@@ -15,7 +15,7 @@ use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
 use crate::ports::permissions::PermissionStore;
 use crate::ports::repositories::RepositoryStore;
-use crate::ports::search::SearchIndex;
+use crate::ports::search::{CachedPackageIndex, SearchIndex};
 use crate::proxy::auth::{default_token_realms, UpstreamAuth, UpstreamCredsSource};
 use crate::proxy::ProxyEngine;
 use crate::storage::StorageError;
@@ -93,6 +93,7 @@ pub struct Cx<'a> {
     pub oci: &'a dyn OciStore,
     pub maven: &'a dyn MavenFileStore,
     pub search: &'a dyn SearchIndex,
+    pub cached: &'a dyn CachedPackageIndex,
     pub nuget: &'a dyn crate::ports::nuget::NugetFeedRead,
     pub proxy: &'a ProxyEngine,
     pub policy: &'a dyn ResolutionRecorder,

@@ -1,6 +1,8 @@
+use chrono::Utc;
 use serde_json::Value;
 
-use crate::domain::{CacheRepo, Format, Outcome};
+use crate::app::search;
+use crate::domain::{CacheRepo, Format, Outcome, Sighting};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
 use crate::proxy::{IntoPayload, Payload};
@@ -49,6 +51,7 @@ impl Leaf for PackumentLeaf {
         let bytes = engine.bytes(&cached).await?;
         let mut json: serde_json::Value = serde_json::from_slice(&bytes)
             .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
+        remember(cx, member, cached.exchanged, &json, &self.name).await;
         if self.abbreviated {
             strip_versions_to_abbreviated(&mut json);
         }
@@ -57,6 +60,28 @@ impl Leaf for PackumentLeaf {
             stale: cached.stale,
         }))
     }
+}
+
+/// What a packument says about the package itself, so that a search answers
+/// for it: npm is the one format whose document carries a description.
+async fn remember(
+    cx: &Cx<'_>,
+    member: CacheRepo<'_>,
+    exchanged: bool,
+    packument: &Value,
+    name: &str,
+) {
+    let seen = Sighting {
+        repository_id: member.0.id,
+        format: Format::Npm,
+        name,
+        description: packument.get("description").and_then(Value::as_str),
+        latest_version: packument
+            .get("dist-tags")
+            .and_then(|tags| tags.get("latest"))
+            .and_then(Value::as_str),
+    };
+    search::remember(cx.cached, exchanged, &seen, Utc::now()).await;
 }
 
 pub struct TarballLeaf {

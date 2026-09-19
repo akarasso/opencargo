@@ -145,6 +145,16 @@ pub async fn remember(
     }
 }
 
+/// What a cache purge takes with it. Eviction does not come here: an evicted
+/// body is refetched on the next request, so the package is still served by
+/// the repository, while a purge is the operator saying it serves nothing.
+pub async fn forget(index: &dyn CachedPackageIndex, purged: &[i64]) -> Result<(), StoreError> {
+    for repo in purged {
+        index.forget_repo(*repo).await?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
