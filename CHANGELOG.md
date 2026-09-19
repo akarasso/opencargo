@@ -107,6 +107,13 @@ All notable changes to this project will be documented in this file.
   database. Removing a token from `[auth].static_tokens` still revokes every
   registry token bought with it; a static-token registry token minted before
   this version is refused once and re-requested by the client.
+- A publish writes 37% fewer bytes to the disk. Migrations 027 and 028 rebuild
+  the placement-pin table as its own expiry index and drop the two indexes a
+  unique constraint already carried; the write-ahead log is checkpointed every
+  16 MiB instead of 4 and is truncated back afterwards. Durability is
+  unchanged. See `docs/write-amplification.md`.
+- The log is plain text unless stdout is a terminal, and the default
+  `RUST_LOG` is `opencargo=info` (`tower_http` logged nothing).
 
 ## [0.1.0-rc.1] - 2026-09-17
 

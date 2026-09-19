@@ -573,6 +573,8 @@ group whose proxy member fronts another instance; locally they print
   and the gap report.
 - [docs/operations.md](docs/operations.md): one instance, the writer lease,
   shutdown and upgrades, backups and the restore drill.
+- [docs/write-amplification.md](docs/write-amplification.md): what a publish
+  writes beyond what it keeps, measured, and what the database does about it.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).
