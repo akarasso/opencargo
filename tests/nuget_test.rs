@@ -7,7 +7,10 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 use common::nuget::{nupkg, push, push_as};
-use common::{add_token, basic_auth_header, create_user, hosted, spawn_server, SpawnOpts, TestServer, STATIC_TOKEN};
+use common::{
+    add_scoped_token, add_token, basic_auth_header, create_user, hosted, repo_scope, spawn_server,
+    SpawnOpts, TestServer, STATIC_TOKEN,
+};
 use opencargo::config::{RepositoryFormat, Visibility};
 
 async fn setup() -> TestServer {
@@ -102,6 +105,24 @@ async fn an_invalid_package_is_a_bad_request() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     let status = push_as(&c, &server.base_url, "npm", STATIC_TOKEN, nupkg("a", "1.0.0", &[])).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "a nupkg into an npm repository");
+}
+
+/// An unlist hides a version without destroying it and relist restores it,
+/// so both are the write rung: the key that pushes a package unlists it.
+#[tokio::test]
+async fn unlist_and_relist_are_the_write_rung() {
+    let server = setup().await;
+    let c = reqwest::Client::new();
+    let base = &server.base_url;
+    create_user(&c, base, STATIC_TOKEN, "ci", "publisher").await;
+    let writer = add_scoped_token(&c, base, "ci", "writer", repo_scope("nuget", &["read", "write"])).await;
+    assert_eq!(push_as(&c, base, "nuget", &writer, nupkg("lib", "1.0.0", &[])).await, StatusCode::CREATED);
+
+    let version = format!("{base}/nuget/v3/package/lib/1.0.0");
+    let unlisted = c.delete(&version).header("X-NuGet-ApiKey", &writer).send().await.unwrap();
+    assert_eq!(unlisted.status(), StatusCode::NO_CONTENT);
+    let relisted = c.post(&version).header("X-NuGet-ApiKey", &writer).send().await.unwrap();
+    assert_eq!(relisted.status(), StatusCode::OK);
 }
 
 #[tokio::test]

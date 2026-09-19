@@ -4,7 +4,10 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use common::{build_cargo_publish_body, build_crate_data, hosted, spawn_server, SpawnOpts};
+use common::{
+    add_scoped_token, build_cargo_publish_body, build_crate_data, create_user, hosted, repo_scope,
+    spawn_server, SpawnOpts, STATIC_TOKEN,
+};
 use opencargo::config::{RepositoryFormat, Visibility};
 
 /// Start a test server with a private cargo repository beside an npm one.
@@ -242,6 +245,32 @@ async fn test_cargo_index_entry() {
         "index entry should contain '\"vers\":\"0.1.0\"', got: {}",
         body_text
     );
+}
+
+/// A yank hides a version without destroying it and unyank restores it, so
+/// both are the write rung: the scope that publishes a crate yanks it.
+#[tokio::test]
+async fn yank_and_unyank_are_the_write_rung() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    create_user(&client, &base_url, STATIC_TOKEN, "ci", "publisher").await;
+    let writer =
+        add_scoped_token(&client, &base_url, "ci", "writer", repo_scope("cargo-*", &["read", "write"])).await;
+    let metadata_json = r#"{"name":"test-crate","vers":"0.1.0","deps":[],"features":{},"authors":[],"description":"Test","license":"MIT"}"#;
+    let published = client
+        .put(format!("{base_url}/cargo-private/api/v1/crates/new"))
+        .bearer_auth(&writer)
+        .body(build_cargo_publish_body(metadata_json, &build_crate_data()))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::OK, "{:?}", published.text().await);
+
+    let crate_url = format!("{base_url}/cargo-private/api/v1/crates/test-crate/0.1.0");
+    let yanked = client.delete(format!("{crate_url}/yank")).bearer_auth(&writer).send().await.unwrap();
+    assert_eq!(yanked.status(), StatusCode::OK, "{:?}", yanked.text().await);
+    let unyanked = client.put(format!("{crate_url}/unyank")).bearer_auth(&writer).send().await.unwrap();
+    assert_eq!(unyanked.status(), StatusCode::OK, "{:?}", unyanked.text().await);
 }
 
 #[tokio::test]

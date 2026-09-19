@@ -19,7 +19,7 @@ use super::scan::{scan, Field, Text};
 use super::surface::canonical_sha256;
 use crate::app::mcp::skills::{PublishSkill, SkillUpload};
 use crate::auth::middleware::AuthUser;
-use crate::domain::{Format, FormatRules, RepoKind, Repository};
+use crate::domain::{Format, FormatRules, RepoAction, RepoKind, Repository};
 use crate::error::{AppError, AppResult};
 use crate::ports::mcp::SkillRow;
 use crate::registry::archive::{zip_check, zip_names, zip_read, ArchiveError, Limits};
@@ -202,11 +202,16 @@ fn caller(request: &axum::http::Request<Body>) -> AppResult<AuthUser> {
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))
 }
 
-async fn hosted_mcp(state: &AppState, name: &str, auth: &AuthUser) -> AppResult<Repository> {
+async fn hosted_mcp(
+    state: &AppState,
+    name: &str,
+    auth: &AuthUser,
+    action: RepoAction,
+) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), name).await?;
     crate::registry::ensure_format(&repo, Format::Mcp)?;
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_action(&state.authorize(), &repo, auth, action).await?;
     Ok(repo)
 }
 
@@ -219,7 +224,7 @@ pub async fn upload(
     let auth = caller(&request)?;
     validate_name(&name)?;
     McpRules.validate_version(&version)?;
-    let repo = hosted_mcp(&state, &repo_name, &auth).await?;
+    let repo = hosted_mcp(&state, &repo_name, &auth, RepoAction::Write).await?;
     let bytes = axum::body::to_bytes(request.into_body(), MAX_ARCHIVE_BYTES)
         .await
         .map_err(|e| AppError::BadRequest(format!("skill archive over {MAX_ARCHIVE_BYTES} bytes or unreadable: {e}")))?;
@@ -250,7 +255,7 @@ pub async fn delete(
     request: axum::http::Request<Body>,
 ) -> AppResult<StatusCode> {
     let auth = caller(&request)?;
-    let repo = hosted_mcp(&state, &repo_name, &auth).await?;
+    let repo = hosted_mcp(&state, &repo_name, &auth, RepoAction::Delete).await?;
     state.mcp.delete_skill(repo.id, &name, &version, state.clock.now()).await?;
     crate::api::record_audit(&state, &auth, "mcp.skill.delete", Some(&format!("{name}@{version}"))).await;
     Ok(StatusCode::NO_CONTENT)

@@ -588,6 +588,35 @@ pub async fn add_token(
     body["token"].as_str().expect("token").to_string()
 }
 
+/// One more API token for an existing user, narrowed to `scope`.
+pub async fn add_scoped_token(
+    client: &reqwest::Client,
+    base_url: &str,
+    username: &str,
+    name: &str,
+    scope: Value,
+) -> String {
+    let resp = client
+        .post(format!("{base_url}/api/v1/users/{username}/tokens"))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&json!({ "name": name, "scope": scope }))
+        .send()
+        .await
+        .expect("create token request failed");
+    let status = resp.status();
+    let body: Value = resp.json().await.expect("invalid json");
+    assert_eq!(status, StatusCode::CREATED, "{body:?}");
+    body["token"].as_str().expect("token").to_string()
+}
+
+/// A `limited` scope of one repository line.
+pub fn repo_scope(pattern: &str, actions: &[&str]) -> Value {
+    json!({
+        "kind": "limited",
+        "grants": [{ "on": "repo", "repo": pattern, "actions": actions }],
+    })
+}
+
 /// Move a hosted version's `published_at` `hours` into the past.
 pub async fn backdate_version(server: &TestServer, package: &str, version: &str, hours: i64) {
     let pool = open_db(server).await;
