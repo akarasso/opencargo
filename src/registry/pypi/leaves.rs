@@ -18,7 +18,7 @@ use super::names::parse_filename;
 use super::parse::{parse_html, parse_json, UpstreamFile, UpstreamPage};
 use super::simple::{Page, PageFile, Yanked};
 use super::upstream::{allowed_host, file_hosts, is_json, page_url, same_endpoint, PypiArtifact, PypiStrategy};
-use super::version;
+use crate::domain::pep440 as version;
 
 /// The URL a page lists a file under: our own files route, relative to
 /// `/{repo}/simple/{project}/`.

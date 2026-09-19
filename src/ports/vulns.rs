@@ -9,7 +9,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::domain::{ScanResult, VulnDetail};
+use crate::domain::{Format, ScanResult, VulnDetail};
 use crate::error::StoreError;
 
 /// How a scan fails. A feed produces `Upstream` or `Unscannable`; `Store` is
@@ -51,7 +51,7 @@ pub trait VulnFeed: Send + Sync {
     /// the order given.
     async fn assess_batch(
         &self,
-        ecosystem: &str,
+        format: Format,
         deps: &[(String, String)],
     ) -> Result<Vec<Vec<VulnDetail>>, ScanError>;
 
@@ -60,7 +60,7 @@ pub trait VulnFeed: Send + Sync {
     async fn assess(
         &self,
         metadata_json: &str,
-        ecosystem: &str,
+        format: Format,
     ) -> Result<ScanResult, ScanError>;
 }
 

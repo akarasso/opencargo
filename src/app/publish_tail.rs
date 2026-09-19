@@ -39,13 +39,13 @@ impl PublishGate {
     /// With `block_on_critical` a critical finding refuses the publish; an
     /// OSV outage follows `fail_closed`.
     pub async fn run(&self, format: Format, metadata_json: &str) -> AppResult<PreScan> {
-        let Some(ecosystem) = format.osv_ecosystem() else {
+        if format.osv_ecosystem().is_none() {
             return Ok(PreScan(None));
-        };
+        }
         if !(self.config.enabled && self.config.block_on_critical) {
             return Ok(PreScan(None));
         }
-        match self.feed.assess(metadata_json, ecosystem).await {
+        match self.feed.assess(metadata_json, format).await {
             Ok(result) if result.status == "critical" => Err(AppError::BadRequest(
                 "publish blocked: critical vulnerabilities found in dependencies".to_string(),
             )),
@@ -132,7 +132,7 @@ impl PublishTail {
     /// Persist the pre-publish scan, or run one in the background when the
     /// gate did not.
     async fn scan(&self, done: &Published<'_>, pre: PreScan, now: DateTime<Utc>) {
-        let (Some(version_id), Some(ecosystem)) = (done.version_id, done.format.osv_ecosystem())
+        let Some(version_id) = done.version_id.filter(|_| done.format.osv_ecosystem().is_some())
         else {
             return;
         };
@@ -146,9 +146,9 @@ impl PublishTail {
             }
             None => {
                 let meta_json = done.metadata_json.to_string();
-                let eco = ecosystem.to_string();
+                let format = done.format;
                 tokio::spawn(async move {
-                    match scan.run(version_id, &meta_json, &eco, Utc::now()).await {
+                    match scan.run(version_id, &meta_json, format, Utc::now()).await {
                         Ok(_) => {}
                         Err(ScanError::Unscannable(why)) => {
                             warn!(version_id, %why, "version not scanned: no scan row will say it was")

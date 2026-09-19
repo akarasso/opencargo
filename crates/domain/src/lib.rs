@@ -13,6 +13,7 @@ pub mod kinds;
 pub mod layout;
 pub mod limits;
 pub mod names;
+pub mod pep440;
 pub mod permission;
 pub mod policy;
 pub mod proxy;
@@ -33,6 +34,7 @@ pub use format_rules::FormatRules;
 pub use governance::{AllowRule, Decision, Drift, Effect, Fingerprint, GateMode};
 pub use identity::CredentialKind;
 pub use kinds::{Format, RepoKind, Visibility};
+pub use pep440::Pep440;
 pub use limits::{LimitScope, PublishLimit, PublishLimits};
 pub use names::{
     validate_npm_read_name, validate_oci_tag, validate_package_name, validate_version,

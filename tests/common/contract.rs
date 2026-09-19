@@ -950,9 +950,9 @@ macro_rules! package_contract {
             }
 
             /// The retention predicate reads the caller's clock and nothing
-            /// else, and only the two formats whose `-` marks a pre-release.
+            /// else, and each format's own spelling of a pre-release.
             #[tokio::test]
-            async fn the_sweep_sees_aged_pre_releases_of_npm_and_cargo_only() {
+            async fn the_sweep_sees_each_format_s_own_aged_pre_releases() {
                 use ::std::time::Duration;
 
                 let handles = $open().await;
@@ -968,9 +968,43 @@ macro_rules! package_contract {
                     )
                     .await
                     .unwrap();
+                let nuget = handles
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            format: Format::Nuget,
+                            ..spec("nuget-hosted", Visibility::Public)
+                        },
+                        at(9),
+                    )
+                    .await
+                    .unwrap();
+                let pypi = handles
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            format: Format::Pypi,
+                            ..spec("pypi-hosted", Visibility::Public)
+                        },
+                        at(9),
+                    )
+                    .await
+                    .unwrap();
                 let store = &handles.packages;
                 let aged = store
                     .publish_version(&release(npm.id, "left-pad", "1.0.0-beta", &[]))
+                    .await
+                    .unwrap();
+                let beta = store
+                    .publish_version(&release(nuget.id, "Acme.Lib", "1.0.0-beta", &[]))
+                    .await
+                    .unwrap();
+                let rc = store
+                    .publish_version(&release(pypi.id, "widget", "1.0rc1", &[]))
+                    .await
+                    .unwrap();
+                store
+                    .publish_version(&release(pypi.id, "widget", "1.0.post1", &[]))
                     .await
                     .unwrap();
                 store
@@ -990,14 +1024,19 @@ macro_rules! package_contract {
                 let day = Duration::from_secs(86_400);
                 let past_it = at(9) + day + Duration::from_secs(1);
                 let stale = store.stale_prereleases(day, past_it).await.unwrap();
+                let mut swept: Vec<i64> = stale.iter().map(|s| s.id).collect();
+                swept.sort();
+                let mut want = vec![aged.version.id, beta.version.id, rc.version.id];
+                want.sort();
                 assert_eq!(
-                    stale.iter().map(|s| s.id).collect::<Vec<_>>(),
-                    [aged.version.id],
-                    "a release version and a go pseudo-version are not pre-releases to sweep"
+                    swept, want,
+                    "a NuGet beta and a PyPI rc are pre-releases; a release version, \
+                     a PyPI post release and a go pseudo-version are not"
                 );
-                assert_eq!(stale[0].package, "left-pad");
-                assert_eq!(stale[0].version, "1.0.0-beta");
-                assert_eq!(stale[0].tarball_path, "npm/r/p/p.tgz");
+                let npm_row = stale.iter().find(|s| s.id == aged.version.id).unwrap();
+                assert_eq!(npm_row.package, "left-pad");
+                assert_eq!(npm_row.version, "1.0.0-beta");
+                assert_eq!(npm_row.tarball_path, "npm/r/p/p.tgz");
 
                 assert!(
                     store

@@ -762,12 +762,15 @@ impl Packages {
             .repositories
             .iter()
             .find(|repo| repo.id == package.repository_id)?;
-        matches!(repo.format.as_str(), "npm" | "cargo").then(|| StalePrerelease {
-            id: version.id,
-            package: package.name.clone(),
-            version: version.version.clone(),
-            tarball_path: version.tarball_path.clone(),
-        })
+        let format: opencargo::domain::Format = repo.format.parse().ok()?;
+        format
+            .is_prerelease(&version.version)
+            .then(|| StalePrerelease {
+                id: version.id,
+                package: package.name.clone(),
+                version: version.version.clone(),
+                tarball_path: version.tarball_path.clone(),
+            })
     }
 
     fn matched(package: &Package, name: &str, how: NameMatch) -> bool {
@@ -1110,7 +1113,7 @@ impl PackageStore for Packages {
             Ok(state
                 .versions
                 .iter()
-                .filter(|v| v.version.contains('-') && v.published_at < cutoff)
+                .filter(|v| v.published_at < cutoff)
                 .filter_map(|v| Self::stale(state, v))
                 .collect())
         })

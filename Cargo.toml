@@ -141,3 +141,55 @@ lto = true
 strip = true
 codegen-units = 1
 opt-level = "z"
+
+[features]
+e2e = []
+
+[[test]]
+name = "cargo_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "docker_cli_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "shutdown_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "go_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "import_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "maven_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "mcp_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "nuget_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "pnpm_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "pypi_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "raw_e2e_test"
+required-features = ["e2e"]
+
+[[test]]
+name = "sso_dex_e2e_test"
+required-features = ["e2e"]
+

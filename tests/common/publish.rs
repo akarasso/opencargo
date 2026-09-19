@@ -199,21 +199,262 @@ pub async fn publish_named(
 pub fn subject(format: Format, n: usize) -> Subject {
     let version = match format {
         Format::Go => "v1.0.0".to_string(),
+        // 1.0.0 canonicalises to 1 under PEP 440, which is not what a
+        // caller would then ask for by name.
+        Format::Pypi => "1.2.3".to_string(),
         Format::Oci => format!("v{n}"),
         _ => "1.0.0".to_string(),
     };
     let name = match format {
         Format::Npm => format!("pkg-{n}"),
         Format::Cargo => format!("krate-{n}"),
-        Format::Go => format!("example.com/mod{n}"),
-        Format::Pypi => format!("widget{n}"),
-        Format::Nuget => format!("Widget{n}"),
+        Format::Go => format!("mod{n}.example.com"),
+        Format::Pypi => format!("wheel{n}"),
+        Format::Nuget => format!("Nupkg{n}"),
         Format::Maven => format!("lib{n}"),
         Format::Oci => "app".to_string(),
         Format::Mcp => format!("io.github.acme/srv{n}"),
         Format::Raw => format!("dist/file-{n}.bin"),
     };
     Subject { name, version }
+}
+
+/// The dependency a `publish_with_dependency` declares, in the format's own
+/// grammar. Exhaustive: a format claiming to be scannable has to say how its
+/// document names what it depends on.
+pub struct Dependency {
+    pub name: &'static str,
+    /// What the published document writes, in the format's own grammar.
+    pub declared: &'static str,
+    /// What an extraction that understood that grammar must come out with.
+    pub resolved: &'static str,
+}
+
+pub fn dependency(format: Format) -> Option<Dependency> {
+    let (name, declared, resolved) = match format {
+        Format::Npm => ("lodash", "^4.17.20", "4.17.20"),
+        Format::Cargo => ("serde", "^1.0.100", "1.0.100"),
+        Format::Go => ("example.com/dep", "v1.2.3", "v1.2.3"),
+        Format::Pypi => ("idna", ">=3.4", "3.4"),
+        Format::Maven => ("org.example:dep", "[2.0.0,3.0.0)", "2.0.0"),
+        Format::Nuget => ("Newtonsoft.Json", "[12.0.1, )", "12.0.1"),
+        Format::Oci | Format::Mcp | Format::Raw => return None,
+    };
+    Some(Dependency {
+        name,
+        declared,
+        resolved,
+    })
+}
+
+/// The same publish, with one dependency declared, for the formats whose row
+/// says a scan can read it.
+pub async fn publish_with_dependency(
+    client: &Client,
+    base_url: &str,
+    format: Format,
+    n: usize,
+) -> (Subject, Response) {
+    let Some(Dependency {
+        name: dep,
+        declared,
+        ..
+    }) = dependency(format)
+    else {
+        return publish_named(client, base_url, format, n).await;
+    };
+    let repo = repo_of(format);
+    let s = subject(format, n);
+    let response = match format {
+        Format::Npm => {
+            let manifest = format!(
+                r#"{{"name":"{}","version":"{}","dependencies":{{"{dep}":"{declared}"}}}}"#,
+                s.name, s.version
+            );
+            let tarball = build_tarball(&manifest);
+            let mut body = build_npm_publish_body(&s.name, &s.version, "matrix", &tarball);
+            body["versions"][&s.version]["dependencies"] = json!({ dep: declared });
+            client
+                .put(format!("{base_url}/{repo}/{}", s.name))
+                .bearer_auth(STATIC_TOKEN)
+                .json(&body)
+                .send()
+                .await
+                .unwrap()
+        }
+        Format::Cargo => {
+            let meta = json!({
+                "name": s.name,
+                "vers": s.version,
+                "deps": [{
+                    "name": dep,
+                    "version_req": declared,
+                    "kind": "normal",
+                }],
+            })
+            .to_string();
+            client
+                .put(format!("{base_url}/{repo}/api/v1/crates/new"))
+                .bearer_auth(STATIC_TOKEN)
+                .body(build_cargo_publish_body(&meta, b"crate bytes"))
+                .send()
+                .await
+                .unwrap()
+        }
+        Format::Go => {
+            let zip = go_zip_requiring(&s.name, &s.version, dep, declared);
+            client
+                .put(format!("{base_url}/{repo}/{}/@v/{}", s.name, s.version))
+                .bearer_auth(STATIC_TOKEN)
+                .header("content-type", "application/zip")
+                .body(zip)
+                .send()
+                .await
+                .unwrap()
+        }
+        Format::Pypi => {
+            let requires = format!("{dep}{declared}");
+            pypi::upload(
+                client,
+                base_url,
+                &repo,
+                &pypi::basic("__token__", STATIC_TOKEN),
+                &pypi::wheel_name(&s.name, &s.version),
+                &pypi::wheel_with(&s.name, &s.version, None, &[requires.as_str()]),
+            )
+            .await
+        }
+        Format::Nuget => {
+            let deps = format!(r#"<dependency id="{dep}" version="{declared}" />"#);
+            client
+                .put(format!("{base_url}/{repo}/v3/package"))
+                .header("X-NuGet-ApiKey", STATIC_TOKEN)
+                .multipart(nuget::form(nuget::nupkg_with(
+                    &s.name,
+                    &s.version,
+                    &deps,
+                    &[],
+                )))
+                .send()
+                .await
+                .unwrap()
+        }
+        Format::Maven => {
+            let dir = format!("org/example/{}", s.name);
+            let jar = b"jar bytes".to_vec();
+            let put = |path: String, body: Vec<u8>| {
+                client
+                    .put(format!("{base_url}/maven/{repo}/{path}"))
+                    .bearer_auth(STATIC_TOKEN)
+                    .body(body)
+                    .send()
+            };
+            let jar_path = format!("{dir}/{0}/{1}-{0}.jar", s.version, s.name);
+            let deployed = put(jar_path.clone(), jar.clone()).await.unwrap();
+            if let Some(refused) = refusal(deployed) {
+                return (s, refused);
+            }
+            let sha = format!("{:x}", sha1::Sha1::digest(&jar));
+            let checksum = put(format!("{jar_path}.sha1"), sha.into_bytes()).await.unwrap();
+            if let Some(refused) = refusal(checksum) {
+                return (s, refused);
+            }
+            let (group, artifact) = dep.split_once(':').unwrap();
+            let pom = format!(
+                "<project><groupId>org.example</groupId><artifactId>{}</artifactId>\
+                 <version>{}</version><dependencies><dependency>\
+                 <groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
+                 <version>{declared}</version></dependency></dependencies></project>",
+                s.name, s.version
+            );
+            put(
+                format!("{dir}/{0}/{1}-{0}.pom", s.version, s.name),
+                pom.into_bytes(),
+            )
+            .await
+            .unwrap()
+        }
+        Format::Oci | Format::Mcp | Format::Raw => unreachable!("no dependency to declare"),
+    };
+    (s, response)
+}
+
+fn go_zip_requiring(module: &str, version: &str, dep: &str, dep_version: &str) -> Vec<u8> {
+    use std::io::Write as _;
+    let mut buf = Vec::new();
+    {
+        let mut zip = zip::ZipWriter::new(std::io::Cursor::new(&mut buf));
+        let options = zip::write::SimpleFileOptions::default()
+            .compression_method(zip::CompressionMethod::Stored)
+            .last_modified_time(zip::DateTime::default());
+        zip.start_file(format!("{module}@{version}/go.mod"), options)
+            .unwrap();
+        zip.write_all(
+            format!("module {module}\n\ngo 1.21\n\nrequire {dep} {dep_version}\n").as_bytes(),
+        )
+        .unwrap();
+        zip.start_file(format!("{module}@{version}/main.go"), options)
+            .unwrap();
+        zip.write_all(b"package mod\n").unwrap();
+        zip.finish().unwrap();
+    }
+    buf
+}
+
+/// The request a client makes to obtain what `publish` created. Exhaustive
+/// too, so a format cannot answer a download column without a download.
+/// The name the version is stored under, which is not always the one the
+/// path carries: a Maven package is its `groupId:artifactId` coordinate.
+pub fn stored_name(format: Format, n: usize) -> String {
+    let s = subject(format, n);
+    match format {
+        Format::Maven => format!("org.example:{}", s.name),
+        Format::Nuget => s.name.to_ascii_lowercase(),
+        _ => s.name,
+    }
+}
+
+pub async fn fetch(client: &Client, base_url: &str, format: Format, n: usize) -> Response {
+    let repo = repo_of(format);
+    let s = subject(format, n);
+    let url = match format {
+        Format::Npm => format!("{base_url}/{repo}/{0}/-/{0}-{1}.tgz", s.name, s.version),
+        Format::Cargo => format!(
+            "{base_url}/{repo}/api/v1/crates/{}/{}/download",
+            s.name, s.version
+        ),
+        Format::Go => format!("{base_url}/{repo}/{}/@v/{}.zip", s.name, s.version),
+        Format::Pypi => format!(
+            "{base_url}/{repo}/files/{}/{}",
+            s.name,
+            pypi::wheel_name(&s.name, &s.version)
+        ),
+        Format::Nuget => format!(
+            "{base_url}/{repo}/v3/flatcontainer/{0}/{1}/{0}.{1}.nupkg",
+            s.name.to_ascii_lowercase(),
+            s.version
+        ),
+        Format::Maven => format!(
+            "{base_url}/maven/{repo}/org/example/{0}/{1}/{0}-{1}.jar",
+            s.name, s.version
+        ),
+        Format::Oci => format!("{base_url}/v2/{repo}/{}/manifests/{}", s.name, s.version),
+        Format::Mcp => format!(
+            "{base_url}/{repo}/v0.1/servers/{}/versions/{}",
+            s.name.replace('/', "%2F"),
+            s.version
+        ),
+        Format::Raw => format!("{base_url}/raw/{repo}/{}", s.name),
+    };
+    let request = client.get(url).bearer_auth(STATIC_TOKEN);
+    let request = match format {
+        Format::Oci => request.header(
+            "accept",
+            "application/vnd.oci.image.manifest.v1+json",
+        ),
+        _ => request,
+    };
+    request.send().await.unwrap()
 }
 
 fn refusal(response: Response) -> Option<Response> {

@@ -28,4 +28,4 @@ export OPENCARGO_TEST_S3_BUCKET=$bucket
 export OPENCARGO_S3_ENDPOINT=http://127.0.0.1:$port
 export OPENCARGO_S3_ACCESS_KEY_ID=$user
 export OPENCARGO_S3_SECRET_ACCESS_KEY=$pass
-cargo test --workspace --no-fail-fast "$@"
+cargo test --workspace --all-features --no-fail-fast "$@"

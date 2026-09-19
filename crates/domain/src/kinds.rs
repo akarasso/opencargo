@@ -97,6 +97,34 @@ impl Format {
     pub const fn supports_kind(self, _kind: RepoKind) -> bool {
         true
     }
+
+    /// Whether every version this format calls a pre-release carries a
+    /// hyphen, which lets a store narrow its scan before the predicate
+    /// decides. False for PEP 440, where `1.0rc1` has none.
+    pub const fn prerelease_implies_hyphen(self) -> bool {
+        match self {
+            Format::Npm | Format::Cargo | Format::Nuget => true,
+            Format::Pypi => false,
+            // No pre-release at all, so the implication holds vacuously.
+            Format::Go | Format::Maven | Format::Oci | Format::Mcp | Format::Raw => true,
+        }
+    }
+
+    /// Whether this format calls `version` a pre-release. A format whose row
+    /// says `No` never does, so the retention sweep cannot reach it.
+    pub fn is_prerelease(self, version: &str) -> bool {
+        match self {
+            // SemVer: everything after the first hyphen is the pre-release.
+            Format::Npm | Format::Cargo | Format::Nuget => version.contains('-'),
+            Format::Pypi => crate::pep440::Pep440::parse(version)
+                .is_some_and(|parsed| parsed.is_prerelease()),
+            Format::Go
+            | Format::Maven
+            | Format::Oci
+            | Format::Mcp
+            | Format::Raw => false,
+        }
+    }
 }
 
 impl FromStr for Format {
@@ -166,7 +194,8 @@ impl Cell {
 pub struct Coverage {
     /// A publish has one request the meter counts.
     pub metered_publish: Cell,
-    /// A publish is judged by the policy gate before anything is written.
+    /// A critical finding in its dependencies refuses the publish, before any
+    /// file or row is written.
     pub publish_gate: Cell,
     /// A proxy resolution is recorded for the policy report.
     pub policy_record: Cell,
@@ -235,7 +264,7 @@ impl Format {
             },
             Format::Oci => Coverage {
                 metered_publish: Cell::Yes,
-                publish_gate: Cell::Yes,
+                publish_gate: Cell::No(NO_DOC),
                 policy_record: Cell::Yes,
                 scannable: Cell::No(NO_DOC),
                 emptiness_probe: Cell::Yes,
@@ -372,5 +401,75 @@ mod coverage_tests {
                 "{format:?}: scannable and osv_ecosystem disagree"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prerelease_tests {
+    use super::*;
+
+    /// A format that declares the notion recognises its own spellings, and a
+    /// format that declares none says no to all of them. The sweep reads this,
+    /// so a `Yes` with a predicate that never fires would delete nothing and
+    /// look healthy.
+    #[test]
+    fn each_format_reads_the_versions_it_calls_pre_releases() {
+        for format in Format::ALL {
+            let spellings: &[&str] = match format {
+                Format::Npm | Format::Cargo | Format::Nuget => &["1.0.0-beta", "2.0.0-rc.1"],
+                Format::Pypi => &["1.0a1", "1.0.b2", "1.0-rc1", "1.0.dev3", "2.0alpha"],
+                _ => &[],
+            };
+            for version in spellings {
+                assert!(
+                    format.is_prerelease(version),
+                    "{format:?} does not read {version} as a pre-release"
+                );
+            }
+            if !format.coverage().prerelease.yes() {
+                for version in ["1.0.0-beta", "1.0a1", "v0.0.0-20200101000000-abcdef"] {
+                    assert!(
+                        !format.is_prerelease(version),
+                        "{format:?} says no to the notion and yes to {version}"
+                    );
+                }
+            }
+            for stable in ["1.0.0", "2.1.3"] {
+                assert!(!format.is_prerelease(stable), "{format:?}: {stable}");
+            }
+        }
+    }
+
+    /// The three that would cost a user an artifact. A Go pseudo-version
+    /// carries a hyphen and is permanent; a PyPI post release is a release;
+    /// a local segment is where a build writes its own name.
+    #[test]
+    fn the_lookalikes_are_not_pre_releases() {
+        assert!(!Format::Go.is_prerelease("v0.0.0-20200101000000-abcdef"));
+        assert!(!Format::Pypi.is_prerelease("1.0.post1"));
+        assert!(!Format::Pypi.is_prerelease("1.0+abc1"));
+        assert!(!Format::Pypi.is_prerelease("1.0+ubuntu22.04"));
+        assert!(!Format::Nuget.is_prerelease("1.0.0"));
+        assert!(!Format::Maven.is_prerelease("1.0-SNAPSHOT"));
+    }
+
+    /// The hint a store pre-filters on, held against the predicate that
+    /// decides: a format claiming the implication must never call a
+    /// hyphen-free version a pre-release, or the narrowed scan loses it.
+    #[test]
+    fn the_hyphen_hint_never_drops_what_the_predicate_would_keep() {
+        for format in Format::ALL.into_iter().filter(|f| f.prerelease_implies_hyphen()) {
+            for version in ["1.0.0", "1.0.0+build", "2024.1.1", "1.0.0rc1", "1.0a1", "1.0.dev3"] {
+                assert!(
+                    !format.is_prerelease(version),
+                    "{format:?} claims every pre-release carries a hyphen and calls \
+                     {version} one, so a hyphen pre-filter would lose it"
+                );
+            }
+        }
+        assert!(
+            !Format::Pypi.prerelease_implies_hyphen(),
+            "PEP 440 spells 1.0rc1 without one, so PyPI cannot be narrowed that way"
+        );
     }
 }

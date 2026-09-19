@@ -3,7 +3,7 @@
 
 use crate::domain::{compile_pattern, DomainError, FormatRules, Pattern};
 
-use super::version::Pep440;
+use crate::domain::Pep440;
 
 pub struct PypiRules;
 

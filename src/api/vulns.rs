@@ -176,17 +176,17 @@ async fn rescan_impl(
     let version = version_of(&state, pkg.id, &name, &version_str).await?;
 
     let format = repo.fmt()?;
-    let ecosystem = format.osv_ecosystem().ok_or_else(|| {
-        AppError::BadRequest(format!(
+    if format.osv_ecosystem().is_none() {
+        return Err(AppError::BadRequest(format!(
             "vulnerability scanning is not available for {} repositories",
             format.as_str()
-        ))
-    })?;
+        )));
+    }
 
     let scan = ScanVersion::new(state.vuln_scanner.clone(), state.vulns.clone());
     scan.forget(version.id).await?;
     let result = scan
-        .run(version.id, &version.metadata_json, ecosystem, Utc::now())
+        .run(version.id, &version.metadata_json, format, Utc::now())
         .await
         .map_err(|e| match e {
             ScanError::Unscannable(why) => AppError::BadRequest(format!("cannot scan: {why}")),

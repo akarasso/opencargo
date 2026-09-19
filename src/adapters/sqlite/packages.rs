@@ -13,7 +13,7 @@ use sqlx::{Sqlite, SqlitePool, Transaction};
 
 use super::{bind_ts, immediate, store_error};
 use crate::adapters::sqlite::rows::{DistTagRow, PackageRow, VersionRow};
-use crate::domain::{DistTag, Package, Version};
+use crate::domain::{DistTag, Format, Package, Version};
 use crate::error::StoreError;
 use crate::ports::packages::{
     ReleaseDependency,
@@ -110,6 +110,7 @@ struct StaleRow {
     package: String,
     version: String,
     tarball_path: String,
+    format: String,
 }
 
 impl From<StaleRow> for StalePrerelease {
@@ -121,6 +122,48 @@ impl From<StaleRow> for StalePrerelease {
             tarball_path: row.tarball_path,
         }
     }
+}
+
+/// The versions the predicate has to judge: the formats that declare the
+/// notion, narrowed by the hyphen where the format says every pre-release
+/// carries one. `Format::is_prerelease` decides; this only keeps the scan
+/// off the stable catalogue.
+fn prerelease_candidates() -> String {
+    let (hyphen, whole): (Vec<&str>, Vec<&str>) = Format::ALL
+        .into_iter()
+        .filter(|f| f.coverage().prerelease.yes())
+        .map(Format::as_str)
+        .partition(|name| {
+            name.parse::<Format>()
+                .is_ok_and(|f| f.prerelease_implies_hyphen())
+        });
+    let quoted = |names: &[&str]| {
+        names
+            .iter()
+            .map(|n| format!("'{n}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    let mut scopes = Vec::new();
+    if !hyphen.is_empty() {
+        scopes.push(format!(
+            "(r.format IN ({}) AND v.version LIKE '%-%')",
+            quoted(&hyphen)
+        ));
+    }
+    if !whole.is_empty() {
+        scopes.push(format!("r.format IN ({})", quoted(&whole)));
+    }
+    format!(
+        "SELECT v.id, p.name AS package, v.version, v.tarball_path, r.format
+         FROM versions v
+         JOIN packages p ON p.id = v.package_id
+         JOIN repositories r ON r.id = p.repository_id
+         WHERE ({})
+           AND v.published_at < ?1
+         ORDER BY v.id",
+        scopes.join(" OR ")
+    )
 }
 
 /// The name predicate, as SQL. `?1` is the repository, `?2` the name.
@@ -523,21 +566,20 @@ impl PackageStore for SqlitePackageStore {
         older_than: Duration,
         now: DateTime<Utc>,
     ) -> Result<Vec<StalePrerelease>, StoreError> {
-        let rows: Vec<StaleRow> = sqlx::query_as(
-            "SELECT v.id, p.name AS package, v.version, v.tarball_path
-             FROM versions v
-             JOIN packages p ON p.id = v.package_id
-             JOIN repositories r ON r.id = p.repository_id
-             WHERE r.format IN ('npm', 'cargo')
-               AND v.version LIKE '%-%'
-               AND v.published_at < ?1
-             ORDER BY v.id",
-        )
-        .bind(bind_ts(now - older_than))
-        .fetch_all(&self.pool)
-        .await
-        .map_err(store_error)?;
-        Ok(rows.into_iter().map(StalePrerelease::from).collect())
+        let rows: Vec<StaleRow> = sqlx::query_as(&prerelease_candidates())
+            .bind(bind_ts(now - older_than))
+            .fetch_all(&self.pool)
+            .await
+            .map_err(store_error)?;
+        Ok(rows
+            .into_iter()
+            .filter(|row| {
+                row.format
+                    .parse::<Format>()
+                    .is_ok_and(|format| format.is_prerelease(&row.version))
+            })
+            .map(StalePrerelease::from)
+            .collect())
     }
 
     async fn delete_version(&self, version: i64, now: DateTime<Utc>) -> Result<(), StoreError> {

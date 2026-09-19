@@ -9,7 +9,7 @@ use std::sync::Arc;
 use chrono::{DateTime, Utc};
 use tracing::info;
 
-use crate::domain::ScanResult;
+use crate::domain::{Format, ScanResult};
 use crate::error::StoreError;
 use crate::ports::vulns::{ScanError, VulnFeed, VulnStore};
 
@@ -29,10 +29,10 @@ impl ScanVersion {
         &self,
         version: i64,
         metadata_json: &str,
-        ecosystem: &str,
+        format: Format,
         now: DateTime<Utc>,
     ) -> Result<ScanResult, ScanError> {
-        let result = self.feed.assess(metadata_json, ecosystem).await?;
+        let result = self.feed.assess(metadata_json, format).await?;
         if self.feed.enabled() {
             self.record(version, &result, now).await?;
         }
@@ -86,7 +86,7 @@ mod tests {
 
         async fn assess_batch(
             &self,
-            _ecosystem: &str,
+            _format: Format,
             deps: &[(String, String)],
         ) -> Result<Vec<Vec<VulnDetail>>, ScanError> {
             Ok(vec![Vec::new(); deps.len()])
@@ -95,7 +95,7 @@ mod tests {
         async fn assess(
             &self,
             _metadata_json: &str,
-            _ecosystem: &str,
+            _format: Format,
         ) -> Result<ScanResult, ScanError> {
             Ok(self.result.clone())
         }
@@ -132,7 +132,7 @@ mod tests {
         });
         let scan = ScanVersion::new(feed, db.vulns());
 
-        let result = scan.run(7, "{}", "npm", at()).await.unwrap();
+        let result = scan.run(7, "{}", Format::Npm, at()).await.unwrap();
 
         assert_eq!(result.vulnerable_deps, 1);
         let stored = db.vulns().latest(7).await.unwrap().unwrap();
@@ -151,7 +151,7 @@ mod tests {
         });
         let scan = ScanVersion::new(feed, db.vulns());
 
-        let result = scan.run(7, "{}", "npm", at()).await.unwrap();
+        let result = scan.run(7, "{}", Format::Npm, at()).await.unwrap();
 
         assert_eq!(result.status, "clean");
         assert!(db.vulns().latest(7).await.unwrap().is_none());
@@ -165,12 +165,12 @@ mod tests {
             result: finding(),
         });
         let scan = ScanVersion::new(feed, db.vulns());
-        scan.run(7, "{}", "npm", at()).await.unwrap();
+        scan.run(7, "{}", Format::Npm, at()).await.unwrap();
 
         scan.forget(7).await.unwrap();
         assert!(db.vulns().latest(7).await.unwrap().is_none());
 
-        scan.run(7, "{}", "npm", at()).await.unwrap();
+        scan.run(7, "{}", Format::Npm, at()).await.unwrap();
         assert!(db.vulns().latest(7).await.unwrap().is_some());
     }
 }

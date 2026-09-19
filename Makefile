@@ -47,21 +47,10 @@ tilt: ## Lancer avec Tilt (hot reload)
 # ---------------------------------------------------------------------------
 
 test: ## Lancer tous les tests
-	cargo test
+	cargo test --all-features
 
-test-quick: ## Tests rapides (sans réseau ni client externe)
-	cargo test --test npm_test --test npm_proxy_test --test npm_memory_test --test cargo_test --test cargo_proxy_test \
-		--test go_test --test go_proxy_test --test oci_test --test oci_nested_test --test oci_proxy_test \
-		--test vuln_test --test group_resolver_test --test auth_test --test features_test \
-		--test promote_test --test permissions_test --test policy_test --test publish_limits_test \
-		--test pypi_test --test pypi_store_test --test pypi_proxy_test \
-		--test maven_test --test maven_proxy_test \
-		--test nuget_test --test nuget_feed_store_test --test nuget_proxy_test --test nuget_group_test \
-		--test sso_test --test sso_store_test \
-		--test mcp_test --test mcp_sync_test --test mcp_probe_test --test mcp_policy_test --test mcp_client_test --test mcp_admin_test \
-		--test import_test --test import_managers_test --test import_oci_test \
-		--test instance_lease_test --test storage_cli_test --test shutdown_test --test backup_test \
-		--test write_amplification_test --test bench_smoke_test --test search_cache_test --test token_store_test --test scopes_test --test routing_test --test raw_test --test raw_store_test --test raw_proxy_test
+test-quick: ## Tests rapides (sans reseau ni client externe)
+	cargo test
 
 test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
 	scripts/test-s3.sh
@@ -80,33 +69,33 @@ test-network: ## Tests contre npmjs.org / osv.dev (OPENCARGO_NETWORK_TESTS=1)
 	OPENCARGO_NETWORK_TESTS=1 cargo test --test proxy_test --test vuln_test
 
 test-docker: ## Tests Docker/OCI (HTTP, sans client docker)
-	cargo test --test oci_test --test oci_nested_test --test oci_proxy_test --test docker_e2e_test
+	cargo test --test oci_test --test oci_nested_test --test oci_proxy_test --test oci_basic_auth_test
 
 test-e2e: ## Tests E2E avec les vrais clients (pnpm, cargo, go, docker, mvn, gradle requis)
-	OPENCARGO_E2E_REQUIRE=1 cargo test --test pnpm_e2e_test --test e2e_scoped_test \
+	OPENCARGO_E2E_REQUIRE=1 cargo test --features e2e --test pnpm_e2e_test \
 		--test cargo_e2e_test --test go_e2e_test --test docker_cli_e2e_test --test maven_e2e_test \
-		--test mcp_e2e_test --test e2e_shutdown_test
+		--test mcp_e2e_test --test shutdown_e2e_test
 
 test-e2e-cargo: ## E2E cargo (client cargo requis, ou CARGO_BIN)
-	OPENCARGO_E2E_REQUIRE=1 cargo test --test cargo_e2e_test
+	OPENCARGO_E2E_REQUIRE=1 cargo test --features e2e --test cargo_e2e_test
 
 test-e2e-go: ## E2E go (client go requis, ou GO_BIN)
-	OPENCARGO_E2E_REQUIRE=1 cargo test --test go_e2e_test
+	OPENCARGO_E2E_REQUIRE=1 cargo test --features e2e --test go_e2e_test
 
 test-e2e-docker: ## E2E docker CLI (client docker requis, ou DOCKER_BIN)
-	OPENCARGO_E2E_REQUIRE=1 cargo test --test docker_cli_e2e_test
+	OPENCARGO_E2E_REQUIRE=1 cargo test --features e2e --test docker_cli_e2e_test
 
 test-e2e-maven: ## E2E mvn et gradle (MVN_BIN, GRADLE_BIN pour un Gradle >= 8)
-	OPENCARGO_E2E_REQUIRE=1 cargo test --test maven_e2e_test
+	OPENCARGO_E2E_REQUIRE=1 cargo test --features e2e --test maven_e2e_test
 
 test-e2e-raw: ## E2E raw avec curl (CURL_BIN)
-	OPENCARGO_E2E_REQUIRE=1 cargo test --test raw_e2e_test
+	OPENCARGO_E2E_REQUIRE=1 cargo test --features e2e --test raw_e2e_test
 
 test-e2e-nuget: ## E2E dotnet (DOTNET_BIN, ou scripts/dotnet-in-docker)
-	DOTNET_BIN=$${DOTNET_BIN:-$(CURDIR)/scripts/dotnet-in-docker} OPENCARGO_E2E_REQUIRE=1 cargo test --test nuget_e2e_test dotnet
+	DOTNET_BIN=$${DOTNET_BIN:-$(CURDIR)/scripts/dotnet-in-docker} OPENCARGO_E2E_REQUIRE=1 cargo test --features e2e --test nuget_e2e_test dotnet
 
 test-e2e-import: ## E2E import contre Verdaccio, Nexus et registry:2 en conteneurs (docker requis)
-	OPENCARGO_E2E_CONTAINERS=1 OPENCARGO_E2E_REQUIRE=1 cargo test --test import_e2e_test
+	OPENCARGO_E2E_CONTAINERS=1 OPENCARGO_E2E_REQUIRE=1 cargo test --features e2e --test import_e2e_test
 
 lint: ## Lancer clippy
 	cargo clippy -- -D warnings

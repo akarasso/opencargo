@@ -14,6 +14,11 @@ pub struct FakeGoProxy {
 
 pub const MODULE: &str = "example.com/gone";
 
+/// The smallest thing a `.zip` request can be answered with: an empty archive.
+/// The proxy stores what it is handed; the module's contents are not this
+/// fake's subject.
+const ZIP: &str = "PK\u{5}\u{6}\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0\0";
+
 impl FakeGoProxy {
     pub fn count(&self, path: &str) -> usize {
         self.hits
@@ -55,6 +60,7 @@ async fn serve(State(hits): State<Arc<Mutex<Vec<String>>>>, req: Request) -> Res
             r#"{"Version":"v1.0.0","Time":"2026-01-01T00:00:00Z"}"#,
         ),
         "@v/v1.0.0.mod" => reply(StatusCode::OK, "text/plain", "module example.com/gone\n"),
+        "@v/v1.0.0.zip" => reply(StatusCode::OK, "application/zip", ZIP),
         "@v/v1.1.0.info" | "@v/v1.1.0.mod" | "@v/v1.1.0.zip" => {
             reply(StatusCode::GONE, "text/plain", "withdrawn")
         }

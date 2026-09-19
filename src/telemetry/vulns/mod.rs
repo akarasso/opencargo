@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use tracing::warn;
 
 use crate::config::VulnScanConfig;
-use crate::domain::{ScanResult, Severity, VulnDetail};
+use crate::domain::{Format, ScanResult, Severity, VulnDetail};
 use crate::ports::vulns::{ScanError, VulnFeed};
 use osv::{Advisory, OsvClient};
 
@@ -52,10 +52,10 @@ impl VulnFeed for VulnScanner {
 
     async fn assess_batch(
         &self,
-        ecosystem: &str,
+        format: Format,
         deps: &[(String, String)],
     ) -> Result<Vec<Vec<VulnDetail>>, ScanError> {
-        let Some(osv) = &self.osv else {
+        let (Some(osv), Some(ecosystem)) = (&self.osv, format.osv_ecosystem()) else {
             return Ok(vec![Vec::new(); deps.len()]);
         };
         let hits = osv.query_batch(ecosystem, deps).await?;
@@ -66,12 +66,12 @@ impl VulnFeed for VulnScanner {
     async fn assess(
         &self,
         metadata_json: &str,
-        ecosystem: &str,
+        format: Format,
     ) -> Result<ScanResult, ScanError> {
-        let Some(osv) = &self.osv else {
+        let (Some(osv), Some(ecosystem)) = (&self.osv, format.osv_ecosystem()) else {
             return Ok(ScanResult::clean());
         };
-        let deps = deps::extract_dependencies(metadata_json, ecosystem).map_err(ScanError::Unscannable)?;
+        let deps = deps::extract_dependencies(metadata_json, format).map_err(ScanError::Unscannable)?;
         if deps.is_empty() {
             return Ok(ScanResult::clean());
         }
