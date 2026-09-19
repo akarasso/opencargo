@@ -1,7 +1,5 @@
 use std::net::{IpAddr, ToSocketAddrs};
 
-use serde_json::Value;
-
 use crate::error::{AppError, AppResult};
 
 pub mod auth;
@@ -129,37 +127,6 @@ pub(crate) fn redirect_policy() -> reqwest::redirect::Policy {
             None => attempt.follow(),
         }
     })
-}
-
-/// Rewrite all `dist.tarball` URLs in an npm package metadata document
-/// to point to our proxy server.
-///
-/// The upstream URLs are replaced with `{base_url}/{repo_name}/{package_name}/-/{filename}`.
-pub fn rewrite_tarball_urls(
-    metadata: &mut Value,
-    base_url: &str,
-    repo_name: &str,
-    package_name: &str,
-) {
-    if let Some(versions) = metadata.get_mut("versions").and_then(|v| v.as_object_mut()) {
-        for (_version_key, version_meta) in versions.iter_mut() {
-            if let Some(dist) = version_meta.get_mut("dist").and_then(|d| d.as_object_mut()) {
-                if let Some(tarball_url) = dist.get("tarball").and_then(|t| t.as_str()) {
-                    // Extract the filename from the upstream tarball URL
-                    if let Some(filename) = tarball_url.rsplit('/').next() {
-                        let new_url = format!(
-                            "{}/{}/{}/-/{}",
-                            base_url.trim_end_matches('/'),
-                            repo_name,
-                            package_name,
-                            filename
-                        );
-                        dist.insert("tarball".to_string(), Value::String(new_url));
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]

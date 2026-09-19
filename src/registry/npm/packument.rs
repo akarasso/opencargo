@@ -7,12 +7,6 @@ use crate::error::StoreError;
 use crate::ports::packages::{NameMatch, PackageStore};
 use crate::wire::wire_ts;
 
-/// A packument before the handler rewrites its tarball URLs.
-pub struct Packument {
-    pub json: Value,
-    pub stale: bool,
-}
-
 /// Build the packument of a hosted member from its own rows; tarball URLs
 /// still carry the member name and are rewritten by the handler.
 pub async fn hosted_packument(
@@ -103,7 +97,7 @@ const ABBREVIATED_FIELDS: [&str; 20] = [
     "funding",
 ];
 
-fn strip_to_abbreviated(meta: &mut Value) {
+pub(super) fn strip_to_abbreviated(meta: &mut Value) {
     if let Some(obj) = meta.as_object_mut() {
         obj.retain(|key, _| ABBREVIATED_FIELDS.contains(&key.as_str()));
     }

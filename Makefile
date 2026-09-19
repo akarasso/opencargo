@@ -50,7 +50,7 @@ test: ## Lancer tous les tests
 	cargo test
 
 test-quick: ## Tests rapides (sans réseau ni client externe)
-	cargo test --test npm_test --test npm_proxy_test --test cargo_test --test cargo_proxy_test \
+	cargo test --test npm_test --test npm_proxy_test --test npm_memory_test --test cargo_test --test cargo_proxy_test \
 		--test go_test --test go_proxy_test --test oci_test --test oci_nested_test --test oci_proxy_test \
 		--test vuln_test --test group_resolver_test --test auth_test --test features_test \
 		--test promote_test --test permissions_test --test policy_test \
