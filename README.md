@@ -105,6 +105,13 @@ the enterprise ones.
   publish once enabled (`[vuln_scan] enabled = true`, off by default), with
   a per-advisory severity (OSV label, else CVSS 3.x/4.0 score) and an
   optional block of critical publishes before anything is written.
+- **MCP governance** (preview): an `mcp` repository mirrors the MCP registry,
+  hosts internal servers and agent skills, and governs what an agent may
+  install — an allowlist and an approval per repository, a fingerprint of
+  every declared permission set and every observed tool list with
+  re-approval on drift, an injection scan with the offending text, and
+  generated `.mcp.json`, `managed-mcp.json`, Cursor and VS Code files built
+  from the approved set. See [docs/mcp.md](docs/mcp.md).
 - **Webhooks** with HMAC signatures, **WebSocket event stream**, **Prometheus
   metrics**, full-text search, rate limiting, native TLS.
 - **Web UI** embedded in the binary: live dashboard, package pages with
@@ -123,9 +130,10 @@ engine, in audit mode first**: rules versioned with your code
 `license in [AGPL]`), evaluated at resolution time, scoped per repository so
 internal packages are not judged like public ones. The first deliverable is a
 weekly report of *what would have been blocked*, before anything is actually
-blocked. Then migration importers from Nexus / Artifactory / Verdaccio /
-GitHub Packages, and governance of MCP servers and agent skills distributed
-through npm, PyPI and OCI.
+blocked. Governance of MCP servers and agent skills is the second layer and
+landed in preview (see above), as did migration importers from Nexus /
+Artifactory / Verdaccio / GitHub Packages (`opencargo import`, see
+[docs/import.md](docs/import.md)).
 
 The registry, audit mode and OIDC SSO are and will stay MIT. Organisation-level
 enforcement (quarantine, approvals, audit exports, compliance reports)
@@ -150,9 +158,21 @@ issue or write to the address in `SECURITY.md`.
 
 Read this before the comparison table sells you anything.
 
-- PyPI, Maven and NuGet (hosted, proxy, group), S3-compatible storage and
-  OIDC SSO are new and in preview: tested in CI, not yet validated on a
-  second deployment. The comparison table above does not count them yet.
+- PyPI, Maven and NuGet (hosted, proxy, group), S3-compatible storage,
+  OIDC SSO and MCP governance are new and in preview: tested in CI, not yet
+  validated on a second deployment. The comparison table above does not count
+  them yet.
+- MCP: the one client that enforces a catalog today is VS Code
+  (`chat.mcp.gallery.serviceUrl` with `chat.mcp.access = "registry"`). Neither
+  the setting's value shape nor its API version is documented and no automated
+  test can drive a real VS Code, so opencargo serves several spellings and
+  **that row is expected, not verified**. Such a gallery repository must be
+  `public` with `anonymous_read` on (VS Code reads a `401` as "no such API"),
+  which is why it should hold the mirror and not internal servers. Tool
+  descriptions exist only where someone observed them: opencargo probes remote
+  servers (never private addresses unless the repository opts in) and takes
+  attested snapshots for stdio servers, and never runs a package to harvest
+  them.
 - The Go checksum database is not proxied: exclude private modules with
   `GONOSUMDB` or run with `GOSUMDB=off`. `go` gets a `404` for an unknown
   module and moves on to the next `GOPROXY` entry, but a `502` (upstream down)
@@ -172,16 +192,18 @@ Read this before the comparison table sells you anything.
 - A cold blob is written to disk in full before the first byte reaches the
   client (bounded by the read timeout, not by size). Pushes are capped at
   1 GiB per request, so a proxied 3 GiB layer pulls but cannot be re-pushed.
-- Deduplication of concurrent downloads, upstream tokens and OSV advisories
-  is per process: several replicas behind one load balancer each fetch their
-  own copy.
+- One instance per database: a second process on the same database refuses
+  to start, and every upgrade has a downtime window (`Recreate`). Read scale
+  is other opencargo instances proxying this one, each with its own cache
+  and upstream traffic. See [docs/operations.md](docs/operations.md).
 - Vulnerability severity is read per advisory from the full OSV record: a
   `database_specific.severity` label wins, else the highest CVSS 3.x/4.0
   vector is scored, and `MAL-` ids are critical. `vuln_scan.block_on_critical`
   refuses such a publish before anything is written; `vuln_scan.fail_closed`
   turns an OSV outage into a 503 instead of an unscanned publish. Advisories
   with only CVSS 2 data (or none) are reported as `unknown` and never block.
-- One maintainer, pre-1.0. Pin the image by digest and keep backups of `/data`.
+- One maintainer, pre-1.0. Pin the image by digest and back up with
+  `opencargo backup` ([docs/operations.md](docs/operations.md)).
 
 ---
 
@@ -316,6 +338,10 @@ bind = "0.0.0.0:6789"                # default: 127.0.0.1:6789
 base_url = "https://registry.example.com"
 storage_path = "/data/storage"
 
+lease_wait = "60s"                 # writer lease, shutdown: docs/operations.md
+shutdown_grace = "30s"
+endpoint_drain = "0s"
+
 [server.tls]                       # optional native TLS (rustls)
 cert_path = "/certs/cert.pem"
 key_path = "/certs/key.pem"
@@ -341,6 +367,14 @@ enabled = true                     # default: false
 prerelease_older_than_days = 90
 proxy_cache_older_than_days = 30   # idle proxy cache entries; swept even with enabled = false
 policy_report_older_than_days = 90 # policy report rows; swept even with enabled = false, 0 disables
+
+[backup]                           # docs/operations.md
+enabled = true                     # default: false
+every = "24h"                      # at t = at (mod every), UTC
+at = "03:00"
+keep = 7
+to = "/backups"
+storage = false                    # the schedule copies the database only
 
 [vuln_scan]
 enabled = true                     # default: false
@@ -401,6 +435,7 @@ erases one user's rows, audited with the count and never the name.
 | `OPENCARGO_UPSTREAM_AUTH_<REPO>` | Upstream credentials for a proxy, `basic:user:pass` or `bearer:token`; overrides `upstream_auth`. `<REPO>` is the name uppercased, non-alphanumerics as `_`. Read at startup for every repository, declared in the file or created through the API (restart after creating one) |
 | `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>` | `1` to allow that proxy's `dl`/token realm on a private IP (same as `dl_allow_private = true`) |
 | `OPENCARGO_OSV_BASE_URL` | OSV API base URL (also `--osv-base-url`) |
+| `OPENCARGO_LEASE_WAIT`, `OPENCARGO_SHUTDOWN_GRACE`, `OPENCARGO_ENDPOINT_DRAIN` | Override `[server]`; the Helm chart sets them from its values |
 | `RUST_LOG` | Log filter, default `opencargo=info,tower_http=info` |
 
 ---
@@ -429,7 +464,9 @@ helm install opencargo helm/opencargo/ \
 **CI sidecar**: run opencargo next to your runners as a pull-through cache.
 Examples for GitHub Actions and GitLab CI in [`k8s/sidecar/`](k8s/sidecar/).
 
-Health: `GET /health/live`, `GET /health/ready`. Metrics: `GET /metrics`.
+Health: `GET /health/live`, `GET /health/ready` (`503 draining` during a
+shutdown). Metrics: `GET /metrics`. Backups, restore and the upgrade window:
+[docs/operations.md](docs/operations.md).
 
 ---
 
@@ -529,6 +566,13 @@ group whose proxy member fronts another instance; locally they print
 
 - [docs/api.md](docs/api.md): every HTTP route, the WebSocket protocol, webhook
   payloads and Prometheus metrics.
+- [docs/mcp.md](docs/mcp.md): MCP servers and agent skills — the mirror, the
+  approvals, the scan and the client files.
+- [docs/import.md](docs/import.md): `opencargo import`, copying Nexus,
+  Artifactory, Verdaccio, GitHub Packages or any OCI registry into opencargo,
+  and the gap report.
+- [docs/operations.md](docs/operations.md): one instance, the writer lease,
+  shutdown and upgrades, backups and the restore drill.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).

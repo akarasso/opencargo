@@ -213,8 +213,9 @@ async fn run_anonymous(
     }
 }
 
+/// A CORS preflight is a read: no body, no effect, the browser asking.
 fn is_read(method: &Method) -> bool {
-    method == Method::GET || method == Method::HEAD
+    method == Method::GET || method == Method::HEAD || method == Method::OPTIONS
 }
 
 fn unauthorized_response() -> Response {

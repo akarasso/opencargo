@@ -4,6 +4,13 @@
 
 mod common;
 
+fn listing() -> opencargo::app::storage_ops::Verify {
+    opencargo::app::storage_ops::Verify {
+        orphans: true,
+        ..opencargo::app::storage_ops::Verify::default()
+    }
+}
+
 use std::time::Duration;
 
 use reqwest::StatusCode;
@@ -22,8 +29,16 @@ fn opts() -> SpawnOpts {
             hosted("npm-hosted", RepositoryFormat::Npm, Visibility::Public),
             hosted("oci-hosted", RepositoryFormat::Oci, Visibility::Public),
         ],
+        lease: true,
         ..Default::default()
     }
+}
+
+/// The config a storage command runs with: the server's, lease on.
+fn command_config(server: &TestServer) -> Config {
+    let mut config = common::config_of(server);
+    config.server.lease = true;
+    config
 }
 
 async fn publish_npm(client: &reqwest::Client, base_url: &str) {
@@ -60,8 +75,8 @@ async fn push_image(client: &reqwest::Client, base_url: &str) -> String {
     layer
 }
 
-async fn stop(server: &TestServer) {
-    server.handle.abort();
+async fn stop(server: &mut TestServer) {
+    server.stop().await;
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     while tokio::net::TcpStream::connect(("127.0.0.1", server.port)).await.is_ok()
         && tokio::time::Instant::now() < deadline
@@ -86,11 +101,11 @@ fn target_config(server: &TestServer) -> Config {
 
 #[tokio::test]
 async fn migrate_then_every_format_serves_from_the_target() {
-    let server = spawn_server(opts()).await;
+    let mut server = spawn_server(opts()).await;
     let client = reqwest::Client::new();
     publish_npm(&client, &server.base_url).await;
     let layer = push_image(&client, &server.base_url).await;
-    let source = common::config_of(&server);
+    let source = command_config(&server);
     let target = target_config(&server);
 
     let mut same_identity = target_config(&server);
@@ -99,8 +114,8 @@ async fn migrate_then_every_format_serves_from_the_target() {
     assert!(refused.unwrap_err().to_string().contains("storage.id"), "two stores without an id share one ledger scope");
 
     let refused = server::storage_migrate(&source, &target, false).await;
-    assert!(refused.unwrap_err().to_string().contains("stop it"), "a running server refuses migrate");
-    stop(&server).await;
+    assert!(refused.unwrap_err().to_string().contains("writer lease"), "a running server refuses migrate");
+    stop(&mut server).await;
 
     let overlapping = common::config_of(&server);
     assert!(server::storage_migrate(&source, &overlapping, false).await.is_err(), "a store onto itself");
@@ -150,16 +165,16 @@ async fn migrate_then_every_format_serves_from_the_target() {
 
 #[tokio::test]
 async fn verify_lists_missing_keys_and_orphans_and_check_passes() {
-    let server = spawn_server(opts()).await;
+    let mut server = spawn_server(opts()).await;
     let client = reqwest::Client::new();
     publish_npm(&client, &server.base_url).await;
-    stop(&server).await;
+    stop(&mut server).await;
     let config = common::config_of(&server);
 
     let report = server::storage_check(&config).await.unwrap();
     assert!(report.ok(), "{report:?}");
 
-    let clean = server::storage_verify(&config, true, chrono::Utc::now()).await.unwrap();
+    let clean = server::storage_verify(&config, listing(), chrono::Utc::now()).await.unwrap();
     assert!(clean.missing.is_empty() && clean.orphans.is_empty(), "{clean:?}");
 
     let tarball = stored_keys(&server)
@@ -174,18 +189,18 @@ async fn verify_lists_missing_keys_and_orphans_and_check_passes() {
         .await
         .unwrap();
 
-    let now = server::storage_verify(&config, true, chrono::Utc::now()).await.unwrap();
+    let now = server::storage_verify(&config, listing(), chrono::Utc::now()).await.unwrap();
     assert_eq!(now.missing, vec![tarball]);
     assert!(now.orphans.is_empty(), "an object inside the grace window is in flight");
     let later = chrono::Utc::now() + chrono::TimeDelta::hours(3);
-    let later = server::storage_verify(&config, true, later).await.unwrap();
+    let later = server::storage_verify(&config, listing(), later).await.unwrap();
     assert_eq!(later.orphans, vec!["stray/object".to_string()]);
 }
 
 #[tokio::test]
 async fn reclaim_prefix_without_repository_row() {
-    let server = spawn_server(opts()).await;
-    stop(&server).await;
+    let mut server = spawn_server(opts()).await;
+    stop(&mut server).await;
     let config = common::config_of(&server);
     let store = storage_of(&server).await;
     for key in ["npm/gone/p/a.tgz", "npm/gone/p/b.tgz", "npm/goner/kept.tgz"] {
@@ -232,4 +247,34 @@ async fn storage_status_names_the_backend_and_no_location() {
         .await
         .unwrap();
     assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn migrate_refuses_while_the_writer_lease_is_held() {
+    let server = spawn_server(opts()).await;
+    let source = command_config(&server);
+    let target = target_config(&server);
+    let refused = server::storage_migrate(&source, &target, false).await.unwrap_err().to_string();
+    assert!(refused.contains("writer lease"), "{refused}");
+    let refused = server::storage_reclaim(&source, None, chrono::Utc::now()).await.unwrap_err().to_string();
+    assert!(refused.contains("writer lease"), "reclaim takes the same lease: {refused}");
+    assert!(stored_keys(&server).await.iter().all(|k| !k.contains("migrated")));
+}
+
+#[tokio::test]
+async fn server_waits_on_lease_held_by_migrate() {
+    let mut server = spawn_server(opts()).await;
+    stop(&mut server).await;
+    let config = command_config(&server);
+    let stores = server::open_stores(&server.tmp.path().join("opencargo.db")).await.unwrap();
+    let held = server::take_writer_lease(&config, &stores).await.unwrap().unwrap();
+    let started = std::time::Instant::now();
+    let releaser = async {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        held.release().await;
+    };
+    let mut config = config;
+    let (booted, ()) = tokio::join!(common::start(&mut config), releaser);
+    assert!(booted.is_ok(), "the server takes the lease once the command gives it back");
+    assert!(started.elapsed() >= Duration::from_secs(1), "and waited for it");
 }

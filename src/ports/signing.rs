@@ -1,11 +1,9 @@
 //! Registry bearer tokens: the short-lived credential an OCI client buys at
 //! `/v2/token` and spends on every pull.
 //!
-//! A port because the key is the interesting part. Today's is random per
-//! process — a restart invalidates every outstanding token, which two
-//! instances behind one address cannot afford — and a persisted-key
-//! implementation has somewhere to land. It also lets the auth tests sign
-//! with a key they chose.
+//! A port because the key is the interesting part: it is persisted, so a
+//! token outlives a restart, and the auth tests can still sign with a key
+//! they chose.
 
 use serde::{Deserialize, Serialize};
 
@@ -28,10 +26,17 @@ pub struct Claims {
     /// The API token it was bought with: revoking that token revokes this one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub api_token_id: Option<String>,
+    /// With `static_token`: the keyed fingerprint of the config token it was
+    /// bought with, so removing that token from the config revokes this one.
+    /// The claims are readable by their holder, hence keyed, never a digest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub static_key: Option<String>,
 }
 
 pub trait RegistryTokenSigner: Send + Sync {
     fn sign(&self, claims: &Claims) -> String;
     /// The claims of a token whose signature holds and which has not expired.
     fn verify(&self, token: &str) -> Option<Claims>;
+    /// A keyed fingerprint of `secret`, domain-separated from `sign`.
+    fn fingerprint(&self, secret: &str) -> String;
 }

@@ -5,7 +5,9 @@
 pub mod error;
 pub mod events;
 pub mod format_rules;
+pub mod governance;
 pub mod identity;
+pub mod import;
 pub mod kinds;
 pub mod layout;
 pub mod names;
@@ -23,6 +25,7 @@ pub use events::{
     announce, Audience, DomainEvent, PackagePromotion, PackageRelease, ResolutionCounts,
 };
 pub use format_rules::FormatRules;
+pub use governance::{AllowRule, Decision, Drift, Effect, Fingerprint, GateMode};
 pub use identity::CredentialKind;
 pub use kinds::{Format, RepoKind, Visibility};
 pub use names::{

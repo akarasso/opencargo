@@ -8,6 +8,7 @@ use chrono::{DateTime, Utc};
 use tracing::{info, warn};
 
 use crate::app::reclaim::{ReclaimOrphans, ReclaimReport};
+use crate::app::storage_ops::SettleEpoch;
 use crate::ports::clock::Clock;
 use crate::ports::oci::OciStore;
 use crate::storage::StorageBackend;
@@ -31,6 +32,7 @@ pub struct SweepReport {
 
 pub struct SweepStorage {
     storage: Arc<dyn StorageBackend>,
+    settle: Option<SettleEpoch>,
     reclaim: Option<ReclaimOrphans>,
     uploads: Option<Arc<dyn OciStore>>,
 }
@@ -39,6 +41,7 @@ impl SweepStorage {
     pub fn new(storage: Arc<dyn StorageBackend>) -> Self {
         Self {
             storage,
+            settle: None,
             reclaim: None,
             uploads: None,
         }
@@ -47,6 +50,13 @@ impl SweepStorage {
     /// Stale and legacy upload sessions: rows removed, prefixes enqueued.
     pub fn reaping_uploads(mut self, oci: Arc<dyn OciStore>) -> Self {
         self.uploads = Some(oci);
+        self
+    }
+
+    /// The high-water mark compared before the pass, and the verify it owes
+    /// run before anything is reclaimed.
+    pub fn settling(mut self, settle: SettleEpoch) -> Self {
+        self.settle = Some(settle);
         self
     }
 
@@ -67,6 +77,11 @@ impl SweepStorage {
                 Err(e) => warn!(error = %e, "storage sweep: abandoned upload sessions"),
             }
         }
+        if let Some(settle) = &self.settle {
+            if let Err(e) = settle.run(now).await {
+                warn!(error = %e, "storage sweep: the epoch is unsettled");
+            }
+        }
         if let Some(reclaim) = &self.reclaim {
             report.reclaim = Some(reclaim.run(now).await);
         }
@@ -76,9 +91,15 @@ impl SweepStorage {
 }
 
 /// One pass per period, the first after one period: never at boot.
-pub async fn start_storage_sweep(sweep: SweepStorage, clock: Arc<dyn Clock>) {
+pub async fn start_storage_sweep(
+    sweep: SweepStorage,
+    clock: Arc<dyn Clock>,
+    lease: crate::app::lease::LeaseHandle,
+) {
     loop {
         tokio::time::sleep(PERIOD).await;
-        sweep.run(clock.now()).await;
+        if lease.held() {
+            sweep.run(clock.now()).await;
+        }
     }
 }

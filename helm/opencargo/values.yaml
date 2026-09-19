@@ -1,5 +1,19 @@
 replicaCount: 1
 
+lease:
+  waitSeconds: 60
+
+startup:
+  periodSeconds: 5
+
+shutdown:
+  endpointDrainSeconds: 0
+  graceSeconds: 30
+  wsCloseGraceSeconds: 5
+
+preStop:
+  sleepSeconds: 2
+
 image:
   repository: ghcr.io/akarasso/opencargo
   # ":latest" is mutable and not reproducible. Prefer an immutable reference
@@ -10,6 +24,15 @@ image:
 storage:
   size: 50Gi
   storageClass: ""
+  # ReadWriteOncePod needs a CSI driver; it forbids any other pod on the
+  # volume while the server runs, which the restore Job never does.
+  accessMode: ReadWriteOnce
+
+# Applied with the Deployment scaled to 0: `restore --from` a snapshot on the
+# data volume.
+restore:
+  enabled: false
+  from: ""
 
 config: |
   [server]

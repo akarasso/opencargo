@@ -6,6 +6,8 @@
 
 pub mod events;
 pub mod fs;
+pub mod import;
+pub mod mcp_http;
 pub mod s3;
 pub mod oidc;
 pub mod sqlite;

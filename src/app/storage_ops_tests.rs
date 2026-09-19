@@ -2,6 +2,8 @@ use bytes::Bytes;
 use chrono::TimeDelta;
 
 use super::*;
+use crate::app::repositories::CreateRepository;
+use crate::domain::layout;
 use crate::app::reclaim::ReclaimPolicy;
 use crate::domain::{Format, RepoKind, RepoSpec, Visibility};
 use crate::ports::packages::{NameMatch, NewRelease};
@@ -60,16 +62,104 @@ async fn verify_lists_missing_keys_and_orphans_outside_the_grace_window() {
     let storage = MemStorage::new();
     publish(&fakes, "npm/r/p/p-1.0.0.tgz").await;
     storage.put("stray/object", Bytes::from_static(b"x")).await.unwrap();
-    let verify = VerifyStorage::new(fakes.referenced(), Arc::new(storage.clone()), GRACE);
+    let verify = VerifyStorage::new(
+        fakes.referenced(),
+        fakes.reclaim(),
+        Arc::new(storage.clone()),
+        GRACE,
+    );
 
-    let now = verify.run(true, Utc::now()).await.unwrap();
+    let now = verify.run(listing(), Utc::now()).await.unwrap();
     assert_eq!(now.missing, vec!["npm/r/p/p-1.0.0.tgz".to_string()]);
     assert!(now.orphans.is_empty(), "an object inside the grace window is in flight");
     assert_eq!(now.objects, 1);
 
-    let later = verify.run(true, Utc::now() + TimeDelta::hours(3)).await.unwrap();
+    let later = verify.run(listing(), Utc::now() + TimeDelta::hours(3)).await.unwrap();
     assert_eq!(later.orphans, vec!["stray/object".to_string()]);
-    assert!(verify.run(false, Utc::now() + TimeDelta::hours(3)).await.unwrap().orphans.is_empty());
+    assert!(verify
+        .run(Verify::default(), Utc::now() + TimeDelta::hours(3))
+        .await
+        .unwrap()
+        .orphans
+        .is_empty());
+}
+
+fn listing() -> Verify {
+    Verify {
+        orphans: true,
+        ..Verify::default()
+    }
+}
+
+/// C-7: a store that keeps noncurrent versions puts a referenced key's
+/// bytes back; one that keeps none refuses the repair rather than pretend.
+#[tokio::test]
+async fn repair_puts_a_noncurrent_version_back_and_refuses_without_one() {
+    let fakes = FakeDb::new();
+    let storage = MemStorage::new().versioned();
+    publish(&fakes, "npm/r/p/p-1.0.0.tgz").await;
+    storage
+        .put("npm/r/p/p-1.0.0.tgz", Bytes::from_static(b"x"))
+        .await
+        .unwrap();
+    storage.delete("npm/r/p/p-1.0.0.tgz").await.unwrap();
+    let verify = VerifyStorage::new(
+        fakes.referenced(),
+        fakes.reclaim(),
+        Arc::new(storage.clone()),
+        GRACE,
+    );
+    let repair = Verify {
+        repair: true,
+        ..Verify::default()
+    };
+    let report = verify.run(repair, Utc::now()).await.unwrap();
+    assert_eq!(report.repaired, vec!["npm/r/p/p-1.0.0.tgz".to_string()]);
+    assert!(report.missing.is_empty());
+    assert!(storage.contains("npm/r/p/p-1.0.0.tgz"));
+
+    let plain = VerifyStorage::new(
+        fakes.referenced(),
+        fakes.reclaim(),
+        Arc::new(MemStorage::new()),
+        GRACE,
+    );
+    assert!(matches!(
+        plain.run(repair, Utc::now()).await,
+        Err(OpsError::NoVersions)
+    ));
+}
+
+/// I7: what a rollback left behind under a live incarnation goes to the
+/// queue, which claims before it deletes; a key under nothing live does not.
+#[tokio::test]
+async fn a_verify_after_a_rollback_queues_the_orphans_of_live_incarnations() {
+    let fakes = FakeDb::new();
+    let storage = MemStorage::new();
+    let prefix = hosted(&fakes, &storage, "r").await;
+    let placed = format!("{prefix}/p/ab/p-1.0.0.tgz~gone");
+    storage.put(&placed, Bytes::from_static(b"x")).await.unwrap();
+    storage.put("elsewhere/object", Bytes::from_static(b"x")).await.unwrap();
+    fakes.reclaim().new_epoch(0).await.unwrap();
+
+    let settle = SettleEpoch::new(
+        fakes.reclaim(),
+        fakes.referenced(),
+        Arc::new(storage.clone()),
+        GRACE,
+    );
+    let later = Utc::now() + TimeDelta::hours(3);
+    let report = settle.run(later).await.unwrap().expect("a verify was owed");
+    assert_eq!(report.enqueued, vec![placed.clone()]);
+    assert!(
+        report.orphans.contains(&"elsewhere/object".to_string()),
+        "reported, never queued: it belongs to no live incarnation"
+    );
+    assert!(
+        !fakes.reclaim().epoch().await.unwrap().verify_pending,
+        "the verify lifts its own refusal"
+    );
+    assert!(settle.run(later).await.unwrap().is_none(), "nothing owed twice");
 }
 
 struct Pair {
@@ -169,4 +259,34 @@ async fn reclaim_prefix_refuses_a_referenced_prefix() {
         .unwrap();
     assert_eq!((report.reclaimed, report.referenced), (0, 1));
     assert!(storage.contains("npm/r/p/p-1.0.0.tgz"));
+}
+
+/// A hosted repository, and the prefix of its incarnation.
+async fn hosted(fakes: &FakeDb, storage: &MemStorage, name: &str) -> String {
+    let repo = CreateRepository::new(
+        fakes.repositories(),
+        fakes.audit(),
+        crate::server::event_bus(),
+    )
+    .guarding(Arc::new(storage.clone()))
+    .run(
+        &RepoSpec {
+            name,
+            kind: RepoKind::Hosted,
+            format: Format::Npm,
+            visibility: Visibility::Public,
+            upstream: None,
+            members: &[],
+        },
+        &crate::app::audit::Actor {
+            user_id: Some(1),
+            username: "root",
+            admin: true,
+        },
+        Utc::now(),
+    )
+    .await
+    .unwrap();
+    let incarnation = fakes.repositories().incarnation(repo.id).await.unwrap().unwrap();
+    layout::incarnation_prefix(&incarnation)
 }

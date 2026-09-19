@@ -188,6 +188,59 @@ not change, and for at most 60 s when a proxy member contributed to it. A publis
 relist shows at once; a new upstream version may take up to that long. Storage or database
 unavailable is `503`.
 
+## MCP (servers and agent skills)
+
+```
+GET    /{repo}/v0.1/servers?limit&cursor&search&updated_since&version&include_deleted
+GET    /{repo}/v0.1/servers/{serverName}/versions?include_deleted
+GET    /{repo}/v0.1/servers/{serverName}/versions/{version}     {version} = latest
+GET    /{repo}/v0/servers[...]                                  the same three, aliased
+POST   /{repo}/v0.1/publish                    server.json, hosted only
+POST   /{repo}/v0.1/surfaces                   {name, version, tools, runner?, protocolVersion?}
+GET    /{repo}/.claude-plugin/marketplace.json
+GET    /{repo}/skills/{name}/{version}/skill.zip
+PUT    /{repo}/skills/{name}/{version}/skill.zip
+DELETE /{repo}/skills/{name}/{version}/skill.zip
+GET    /{repo}/clients/{client}/config.json?npm=&pypi=
+```
+
+The catalog is the MCP registry's own read API, so a conforming aggregator
+can mirror this one. `limit` is clamped to `1..=100` (default 30), the cursor
+is `name:version`, `updated_since` filters on our own clock (never on the
+`updatedAt` we re-emit) and implies `include_deleted` unless it is given
+explicitly. A server name carries one `/` and is percent-encoded by the
+client. Records are served verbatim with one key added,
+`_meta["eu.opencargo.registry/mirror"]`: the approval, the gate and its
+reason, the surface digests and their source, the endpoint counts, the drift
+and the finding counts. The official block is the upstream's, byte for byte;
+on a hosted repository opencargo mints it (`publishedAt` kept on a republish,
+`isLatest` moved by publication order). A non-`mcp` repository answers `400`,
+a private one `401`, a version the gate hides `404`. The catalog answers CORS
+preflights, which the VS Code gallery sends.
+
+`client` is `claude-code`, `claude-code-managed-file`, `claude-code-managed`,
+`cursor` or `vscode`; see [docs/mcp.md](mcp.md).
+
+```
+POST   /api/v1/mcp/{repo}/sync                 {full?}        one run now, with its report
+POST   /api/v1/mcp/{repo}/probe                {name?, version?}
+GET    /api/v1/mcp/{repo}/servers?state=&q=&limit=            state = all|pending|drifted|blocked|approved|not_observed
+GET    /api/v1/mcp/{repo}/evidence?name=&version=             surfaces, findings, decisions, probe runs
+POST   /api/v1/mcp/{repo}/approvals            {name, version, state, skill?, note?}
+GET    /api/v1/mcp/{repo}/allow-rules
+POST   /api/v1/mcp/{repo}/allow-rules          {pattern, effect}
+DELETE /api/v1/mcp/{repo}/allow-rules/{id}
+GET    /api/v1/mcp/{repo}/suppressions
+POST   /api/v1/mcp/{repo}/suppressions         {pattern, tool?}
+DELETE /api/v1/mcp/{repo}/suppressions/{id}
+```
+
+Admin only, audited. An approval decides every endpoint of the version's
+current set in one transaction; a pattern is an exact name or a prefix
+ending in `*` after a `/` or a `.`, and the first `allow` rule closes the
+repository to everything it does not match. `opencargo mcp sync [--repo R]
+[--full]` runs the same code from the command line.
+
 ## Administration
 
 ```
@@ -234,7 +287,8 @@ with no rule on records nothing, so `/rules` says which members record
 `since` is an age (`24h`, `7d`; `s`/`m`/`h`/`d` only, default `24h`, `400`
 when it reaches before the earliest representable instant) or an RFC 3339
 instant; `repo` matches the requested or the member repository; `rule` is
-one of `min_release_age`, `osv_severity`, `install_scripts`, `typosquat`
+one of `min_release_age`, `osv_severity`, `install_scripts`, `typosquat`,
+`mcp_allowlist`, `mcp_injection`, `mcp_transport`, `mcp_drift`
 and narrows every total, chip and verdict to that rule's own row. `totals`
 are scoped by the filter; on the admin report alone,
 `process.dropped_since_start` is the process-lifetime count of events the
@@ -344,6 +398,8 @@ GET    /api/v1/search?q=
 | `permissions.changed` | authenticated | `{username}` |
 | `audit.entry` | admin | `{username, action, target}` |
 | `policy.resolution` | admin | `{repo, member, count, would_block, unknown}`, one per flush per repo pair, at most two a second per pair |
+| `mcp.sync` | admin | `{repository, changed, failed}`, one per mirror sync run |
+| `mcp.drift` | admin | `{repository, server, version, drift}` when a served version stops matching what was approved |
 
 Client may send `{"type":"ping"}`; server answers `{"type":"pong"}`, pings
 every 30 s, re-validates the token every ~5 min (revoked token closes with
@@ -358,9 +414,17 @@ delivery carries `X-Webhook-Signature` = HMAC-SHA256 of the body.
 
 ```
 GET    /health/live
-GET    /health/ready
+GET    /health/ready             503 {"status":"draining"} during a shutdown
 GET    /metrics
+GET    /api/v1/system/instance   admin
 ```
+
+`/api/v1/system/instance` answers `owner` (8 characters), `version`,
+`acquired_at`, `renewed_at`, `lease` (`held`, `lost` or `disabled`),
+`last_backup_at`, `last_sweep_at`, `last_backup_wal` (`truncated`, `busy` or
+null), `incomplete_snapshots`, `shutdown_grace_secs`, `endpoint_drain_secs`
+and `open_http_connections`, which excludes WebSocket clients. A lost lease is
+never a readiness failure.
 
 Prometheus metrics: `opencargo_http_requests_total{method,path,status}`,
 `opencargo_http_request_duration_seconds{method,path}`,

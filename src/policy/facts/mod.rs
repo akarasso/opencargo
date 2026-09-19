@@ -1,3 +1,4 @@
+pub mod mcp;
 mod npm;
 mod oci;
 
@@ -88,6 +89,15 @@ pub(crate) async fn gather(shared: &Shared, cfg: &PolicyConfig, p: Pending) -> R
             facts.install_scripts = nuget_install_assets(&shared.proxy, &body).await;
             facts.date_source = if published.is_some() { "registration" } else { "none" };
             (body.entry.digest.clone(), version, published)
+        }
+        Source::Mcp {
+            facts: gathered,
+            digest,
+            published,
+        } => {
+            facts.mcp = Some(gathered);
+            facts.date_source = "registry";
+            (digest, version, published)
         }
         Source::Oci {
             body,
@@ -431,6 +441,7 @@ mod tests {
                 facts: Facts {
                     install_scripts: fact,
                     date_source: "none",
+                    mcp: None,
                 },
             };
             assert_eq!(InstallScripts.evaluate(&cfg, &r, Utc::now()).unwrap().verdict, verdict);

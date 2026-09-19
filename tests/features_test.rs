@@ -610,3 +610,235 @@ async fn test_dashboard_hides_private_packages() {
         names
     );
 }
+
+// ---------------------------------------------------------------------------
+// Deployment manifests
+// ---------------------------------------------------------------------------
+
+use common::manifests::{block, document, env_value, helm_renders, items, kustomize_deployment, number, scalar};
+
+fn helm_deployments(extra: &[&str]) -> Option<Vec<String>> {
+    Some(
+        helm_renders(extra)?
+            .iter()
+            .map(|r| document(r, "Deployment").expect("the chart renders a Deployment"))
+            .collect(),
+    )
+}
+
+#[test]
+fn helm_args_put_global_flags_before_the_subcommand() {
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in deployments.iter().chain([&kustomize_deployment()]) {
+        let args = items(&block(doc, "args"));
+        assert_eq!(args, ["--config", "/etc/opencargo/config.toml", "serve"], "{doc}");
+    }
+}
+
+#[test]
+fn helm_deployment_declares_recreate_strategy() {
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in deployments.iter().chain([&kustomize_deployment()]) {
+        assert_eq!(scalar(&block(doc, "strategy"), "type").as_deref(), Some("Recreate"));
+    }
+}
+
+#[test]
+fn helm_replica_count_is_one() {
+    let schema: Value = serde_json::from_str(&common::manifests::read(std::path::Path::new(
+        "helm/opencargo/values.schema.json",
+    )))
+    .unwrap();
+    assert_eq!(schema["properties"]["replicaCount"]["maximum"], 1);
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in &deployments {
+        assert_eq!(number(doc, "replicas"), 1);
+    }
+    let Some(helm) = common::client_bin("HELM_BIN") else { return };
+    let out = std::process::Command::new(helm)
+        .args(["template", "r", "helm/opencargo", "--set", "auth.adminPassword=x", "--set", "replicaCount=2"])
+        .current_dir(common::manifests::repo())
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "two replicas are refused by the schema");
+}
+
+#[test]
+fn liveness_cannot_kill_a_pod_waiting_for_the_lease() {
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in deployments.iter().chain([&kustomize_deployment()]) {
+        let startup = block(doc, "startupProbe");
+        let budget = number(&startup, "failureThreshold") * number(&startup, "periodSeconds");
+        let wait: u64 = env_value(doc, "OPENCARGO_LEASE_WAIT")
+            .expect("the lease wait reaches the container")
+            .parse()
+            .unwrap();
+        assert!(budget > wait + 30, "startup budget {budget}s against a {wait}s lease wait:\n{doc}");
+    }
+}
+
+fn pre_stop_sleep(doc: &str) -> u64 {
+    let lifecycle = block(doc, "preStop");
+    let command = scalar(&lifecycle, "command").expect("a preStop command");
+    command
+        .trim_matches(|c| c == '[' || c == ']')
+        .split(',')
+        .map(|s| s.trim().trim_matches('"'))
+        .nth(1)
+        .and_then(|n| n.parse().ok())
+        .expect("preStop is a sleep of whole seconds")
+}
+
+fn env_secs(doc: &str, name: &str) -> u64 {
+    env_value(doc, name)
+        .unwrap_or_else(|| panic!("{name} reaches the container"))
+        .parse()
+        .unwrap()
+}
+
+/// Every term of the shutdown path fits before SIGKILL, in both manifests,
+/// at the default config and under an override, and when the values move.
+#[test]
+fn grace_period_covers_drain_plus_shutdown() {
+    let ws_close = opencargo::server::shutdown::WS_CLOSE_GRACE.as_secs();
+    let check = |doc: &str| {
+        let tgps = number(doc, "terminationGracePeriodSeconds");
+        let path = pre_stop_sleep(doc)
+            + env_secs(doc, "OPENCARGO_ENDPOINT_DRAIN")
+            + ws_close
+            + env_secs(doc, "OPENCARGO_SHUTDOWN_GRACE");
+        assert!(tgps >= path, "terminationGracePeriodSeconds {tgps} < {path}:\n{doc}");
+    };
+    check(&kustomize_deployment());
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    deployments.iter().for_each(|d| check(d));
+    let moved = helm_deployments(&[
+        "--set",
+        "shutdown.graceSeconds=90",
+        "--set",
+        "shutdown.endpointDrainSeconds=15",
+        "--set",
+        "preStop.sleepSeconds=4",
+    ])
+    .unwrap();
+    for doc in &moved {
+        check(doc);
+        assert_eq!(env_secs(doc, "OPENCARGO_SHUTDOWN_GRACE"), 90);
+    }
+}
+
+#[test]
+fn ws_close_grace_value_matches_the_constant() {
+    let values = common::manifests::read(std::path::Path::new("helm/opencargo/values.yaml"));
+    let mirrored: u64 = scalar(&values, "wsCloseGraceSeconds").unwrap().parse().unwrap();
+    assert_eq!(mirrored, opencargo::server::shutdown::WS_CLOSE_GRACE.as_secs());
+}
+
+/// The numbers the grace period is derived from reach the process as env,
+/// so an install that replaces the config block cannot move them apart.
+#[test]
+fn helm_shutdown_values_reach_the_container_as_env() {
+    let Some(deployments) = helm_deployments(&["--set", "shutdown.graceSeconds=45", "--set", "lease.waitSeconds=75"]) else {
+        return;
+    };
+    for doc in &deployments {
+        assert_eq!(env_secs(doc, "OPENCARGO_SHUTDOWN_GRACE"), 45);
+        assert_eq!(env_secs(doc, "OPENCARGO_ENDPOINT_DRAIN"), 0);
+        assert_eq!(env_secs(doc, "OPENCARGO_LEASE_WAIT"), 75);
+    }
+    let configmap = helm_renders(&[]).unwrap()[1].clone();
+    let configmap = document(&configmap, "ConfigMap").unwrap();
+    assert!(configmap.contains("registry.corp.example") && !configmap.contains("shutdown_grace"));
+}
+
+#[test]
+fn readiness_probe_keeps_the_default_failure_threshold() {
+    let Some(deployments) = helm_deployments(&[]) else { return };
+    for doc in deployments.iter().chain([&kustomize_deployment()]) {
+        let readiness = block(doc, "readinessProbe");
+        assert_eq!(scalar(&readiness, "failureThreshold"), None, "{readiness}");
+        assert_eq!(number(&readiness, "timeoutSeconds"), 3);
+    }
+}
+
+#[test]
+fn helm_restore_job_is_absent_by_default_and_mounts_the_data_pvc() {
+    let Some(defaults) = helm_renders(&[]) else { return };
+    assert!(defaults.iter().all(|r| document(r, "Job").is_none()), "no Job unless asked for");
+    let renders = helm_renders(&["--set", "restore.enabled=true", "--set", "restore.from=/data/backups/opencargo-x"]).unwrap();
+    for render in &renders {
+        let job = document(render, "Job").expect("the restore Job");
+        let deployment = document(render, "Deployment").unwrap();
+        let claim = |doc: &str| scalar(&block(doc, "persistentVolumeClaim"), "claimName").unwrap();
+        assert_eq!(claim(&job), claim(&deployment), "the same data volume");
+        assert_eq!(
+            items(&block(&job, "command")),
+            ["opencargo", "--config", "/etc/opencargo/config.toml", "restore", "--from", "/data/backups/opencargo-x"]
+        );
+        assert_eq!(number(&job, "backoffLimit"), 0);
+        assert_eq!(scalar(&job, "restartPolicy").as_deref(), Some("Never"));
+    }
+    let plain = common::manifests::read(std::path::Path::new("k8s/restore-job.yaml"));
+    assert_eq!(items(&block(&plain, "command"))[..4], ["opencargo", "--config", "/etc/opencargo/config.toml", "restore"]);
+    assert_eq!(scalar(&block(&plain, "persistentVolumeClaim"), "claimName").as_deref(), Some("opencargo-data"));
+    for kustomization in ["k8s/kustomization.yaml", "k8s/base/kustomization.yaml"] {
+        let text = common::manifests::read(std::path::Path::new(kustomization));
+        assert!(!text.contains("restore-job"), "{kustomization} never reconciles the restore Job");
+    }
+}
+
+#[test]
+fn the_ownership_init_container_does_not_walk_the_backup_directory() {
+    let deployment = kustomize_deployment();
+    let init = block(&deployment, "initContainers");
+    let command = scalar(&init, "command").unwrap();
+    assert!(command.contains("/data/db") && command.contains("/data/storage"), "{command}");
+    assert!(!command.contains("-R 10001:10001 /data\""), "a recursive walk of the whole volume: {command}");
+}
+
+#[test]
+fn helm_access_mode_defaults_to_read_write_once() {
+    let Some(renders) = helm_renders(&["--set", "storage.accessMode=ReadWriteOncePod"]) else { return };
+    let pvc = document(&renders[0], "PersistentVolumeClaim").unwrap();
+    assert_eq!(items(&block(&pvc, "accessModes")), ["ReadWriteOncePod"]);
+    let defaults = helm_renders(&[]).unwrap();
+    let pvc = document(&defaults[0], "PersistentVolumeClaim").unwrap();
+    assert_eq!(items(&block(&pvc, "accessModes")), ["ReadWriteOnce"]);
+}
+
+#[tokio::test]
+async fn system_instance_admin_only() {
+    let server = spawn_server(SpawnOpts { lease: true, ..Default::default() }).await;
+    let client = reqwest::Client::new();
+    let url = format!("{}/api/v1/system/instance", server.base_url);
+    assert_eq!(client.get(&url).send().await.unwrap().status(), StatusCode::UNAUTHORIZED);
+    let reader = common::named_token(&client, &server.base_url, "watcher", "t").await;
+    assert_eq!(client.get(&url).bearer_auth(&reader).send().await.unwrap().status(), StatusCode::FORBIDDEN);
+
+    let resp = client.get(&url).bearer_auth(common::STATIC_TOKEN).send().await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let text = resp.text().await.unwrap();
+    let body: Value = serde_json::from_str(&text).unwrap();
+    assert_eq!(body["lease"], "held");
+    assert_eq!(body["owner"].as_str().unwrap().len(), 8);
+    assert!(body["renewed_at"].is_string() && body["acquired_at"].is_string());
+    assert!(body["last_backup_at"].is_null() && body["last_backup_wal"].is_null());
+    assert_eq!(body["incomplete_snapshots"], 0);
+    assert_eq!(body["shutdown_grace_secs"], 30);
+    assert_eq!(body["endpoint_drain_secs"], 0);
+    assert!(body["open_http_connections"].is_u64());
+    let tmp = server.tmp.path().to_string_lossy().into_owned();
+    for leak in [tmp.as_str(), "127.0.0.1", "localhost"] {
+        assert!(!text.contains(leak), "{text} names {leak}");
+    }
+}
+
+#[test]
+fn readme_has_no_multi_replica_claim() {
+    let readme = common::manifests::read(std::path::Path::new("README.md"));
+    assert!(!readme.contains("several replicas behind one load balancer"));
+    assert!(readme.contains("One instance per database"));
+    let example = common::manifests::read(std::path::Path::new("config.example.toml"));
+    let config: opencargo::config::Config = toml::from_str(&example).unwrap();
+    assert!(config.problems().is_empty(), "{:?}", config.problems());
+}

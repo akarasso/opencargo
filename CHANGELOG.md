@@ -5,6 +5,42 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+<<<<<<< HEAD
+- Governance of MCP servers and agent skills, a preview. The `mcp` repository
+  format mirrors the MCP registry (`proxy`), hosts internal servers and
+  skills (`hosted`) and merges both for a team (`group`); migration 023
+  admits it. The catalog is the registry's own API, so another aggregator can
+  mirror this one: `/{repo}/v0.1/servers` with the upstream's cursor, aliased
+  under `/v0`. Every declared permission set and every observed tool list is
+  fingerprinted, approved per endpoint and re-reviewed on drift; an injection
+  scan keeps the offending text with its span; four policy rules
+  (`mcp_allowlist`, `mcp_injection`, `mcp_transport`, `mcp_drift`) record what
+  they would have blocked. Skills ship as Claude Code plugins with a gated
+  `marketplace.json`, and `/{repo}/clients/{client}/config.json` generates
+  `.mcp.json`, `managed-mcp.json`, the managed-settings fragment, Cursor and
+  VS Code files from the approved set. Admin routes under `/api/v1/mcp/`,
+  `opencargo mcp sync`, and an `/admin/mcp` screen. See `docs/mcp.md` for
+  what is enforceable and what is not.
+- `opencargo import run|resume|status|report|permissions|forget`, a preview:
+  copies Verdaccio, Nexus, Artifactory, GitHub Packages and any OCI
+  distribution registry (npm, cargo, go, OCI) into hosted repositories over
+  opencargo's own publish protocols, resumable from a state file, with a gap
+  report whose kinds set the exit code. See `docs/import.md`.
+- The cargo sparse index now carries `v` and `rust_version` when a publish
+  declared them.
+=======
+- One instance per database: a writer lease taken before any migration, so a
+  second process on the same database refuses to start and names the holder.
+  `opencargo migrate`, `storage migrate` and `storage reclaim` take it too.
+  See `docs/operations.md`.
+- Graceful shutdown: `/health/ready` answers `503 draining`, WebSocket
+  clients get a close frame, in-flight requests finish within
+  `[server].shutdown_grace`.
+- `opencargo backup`, `backup --check` and `restore`, an in-process
+  `[backup]` schedule, an optional `[backup.sink]`, and a restore Job in
+  the Helm chart and `k8s/restore-job.yaml`.
+- `GET /api/v1/system/instance` and an Instance tile on the System page.
+>>>>>>> 76095200d22b5fddcab8eaddee6e9f65b4de4ccd
 - S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
   validated against MinIO, not yet against a hosted provider. Credentials
   come only from an allowlisted environment; TLS trusts the compiled-in
@@ -60,6 +96,17 @@ All notable changes to this project will be documented in this file.
   counted per account across Basic, `npm login` and the password change;
   token failures are counted per client address. `auth.trusted_proxies`
   names the proxies whose `X-Forwarded-For` is believed.
+- The Helm chart deploys with `strategy: Recreate`, puts `--config` before
+  the subcommand, refuses `replicaCount` above 1 and gives the lease wait a
+  startup probe budget; global flags are accepted after the subcommand.
+- A new `[server]` or `[backup]` key that fails validation stops `serve` and
+  `migrate`; `restore`, `backup` and `validate-config` report it and run.
+  `validate-config` reports every problem of the file it names.
+- Background sweeps and scheduled backups run only on the lease holder.
+- Registry tokens (`ocr_`) survive a restart: the signing key lives in the
+  database. Removing a token from `[auth].static_tokens` still revokes every
+  registry token bought with it; a static-token registry token minted before
+  this version is refused once and re-requested by the client.
 
 ## [0.1.0-rc.1] - 2026-09-17
 

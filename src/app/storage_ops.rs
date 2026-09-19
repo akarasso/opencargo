@@ -13,19 +13,42 @@ use futures_util::{StreamExt, TryStreamExt};
 use sha2::{Digest, Sha256};
 use tokio::io::AsyncReadExt;
 
+use crate::app::mark::{HighWaterMark, MarkError};
 use crate::app::reclaim::{ReclaimOrphans, ReclaimReport};
 use crate::domain::layout;
 use crate::error::StoreError;
 use crate::ports::reclaim::{Candidate, ReclaimStore};
 use crate::ports::referenced::ReferencedKeys;
-use crate::storage::{StorageBackend, StorageError};
+use crate::storage::{StorageBackend, StorageError, Versioning};
 
 #[derive(Debug, thiserror::Error)]
 pub enum OpsError {
+    #[error(
+        "--repair needs a store that keeps noncurrent versions: this one keeps none, \
+         so a referenced key with no object is a loss to report, not one to undo"
+    )]
+    NoVersions,
+
+    #[error(transparent)]
+    Mark(#[from] MarkError),
+
     #[error(transparent)]
     Store(#[from] StoreError),
+
     #[error(transparent)]
     Storage(#[from] StorageError),
+}
+
+/// What one `storage verify` does beyond listing what rows reference.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Verify {
+    /// List the objects nothing references.
+    pub orphans: bool,
+    /// Queue those of them that lie under a live incarnation (I7).
+    pub enqueue: bool,
+    /// Put the last noncurrent version of a referenced key with no object
+    /// back (C-7); refused on a store that keeps none.
+    pub repair: bool,
 }
 
 #[derive(Debug, Default, PartialEq, Eq)]
@@ -37,24 +60,39 @@ pub struct VerifyReport {
     /// Objects older than the grace that nothing references; only filled
     /// when asked for.
     pub orphans: Vec<String>,
+    /// Of those, the ones queued for reclamation.
+    pub enqueued: Vec<String>,
+    /// Keys a noncurrent version was put back for.
+    pub repaired: Vec<String>,
 }
 
 pub struct VerifyStorage {
     referenced: Arc<dyn ReferencedKeys>,
+    store: Arc<dyn ReclaimStore>,
     storage: Arc<dyn StorageBackend>,
     grace: Duration,
 }
 
 impl VerifyStorage {
-    pub fn new(referenced: Arc<dyn ReferencedKeys>, storage: Arc<dyn StorageBackend>, grace: Duration) -> Self {
+    pub fn new(
+        referenced: Arc<dyn ReferencedKeys>,
+        store: Arc<dyn ReclaimStore>,
+        storage: Arc<dyn StorageBackend>,
+        grace: Duration,
+    ) -> Self {
         Self {
             referenced,
+            store,
             storage,
             grace,
         }
     }
 
-    pub async fn run(&self, orphans: bool, now: DateTime<Utc>) -> Result<VerifyReport, OpsError> {
+    pub async fn run(&self, options: Verify, now: DateTime<Utc>) -> Result<VerifyReport, OpsError> {
+        if options.repair && self.storage.versioning().await? != Versioning::Kept {
+            return Err(OpsError::NoVersions);
+        }
+        let orphans = options.orphans || options.enqueue;
         let referenced: Vec<_> = self.referenced.referenced(self.grace, now).try_collect().await?;
         let prefixes: Vec<&str> = referenced
             .iter()
@@ -72,6 +110,9 @@ impl VerifyStorage {
         let mut listed = self.storage.list("");
         while let Some(meta) = listed.next().await {
             let meta = meta?;
+            if layout::reserved(&meta.key) {
+                continue;
+            }
             report.objects += 1;
             let covered = exact.contains(meta.key.as_str())
                 || prefixes.iter().any(|p| layout::under(&meta.key, p));
@@ -87,7 +128,92 @@ impl VerifyStorage {
             .collect();
         report.missing.sort();
         report.orphans.sort();
+        if options.repair {
+            self.repair(&mut report).await?;
+        }
+        if options.enqueue {
+            self.enqueue(&mut report, now).await?;
+        }
         Ok(report)
+    }
+
+    /// Every referenced key with no object gets its last noncurrent version
+    /// back; what the store has none for stays reported as missing.
+    async fn repair(&self, report: &mut VerifyReport) -> Result<(), OpsError> {
+        let mut missing = Vec::new();
+        for key in std::mem::take(&mut report.missing) {
+            if self.storage.restore_last_version(&key).await? {
+                report.repaired.push(key);
+            } else {
+                missing.push(key);
+            }
+        }
+        report.missing = missing;
+        Ok(())
+    }
+
+    /// What a rollback left behind: an object no row references, under a
+    /// live incarnation, goes to the reclamation queue, which re-checks
+    /// before it deletes anything.
+    async fn enqueue(&self, report: &mut VerifyReport, now: DateTime<Utc>) -> Result<(), OpsError> {
+        let live = self.store.live_prefixes().await?;
+        report.enqueued = report
+            .orphans
+            .iter()
+            .filter(|key| live.iter().any(|prefix| layout::under(key, prefix)))
+            .cloned()
+            .collect();
+        if !report.enqueued.is_empty() {
+            self.store.enqueue(&report.enqueued, now).await?;
+        }
+        Ok(())
+    }
+}
+
+/// The epoch settled against the artifact store (C-3, I7): the mark is
+/// compared both ways, and the verify it owes runs and lifts the refusal it
+/// set. Nothing here deletes: what it finds goes to the queue, which claims
+/// before it acts.
+pub struct SettleEpoch {
+    store: Arc<dyn ReclaimStore>,
+    mark: HighWaterMark,
+    verify: VerifyStorage,
+}
+
+impl SettleEpoch {
+    pub fn new(
+        store: Arc<dyn ReclaimStore>,
+        referenced: Arc<dyn ReferencedKeys>,
+        storage: Arc<dyn StorageBackend>,
+        grace: Duration,
+    ) -> Self {
+        Self {
+            mark: HighWaterMark::new(store.clone(), storage.clone()),
+            verify: VerifyStorage::new(referenced, store.clone(), storage, grace),
+            store,
+        }
+    }
+
+    /// `None` when nothing was owed.
+    pub async fn run(&self, now: DateTime<Utc>) -> Result<Option<VerifyReport>, OpsError> {
+        self.mark.guard().await?;
+        let state = self.store.epoch().await?;
+        if !state.verify_pending {
+            return Ok(None);
+        }
+        let report = self
+            .verify
+            .run(
+                Verify {
+                    orphans: true,
+                    enqueue: true,
+                    repair: false,
+                },
+                now,
+            )
+            .await?;
+        self.store.verified(&state.epoch).await?;
+        Ok(Some(report))
     }
 }
 

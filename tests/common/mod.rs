@@ -4,13 +4,18 @@
 
 #![allow(dead_code)]
 
+pub mod containers;
 pub mod contract;
 pub mod fake_idp;
+pub mod fake_source;
 pub mod fake_osv;
 pub mod fake_upstream;
 pub mod fakes;
+pub mod manifests;
+pub mod mcp;
 pub mod pypi;
 pub mod faults;
+pub mod import;
 pub mod nuget;
 pub mod upstream_tap;
 
@@ -20,13 +25,11 @@ use std::io::Write;
 use std::path::Path;
 use std::time::Duration;
 
-use axum::ServiceExt as _;
 use base64::Engine;
 use reqwest::StatusCode;
 use serde_json::{json, Value};
 use sha2::Digest;
 use tempfile::TempDir;
-use tower::ServiceExt as _;
 
 use opencargo::config::{
     AuthConfig, Config, DatabaseConfig, ProxyConfig, RepositoryConfig, RepositoryFormat,
@@ -36,6 +39,7 @@ use opencargo::policy::rules::PolicyConfig;
 use opencargo::policy::{PolicyEngine, Tuning};
 use opencargo::proxy::UpstreamAuth;
 use opencargo::server;
+use opencargo::server::shutdown::{ServerHandle, Shutdown};
 
 /// The one static token every spawned server accepts.
 pub const STATIC_TOKEN: &str = "test-token";
@@ -46,6 +50,7 @@ pub struct SpawnOpts {
     pub proxy: ProxyConfig,
     pub vuln: VulnScanConfig,
     pub policy: HashMap<String, PolicyConfig>,
+    pub mcp: HashMap<String, opencargo::config::McpConfig>,
     /// Replaces the policy engine's timing knobs after `build_state`.
     pub policy_tuning: Option<Tuning>,
     /// Puts the storage and the permission store behind switches.
@@ -53,6 +58,12 @@ pub struct SpawnOpts {
     pub sso: opencargo::config::SsoConfig,
     /// The URL clients reach the server by, when a reverse proxy fronts it.
     pub public_url: Option<String>,
+    /// Take the writer lease, on terms short enough for a test to outwait.
+    pub lease: bool,
+    /// `[auth].static_tokens`.
+    pub static_tokens: Vec<String>,
+    /// `[server].endpoint_drain`.
+    pub endpoint_drain: String,
 }
 
 impl Default for SpawnOpts {
@@ -63,10 +74,14 @@ impl Default for SpawnOpts {
             proxy: ProxyConfig::default(),
             vuln: VulnScanConfig::default(),
             policy: HashMap::new(),
+            mcp: HashMap::new(),
             policy_tuning: None,
             outage: None,
             sso: Default::default(),
             public_url: None,
+            lease: false,
+            static_tokens: vec![STATIC_TOKEN.to_string()],
+            endpoint_drain: "0s".to_string(),
         }
     }
 }
@@ -78,6 +93,52 @@ pub struct TestServer {
     pub tmp: TempDir,
     /// The store the server ran on, kept so a restart finds its bytes.
     pub storage: opencargo::config::StorageConfig,
+    pub lease: Option<opencargo::app::lease::LeaseGuard>,
+    pub srv: ServerHandle,
+    pub shutdown: Shutdown,
+    pub lock: Option<opencargo::backup::lock::RestoreLock>,
+    endpoint_drain: Duration,
+    grace: Duration,
+    joined: bool,
+}
+
+impl TestServer {
+    /// Stop serving and give the lease back, as a clean shutdown would.
+    pub async fn stop(&mut self) {
+        self.handle.abort();
+        // A barrier, not a request: nothing the server owned outlives `stop`,
+        // so the next door finds no descriptor of its still open.
+        self.join().await;
+        if let Some(lease) = self.lease.take() {
+            lease.release().await;
+        }
+        self.lock = None;
+    }
+
+    /// Production's drain, then the end of serving, then the lease: what
+    /// `main` does on SIGTERM, without a signal.
+    pub async fn drain(&mut self) {
+        self.shutdown.drain(&self.srv, self.endpoint_drain, self.grace).await;
+        self.join().await;
+        if let Some(lease) = self.lease.take() {
+            lease.release().await;
+        }
+        self.lock = None;
+    }
+
+    async fn join(&mut self) {
+        if !self.joined {
+            self.joined = true;
+            (&mut self.handle).await.ok();
+        }
+    }
+}
+
+/// Lease terms a test can outwait: renewed every second, stale after three.
+pub fn short_lease(server: &mut ServerConfig) {
+    server.lease_wait = "4s".to_string();
+    server.lease_stale_after = "3s".to_string();
+    server.lease_renew = "1s".to_string();
 }
 
 /// The config every spawned server runs with: storage and database under `tmp`.
@@ -85,7 +146,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
     let public_url = opts.public_url.clone().unwrap_or_else(|| base_url.to_string());
     let storage_path = tmp.path().join("storage");
     let db_path = tmp.path().join("opencargo.db");
-    Config {
+    let mut config = Config {
         server: ServerConfig {
             bind: base_url.trim_start_matches("http://").to_string(),
             base_url: public_url,
@@ -93,6 +154,8 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
                 .to_str()
                 .expect("non-utf8 temp path")
                 .to_string(),
+            lease: opts.lease,
+            endpoint_drain: opts.endpoint_drain.clone(),
             ..Default::default()
         },
         database: DatabaseConfig {
@@ -103,7 +166,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         },
         auth: AuthConfig {
             anonymous_read: opts.anonymous_read,
-            static_tokens: vec![STATIC_TOKEN.to_string()],
+            static_tokens: opts.static_tokens.clone(),
             sso: opts.sso.clone(),
             ..Default::default()
         },
@@ -111,8 +174,11 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         repositories: opts.repositories,
         vuln_scan: opts.vuln,
         policy: opts.policy,
+        mcp: opts.mcp,
         ..Default::default()
-    }
+    };
+    short_lease(&mut config.server);
+    config
 }
 
 /// Whether this run puts every test server on S3 (`OPENCARGO_TEST_STORAGE=s3`,
@@ -139,12 +205,26 @@ pub fn switch_storage(config: &mut Config) {
 
 /// `server::build_state` behind the switch, refusing a vacuous S3 run: a
 /// switched server that did not build an S3 store fails the test.
-pub async fn build_state(config: &mut Config) -> anyhow::Result<opencargo::server::AppState> {
+pub async fn start(config: &mut Config) -> anyhow::Result<server::Started> {
+    start_with(config, ServerHandle::new(), Shutdown::new()).await
+}
+
+pub async fn start_with(
+    config: &mut Config,
+    srv: ServerHandle,
+    shutdown: Shutdown,
+) -> anyhow::Result<server::Started> {
     switch_storage(config);
-    let state = server::build_state(config).await?;
+    let started = server::build_state(config, srv, shutdown).await?;
     let want = if storage_is_s3() { "s3" } else { "fs" };
-    assert_eq!(state.storage_backend, want, "the storage switch was not applied");
-    Ok(state)
+    assert_eq!(started.state.storage_backend, want, "the storage switch was not applied");
+    Ok(started)
+}
+
+/// The state alone, for the files that build their own config; a lease it
+/// took stops renewing when its guard drops here.
+pub async fn build_state(config: &mut Config) -> anyhow::Result<opencargo::server::AppState> {
+    Ok(start(config).await?.state)
 }
 
 /// Start an opencargo on a random loopback port, ready to serve.
@@ -154,8 +234,8 @@ pub async fn spawn_server(opts: SpawnOpts) -> TestServer {
 }
 
 /// Stop `server` and start another on its database and storage: a restart.
-pub async fn respawn(server: TestServer, opts: SpawnOpts) -> TestServer {
-    server.handle.abort();
+pub async fn respawn(mut server: TestServer, opts: SpawnOpts) -> TestServer {
+    server.stop().await;
     spawn_in(server.tmp, opts, Some(server.storage)).await
 }
 
@@ -169,6 +249,37 @@ pub async fn storage_of(server: &TestServer) -> std::sync::Arc<dyn opencargo::st
     server::storage_for(&config, stores.multipart()).expect("failed to build the server's store")
 }
 
+static NO_CHILD: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// A fork copies every descriptor this process holds, and the copy keeps its
+/// `flock` alive until the child's exec closes it — so a child one test spawns
+/// can refuse the `{db}.lock` another test has just released. Hold this while
+/// a child lives, and while taking that lock, and the two never overlap.
+pub async fn no_child() -> tokio::sync::MutexGuard<'static, ()> {
+    NO_CHILD.lock().await
+}
+
+/// Every object of the server's store, deleted. On S3 the bytes are not
+/// under `tmp`, so removing the storage directory empties nothing.
+pub async fn clear_storage(server: &TestServer) {
+    use futures_util::TryStreamExt;
+    let mut config = test_config(&server.tmp, "http://127.0.0.1:0", SpawnOpts::default());
+    config.storage = server.storage.clone();
+    let stores = server::open_stores(&server.tmp.path().join("opencargo.db"))
+        .await
+        .expect("failed to open the server database");
+    let storage = server::storage_for(&config, stores.multipart()).expect("failed to build the server's store");
+    let keys: Vec<String> = storage
+        .list("")
+        .map_ok(|meta| meta.key)
+        .try_collect()
+        .await
+        .expect("failed to list the server's store");
+    storage.delete_batch(&keys).await.expect("failed to empty the server's store");
+    stores.close().await;
+}
+
 /// The config `server` runs with, its store included.
 pub fn config_of(server: &TestServer) -> Config {
     let mut config = test_config(&server.tmp, &server.base_url, SpawnOpts::default());
@@ -176,13 +287,14 @@ pub fn config_of(server: &TestServer) -> Config {
     config
 }
 
-/// Every key the server's store holds, sorted.
+/// Every key the server's store holds but its own reserved tree, sorted.
 pub async fn stored_keys(server: &TestServer) -> Vec<String> {
     use futures_util::TryStreamExt;
     let mut keys: Vec<String> = storage_of(server)
         .await
         .list("")
         .map_ok(|meta| meta.key)
+        .try_filter(|key| std::future::ready(!opencargo::domain::layout::reserved(key)))
         .try_collect()
         .await
         .expect("failed to list the server's store");
@@ -195,9 +307,8 @@ async fn spawn_in(
     opts: SpawnOpts,
     storage: Option<opencargo::config::StorageConfig>,
 ) -> TestServer {
-    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-        .await
-        .expect("failed to bind to random port");
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("failed to bind to random port");
+    listener.set_nonblocking(true).expect("a non-blocking listener");
     let addr = listener.local_addr().expect("no local addr");
     let base_url = format!("http://{addr}");
 
@@ -207,7 +318,9 @@ async fn spawn_in(
     if let Some(storage) = storage {
         config.storage = storage;
     }
-    let mut state = build_state(&mut config)
+    let srv = ServerHandle::new();
+    let shutdown = Shutdown::new();
+    let server::Started { mut state, lease, lock } = start_with(&mut config, srv.clone(), shutdown.clone())
         .await
         .expect("failed to build app state");
     if let Some(tuning) = tuning {
@@ -223,12 +336,13 @@ async fn spawn_in(
     if let Some(outage) = outage {
         outage.install(&mut state);
     }
-    let app = server::build_router(state)
-        .map_request(server::decode_percent_encoded_slashes)
-        .into_make_service_with_connect_info::<std::net::SocketAddr>();
+    let app = server::build_router(state).into_make_service_with_connect_info::<std::net::SocketAddr>();
 
+    let serving = axum_server::from_tcp(listener)
+        .expect("a listener axum_server accepts")
+        .handle(srv.clone());
     let handle = tokio::spawn(async move {
-        axum::serve(listener, app).await.ok();
+        serving.serve(app).await.ok();
     });
 
     let client = reqwest::Client::new();
@@ -245,14 +359,21 @@ async fn spawn_in(
         handle,
         tmp,
         storage: config.storage.clone(),
+        lease,
+        srv,
+        shutdown,
+        lock,
+        joined: false,
+        endpoint_drain: config.server.endpoint_drain().expect("a valid endpoint_drain"),
+        grace: config.server.shutdown_grace().expect("a valid shutdown_grace"),
     }
 }
 
 /// The error a restart of `server` on its own database refuses to start
 /// with under `opts`; the running server is left alone.
 pub async fn start_error_in(server: &TestServer, opts: SpawnOpts) -> String {
-    let config = test_config(&server.tmp, "http://127.0.0.1:0", opts);
-    server::build_state(&config)
+    let mut config = test_config(&server.tmp, "http://127.0.0.1:0", opts);
+    start(&mut config)
         .await
         .err()
         .expect("the start should be refused")
@@ -279,11 +400,28 @@ pub async fn seed_error_opts(opts: SpawnOpts) -> String {
         .to_string()
 }
 
-async fn open_db(server: &TestServer) -> sqlx::SqlitePool {
-    let db_path = server.tmp.path().join("opencargo.db");
-    sqlx::SqlitePool::connect(&format!("sqlite:{}", db_path.display()))
+type Db = sqlx::SqlitePool;
+
+async fn open_db(server: &TestServer) -> Db {
+    open_db_at(&server.tmp.path().join("opencargo.db")).await
+}
+
+async fn open_db_at(db_path: &Path) -> Db {
+    Db::connect(&format!("sqlite:{}", db_path.display()))
         .await
         .expect("failed to open the server database")
+}
+
+/// Every table of the SQLite file at `db_path`, sorted: what proves a
+/// refused start wrote nothing.
+pub async fn table_names(db_path: &Path) -> Vec<String> {
+    let pool = open_db_at(db_path).await;
+    let names = sqlx::query_scalar("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+        .fetch_all(&pool)
+        .await
+        .expect("failed to list tables");
+    pool.close().await;
+    names
 }
 
 /// One `policy_resolutions` row as the report will read it.

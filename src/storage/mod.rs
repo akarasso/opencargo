@@ -103,6 +103,16 @@ impl CheckReport {
     }
 }
 
+/// Whether the store keeps noncurrent versions of an overwritten or deleted
+/// key, which is what `storage verify --repair` puts back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Versioning {
+    Kept,
+    NotKept,
+    /// The store may keep them; this adapter cannot tell.
+    Unknown,
+}
+
 /// An opaque, declared name for a store: never an endpoint, bucket or path.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct StoreIdentity(pub String);
@@ -156,6 +166,17 @@ pub trait StorageBackend: Send + Sync {
     ) -> Result<u64, StorageError>;
 
     async fn probe(&self) -> Result<(), StorageError>;
+
+    /// Read at startup and before a repair; never assumed.
+    async fn versioning(&self) -> Result<Versioning, StorageError> {
+        Ok(Versioning::Unknown)
+    }
+
+    /// Puts the last noncurrent version of `key` back as the current one.
+    /// `Ok(false)` when the store has none to put back.
+    async fn restore_last_version(&self, _key: &str) -> Result<bool, StorageError> {
+        Ok(false)
+    }
 
     fn upload_plan(&self) -> UploadPlan;
 

@@ -2180,6 +2180,76 @@ macro_rules! reclaim_contract {
             }
 
             #[tokio::test]
+            async fn pin_after_epoch_change_never_reuses_an_old_generation() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "r").await;
+                let before = pin(&h, &prefix, &["r/x"], 2).await;
+                publish(&h, r.id, "1.0.0", &before[0].physical_key).await;
+                let first = h.reclaim.epoch().await.unwrap();
+                assert!(!first.installation.is_empty(), "an installation identifier is persisted");
+                assert!(
+                    before[0].physical_key.ends_with(&format!("~{}-{}", first.epoch,
+                        before[0].physical_key.rsplit('-').next().unwrap())),
+                    "the epoch is readable from the generation: {}",
+                    before[0].physical_key
+                );
+
+                let drawn = h.reclaim.new_epoch(0).await.unwrap();
+                assert_ne!(drawn.epoch, first.epoch, "an epoch is opaque and freshly drawn");
+                assert_eq!(drawn.installation, first.installation, "the installation outlives it");
+                assert!(drawn.verify_pending, "a new epoch owes a verify");
+                let after = pin(&h, &prefix, &["r/x"], 9).await;
+                assert_ne!(
+                    after[0].physical_key, before[0].physical_key,
+                    "a generation of another epoch is never reusable"
+                );
+
+                let again = h.reclaim.new_epoch(0).await.unwrap();
+                assert_ne!(again.epoch, drawn.epoch, "two draws never collide");
+                h.reclaim.verified(&drawn.epoch).await.unwrap();
+                assert!(
+                    h.reclaim.epoch().await.unwrap().verify_pending,
+                    "a verify of a spent epoch lifts nothing"
+                );
+                h.reclaim.verified(&again.epoch).await.unwrap();
+                assert!(!h.reclaim.epoch().await.unwrap().verify_pending);
+            }
+
+            #[tokio::test]
+            async fn the_counter_advances_once_and_only_under_the_current_epoch() {
+                let h = $open().await;
+                let state = h.reclaim.epoch().await.unwrap();
+                assert_eq!(state.counter, 0);
+                assert!(h.reclaim.advance(&state.epoch, 1).await.unwrap());
+                assert!(
+                    !h.reclaim.advance(&state.epoch, 1).await.unwrap(),
+                    "the counter only moves forward"
+                );
+                assert_eq!(h.reclaim.epoch().await.unwrap().counter, 1);
+                assert!(
+                    !h.reclaim.advance("someone else's epoch", 2).await.unwrap(),
+                    "a foreign epoch advances nothing"
+                );
+                h.reclaim.require_verify().await.unwrap();
+                assert!(
+                    !h.reclaim.advance(&state.epoch, 2).await.unwrap(),
+                    "a pending verify refuses the batch that would advance it"
+                );
+                assert_eq!(h.reclaim.epoch().await.unwrap().counter, 1);
+            }
+
+            #[tokio::test]
+            async fn live_prefixes_are_what_a_verify_may_enqueue_under() {
+                let h = $open().await;
+                let (_, prefix) = repo(&h, "r").await;
+                let (_, gone) = repo(&h, "r2").await;
+                h.repos.retire("r2", at(2)).await.unwrap();
+                let live = h.reclaim.live_prefixes().await.unwrap();
+                assert!(live.contains(&prefix) && live.contains(&"npm/r".to_string()));
+                assert!(!live.contains(&gone), "a retired incarnation is not live");
+            }
+
+            #[tokio::test]
             async fn pin_under_retired_incarnation_is_refused() {
                 let h = $open().await;
                 let (_, prefix) = repo(&h, "r").await;

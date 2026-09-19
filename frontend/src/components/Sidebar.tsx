@@ -120,6 +120,10 @@ export default function Sidebar() {
                 <Icon name="shield" />
                 <span>Policy report</span>
               </A>
+              <A class="nav-link" href="/admin/mcp" activeClass="active" onClick={close}>
+                <Icon name="terminal" />
+                <span>MCP governance</span>
+              </A>
               <A class="nav-link" href="/admin/system" activeClass="active" onClick={close}>
                 <Icon name="settings" />
                 <span>System</span>

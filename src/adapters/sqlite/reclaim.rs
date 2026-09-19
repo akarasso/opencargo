@@ -16,7 +16,7 @@ use super::{bind_ts, immediate, store_error, Tx};
 use crate::domain::layout;
 use crate::error::StoreError;
 use crate::ports::reclaim::{
-    Backlog, Candidate, Claim, ClaimToken, Pinned, PinToken, ReclaimStore, Renewal,
+    Backlog, Candidate, Claim, ClaimToken, Epoch, Pinned, PinToken, ReclaimStore, Renewal,
 };
 use crate::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 
@@ -37,7 +37,11 @@ pub(crate) const REFERENCED: &str = "
 
 /// Every port's contribution, as one union.
 fn referenced() -> String {
-    format!("{REFERENCED} UNION ALL {}", super::pypi::REFERENCED)
+    format!(
+        "{REFERENCED} UNION ALL {} UNION ALL {}",
+        super::pypi::REFERENCED,
+        super::mcp::REFERENCED
+    )
 }
 
 /// `?1` is referenced, or (for a prefix) something under it is, or a
@@ -147,21 +151,40 @@ async fn is_retired(tx: &mut Tx, repo_prefix: &str) -> Result<bool, sqlx::Error>
     Ok(!live)
 }
 
-/// A generation of `logical` that a committed row references and no claim
-/// ever took.
-async fn reusable(tx: &mut Tx, logical: &str) -> Result<Option<String>, sqlx::Error> {
+/// A generation of `logical` minted under `epoch`, that a committed row
+/// references and no claim ever took. A generation of another epoch is
+/// never reusable: it may have been placed on the other side of a restore.
+async fn reusable(tx: &mut Tx, logical: &str, epoch: &str) -> Result<Option<String>, sqlx::Error> {
     let stem = layout::physical_key(logical, "");
+    let minted = format!("{epoch}-");
     let referenced = referenced();
     sqlx::query_scalar(&format!(
         "SELECT refs.k FROM ({referenced}) refs
          WHERE refs.p = 0 AND substr(refs.k, 1, length(?1)) = ?1
            AND instr(substr(refs.k, length(?1) + 1), '/') = 0
+           AND substr(refs.k, length(?1) + 1, length(?2)) = ?2
            AND refs.k NOT IN (SELECT physical_key FROM reclaim_claimed)
          LIMIT 1"
     ))
     .bind(&stem)
+    .bind(&minted)
     .fetch_optional(&mut **tx)
     .await
+}
+
+async fn current_epoch(tx: &mut Tx) -> Result<Epoch, sqlx::Error> {
+    let (installation, epoch, counter, pending): (String, String, i64, i64) =
+        sqlx::query_as(
+            "SELECT installation, epoch, counter, verify_pending FROM reclaim_epoch WHERE id = 1",
+        )
+        .fetch_one(&mut **tx)
+        .await?;
+    Ok(Epoch {
+        installation,
+        epoch,
+        counter: counter.unsigned_abs(),
+        verify_pending: pending != 0,
+    })
 }
 
 async fn pin_all(
@@ -173,11 +196,16 @@ async fn pin_all(
     if is_retired(tx, repo_prefix).await? {
         return Ok(Ok(Pinned::Retired));
     }
+    let epoch = current_epoch(tx).await?.epoch;
     let mut tokens = Vec::with_capacity(logical_keys.len());
     for logical in logical_keys {
-        let physical = match reusable(tx, logical).await? {
+        let physical = match reusable(tx, logical, &epoch).await? {
             Some(physical) => physical,
-            None => layout::physical_key(logical, &uuid::Uuid::new_v4().simple().to_string()),
+            None => {
+                let generation =
+                    layout::generation(&epoch, &uuid::Uuid::new_v4().simple().to_string());
+                layout::physical_key(logical, &generation)
+            }
         };
         let token = uuid::Uuid::new_v4().to_string();
         sqlx::query(
@@ -334,6 +362,81 @@ impl SqliteReclaimStore {
 
 #[async_trait]
 impl ReclaimStore for SqliteReclaimStore {
+    async fn epoch(&self) -> Result<Epoch, StoreError> {
+        immediate(&self.pool, |mut tx| {
+            Box::pin(async move {
+                let state = current_epoch(&mut tx).await.map(Ok);
+                (tx, state)
+            })
+        })
+        .await
+    }
+
+    async fn new_epoch(&self, counter: u64) -> Result<Epoch, StoreError> {
+        let counter = i64::try_from(counter).unwrap_or(i64::MAX);
+        immediate(&self.pool, move |mut tx| {
+            Box::pin(async move {
+                let drawn = async {
+                    sqlx::query(
+                        "UPDATE reclaim_epoch
+                         SET epoch = lower(hex(randomblob(16))),
+                             counter = max(counter, ?1),
+                             verify_pending = 1
+                         WHERE id = 1",
+                    )
+                    .bind(counter)
+                    .execute(&mut *tx)
+                    .await?;
+                    Ok(Ok(current_epoch(&mut tx).await?))
+                }
+                .await;
+                (tx, drawn)
+            })
+        })
+        .await
+    }
+
+    async fn require_verify(&self) -> Result<(), StoreError> {
+        sqlx::query("UPDATE reclaim_epoch SET verify_pending = 1 WHERE id = 1")
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn verified(&self, epoch: &str) -> Result<(), StoreError> {
+        sqlx::query("UPDATE reclaim_epoch SET verify_pending = 0 WHERE id = 1 AND epoch = ?1")
+            .bind(epoch)
+            .execute(&self.pool)
+            .await
+            .map_err(store_error)?;
+        Ok(())
+    }
+
+    async fn advance(&self, epoch: &str, counter: u64) -> Result<bool, StoreError> {
+        let done = sqlx::query(
+            "UPDATE reclaim_epoch SET counter = ?2
+             WHERE id = 1 AND epoch = ?1 AND counter < ?2 AND verify_pending = 0",
+        )
+        .bind(epoch)
+        .bind(i64::try_from(counter).unwrap_or(i64::MAX))
+        .execute(&self.pool)
+        .await
+        .map_err(store_error)?;
+        Ok(done.rows_affected() == 1)
+    }
+
+    async fn live_prefixes(&self) -> Result<Vec<String>, StoreError> {
+        sqlx::query_scalar(
+            "SELECT prefix FROM storage_prefixes
+             WHERE incarnation NOT IN (SELECT incarnation FROM retired_incarnations)
+             ORDER BY prefix",
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(store_error)
+    }
+
     async fn pin(
         &self,
         repo_prefix: &str,
@@ -596,3 +699,7 @@ impl ReferencedKeys for SqliteReferencedKeys {
         ))
     }
 }
+
+#[cfg(test)]
+#[path = "serializable_tests.rs"]
+mod serializable_tests;

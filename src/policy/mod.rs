@@ -139,6 +139,13 @@ pub enum Source {
         served: Option<Cached>,
         parsed: Option<serde_json::Value>,
     },
+    /// Gathered by the read path from the addressed repository's rows:
+    /// the verdicts are that repository's, never the mirror's.
+    Mcp {
+        facts: Arc<facts::mcp::McpFacts>,
+        digest: Option<String>,
+        published: Option<DateTime<Utc>>,
+    },
 }
 
 /// One served artifact on its way to the writer; `name` is the client's.
@@ -171,6 +178,7 @@ pub struct Resolution {
 pub struct Facts {
     pub install_scripts: Option<bool>,
     pub date_source: &'static str,
+    pub mcp: Option<Arc<facts::mcp::McpFacts>>,
 }
 
 /// Timing knobs; tests shrink them, production runs the defaults.

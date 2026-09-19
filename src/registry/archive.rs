@@ -19,6 +19,59 @@ pub enum ArchiveError {
     TooManyMembers(usize),
     #[error("archive member {0} is larger than {1} bytes")]
     TooLarge(String, u64),
+    #[error("archive member {0} is not a safe path")]
+    UnsafePath(String),
+    #[error("archive member {0} is a link")]
+    Link(String),
+    #[error("archive inflates past {0} bytes")]
+    TooLargeInflated(u64),
+}
+
+/// What a whole-archive check allows: `None` is unbounded.
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_members: Option<usize>,
+    pub max_inflated: Option<u64>,
+}
+
+fn safe_path(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with('/')
+        && !name.contains('\\')
+        && !name.contains('\0')
+        && !name.split('/').any(|s| s == ".." || s.contains(':'))
+}
+
+/// Every member's path and kind, the member count and the declared
+/// inflated total, before anything is read: nothing is inflated here.
+pub fn zip_check(bytes: &[u8], limits: Limits) -> Result<(), ArchiveError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| ArchiveError::Unreadable(e.to_string()))?;
+    if let Some(max) = limits.max_members {
+        if archive.len() > max {
+            return Err(ArchiveError::TooManyMembers(max));
+        }
+    }
+    let mut total: u64 = 0;
+    for i in 0..archive.len() {
+        let file = archive
+            .by_index_raw(i)
+            .map_err(|e| ArchiveError::Unreadable(e.to_string()))?;
+        let name = file.name().to_string();
+        if !safe_path(&name) {
+            return Err(ArchiveError::UnsafePath(name));
+        }
+        if file.is_symlink() {
+            return Err(ArchiveError::Link(name));
+        }
+        total = total.saturating_add(file.size());
+        if let Some(max) = limits.max_inflated {
+            if total > max {
+                return Err(ArchiveError::TooLargeInflated(max));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bounded(mut r: impl Read, name: &str, max: u64) -> Result<Vec<u8>, ArchiveError> {
@@ -59,6 +112,31 @@ pub fn zip_member(
         return Ok(Some((name, body)));
     }
     Ok(None)
+}
+
+/// Every member name, in archive order; nothing is inflated.
+pub fn zip_names(bytes: &[u8]) -> Result<Vec<String>, ArchiveError> {
+    let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))
+        .map_err(|e| ArchiveError::Unreadable(e.to_string()))?;
+    let mut out = Vec::with_capacity(archive.len());
+    for i in 0..archive.len() {
+        let file = archive
+            .by_index_raw(i)
+            .map_err(|e| ArchiveError::Unreadable(e.to_string()))?;
+        out.push(file.name().to_string());
+    }
+    Ok(out)
+}
+
+/// One named member, read under its own cap.
+pub fn zip_read(bytes: &[u8], name: &str, max_bytes: u64) -> Result<Vec<u8>, ArchiveError> {
+    let budget = Budget {
+        max_members: usize::MAX,
+        max_member_bytes: max_bytes,
+    };
+    zip_member(bytes, budget, |n| n == name)?
+        .map(|(_, body)| body)
+        .ok_or_else(|| ArchiveError::Unreadable(format!("no member {name}")))
 }
 
 /// The first member of a gzipped tarball whose path `wanted` accepts.
@@ -148,5 +226,35 @@ mod tests {
         let big = tar_gz_of(&[("p/PKG-INFO", &[b'x'; 64])]);
         assert!(matches!(tar_gz_member(&big, BUDGET, |_| true), Err(ArchiveError::TooLarge(..))));
         assert!(tar_gz_member(b"junk", BUDGET, |_| true).is_err());
+    }
+
+    fn zip_with_link() -> Vec<u8> {
+        let mut out = std::io::Cursor::new(Vec::new());
+        let mut zip = zip::ZipWriter::new(&mut out);
+        zip.add_symlink("evil", "/etc/passwd", zip::write::SimpleFileOptions::default()).unwrap();
+        zip.finish().unwrap();
+        out.into_inner()
+    }
+
+    #[test]
+    fn a_whole_archive_check_refuses_traversal_links_and_bombs_before_reading() {
+        let open = Limits {
+            max_members: None,
+            max_inflated: None,
+        };
+        assert!(zip_check(&zip_of(&[("a/b", b"x"), ("c", b"y")]), open).is_ok());
+        for bad in ["../x", "/abs", "a/../../x", "a\\b", "c:/x"] {
+            assert!(matches!(zip_check(&zip_of(&[(bad, b"x")]), open), Err(ArchiveError::UnsafePath(_))), "{bad}");
+        }
+        assert!(matches!(zip_check(&zip_with_link(), open), Err(ArchiveError::Link(_))));
+        let tight = Limits {
+            max_members: Some(1),
+            max_inflated: Some(4),
+        };
+        assert!(matches!(zip_check(&zip_of(&[("a", b""), ("b", b"")]), tight), Err(ArchiveError::TooManyMembers(1))));
+        assert!(matches!(zip_check(&zip_of(&[("a", &[0u8; 64])]), tight), Err(ArchiveError::TooLargeInflated(4))));
+        let many: Vec<(String, &[u8])> = (0..3000).map(|i| (format!("m/f{i}"), &b""[..])).collect();
+        let refs: Vec<(&str, &[u8])> = many.iter().map(|(n, b)| (n.as_str(), *b)).collect();
+        assert!(zip_check(&zip_of(&refs), open).is_ok(), "an unbounded count admits a vendored module");
     }
 }

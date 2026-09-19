@@ -25,6 +25,7 @@ use crate::ports::multipart::MultipartLedger;
 use crate::ports::maven::MavenFileStore;
 use crate::ports::handoffs::LoginHandoffStore;
 use crate::ports::identities::IdentityStore;
+use crate::ports::leases::{LeaseStore, ServerStateStore};
 use crate::ports::secrets::ServerSecretStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
@@ -42,10 +43,14 @@ use crate::ports::vulns::VulnStore;
 use crate::ports::webhooks::WebhookStore;
 
 pub mod audit;
+pub mod backup;
 pub mod dashboard;
 pub mod deps;
 pub mod maven;
+pub mod mcp;
 pub mod identities;
+pub mod leases;
+pub mod import_journal;
 pub mod migrate;
 pub mod multipart;
 pub mod nuget;
@@ -347,6 +352,32 @@ impl SqliteStores {
 
     pub fn secrets(&self) -> Arc<dyn ServerSecretStore> {
         Arc::new(identities::SqliteSecretStore::new(self.pool.clone()))
+    }
+
+    pub fn mcp(&self) -> Arc<dyn crate::ports::mcp::McpStore> {
+        Arc::new(mcp::SqliteMcpStore::new(self.pool.clone()))
+    }
+
+    pub fn backup(&self) -> Arc<dyn crate::ports::backup::DatabaseBackup> {
+        Arc::new(backup::SqliteBackup::new(self.pool.clone()))
+    }
+
+    /// Closes the pool, so nothing holds the database file open.
+    pub async fn close(&self) {
+        self.pool.close().await;
+    }
+
+    pub fn leases(&self) -> Arc<dyn LeaseStore> {
+        Arc::new(leases::SqliteLeaseStore::new(self.pool.clone()))
+    }
+
+    pub fn server_state(&self) -> Arc<dyn ServerStateStore> {
+        Arc::new(leases::SqliteServerState::new(self.pool.clone()))
+    }
+
+    /// Every migration this binary carries, on these stores' database.
+    pub async fn migrate(&self) -> Result<(), StoreError> {
+        migrate::run_all(&self.pool).await.map(|_| ())
     }
 
     pub fn dashboard(&self) -> Arc<dyn DashboardRead> {
