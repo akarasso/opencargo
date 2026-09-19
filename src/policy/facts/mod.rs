@@ -322,6 +322,7 @@ mod tests {
                 fresh: true,
             },
             stale: false,
+            exchanged: true,
         }
     }
 

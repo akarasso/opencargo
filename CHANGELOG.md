@@ -10,7 +10,6 @@ All notable changes to this project will be documented in this file.
   limit it hit. The defaults are what was hard-coded before -- thirty npm
   publishes and thirty PyPI uploads a minute per account -- and Cargo, Go and
   NuGet publishes can now be metered too. See `docs/operations.md`.
-<<<<<<< HEAD
 - Governance of MCP servers and agent skills, a preview. The `mcp` repository
   format mirrors the MCP registry (`proxy`), hosts internal servers and
   skills (`hosted`) and merges both for a team (`group`); migration 023
@@ -33,7 +32,6 @@ All notable changes to this project will be documented in this file.
   report whose kinds set the exit code. See `docs/import.md`.
 - The cargo sparse index now carries `v` and `rust_version` when a publish
   declared them.
-=======
 - One instance per database: a writer lease taken before any migration, so a
   second process on the same database refuses to start and names the holder.
   `opencargo migrate`, `storage migrate` and `storage reclaim` take it too.
@@ -45,7 +43,6 @@ All notable changes to this project will be documented in this file.
   `[backup]` schedule, an optional `[backup.sink]`, and a restore Job in
   the Helm chart and `k8s/restore-job.yaml`.
 - `GET /api/v1/system/instance` and an Instance tile on the System page.
->>>>>>> 76095200d22b5fddcab8eaddee6e9f65b4de4ccd
 - S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
   validated against MinIO, not yet against a hosted provider. Credentials
   come only from an allowlisted environment; TLS trusts the compiled-in

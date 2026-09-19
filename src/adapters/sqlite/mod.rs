@@ -36,7 +36,7 @@ use crate::ports::pypi::PypiFileStore;
 use crate::ports::reclaim::ReclaimStore;
 use crate::ports::referenced::ReferencedKeys;
 use crate::ports::repositories::RepositoryStore;
-use crate::ports::search::SearchIndex;
+use crate::ports::search::{CachedPackageIndex, SearchIndex};
 use crate::ports::tokens::TokenStore;
 use crate::ports::users::UserStore;
 use crate::ports::vulns::VulnStore;
@@ -44,6 +44,7 @@ use crate::ports::webhooks::WebhookStore;
 
 pub mod audit;
 pub mod backup;
+pub mod cached;
 pub mod dashboard;
 pub mod deps;
 pub mod maven;
@@ -317,6 +318,10 @@ impl SqliteStores {
 
     pub fn search(&self) -> Arc<dyn SearchIndex> {
         Arc::new(search::SqliteSearchIndex::new(self.pool.clone()))
+    }
+
+    pub fn cached_packages(&self) -> Arc<dyn CachedPackageIndex> {
+        Arc::new(cached::SqliteCachedPackageIndex::new(self.pool.clone()))
     }
 
     pub fn oci(&self) -> Arc<dyn OciStore> {

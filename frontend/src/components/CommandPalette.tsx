@@ -122,10 +122,16 @@ export default function CommandPalette() {
     const pkgCommands: Command[] = (results()?.results ?? []).slice(0, 6).map((r) => ({
       id: `pkg-${r.name}`,
       label: r.name,
-      detail: r.latest_version,
+      // A proxied package has no page of its own; the palette opens the search
+      // that found it rather than a 404.
+      detail:
+        r.source === 'cached' ? `${r.latest_version} · proxied ${r.repository}` : r.latest_version,
       icon: 'package',
       group: 'Packages' as const,
-      run: () => navigate(`/packages/${r.name}`),
+      run: () =>
+        navigate(
+          r.source === 'cached' ? `/search?q=${encodeURIComponent(r.name)}` : `/packages/${r.name}`,
+        ),
     }));
     const nav = q ? navCommands().filter((c) => c.label.toLowerCase().includes(q)) : navCommands();
     return [...pkgCommands, ...nav];

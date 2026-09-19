@@ -12,7 +12,7 @@ use serde_json::{json, Value};
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppResult, StoreError};
 use crate::ports::packages::PackageStore;
-use crate::ports::search::{SearchIndex, SearchQuery as Tokens, SearchScope};
+use crate::ports::search::{CachedPackageIndex, SearchIndex, SearchQuery as Tokens, SearchScope};
 use crate::registry::cx;
 use crate::registry::resolve::collect;
 use crate::server::AppState;
@@ -115,6 +115,40 @@ pub async fn search_in_repo(
         }));
     }
     Ok(objects)
+}
+
+/// The first `limit` search objects a proxy member contributes: the packages
+/// it has been seen serving. `date` is when it last served the package and not
+/// a publish date, which is upstream's to know and no client reads.
+pub async fn cached_in_repo(
+    index: &dyn CachedPackageIndex,
+    repo_id: i64,
+    text: &str,
+    limit: i64,
+) -> Result<Vec<Value>, StoreError> {
+    let Some(query) = browse_or_match(text) else {
+        return Ok(Vec::new());
+    };
+    let found = index
+        .search(
+            SearchScope::Repo(repo_id),
+            query.as_ref(),
+            limit.clamp(0, i64::from(u32::MAX)) as u32,
+        )
+        .await?;
+    Ok(found
+        .into_iter()
+        .map(|row| {
+            json!({
+                "package": {
+                    "name": row.name,
+                    "description": row.description,
+                    "version": row.latest_version.unwrap_or_else(|| "0.0.0".to_string()),
+                    "date": wire_ts(row.last_seen_at),
+                },
+            })
+        })
+        .collect())
 }
 
 /// What the index is asked for, and the one case it is asked nothing.

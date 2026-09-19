@@ -317,6 +317,7 @@ impl ProxyEngine {
         Ok(self.resolve_row(s, a, row, now).await?.map(|entry| Cached {
             entry,
             stale: !fresh,
+            exchanged: false,
         }))
     }
 
@@ -399,6 +400,7 @@ impl ProxyEngine {
                     Ok(Outcome::Found(Cached {
                         entry: target,
                         stale: false,
+                        exchanged: true,
                     }))
                 }
                 None => Err(AppError::BadGateway(
@@ -408,6 +410,7 @@ impl ProxyEngine {
             Ok(Reply::Stored(entry)) => Ok(Outcome::Found(Cached {
                 entry: *entry,
                 stale: false,
+                exchanged: true,
             })),
             Ok(Reply::Miss(status)) if pass.miss == Miss::Record => {
                 self.record_miss(member, &key, status, stale.as_ref(), pass.now)
@@ -421,6 +424,7 @@ impl ProxyEngine {
                     Ok(Outcome::Found(Cached {
                         entry: target,
                         stale: true,
+                        exchanged: false,
                     }))
                 }
                 Some(_) => Ok(Outcome::NotFound),
@@ -697,6 +701,7 @@ impl ProxyEngine {
         Ok(Cached {
             entry: target,
             stale: false,
+            exchanged: false,
         })
     }
 

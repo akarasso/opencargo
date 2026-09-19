@@ -45,6 +45,7 @@ pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Reposit
         oci: state.oci.as_ref(),
         maven: state.maven.as_ref(),
         search: state.search.as_ref(),
+        cached: state.cached.as_ref(),
         nuget: state.nuget_feed.as_ref(),
         proxy: &state.proxy,
         policy: &state.policy,

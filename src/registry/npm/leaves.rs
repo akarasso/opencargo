@@ -1,7 +1,9 @@
 use bytes::Bytes;
+use chrono::Utc;
 use serde_json::Value;
 
-use crate::domain::{CacheRepo, Format, Outcome};
+use crate::app::search;
+use crate::domain::{CacheRepo, Format, Outcome, Sighting};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
 use crate::proxy::strategy::CacheKey;
@@ -10,7 +12,7 @@ use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
 use super::packument::{dist_tags_map, hosted_packument};
 use super::render::{self, Flavor};
-use super::search::search_in_repo;
+use super::search::{cached_in_repo, search_in_repo};
 use super::upstream::{NpmArtifact, NpmUpstream};
 
 /// The packument a client is served: already rendered, so nothing above
@@ -92,6 +94,7 @@ impl Leaf for PackumentLeaf {
         let raw = engine.bytes(&cached).await?;
         let body = render::render(&raw, self.flavor(), cx.base_url, cx.url.0, &self.name)
             .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
+        remember(cx, member, cached.exchanged, &raw, &self.name).await;
         drop(raw);
         let content_type = self.flavor().content_type();
         let mut payload = match &key {
@@ -105,6 +108,26 @@ impl Leaf for PackumentLeaf {
         payload.stale = cached.stale;
         Ok(Outcome::Found(payload))
     }
+}
+
+/// What a packument says about the package itself, so that a search answers
+/// for it: npm is the one format whose document carries a description.
+/// Two fields out of the packument's bytes, never a tree over the whole of
+/// it: the rendering path deliberately never builds one.
+async fn remember(cx: &Cx<'_>, member: CacheRepo<'_>, exchanged: bool, raw: &[u8], name: &str) {
+    let description = render::field(raw, "description").ok().flatten();
+    let tags = render::field(raw, "dist-tags").ok().flatten();
+    let seen = Sighting {
+        repository_id: member.0.id,
+        format: Format::Npm,
+        name,
+        description: description.as_ref().and_then(Value::as_str),
+        latest_version: tags
+            .as_ref()
+            .and_then(|t| t.get("latest"))
+            .and_then(Value::as_str),
+    };
+    search::remember(cx.cached, exchanged, &seen, Utc::now()).await;
 }
 
 pub struct TarballLeaf {
@@ -217,8 +240,9 @@ impl Leaf for DistTagsLeaf {
     }
 }
 
-/// The first `limit` local search objects of a member; a proxy member has no
-/// searchable index and contributes nothing.
+/// The first `limit` search objects of a member: what it hosts, or what it has
+/// been seen serving. Neither asks an upstream -- a search is answered from
+/// what this server holds, never from an upstream's own catalogue and ranking.
 pub struct SearchLeaf {
     pub text: String,
     pub limit: i64,
@@ -240,10 +264,11 @@ impl Leaf for SearchLeaf {
 
     async fn proxy(
         &self,
-        _cx: &Cx<'_>,
-        _member: CacheRepo<'_>,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
         _up: &Upstream,
     ) -> Result<Outcome<Vec<Value>>, ResolveError> {
-        Ok(Outcome::NotFound)
+        let objects = cached_in_repo(cx.cached, member.0.id, &self.text, self.limit).await?;
+        Ok(Outcome::Found(objects))
     }
 }

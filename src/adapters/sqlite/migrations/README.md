@@ -47,6 +47,7 @@ checksum in the same commit.
 | 026 | 026_reclaim_epoch.sql | ha-profiles C-1/C-9 (restore epoch, installation identifier, high-water counter) | 109b9ff6860ee44be9d9528a6d99613b735675f0a6450fa03ef92b08e2fd30c9 |
 | 027 | 027_pins_by_expiry.sql | write amplification (reclaim_pins keyed by expiry, WITHOUT ROWID) | 86dda7165b421babb8c098dac6eacdd618a0f4c41d167db2a9a400f50872e77b |
 | 028 | 028_redundant_indexes.sql | write amplification (the two indexes a unique constraint already carries) | 4ca3c60c8bc8168054c89d86b5f06e02cbfdb19901ded4f7a05d2943cd4f5c13 |
+| 029 | 029_cached_packages.sql | search-over-cache.md (port 24: what the proxy has served) | aed68ab685f6da77542314245529a8e4e5d8ca2c6d153d73021057a62f4c57b3 |
 
 A `Step::Rust` migration has no file and so no checksum: `020` is the
 `repositories` CHECK widened by `migrate::widen_format_check`, the one helper

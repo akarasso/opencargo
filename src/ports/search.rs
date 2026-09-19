@@ -6,8 +6,9 @@
 //! a search after a publish finds the package.
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 
-use crate::domain::Package;
+use crate::domain::{CachedPackage, Package, Sighting};
 use crate::error::StoreError;
 
 /// Which packages a search may return. `PublicOnly` and `All` are the two
@@ -56,4 +57,34 @@ pub trait SearchIndex: Send + Sync {
         query: Option<&SearchQuery>,
         limit: u32,
     ) -> Result<Vec<Package>, StoreError>;
+}
+
+/// Port 24 (A1 C1, proposed at its next revision): what the proxy has been
+/// seen serving, so a search answers for the packages this server served and
+/// not only for the ones it hosts.
+///
+/// A separate port rather than a write side on [`SearchIndex`]: `packages_fts`
+/// is maintained by the adapter's own `packages` writes, while nothing writes
+/// these rows unless the proxy path says so, and what they answer is a
+/// different read model with a lifecycle of its own.
+#[async_trait]
+pub trait CachedPackageIndex: Send + Sync {
+    /// Idempotent under (repository, name): a second sighting of a package
+    /// refreshes what the document said and moves `last_seen_at`.
+    async fn remember(&self, seen: &Sighting<'_>, now: DateTime<Utc>) -> Result<(), StoreError>;
+
+    /// `Some(q)`: relevance-ordered. `None`: a browse, the scope's rows in the
+    /// adapter's natural order -- [`SearchIndex::search`]'s contract, over the
+    /// other index.
+    async fn search(
+        &self,
+        scope: SearchScope,
+        query: Option<&SearchQuery>,
+        limit: u32,
+    ) -> Result<Vec<CachedPackage>, StoreError>;
+
+    /// What a cache purge drops, since a purge is the operator saying the
+    /// repository has served nothing; eviction does not, because the next
+    /// request fetches the package again.
+    async fn forget_repo(&self, repo: i64) -> Result<u64, StoreError>;
 }

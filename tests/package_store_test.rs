@@ -4,7 +4,7 @@
 
 mod common;
 
-use common::contract::{package_contract, Handles, Ports};
+use common::contract::{cached_contract, package_contract, Handles, Ports};
 use common::fakes::FakeDb;
 use opencargo::adapters::sqlite::SqliteStores;
 use tempfile::TempDir;
@@ -16,6 +16,7 @@ async fn fake() -> Handles {
         repos: db.repositories(),
         packages: db.packages(),
         search: db.search(),
+        cached: db.cached_packages(),
         deps: db.dependencies(),
     };
     Handles::new(ports, Box::new(db))
@@ -31,6 +32,7 @@ async fn sqlite() -> Handles {
         repos: stores.repositories(),
         packages: stores.packages(),
         search: stores.search(),
+        cached: stores.cached_packages(),
         deps: stores.dependencies(),
     };
     Handles::new(ports, Box::new((tmp, stores)))
@@ -38,3 +40,5 @@ async fn sqlite() -> Handles {
 
 package_contract!(fake_db, fake);
 package_contract!(sqlite_adapter, sqlite);
+cached_contract!(fake_cached, fake);
+cached_contract!(sqlite_cached, sqlite);

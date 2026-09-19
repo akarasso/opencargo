@@ -221,8 +221,8 @@ Read this before the comparison table sells you anything.
 
 A `group` such as `npm-all` answers `npm install` and `npm dist-tag ls` from
 its hosted members first, then from its proxies (dist-tags come from the
-cached packument); `npm search` covers hosted members only, nested groups
-included, so proxied packages are not searchable. `npm publish` and
+cached packument); `npm search` and the UI cover hosted members and whatever
+the proxy members have already served, nested groups included. `npm publish` and
 `npm dist-tag add|rm` are accepted on hosted repositories only.
 
 ### Cargo
