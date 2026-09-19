@@ -4,7 +4,10 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 use tempfile::TempDir;
 
-use common::{hosted, push_blob, sha256_digest, spawn_server, SpawnOpts};
+use common::{
+    add_scoped_token, create_user, hosted, push_blob, repo_scope, sha256_digest, spawn_server,
+    SpawnOpts, STATIC_TOKEN,
+};
 use opencargo::config::{RepositoryFormat, Visibility};
 
 /// Start a test server on a random port with an OCI hosted repository.
@@ -224,6 +227,35 @@ async fn test_oci_blob_refcount_and_gc() {
         StatusCode::NOT_FOUND,
         "an orphaned blob should be garbage-collected on manifest deletion"
     );
+}
+
+/// A blob is content of the repository, so removing one is the delete rung:
+/// a scope that only writes pushes it and does not remove it.
+#[tokio::test]
+async fn deleting_a_blob_asks_for_the_delete_rung() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    create_user(&client, &base_url, STATIC_TOKEN, "ci", "publisher").await;
+    let writer =
+        add_scoped_token(&client, &base_url, "ci", "writer", repo_scope("oci-*", &["read", "write"])).await;
+    let remover = add_scoped_token(
+        &client,
+        &base_url,
+        "ci",
+        "remover",
+        repo_scope("oci-*", &["read", "write", "delete"]),
+    )
+    .await;
+    let digest = push_blob(&client, &base_url, "oci-private/myapp", b"orphan-layer").await;
+    let url = format!("{base_url}/v2/oci-private/myapp/blobs/{digest}");
+
+    let refused = client.delete(&url).bearer_auth(&writer).send().await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    let body: Value = refused.json().await.unwrap();
+    assert_eq!(body["code"], "insufficient_scope");
+
+    let removed = client.delete(&url).bearer_auth(&remover).send().await.unwrap();
+    assert_eq!(removed.status(), StatusCode::ACCEPTED);
 }
 
 #[tokio::test]

@@ -55,12 +55,12 @@ pub async fn publish(
     let auth = caller(&request)?;
     let repo = mcp_repo(&state, &repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
     let mut record = json_body(request, MAX_RECORD_BYTES).await?;
     if let Some(meta) = record.get_mut("_meta").and_then(Value::as_object_mut) {
         meta.remove(super::schema::MIRROR_META);
     }
     let (detail, schema) = parse(&record)?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&detail.name), &auth).await?;
     if let SchemaId::Unknown(url) = schema {
         return Err(AppError::BadRequest(format!("unknown server.json schema: {url}")));
     }
@@ -114,8 +114,8 @@ pub async fn attest(
 ) -> AppResult<Json<Value>> {
     let auth = caller(&request)?;
     let repo = mcp_repo(&state, &repo_name).await?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
     let body: Attestation = serde_json::from_value(json_body(request, MAX_ATTESTED_BYTES).await?)?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&body.name), &auth).await?;
     if body.tools.len() > MAX_ATTESTED_TOOLS {
         return Err(AppError::BadRequest(format!("at most {MAX_ATTESTED_TOOLS} tools")));
     }

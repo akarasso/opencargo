@@ -6,7 +6,9 @@ use serde_json::{json, Value};
 use sha2::Digest;
 
 use common::mcp::*;
-use common::{group, spawn_server, SpawnOpts, TestServer, STATIC_TOKEN};
+use common::{
+    add_scoped_token, create_user, group, repo_scope, spawn_server, SpawnOpts, TestServer, STATIC_TOKEN,
+};
 use opencargo::config::{McpConfig, RepositoryFormat, Visibility};
 
 fn skill_zip(members: &[(&str, &str)]) -> Vec<u8> {
@@ -170,6 +172,41 @@ async fn an_unapproved_skill_is_absent_under_hide_mode_and_a_private_marketplace
     let source = &m["plugins"][0]["source"];
     assert_eq!(source["headersHelper"], "/usr/local/bin/opencargo-auth-header");
     assert!(!m.to_string().contains(STATIC_TOKEN), "never a literal token");
+}
+
+/// Removing a skill is the delete rung: the scope that published it does
+/// not thereby remove it.
+#[tokio::test]
+async fn deleting_a_skill_asks_for_the_delete_rung() {
+    let server = skills_server(vec![]).await;
+    let client = reqwest::Client::new();
+    create_user(&client, &server.base_url, STATIC_TOKEN, "ci", "publisher").await;
+    let writer =
+        add_scoped_token(&client, &server.base_url, "ci", "writer", repo_scope("skills", &["read", "write"])).await;
+    let remover = add_scoped_token(
+        &client,
+        &server.base_url,
+        "ci",
+        "remover",
+        repo_scope("skills", &["read", "write", "delete"]),
+    )
+    .await;
+    let url = format!("{}/skills/skills/deploy-runbook/1.2.0/skill.zip", server.base_url);
+    let published = client
+        .put(&url)
+        .bearer_auth(&writer)
+        .body(plugin("deploy-runbook", CLEAN))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), 201, "{:?}", published.text().await);
+
+    let refused = client.delete(&url).bearer_auth(&writer).send().await.unwrap();
+    assert_eq!(refused.status(), 403);
+    assert_eq!(refused.json::<Value>().await.unwrap()["code"], "insufficient_scope");
+
+    let removed = client.delete(&url).bearer_auth(&remover).send().await.unwrap();
+    assert_eq!(removed.status(), 204);
 }
 
 #[tokio::test]

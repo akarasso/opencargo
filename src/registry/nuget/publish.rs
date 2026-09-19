@@ -49,10 +49,11 @@ fn require_user(auth: Option<axum::Extension<AuthUser>>) -> AppResult<AuthUser> 
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))
 }
 
-async fn writable(state: &AppState, repo_name: &str, user: &AuthUser) -> AppResult<Repository> {
+/// The hosted NuGet repository `repo_name` names; the right is judged once
+/// the package id is known.
+async fn hosted_nuget(state: &AppState, repo_name: &str) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Nuget)?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, user).await?;
     crate::registry::ensure_hosted(&repo)?;
     Ok(repo)
 }
@@ -121,7 +122,7 @@ pub async fn push(
 ) -> AppResult<Response> {
     let user = require_user(auth)?;
     crate::registry::meter_publish(&state, &user, Format::Nuget, &repo_name)?;
-    let repo = writable(&state, &repo_name, &user).await?;
+    let repo = hosted_nuget(&state, &repo_name).await?;
     let limits = Limits {
         cap: MAX_NUPKG_BYTES,
         budget: budget(),
@@ -148,6 +149,7 @@ pub async fn push(
         .await
         .map_err(|e| AppError::Internal(format!("nuspec task failed: {e}")))?
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&parsed.id), &user).await?;
     let version = NuGetVersion::parse(&parsed.version)
         .map_err(|e| AppError::BadRequest(e.to_string()))?;
     let facts = HostedFacts::new(
@@ -226,7 +228,8 @@ async fn set_listed(
     let user = require_user(auth)?;
     let id = id_of(id)?;
     let key = key_of(version)?;
-    let repo = writable(state, repo_name, &user).await?;
+    let repo = hosted_nuget(state, repo_name).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&id), &user).await?;
     Yank::new(state.packages.clone())
         .run(repo.id, &id, &key, !listed)
         .await?;

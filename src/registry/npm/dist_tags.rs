@@ -32,7 +32,7 @@ pub async fn get_dist_tags(
 
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&package_name), auth).await?;
 
     let leaf = DistTagsLeaf { name: package_name };
     let tags = first_hit(&cx(&state, auth, &repo), &repo, &leaf).await?;
@@ -60,7 +60,7 @@ async fn tag_target(
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Npm)?;
-    crate::registry::ensure_action(&state.authorize(), &repo, &user, action).await?;
+    crate::registry::ensure_action(&state.authorize(), &repo, Some(&package_name), &user, action).await?;
 
     let package = state
         .packages

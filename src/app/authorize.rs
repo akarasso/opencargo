@@ -17,6 +17,7 @@ use crate::domain::{
 use crate::error::{AppError, AppResult};
 use crate::ports::permissions::PermissionStore;
 use crate::ports::repositories::RepositoryStore;
+use crate::registry::rules::rules_of;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Verdict {
@@ -42,7 +43,9 @@ pub struct Authorize<'a> {
 }
 
 impl Authorize<'_> {
-    /// What the caller may do to this repository, scope included.
+    /// What the caller may do to this repository, scope included, on a
+    /// route that names no package: an enumeration, or content of the
+    /// repository itself. A package line of a scope does not cover it.
     pub async fn repository(
         &self,
         caller: Option<&AuthUser>,
@@ -50,7 +53,20 @@ impl Authorize<'_> {
         action: RepoAction,
     ) -> Verdict {
         let scope = caller.map_or(&TokenScope::Inherit, |c| &c.scope);
-        self.decide(caller, repo, action, scope).await
+        self.decide(caller, repo, None, action, scope).await
+    }
+
+    /// The same on a route that names a package: a package line covers it
+    /// when its pattern reaches the name under the format's own key.
+    pub async fn package(
+        &self,
+        caller: Option<&AuthUser>,
+        repo: &Repository,
+        package: &str,
+        action: RepoAction,
+    ) -> Verdict {
+        let scope = caller.map_or(&TokenScope::Inherit, |c| &c.scope);
+        self.decide(caller, repo, Some(package), action, scope).await
     }
 
     /// Inside a group's walk the scope is not evaluated: it was judged at the
@@ -63,13 +79,14 @@ impl Authorize<'_> {
         repo: &Repository,
         action: RepoAction,
     ) -> Verdict {
-        self.decide(caller, repo, action, &TokenScope::Inherit).await
+        self.decide(caller, repo, None, action, &TokenScope::Inherit).await
     }
 
     async fn decide(
         &self,
         caller: Option<&AuthUser>,
         repo: &Repository,
+        package: Option<&str>,
         action: RepoAction,
         scope: &TokenScope,
     ) -> Verdict {
@@ -111,8 +128,21 @@ impl Authorize<'_> {
             // scope that cannot name it allows nothing on it.
             return Verdict::OutOfScope;
         };
-        let subject = Subject::Repository {
-            incarnation: &incarnation,
+        let subject = match package {
+            None => Subject::Repository {
+                incarnation: &incarnation,
+            },
+            Some(package) => match repo.fmt().ok().and_then(|format| rules_of(format).ok()) {
+                Some(rules) => Subject::Package {
+                    incarnation: &incarnation,
+                    package,
+                    rules,
+                },
+                // A name no format keys is one no package line can be
+                // compared on, and a line that cannot be compared allows
+                // nothing.
+                None => return verdict(held, Rights::NONE, action),
+            },
         };
         verdict(held, narrow(held, scope, &subject), action)
     }
@@ -139,7 +169,7 @@ impl Verdict {
             Verdict::Unauthenticated => Err(AppError::Unauthorized(unauthenticated.to_string())),
             Verdict::Forbidden => Err(AppError::Forbidden(denied())),
             Verdict::OutOfScope => Err(AppError::InsufficientScope(
-                "the presented token is not scoped to this repository".to_string(),
+                "the presented token is not scoped to this repository or package".to_string(),
             )),
             Verdict::Unavailable => Err(AppError::ServiceUnavailable(
                 "permission check temporarily unavailable, try again".to_string(),

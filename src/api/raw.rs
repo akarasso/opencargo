@@ -64,7 +64,7 @@ pub async fn list_files(
     let auth = auth.as_ref().map(|e| &e.0);
     let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Raw)?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, None, auth).await?;
     let cx = crate::registry::cx(&state, auth, &repo);
 
     let mut merged: Vec<(String, RawFile)> = Vec::new();

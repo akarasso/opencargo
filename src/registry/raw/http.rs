@@ -85,7 +85,7 @@ pub async fn read(
     let auth = auth.as_ref().map(|e| &e.0);
     let path = super::admit(&path)?.to_string();
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&path), auth).await?;
     let cx = crate::registry::cx(&state, auth, &repo);
     let attachment = disposition(&path);
     let mut payload = first_hit(&cx, &repo, &FileLeaf { path }).await?;
@@ -110,7 +110,7 @@ pub async fn put(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
     let path = super::admit(&path)?.to_string();
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&path), &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
     let content_type = content_type(request.headers());
     let declared = declared_sha256(request.headers())?;
@@ -159,7 +159,7 @@ pub async fn delete(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
     let path = super::admit(&path)?.to_string();
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_delete(&state.authorize(), &repo, &auth).await?;
+    crate::registry::ensure_can_delete(&state.authorize(), &repo, Some(&path), &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
     state
         .delete_raw_file()

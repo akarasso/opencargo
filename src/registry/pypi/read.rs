@@ -17,9 +17,14 @@ use super::names::{is_valid_name, normalize, parse_filename};
 use super::simple::{negotiate, render_index, render_page, Flavor};
 use super::{PypiError, PypiResult};
 
-async fn open(state: &AppState, repo_name: &str, auth: Option<&AuthUser>) -> Result<Repository, AppError> {
+async fn open(
+    state: &AppState,
+    repo_name: &str,
+    project: Option<&str>,
+    auth: Option<&AuthUser>,
+) -> Result<Repository, AppError> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, project, auth).await?;
     crate::registry::ensure_format(&repo, Format::Pypi)?;
     Ok(repo)
 }
@@ -61,7 +66,7 @@ pub async fn index(
 ) -> PypiResult<Response> {
     let auth = auth.as_ref().map(|e| &e.0);
     let flavor = flavor(&headers)?;
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, None, auth).await?;
     let leaf = IndexLeaf {
         files: state.pypi.as_ref(),
     };
@@ -91,7 +96,7 @@ pub async fn project(
     }
     let auth = auth.as_ref().map(|e| &e.0);
     let flavor = flavor(&headers)?;
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&project), auth).await?;
     let leaf = PageLeaf {
         files: state.pypi.as_ref(),
         memo: &state.pypi_pages,
@@ -123,7 +128,7 @@ pub async fn file(
         return Err(AppError::NotFound(format!("no file named '{requested}'")).into());
     }
     let auth = auth.as_ref().map(|e| &e.0);
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&project), auth).await?;
     let leaf = FileLeaf {
         files: state.pypi.as_ref(),
         memo: &state.pypi_pages,
