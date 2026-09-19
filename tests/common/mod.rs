@@ -249,6 +249,17 @@ pub async fn storage_of(server: &TestServer) -> std::sync::Arc<dyn opencargo::st
     server::storage_for(&config, stores.multipart()).expect("failed to build the server's store")
 }
 
+static NO_CHILD: std::sync::LazyLock<tokio::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| tokio::sync::Mutex::new(()));
+
+/// A fork copies every descriptor this process holds, and the copy keeps its
+/// `flock` alive until the child's exec closes it — so a child one test spawns
+/// can refuse the `{db}.lock` another test has just released. Hold this while
+/// a child lives, and while taking that lock, and the two never overlap.
+pub async fn no_child() -> tokio::sync::MutexGuard<'static, ()> {
+    NO_CHILD.lock().await
+}
+
 /// Every object of the server's store, deleted. On S3 the bytes are not
 /// under `tmp`, so removing the storage directory empties nothing.
 pub async fn clear_storage(server: &TestServer) {

@@ -115,8 +115,20 @@ async fn wipe(server: &TestServer) {
 
 async fn restore(config: &Config, from: &Path, force: bool) -> anyhow::Result<server::RestoreReport> {
     let db = server::database_path(config).unwrap();
+    let _no_child = common::no_child().await;
     let lock = restore_lock_guard(&db, Lock::Exclusive(from))?;
     server::run_restore(config, from, force, lock).await
+}
+
+/// The subcommand as the operator runs it.
+async fn cli(args: &[&str]) -> std::process::Output {
+    let _no_child = common::no_child().await;
+    tokio::process::Command::new(env!("CARGO_BIN_EXE_opencargo"))
+        .args(args)
+        .env("RUST_LOG", "off")
+        .output()
+        .await
+        .unwrap()
 }
 
 fn rebase(url: &str, from: &str, to: &str) -> String {
@@ -244,6 +256,7 @@ async fn backup_refuses_while_a_restore_is_in_progress() {
     let to = server.tmp.path().join("b");
     let first = server::run_backup(&config, args(&to, true)).await.unwrap();
     server.stop().await;
+    let _no_child = common::no_child().await;
     let held = restore_lock_guard(&db_path(&server), Lock::Exclusive(&first.dir)).unwrap();
     let err = server::run_backup(&config, args(&to, true)).await.unwrap_err().to_string();
     assert!(err.contains("a restore is running"), "{err}");
@@ -259,7 +272,11 @@ async fn migrate_refuses_while_a_restore_is_in_progress() {
     let mut server = spawn_server(opts()).await;
     server.stop().await;
     let db = db_path(&server);
-    let _held = restore_lock_guard(&db, Lock::Exclusive(Path::new("/nowhere"))).unwrap();
+    // Released before the child is spawned: this lock is what the child must meet.
+    let _held = {
+        let _no_child = common::no_child().await;
+        restore_lock_guard(&db, Lock::Exclusive(Path::new("/nowhere"))).unwrap()
+    };
     let mut wal = db.clone().into_os_string();
     wal.push("-wal");
     let _ = std::fs::remove_file(PathBuf::from(&wal));
@@ -269,12 +286,7 @@ async fn migrate_refuses_while_a_restore_is_in_progress() {
         format!("[server]\nstorage_path = \"{}\"\n[database]\nurl = \"sqlite:{}\"\n", server.tmp.path().join("storage").display(), db.display()),
     )
     .unwrap();
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencargo"))
-        .args(["--config", config.to_str().unwrap(), "migrate", "--force"])
-        .env("RUST_LOG", "off")
-        .output()
-        .await
-        .unwrap();
+    let out = cli(&["--config", config.to_str().unwrap(), "migrate", "--force"]).await;
     assert!(!out.status.success(), "--force overrides a lease holder, never the restore lock");
     assert!(String::from_utf8_lossy(&out.stderr).contains("a restore is running"));
     assert!(!PathBuf::from(&wal).exists(), "nothing connected");
@@ -353,12 +365,7 @@ async fn restore_runs_with_an_invalid_backup_block() {
         ),
     )
     .unwrap();
-    let out = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencargo"))
-        .args(["--config", file.to_str().unwrap(), "restore", "--from", snapshot.dir.to_str().unwrap(), "--force"])
-        .env("RUST_LOG", "off")
-        .output()
-        .await
-        .unwrap();
+    let out = cli(&["--config", file.to_str().unwrap(), "restore", "--from", snapshot.dir.to_str().unwrap(), "--force"]).await;
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(out.status.success(), "{stderr}");
     for problem in ["enabled needs `to`", "does not divide the day", "HH:MM"] {
