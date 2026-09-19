@@ -69,6 +69,8 @@ pub enum RightsSource {
     Admin,
     Grant,
     Role,
+    /// The credential's own scope removed something the ladder allowed.
+    Scope,
 }
 
 impl RightsSource {
@@ -77,6 +79,7 @@ impl RightsSource {
             RightsSource::Admin => "admin",
             RightsSource::Grant => "grant",
             RightsSource::Role => "role",
+            RightsSource::Scope => "scope",
         }
     }
 }
@@ -220,5 +223,6 @@ mod tests {
         assert_eq!(RightsSource::Admin.as_str(), "admin");
         assert_eq!(RightsSource::Grant.as_str(), "grant");
         assert_eq!(RightsSource::Role.as_str(), "role");
+        assert_eq!(RightsSource::Scope.as_str(), "scope");
     }
 }
