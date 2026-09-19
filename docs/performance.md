@@ -106,6 +106,13 @@ machine was otherwise idle. Settings: 15 s settle, concurrency 50, 1 000 reads,
 50 publishes per format, 10 000 versions, 16 KiB payloads, the shipped
 `RUST_LOG`.
 
+> **These rows predate two fixes that land in the same release** — the npm
+> proxy's packument rendering and the publish path's write amplification — so
+> `npm-install-warm`'s peak and every `written` column are the *before* of a
+> problem that was measured and fixed, not what this build costs. They are
+> re-measured on the merged tree before any of them is quoted anywhere else;
+> until that run replaces this table, read it as history.
+
 | scenario | storage | wall (s) | peak RSS (MiB) | steady RSS (MiB) | CPU avg % | CPU peak % | CPU (s) | written (MiB) | db (KiB) | storage (MiB) | reqs | err | p50 (ms) | p95 (ms) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | idle | fs | 0 | 16.2 | 16.2 | 0.0 | 0.0 | 0.000 | 0 | 1991 | 0 | n/a | n/a | n/a | n/a |
