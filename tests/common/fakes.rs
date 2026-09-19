@@ -22,8 +22,9 @@ use chrono::{DateTime, Utc};
 use opencargo::domain::identity::{Authority, IdentityKey, LinkState, LoginState, Outage};
 use opencargo::domain::layout;
 use opencargo::domain::{
-    ApiToken, CacheEntry, CacheEntryId, DistTag, NewEntry, Package, RepoConfig, RepoId, RepoSpec,
-    Repository, Rights, ScanResult, User, Verdict, Version, Visibility, Webhook,
+    ApiToken, CacheEntry, CacheEntryId, CachedPackage, DistTag, NewEntry, Package, RepoConfig,
+    RepoId, RepoSpec, Repository, Rights, ScanResult, Sighting, User, Verdict, Version, Visibility,
+    Webhook,
 };
 use opencargo::error::StoreError;
 use opencargo::ports::audit::{AuditEntry, AuditStore, NewAuditEntry};
@@ -54,7 +55,7 @@ use opencargo::ports::reclaim::{
 use opencargo::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
 use opencargo::ports::nuget::{FeedPage, FeedQuery, NugetFeedRead};
-use opencargo::ports::search::{SearchIndex, SearchQuery, SearchScope};
+use opencargo::ports::search::{CachedPackageIndex, SearchIndex, SearchQuery, SearchScope};
 use opencargo::ports::secrets::ServerSecretStore;
 use opencargo::ports::tokens::{NewToken, TokenStore};
 use opencargo::ports::users::{NewUser, UserPatch, UserStore};
@@ -68,6 +69,7 @@ pub enum PortId {
     Repositories,
     Packages,
     Search,
+    CachedPackages,
     ProxyCache,
     Users,
     Tokens,
@@ -173,6 +175,7 @@ struct State {
     webhooks: Vec<Webhook>,
     repositories: Vec<Repository>,
     packages: Vec<Package>,
+    cached: Vec<CachedPackage>,
     versions: Vec<Version>,
     dist_tags: Vec<DistTag>,
     audit: Vec<AuditEntry>,
@@ -237,6 +240,10 @@ impl FakeDb {
 
     pub fn search(&self) -> Arc<dyn SearchIndex> {
         Arc::new(Search(self.0.clone()))
+    }
+
+    pub fn cached_packages(&self) -> Arc<dyn CachedPackageIndex> {
+        Arc::new(CachedIndex(self.0.clone()))
     }
 
     pub fn nuget_feed(&self) -> Arc<dyn NugetFeedRead> {
@@ -1181,17 +1188,96 @@ impl SearchIndex for Search {
     }
 }
 
+struct CachedIndex(Arc<Mutex<State>>);
+
+#[async_trait]
+impl CachedPackageIndex for CachedIndex {
+    async fn remember(&self, seen: &Sighting<'_>, now: DateTime<Utc>) -> Result<(), StoreError> {
+        with(&self.0, PortId::CachedPackages, |state| {
+            match state
+                .cached
+                .iter_mut()
+                .find(|row| row.repository_id == seen.repository_id && row.name == seen.name)
+            {
+                Some(row) => {
+                    row.format = seen.format;
+                    row.description = seen
+                        .description
+                        .map(str::to_string)
+                        .or(row.description.take());
+                    row.latest_version = seen
+                        .latest_version
+                        .map(str::to_string)
+                        .or(row.latest_version.take());
+                    row.last_seen_at = now;
+                }
+                None => state.cached.push(CachedPackage {
+                    repository_id: seen.repository_id,
+                    format: seen.format,
+                    name: seen.name.to_string(),
+                    description: seen.description.map(str::to_string),
+                    latest_version: seen.latest_version.map(str::to_string),
+                    first_seen_at: now,
+                    last_seen_at: now,
+                }),
+            }
+            Ok(())
+        })
+    }
+
+    async fn search(
+        &self,
+        scope: SearchScope,
+        query: Option<&SearchQuery>,
+        limit: u32,
+    ) -> Result<Vec<CachedPackage>, StoreError> {
+        with(&self.0, PortId::CachedPackages, |state| {
+            let public: Vec<i64> = state
+                .repositories
+                .iter()
+                .filter(|repo| repo.visibility == Visibility::Public)
+                .map(|repo| repo.id)
+                .collect();
+            let hits = state
+                .cached
+                .iter()
+                .filter(|row| match scope {
+                    SearchScope::Repo(repo) => row.repository_id == repo,
+                    SearchScope::PublicOnly => public.contains(&row.repository_id),
+                    SearchScope::All => true,
+                })
+                .filter(|row| {
+                    query.is_none_or(|q| matches_words(&row.name, row.description.as_deref(), q))
+                })
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(hits)
+        })
+    }
+
+    async fn forget_repo(&self, repo: i64) -> Result<u64, StoreError> {
+        with(&self.0, PortId::CachedPackages, |state| {
+            let before = state.cached.len();
+            state.cached.retain(|row| row.repository_id != repo);
+            Ok((before - state.cached.len()) as u64)
+        })
+    }
+}
+
+
 /// Every token has to appear, which is what FTS5's implicit `AND` of quoted
 /// phrases does; the ranking a real index adds is not something a fake can
 /// stand in for, so the contract never asserts a full ordering.
 fn matches_tokens(package: &Package, query: &SearchQuery) -> bool {
+    matches_words(&package.name, package.description.as_deref(), query)
+}
+
+fn matches_words(name: &str, description: Option<&str>, query: &SearchQuery) -> bool {
     query.tokens().iter().all(|token| {
         let token = token.to_lowercase();
-        package.name.to_lowercase().contains(&token)
-            || package
-                .description
-                .as_deref()
-                .is_some_and(|text| text.to_lowercase().contains(&token))
+        name.to_lowercase().contains(&token)
+            || description.is_some_and(|text| text.to_lowercase().contains(&token))
     })
 }
 

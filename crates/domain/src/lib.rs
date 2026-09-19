@@ -2,6 +2,7 @@
 //! registry written in any language. Nothing here performs I/O, and nothing
 //! here names a transport, a driver or a storage format.
 
+pub mod cached;
 pub mod error;
 pub mod events;
 pub mod format_rules;
@@ -20,6 +21,7 @@ pub mod user;
 pub mod vulns;
 pub mod webhook;
 
+pub use cached::{CachedPackage, Sighting};
 pub use error::{Action, DomainError, Resource};
 pub use events::{
     announce, Audience, DomainEvent, PackagePromotion, PackageRelease, ResolutionCounts,

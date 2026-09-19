@@ -163,6 +163,11 @@ pub const MIGRATIONS: &[Migration] = &[
         Sentinel::Object("idx_reclaim_candidates_enqueued")
     ),
     sql_migration!("026", "026_reclaim_epoch.sql", Sentinel::Object("reclaim_epoch")),
+    sql_migration!(
+        "027",
+        "027_cached_packages.sql",
+        Sentinel::Object("cached_packages_fts_update")
+    ),
 ];
 
 /// 020: the `nuget` format, through the shared rebuild; no table of its own.
