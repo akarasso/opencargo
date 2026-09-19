@@ -258,7 +258,10 @@ const MAVEN_PROMOTION_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
 
 /// The path prefixes the protocol adapters mount under the root, which no
 /// new repository may be named after.
-pub const RESERVED_NAMES: &[&str] = &[crate::registry::maven::MOUNT];
+pub const RESERVED_NAMES: &[&str] = &[
+    crate::registry::maven::MOUNT,
+    crate::registry::raw::MOUNT,
+];
 
 /// Migrate a database and nothing else: the `opencargo migrate` subcommand, so
 /// the binary reaches the adapter through the composition root rather than
@@ -664,6 +667,7 @@ fn auth_state(
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
             Arc::new(crate::registry::pypi::auth_rules::PypiRouteRules),
             Arc::new(crate::registry::maven::auth_rules::MavenRouteRules),
+            Arc::new(crate::registry::raw::auth_rules::RawRouteRules),
             Arc::new(crate::registry::nuget::auth_rules::NugetRouteRules {
                 token_shaped: {
                     let authenticate = authenticate.clone();
@@ -1318,6 +1322,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::pypi::routes::routes())
         .merge(crate::registry::oci::routes::routes())
         .merge(crate::registry::maven::routes::routes())
+        .merge(crate::registry::raw::routes::routes())
         .merge(crate::registry::nuget::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
         // so handlers receive the optional AuthUser and filter private repos.

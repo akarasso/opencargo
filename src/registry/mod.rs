@@ -6,6 +6,7 @@ pub mod archive;
 pub mod nuget;
 pub mod oci;
 pub mod pypi;
+pub mod raw;
 pub mod resolve;
 pub mod rules;
 
@@ -42,6 +43,7 @@ pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Reposit
         packages: state.packages.as_ref(),
         oci: state.oci.as_ref(),
         maven: state.maven.as_ref(),
+        raw: state.raw.as_ref(),
         search: state.search.as_ref(),
         nuget: state.nuget_feed.as_ref(),
         proxy: &state.proxy,
@@ -113,6 +115,26 @@ pub async fn ensure_can_write(
             "write access denied on repository '{}': your role is '{}'. Publishing requires \
              the 'publisher' or 'admin' role, or an explicit write permission on this \
              repository granted by an admin.",
+            repo.name, auth_user.role
+        )))
+    }
+}
+
+/// Enforce delete access, the matrix column no protocol used before raw: a
+/// publisher may add a file without being able to remove one, and an admin
+/// or an explicit grant may.
+pub async fn ensure_can_delete(
+    perms: &dyn PermissionStore,
+    repo: &Repository,
+    auth_user: &AuthUser,
+) -> AppResult<()> {
+    if check_repo_permission(perms, auth_user.user_id, &auth_user.role, repo.id, "delete").await? {
+        Ok(())
+    } else {
+        Err(AppError::Forbidden(format!(
+            "delete access denied on repository '{}': your role is '{}'. Removing content \
+             requires the 'admin' role, or an explicit delete permission on this repository \
+             granted by an admin.",
             repo.name, auth_user.role
         )))
     }
