@@ -21,7 +21,7 @@ use crate::domain::identity::{
     self, email_link_eligible, provisioned_name, safe_return_to, Authority, Decision, EmailTrust,
     ExternalIdentity, IdentityKey, Reconcile, SsoRefusal,
 };
-use crate::domain::{can_admin, Rights, User, Visibility};
+use crate::domain::{can_admin, Rights, TokenScope, User, Visibility};
 use crate::error::StoreError;
 use crate::ports::audit::{AuditStore, NewAuditEntry};
 use crate::ports::clock::Clock;
@@ -682,7 +682,7 @@ impl Sso {
         }
         let now = self.clock.now();
         let id = self.ids.token_id();
-        let (token, hash) = credentials::generate_token(TOKEN_PREFIX);
+        let (token, hash) = credentials::generate_token(TOKEN_PREFIX, false);
         let expires_at = now + self.settings.session_ttl;
         let issued = self
             .identities
@@ -694,6 +694,7 @@ impl Sso {
                     prefix: &token[..16],
                     token_hash: &hash,
                     expires_at: Some(expires_at),
+                    scope: &TokenScope::Inherit,
                 },
                 &key,
                 now,

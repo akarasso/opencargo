@@ -43,7 +43,7 @@ pub(super) async fn open(
 ) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Nuget)?;
-    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
     match probe_access(&cx(state, auth, &repo), &repo).await {
         Ok(()) => Ok(repo),
         Err(ResolveError::Domain(DomainError::Forbidden(_))) => Err(AppError::Unauthorized(

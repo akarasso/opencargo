@@ -262,7 +262,7 @@ PUT    /api/v1/users/{username}
 DELETE /api/v1/users/{username}
 PUT    /api/v1/users/{username}/password           {current_password, new_password}
 GET    /api/v1/users/{username}/tokens
-POST   /api/v1/users/{username}/tokens             {name, expires_in_days}  -> one-time token
+POST   /api/v1/users/{username}/tokens             {name, expires_in_days, scope?}  -> one-time token
 DELETE /api/v1/users/{username}/tokens/{id}
 GET    /api/v1/users/{username}/permissions
 PUT    /api/v1/users/{username}/permissions/{repo} {can_read, can_write, can_delete, can_admin}
@@ -303,6 +303,49 @@ named alike keeps its rows. The erasure is audited as `policy.erase` with
 `deleted=N` as its target, never the name. `/me/policy` is forced to the
 caller's own rows (a DB user's, every token included, or the config token's)
 whatever the query says.
+
+## Scoped tokens
+
+A token carries a scope. Without one it is `{"kind":"inherit"}`: every right
+its bearer holds, which is what every token was before scopes. With one it is
+`{"kind":"limited","grants":[...]}`, and each grant is a selector plus the
+actions it allows there:
+
+```json
+{ "on": "repo",    "repo": "libs-*",            "actions": ["read", "write"] }
+{ "on": "package", "repo": "npm", "package": "@acme/*", "actions": ["read"] }
+{ "on": "admin",   "domain": "repos",           "actions": ["read"] }
+{ "on": "account", "account": "ci",             "actions": ["read"] }
+```
+
+A scope only ever removes: the effective right is what the bearer may do at
+that instant, intersected with what the token allows, so a scope never
+outlives a revoked grant and never exceeds the role behind it. `*` is the only
+metacharacter and covers any substring, `/` included, because four of the
+seven formats put `/` inside a name. Repository names are compared in
+lowercase on both sides. Actions are `read`, `write`, `delete` and `admin`
+(the rung promotion and cache purge ask for).
+
+Patterns are resolved to repositories once, when the token is issued: a
+repository created afterwards is outside the scope, and a name retired and
+recreated is a different repository that no earlier scope reaches. A scope is
+immutable — changing one means revoking the token and issuing another.
+
+A scoped token is refused on the whole administrative API, including on its
+own account, and it issues no credential of any kind. `admin:*` grants
+therefore exist in read only, and `webhooks` even in read is not a write:
+a subscription is a standing read of every repository that no repository
+selector can narrow. Out of scope the answer is `403` with
+`{"code":"insufficient_scope"}`, never the `401` that would send a client
+looking for credentials it already has.
+
+Scoped tokens carry a form of their own (`trgs_` beside `trg_`). A binary
+that predates scopes does not recognise it and refuses it, so rolling an image
+back never turns a restricted credential into a full one.
+
+**Configuration tokens (`auth.static_tokens`) have no scope**: they are
+operations keys, not identities. To scope a CI, give it an account and a
+token, not a configuration key.
 
 Repository names match `[a-z0-9][a-z0-9._-]{0,63}` without `..`. `type` is
 `hosted`, `proxy` (requires `upstream`, an `http(s)` URL) or `group`

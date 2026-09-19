@@ -30,7 +30,7 @@ const MAX_SEARCH_BATCHES: usize = 2;
 
 pub async fn open(state: &AppState, name: &str, auth: Option<&AuthUser>) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), name).await?;
-    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
     crate::registry::ensure_format(&repo, Format::Mcp)?;
     Ok(repo)
 }

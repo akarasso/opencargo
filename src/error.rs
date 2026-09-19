@@ -29,6 +29,11 @@ pub enum AppError {
     #[error("{0}")]
     Forbidden(String),
 
+    /// A valid credential whose scope removed the right: a 403 that names
+    /// itself, so a client does not restart a token dance it cannot win.
+    #[error("{0}")]
+    InsufficientScope(String),
+
     #[error("{0}")]
     Conflict(String),
 
@@ -66,6 +71,7 @@ impl IntoResponse for AppError {
             AppError::BadRequest(msg) => (StatusCode::BAD_REQUEST, msg.clone()),
             AppError::Unauthorized(msg) => (StatusCode::UNAUTHORIZED, msg.clone()),
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
+            AppError::InsufficientScope(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
             AppError::RateLimited { message, .. } => {
@@ -84,7 +90,12 @@ impl IntoResponse for AppError {
             }
         };
 
-        let body = Json(json!({ "error": message }));
+        let body = match self {
+            AppError::InsufficientScope(_) => {
+                Json(json!({ "error": message, "code": "insufficient_scope" }))
+            }
+            _ => Json(json!({ "error": message })),
+        };
         let mut response = (status, body).into_response();
         if let AppError::RateLimited { retry_after_secs, .. } = &self {
             if let Ok(value) = axum::http::HeaderValue::try_from(retry_after_secs.to_string()) {

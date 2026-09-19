@@ -126,6 +126,7 @@ impl Resolver {
             policy: &self.policy,
             creds: &self.creds,
             auth,
+            anonymous_read: true,
             url: UrlRepo(url),
             base_url: &self.base_url,
         }
@@ -218,5 +219,7 @@ pub fn user(id: i64, role: &str) -> AuthUser {
         role: role.to_string(),
         must_change_password: false,
         token_name: None,
+        api_token_id: None,
+        scope: crate::domain::TokenScope::Inherit,
     }
 }

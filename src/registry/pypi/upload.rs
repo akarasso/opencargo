@@ -78,7 +78,7 @@ pub async fn upload(
     let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Pypi)?;
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_can_write(&*state.permissions, &repo, &auth).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
 
     let content_type = request
         .headers()

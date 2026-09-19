@@ -44,6 +44,7 @@
 
 pub mod audit;
 pub mod authenticate;
+pub mod authorize;
 pub mod events;
 pub mod import;
 pub mod maven;

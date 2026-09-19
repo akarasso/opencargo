@@ -17,9 +17,7 @@ pub async fn storage_status(
         .get::<AuthUser>()
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    if caller.role != "admin" {
-        return Err(AppError::Forbidden("admin access required".to_string()));
-    }
+    crate::api::require_admin(&caller)?;
     let backlog = state.reclaim.backlog().await?;
     Ok(Json(json!({
         "backend": state.storage_backend,

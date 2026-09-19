@@ -206,7 +206,7 @@ async fn hosted_mcp(state: &AppState, name: &str, auth: &AuthUser) -> AppResult<
     let repo = crate::registry::load_repo(state.repos.as_ref(), name).await?;
     crate::registry::ensure_format(&repo, Format::Mcp)?;
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_can_write(&*state.permissions, &repo, auth).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, auth).await?;
     Ok(repo)
 }
 

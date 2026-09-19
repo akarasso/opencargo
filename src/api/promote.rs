@@ -12,7 +12,7 @@ use tracing::info;
 use crate::app::promote::{is_conflict, Promoter, Request};
 use crate::auth::middleware::AuthUser;
 use crate::domain::{
-    can_admin, Audience, DomainEvent, PackagePromotion, RepoKind, Repository, Visibility,
+    Audience, DomainEvent, PackagePromotion, RepoKind, Repository, Visibility,
 };
 use crate::error::{AppError, AppResult};
 use crate::ports::packages::NameMatch;
@@ -310,10 +310,6 @@ async fn promote_impl(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    if !can_admin(&auth_user.role) {
-        return Err(AppError::Forbidden("admin access required".to_string()));
-    }
-
     // Parse the request body
     let body: PromoteRequest = {
         let bytes = axum::body::to_bytes(request.into_body(), 1024 * 1024)
@@ -324,6 +320,15 @@ async fn promote_impl(
 
     // 2. Validate both repos exist and are hosted with the same format
     let (from_repo, to_repo) = hosted_pair(&state, &body).await?;
+    for repo in [&from_repo, &to_repo] {
+        crate::registry::ensure_action(
+            &state.authorize(),
+            repo,
+            &auth_user,
+            crate::domain::RepoAction::Admin,
+        )
+        .await?;
+    }
 
     let target_str = format!("{name}@{version}");
     move_version(&state, &body, &auth_user, (&from_repo, &to_repo), (&name, &version)).await?;

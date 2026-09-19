@@ -3,6 +3,7 @@ use std::pin::Pin;
 
 use tracing::warn;
 
+use crate::app::authorize::{Authorize, Verdict};
 use crate::auth::middleware::AuthUser;
 use crate::domain::{
     Action, CacheRepo, DomainError, Miss, Resource, Outcome, RepoKind, Repository, UrlRepo, Visit, Walk,
@@ -86,6 +87,18 @@ impl From<AppError> for ResolveError {
 /// One request's way to everything a leaf may reach: ports, the proxy engine
 /// and who is asking. Built once by the HTTP adapter, where the composition
 /// root's state lives; nothing below it knows a pool exists.
+impl<'a> Cx<'a> {
+    /// The authority the walk asks, built from the two stores it already
+    /// holds: a group's entry was judged before the walk began.
+    pub fn authorize(&self) -> Authorize<'_> {
+        Authorize {
+            perms: self.perms,
+            repos: self.repos,
+            anonymous_read: self.anonymous_read,
+        }
+    }
+}
+
 pub struct Cx<'a> {
     pub repos: &'a dyn RepositoryStore,
     pub perms: &'a dyn PermissionStore,
@@ -99,6 +112,9 @@ pub struct Cx<'a> {
     pub policy: &'a dyn ResolutionRecorder,
     pub creds: &'a dyn UpstreamCredsSource,
     pub auth: Option<&'a AuthUser>,
+    /// The deployment's answer for a public repository, which the walk needs
+    /// to judge a member the same way the entry was judged.
+    pub anonymous_read: bool,
     pub url: UrlRepo<'a>,
     pub base_url: &'a str,
 }
@@ -385,10 +401,14 @@ fn view_of<'a>(
 /// and "authorization is unsafe to decide" are the same fact, so the walk
 /// stops with a retryable answer instead of silently skipping the member.
 async fn readable(cx: &Cx<'_>, member: &Repository) -> Result<bool, ResolveError> {
-    match super::ensure_can_read(cx.perms, member, cx.auth).await {
-        Ok(()) => Ok(true),
-        Err(AppError::Unauthorized(_) | AppError::Forbidden(_)) => Ok(false),
-        Err(_) => Err(ResolveError::Store(StoreError::Unavailable)),
+    let authz = cx.authorize();
+    match authz
+        .member(cx.auth, member, crate::domain::RepoAction::Read)
+        .await
+    {
+        Verdict::Ok => Ok(true),
+        Verdict::Unauthenticated | Verdict::Forbidden | Verdict::OutOfScope => Ok(false),
+        Verdict::Unavailable => Err(ResolveError::Store(StoreError::Unavailable)),
     }
 }
 

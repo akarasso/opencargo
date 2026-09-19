@@ -174,6 +174,11 @@ pub const MIGRATIONS: &[Migration] = &[
         "029_cached_packages.sql",
         Sentinel::Object("cached_packages_fts_update")
     ),
+    sql_migration!(
+        "030",
+        "030_token_scopes.sql",
+        Sentinel::Column { table: "api_tokens", column: "scope" }
+    ),
 ];
 
 /// 020: the `nuget` format, through the shared rebuild; no table of its own.

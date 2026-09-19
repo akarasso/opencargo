@@ -186,6 +186,16 @@ pub struct Started {
 }
 
 impl AppState {
+    /// The one authority on what a caller may do, built per request from the
+    /// two stores it reads and the anonymous-read setting.
+    pub fn authorize(&self) -> crate::app::authorize::Authorize<'_> {
+        crate::app::authorize::Authorize {
+            perms: &*self.permissions,
+            repos: &*self.repos,
+            anonymous_read: self.auth.anonymous_read,
+        }
+    }
+
     /// The gate every publish passes before its first write.
     pub fn publish_gate(&self) -> PublishGate {
         PublishGate::new(self.vuln_scanner.clone(), self.vuln_scan_config.clone())
@@ -2079,7 +2089,7 @@ async fn issue_login_token(
     state: &AppState,
     user_id: i64,
 ) -> Result<String, crate::error::StoreError> {
-    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_");
+    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_", false);
     let now = state.clock.now();
     state
         .tokens
@@ -2091,6 +2101,7 @@ async fn issue_login_token(
                 prefix: &raw_token[..16],
                 token_hash: &token_hash,
                 expires_at: Some(now + chrono::Duration::days(30)),
+                scope: &crate::domain::TokenScope::Inherit,
             },
             now,
         )
