@@ -1,7 +1,9 @@
 import FormatLandingPage from '../components/FormatLandingPage.tsx';
+import { connectLine, endpointOf, exampleRepo, quickstart } from '../core/quickstart.ts';
 
 export default function OciImages() {
   const host = () => location.host;
+  const at = () => endpointOf(location);
 
   return (
     <FormatLandingPage
@@ -13,13 +15,9 @@ export default function OciImages() {
       emptyTitle="No OCI repository yet"
       emptyTextAdmin="Create a repository with format “oci” to start pushing images."
       emptyTextOther="Ask an administrator to create a repository with format “oci”."
-      exampleFallback="oci-private"
-      repoCommand={(name) => `${host()}/${name}/image:tag`}
-      steps={(example) => [
-        { label: '1 · Sign in', command: `docker login ${host()}` },
-        { label: '2 · Tag', command: `docker tag myapp:latest ${host()}/${example}/myapp:latest` },
-        { label: '3 · Push', command: `docker push ${host()}/${example}/myapp:latest` },
-      ]}
+      exampleFallback={exampleRepo('oci')}
+      repoCommand={(name) => connectLine('oci', name, at())}
+      steps={(example) => quickstart('oci', example, at())}
       alert={
         <>
           Serving over plain HTTP? Add <span class="mono">"insecure-registries": ["{host()}"]</span>{' '}
