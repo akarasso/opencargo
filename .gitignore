@@ -51,3 +51,6 @@ plan-lancement.md
 
 # Release assets built locally by scripts/release
 /dist
+
+# Benchmark runs
+/bench-results

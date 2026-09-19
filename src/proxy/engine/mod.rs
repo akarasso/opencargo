@@ -317,6 +317,7 @@ impl ProxyEngine {
         Ok(self.resolve_row(s, a, row, now).await?.map(|entry| Cached {
             entry,
             stale: !fresh,
+            exchanged: false,
         }))
     }
 
@@ -399,6 +400,7 @@ impl ProxyEngine {
                     Ok(Outcome::Found(Cached {
                         entry: target,
                         stale: false,
+                        exchanged: true,
                     }))
                 }
                 None => Err(AppError::BadGateway(
@@ -408,6 +410,7 @@ impl ProxyEngine {
             Ok(Reply::Stored(entry)) => Ok(Outcome::Found(Cached {
                 entry: *entry,
                 stale: false,
+                exchanged: true,
             })),
             Ok(Reply::Miss(status)) if pass.miss == Miss::Record => {
                 self.record_miss(member, &key, status, stale.as_ref(), pass.now)
@@ -421,6 +424,7 @@ impl ProxyEngine {
                     Ok(Outcome::Found(Cached {
                         entry: target,
                         stale: true,
+                        exchanged: false,
                     }))
                 }
                 Some(_) => Ok(Outcome::NotFound),
@@ -474,6 +478,75 @@ impl ProxyEngine {
             return Ok(self.fetch(s, up, member, a).await?.into_payload());
         }
         self.forward_head(s, up, member, a).await
+    }
+
+    /// A body this server derived from a cached one, under a key the caller
+    /// owns: `None` while it has not been derived, or its file is gone. The
+    /// key names what the body was derived from, so a rendering is never
+    /// stale — it is replaced by the one under the next source's key.
+    pub async fn derived(
+        &self,
+        member: CacheRepo<'_>,
+        key: &CacheKey,
+    ) -> AppResult<Option<Payload>> {
+        let now = Utc::now();
+        let Some(row) = self.row(member, key, now).await? else {
+            return Ok(None);
+        };
+        let Some(path) = row.storage_path.as_deref() else {
+            return Ok(None);
+        };
+        if self.storage.head(path).await?.is_none() {
+            return Ok(None);
+        }
+        self.cache.touch(row.id, None, now).await?;
+        Ok(Some(Payload {
+            src: Src::File(path.to_string()),
+            size: row.size.max(0) as u64,
+            content_type: row.content_type,
+            digest: None,
+            stale: false,
+        }))
+    }
+
+    /// Remember a derived body, and answer with the file it now lives in:
+    /// what a client is served next is streamed, never held. It expires
+    /// like an immutable body — the sweep reclaims it once it falls idle.
+    pub async fn put_derived(
+        &self,
+        member: CacheRepo<'_>,
+        key: &CacheKey,
+        body: Bytes,
+        content_type: &str,
+    ) -> AppResult<Payload> {
+        let now = Utc::now();
+        let root = self.cache_root(member).await?;
+        let path = cache_path(&root, key);
+        let size = body.len() as u64;
+        self.storage.put(&path, body).await?;
+        let entry = NewEntry {
+            repository_id: member.0.id,
+            kind: key.kind,
+            cache_key: &key.key,
+            status: 200,
+            storage_path: Some(&path),
+            content_type: Some(content_type),
+            etag: None,
+            digest: None,
+            size: size as i64,
+            ttl_secs: None,
+        };
+        if let Err(e) = self.cache.upsert(&entry, now).await {
+            self.release(std::slice::from_ref(&path), now).await;
+            return Err(e.into());
+        }
+        Ok(Payload {
+            src: Src::File(path),
+            size,
+            content_type: Some(content_type.to_string()),
+            digest: None,
+            stale: false,
+        })
     }
 
     pub async fn bytes(&self, c: &Cached) -> AppResult<Bytes> {
@@ -628,6 +701,7 @@ impl ProxyEngine {
         Ok(Cached {
             entry: target,
             stale: false,
+            exchanged: false,
         })
     }
 

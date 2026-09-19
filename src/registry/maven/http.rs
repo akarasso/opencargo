@@ -113,7 +113,7 @@ pub async fn read(
     let auth = auth.as_ref().map(|e| &e.0);
     let parsed = MavenPath::parse(&path)?;
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_read(state.permissions.as_ref(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
     let cx = crate::registry::cx(&state, auth, &repo);
     match &parsed.target {
         Target::Metadata(dir) => {
@@ -155,7 +155,7 @@ pub async fn deposit(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
     let parsed = MavenPath::parse(&path)?;
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_write(state.permissions.as_ref(), &repo, &auth).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
     let deposits = state.maven_deposits();
     let now = state.clock.now();

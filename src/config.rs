@@ -27,12 +27,221 @@ pub struct Config {
     pub webhooks: Vec<WebhookConfig>,
     #[serde(default)]
     pub vuln_scan: VulnScanConfig,
+    pub limits: LimitsConfig,
     /// Policy rules per proxy repository name; a member with none on records nothing.
     #[serde(default)]
     pub policy: HashMap<String, PolicyConfig>,
     /// MCP governance per `mcp` repository name.
     #[serde(default)]
     pub mcp: HashMap<String, McpConfig>,
+    #[serde(default)]
+    pub routing: RoutingConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Limits
+// ---------------------------------------------------------------------------
+
+/// What one account may do per window. Publishing is the only metered action
+/// today, and only on the formats whose publish is a single request.
+#[derive(Debug, Deserialize, Clone, Default)]
+#[serde(default, deny_unknown_fields)]
+pub struct LimitsConfig {
+    pub publish: PublishLimitsConfig,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+pub struct PublishLimitsConfig {
+    /// The window every entry counts in, unless the entry names its own.
+    pub window: String,
+    /// The limit of a format with no entry of its own. Setting it drops the
+    /// shipped defaults below, so one value meters every format at once.
+    pub per_window: Option<u32>,
+    pub format: HashMap<String, PublishLimitEntry>,
+    pub repository: HashMap<String, PublishLimitEntry>,
+}
+
+/// `npm = 120`, or `npm = { max = 500, per = "5m" }`.
+#[derive(Debug, Deserialize, Clone)]
+#[serde(untagged)]
+pub enum PublishLimitEntry {
+    PerWindow(u32),
+    Windowed {
+        max: u32,
+        #[serde(default)]
+        per: Option<String>,
+    },
+}
+
+impl PublishLimitEntry {
+    fn limit(
+        &self,
+        default_window: u64,
+        table: &str,
+        key: &str,
+        problems: &mut Vec<String>,
+    ) -> Option<crate::domain::PublishLimit> {
+        let (max, per) = match self {
+            PublishLimitEntry::PerWindow(max) => (*max, None),
+            PublishLimitEntry::Windowed { max, per } => (*max, per.as_deref()),
+        };
+        let secs = match per {
+            None => default_window,
+            Some(per) => match parse_duration(per) {
+                Ok(d) => d.as_secs(),
+                Err(_) => {
+                    problems.push(format!(
+                        "[limits.publish.{table}] {key}: per = {per:?} is not a duration"
+                    ));
+                    return None;
+                }
+            },
+        };
+        match crate::domain::PublishLimit::new(max, secs) {
+            Ok(limit) => Some(limit),
+            Err(e) => {
+                problems.push(format!("[limits.publish.{table}] {key}: {e}"));
+                None
+            }
+        }
+    }
+}
+
+/// The formats metered out of the box, at the rate opencargo has always
+/// enforced on them.
+const SHIPPED_PUBLISH_LIMITS: [(crate::domain::Format, u32); 2] = [
+    (crate::domain::Format::Npm, 30),
+    (crate::domain::Format::Pypi, 30),
+];
+
+impl Default for PublishLimitsConfig {
+    fn default() -> Self {
+        Self {
+            window: "1m".to_string(),
+            per_window: None,
+            format: HashMap::new(),
+            repository: HashMap::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group routing rules
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// How often a node re-reads the rules.
+    pub refresh_secs: u64,
+    /// How long a node serves a snapshot nothing has refreshed. Past it the
+    /// proxy members of every format a rule speaks for are refused, rather
+    /// than serving the state from before a rule this node may not have seen.
+    /// Several refresh periods, so a single failed read is not an outage.
+    pub max_snapshot_age_secs: u64,
+    /// How long one refused (name, repository, member) stays deduplicated
+    /// before it is worth an audit line again.
+    pub refusal_window_secs: u64,
+    /// Rules to write **into an empty table**, once. The file seeds a
+    /// deployment; it never owns it afterwards, so a rule deleted here does
+    /// not come back and a rule hardened here has no effect. A drift between
+    /// the two is named in a startup note rather than applied.
+    pub rules: Vec<RoutingRuleConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RoutingRuleConfig {
+    pub name: String,
+    pub format: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub except: Vec<String>,
+    pub effect: String,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub confirm_catch_all: bool,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            refresh_secs: 30,
+            max_snapshot_age_secs: 300,
+            refusal_window_secs: 3600,
+            rules: Vec::new(),
+        }
+    }
+}
+
+impl PublishLimitsConfig {
+    /// The limits this section describes, or every rule it breaks.
+    pub fn resolve(&self) -> Result<crate::domain::PublishLimits, Vec<String>> {
+        let mut problems = Vec::new();
+        let default_window = match self.window_secs() {
+            Ok(secs) => secs,
+            Err(problem) => {
+                problems.push(problem);
+                60
+            }
+        };
+        let mut per_format = HashMap::new();
+        if self.per_window.is_none() {
+            for (format, max) in SHIPPED_PUBLISH_LIMITS {
+                if let Ok(shipped) = crate::domain::PublishLimit::new(max, default_window) {
+                    per_format.insert(format, shipped);
+                }
+            }
+        }
+        for (name, entry) in &self.format {
+            let Ok(format) = name.parse::<crate::domain::Format>() else {
+                problems.push(format!("[limits.publish.format] {name:?} is not a format"));
+                continue;
+            };
+            if let Some(limit) = entry.limit(default_window, "format", name, &mut problems) {
+                per_format.insert(format, limit);
+            }
+        }
+
+        let mut per_repository = HashMap::new();
+        for (name, entry) in &self.repository {
+            if name.trim().is_empty() {
+                problems.push("[limits.publish.repository] a repository name may not be empty".to_string());
+                continue;
+            }
+            if let Some(limit) = entry.limit(default_window, "repository", name, &mut problems) {
+                per_repository.insert(name.clone(), limit);
+            }
+        }
+
+        let every = match self.per_window {
+            None => None,
+            Some(max) => match crate::domain::PublishLimit::new(max, default_window) {
+                Ok(limit) => Some(limit),
+                Err(e) => {
+                    problems.push(format!("[limits.publish] per_window: {e}"));
+                    None
+                }
+            },
+        };
+
+        if problems.is_empty() {
+            Ok(crate::domain::PublishLimits::new(every, per_format, per_repository))
+        } else {
+            Err(problems)
+        }
+    }
+
+    fn window_secs(&self) -> Result<u64, String> {
+        match parse_duration(&self.window) {
+            Ok(d) => Ok(d.as_secs()),
+            Err(_) => Err(format!(
+                "[limits.publish] window = {:?} is not a duration (30s, 5m, 1h)",
+                self.window
+            )),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -105,6 +314,20 @@ impl McpConfig {
             );
         }
         Ok(())
+    }
+}
+
+impl RoutingConfig {
+    pub fn refresh(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refresh_secs)
+    }
+
+    pub fn max_snapshot_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.max_snapshot_age_secs)
+    }
+
+    pub fn refusal_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refusal_window_secs)
     }
 }
 
@@ -490,6 +713,9 @@ impl Config {
                 problems.push(e.to_string());
             }
         }
+        if let Err(limits) = self.limits.publish.resolve() {
+            problems.extend(limits);
+        }
         if self.storage.backend == StorageKind::S3 {
             let s3 = &self.storage.s3;
             if s3.bucket.trim().is_empty() && std::env::var("OPENCARGO_S3_BUCKET").is_err() {
@@ -844,6 +1070,72 @@ mod tests {
         let partial: Config = toml::from_str("[storage]\nbackend = \"s3\"\n[storage.s3]\nbucket = \"b\"\n").unwrap();
         assert_eq!(partial.storage.s3.request_timeout, "30s", "a partial section keeps the defaults");
         partial.validate().unwrap();
+    }
+
+    fn limits_of(toml: &str) -> crate::domain::PublishLimits {
+        let config: Config = toml::from_str(toml).expect("a readable config");
+        config.validate().expect("a valid config");
+        config.limits.publish.resolve().expect("resolvable limits")
+    }
+
+    #[test]
+    fn no_limits_section_meters_npm_and_pypi_only() {
+        let limits = limits_of("");
+        for format in [crate::domain::Format::Npm, crate::domain::Format::Pypi] {
+            let (scope, limit) = limits.applicable(format, "any").expect("a shipped limit");
+            assert_eq!(scope, crate::domain::LimitScope::Format(format));
+            assert_eq!((limit.max(), limit.window_secs()), (30, 60));
+        }
+        assert!(limits.applicable(crate::domain::Format::Cargo, "crates").is_none());
+    }
+
+    #[test]
+    fn an_entry_replaces_the_shipped_default_for_its_scope() {
+        let limits = limits_of(
+            "[limits.publish.format]\nnpm = 500\ncargo = { max = 1000, per = \"5m\" }\n\
+             [limits.publish.repository]\nnpm-ci = { max = 2000, per = \"1h\" }\n",
+        );
+        let (_, npm) = limits.applicable(crate::domain::Format::Npm, "npm-private").expect("npm");
+        assert_eq!((npm.max(), npm.window_secs()), (500, 60));
+        let (_, cargo) = limits.applicable(crate::domain::Format::Cargo, "crates").expect("cargo");
+        assert_eq!((cargo.max(), cargo.window_secs()), (1000, 300));
+        let (scope, ci) = limits.applicable(crate::domain::Format::Npm, "npm-ci").expect("npm-ci");
+        assert_eq!(scope, crate::domain::LimitScope::Repository("npm-ci".to_string()));
+        assert_eq!((ci.max(), ci.window_secs()), (2000, 3600));
+        let (_, pypi) = limits.applicable(crate::domain::Format::Pypi, "pypi").expect("pypi");
+        assert_eq!(pypi.max(), 30, "an untouched format keeps its shipped default");
+    }
+
+    #[test]
+    fn per_window_meters_every_format_at_once() {
+        let limits = limits_of("[limits.publish]\nper_window = 500\nwindow = \"5m\"\n[limits.publish.format]\npypi = 60\n");
+        let (scope, npm) = limits.applicable(crate::domain::Format::Npm, "npm-private").expect("npm");
+        assert_eq!(scope, crate::domain::LimitScope::Every);
+        assert_eq!((npm.max(), npm.window_secs()), (500, 300));
+        let (_, oci) = limits.applicable(crate::domain::Format::Oci, "images").expect("oci");
+        assert_eq!(oci.max(), 500);
+        let (_, pypi) = limits.applicable(crate::domain::Format::Pypi, "pypi").expect("pypi");
+        assert_eq!((pypi.max(), pypi.window_secs()), (60, 300));
+    }
+
+    #[test]
+    fn a_limit_that_cannot_be_read_or_is_not_finite_is_refused() {
+        for bad in [
+            "[limits.publish]\nwindow = \"soon\"\n",
+            "[limits.publish]\nper_window = 0\n",
+            "[limits.publish.format]\nnpm = 0\n",
+            "[limits.publish.format]\nnpm = { max = 10, per = \"soon\" }\n",
+            "[limits.publish.format]\nnpm = { max = 10, per = \"48h\" }\n",
+            "[limits.publish.format]\nnode = 10\n",
+            "[limits.publish.repository]\n\"\" = 10\n",
+            "[limits.publish]\nunknown = 1\n",
+        ] {
+            let read: Result<Config, _> = toml::from_str(bad);
+            match read {
+                Err(_) => {}
+                Ok(config) => assert!(config.validate().is_err(), "{bad} should be refused"),
+            }
+        }
     }
 
     #[test]

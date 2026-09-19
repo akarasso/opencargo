@@ -20,8 +20,12 @@ import type {
   PolicyQuery,
   PolicyReport,
   PolicyRules,
+  Explanation,
+  RawFilesResponse,
   RepositoriesResponse,
   RepositoryDetail,
+  RoutingRule,
+  RoutingRules,
   SearchResponse,
   StorageStatus,
   InstanceStatus,
@@ -359,4 +363,43 @@ export function syncMcp(repo: string, full = false): Promise<unknown> {
 
 export function probeMcp(repo: string, name?: string, version?: string): Promise<unknown> {
   return http.post(`/api/v1/mcp/${enc(repo)}/probe`, { name, version });
+}
+
+// --- Routing rules -------------------------------------------------------------
+
+export function fetchRoutingRules(): Promise<RoutingRules> {
+  return http.get('/api/v1/routing-rules');
+}
+
+export function createRoutingRule(rule: {
+  name: string;
+  format: string;
+  patterns: string[];
+  except: string[];
+  effect: string;
+  targets: string[];
+}): Promise<RoutingRule> {
+  return http.post('/api/v1/routing-rules', rule);
+}
+
+export function deleteRoutingRule(name: string): Promise<{ deleted: string; still_refused_by: string[] }> {
+  return http.del(`/api/v1/routing-rules/${enc(name)}`);
+}
+
+/** The dry run: the same verdict the resolver reaches, on the same snapshot. */
+export function explainRoute(repository: string, name: string): Promise<Explanation> {
+  return http.post('/api/v1/routing-rules/explain', { repository, name });
+}
+
+// --- Raw files -----------------------------------------------------------------
+
+export function fetchRawFiles(params: {
+  repo: string;
+  prefix: string;
+  page: number;
+}): Promise<RawFilesResponse> {
+  const search = new URLSearchParams();
+  if (params.prefix) search.set('prefix', params.prefix);
+  search.set('page', String(params.page));
+  return http.get(`/api/v1/raw/${params.repo}/files?${search.toString()}`);
 }

@@ -12,17 +12,17 @@ use chrono::{DateTime, Duration, Utc};
 use crate::app::audit::{self, Actor};
 use crate::app::users::load_account;
 use crate::auth::tokens as credentials;
-use crate::domain::ApiToken;
+use crate::domain::{ApiToken, Incarnation, TokenScope};
 use crate::error::{AppError, AppResult};
 use crate::ports::audit::AuditStore;
 use crate::ports::events::Events;
 use crate::ports::ids::Ids;
+use crate::ports::repositories::RepositoryStore;
 use crate::ports::tokens::{NewToken, TokenStore};
 use crate::ports::users::UserStore;
 
-/// The prefix every issued token carries, and the length of the lookup key
-/// cut from its front.
-const TOKEN_PREFIX: &str = "trg_";
+/// The length of the lookup key cut from the front of an issued token; the
+/// form it carries is the composition root's, not this module's.
 const KEY_LEN: usize = 16;
 
 /// A token as its owner sees it exactly once.
@@ -33,30 +33,41 @@ pub struct Issued {
     /// The only copy: nothing stores it.
     pub token: String,
     pub expires_at: Option<DateTime<Utc>>,
+    pub scope: TokenScope,
 }
 
 pub struct IssueToken {
     users: Arc<dyn UserStore>,
     tokens: Arc<dyn TokenStore>,
+    repos: Arc<dyn RepositoryStore>,
     ids: Arc<dyn Ids>,
     audit: Arc<dyn AuditStore>,
     events: Arc<dyn Events>,
+    /// The form the composition root issues under; a scoped credential takes
+    /// its sibling form, which an older binary does not recognise.
+    prefix: String,
+}
+
+pub struct IssueTokenDeps {
+    pub users: Arc<dyn UserStore>,
+    pub tokens: Arc<dyn TokenStore>,
+    pub repos: Arc<dyn RepositoryStore>,
+    pub ids: Arc<dyn Ids>,
+    pub audit: Arc<dyn AuditStore>,
+    pub events: Arc<dyn Events>,
+    pub prefix: String,
 }
 
 impl IssueToken {
-    pub fn new(
-        users: Arc<dyn UserStore>,
-        tokens: Arc<dyn TokenStore>,
-        ids: Arc<dyn Ids>,
-        audit: Arc<dyn AuditStore>,
-        events: Arc<dyn Events>,
-    ) -> Self {
+    pub fn new(deps: IssueTokenDeps) -> Self {
         Self {
-            users,
-            tokens,
-            ids,
-            audit,
-            events,
+            users: deps.users,
+            tokens: deps.tokens,
+            repos: deps.repos,
+            ids: deps.ids,
+            audit: deps.audit,
+            events: deps.events,
+            prefix: deps.prefix,
         }
     }
 
@@ -65,13 +76,23 @@ impl IssueToken {
         username: &str,
         name: &str,
         expires_in_days: Option<i64>,
+        scope: &TokenScope,
         by: &Actor<'_>,
         now: DateTime<Utc>,
     ) -> AppResult<Issued> {
+        if by.scoped {
+            return Err(AppError::Forbidden(
+                "a scoped credential never issues another credential".to_string(),
+            ));
+        }
+        scope
+            .validate()
+            .map_err(|e| AppError::BadRequest(format!("invalid scope: {e}")))?;
         let user = load_account(&*self.users, username).await?;
+        let scope = self.resolve(scope).await?;
 
         let id = self.ids.token_id();
-        let (token, token_hash) = credentials::generate_token(TOKEN_PREFIX);
+        let (token, token_hash) = credentials::generate_token(&self.prefix, !scope.is_inherit());
         let prefix = token[..KEY_LEN].to_string();
         let expires_at = expires_in_days.map(|days| now + Duration::days(days));
 
@@ -84,6 +105,7 @@ impl IssueToken {
                     prefix: &prefix,
                     token_hash: &token_hash,
                     expires_at,
+                    scope: &scope,
                 },
                 now,
             )
@@ -104,7 +126,29 @@ impl IssueToken {
             prefix,
             token,
             expires_at,
+            scope,
         })
+    }
+
+    /// Patterns become incarnations here, once: what the scope holds is the
+    /// repositories that existed when it was written, never the name.
+    async fn resolve(&self, scope: &TokenScope) -> AppResult<TokenScope> {
+        if scope.is_inherit() {
+            return Ok(TokenScope::Inherit);
+        }
+        // One lookup per repository, on the coldest path there is: a token is
+        // issued once and judged on every request afterwards.
+        let mut world = Vec::new();
+        for repo in self.repos.all().await? {
+            if let Some(incarnation) = self.repos.incarnation(repo.id).await? {
+                world.push((repo.name, incarnation));
+            }
+        }
+        let world: Vec<Incarnation<'_>> = world
+            .iter()
+            .map(|(name, incarnation)| Incarnation { name, incarnation })
+            .collect();
+        Ok(scope.resolved(&world))
     }
 }
 
@@ -192,6 +236,7 @@ mod tests {
             user_id: Some(1),
             username: "root",
             admin: true,
+            scoped: false,
         }
     }
 
@@ -211,16 +256,73 @@ mod tests {
     }
 
     async fn issue(db: &FakeDb, username: &str, days: Option<i64>) -> Issued {
-        IssueToken::new(
-            db.users(),
-            db.tokens(),
-            Arc::new(SeqIds::default()),
-            db.audit(),
-            crate::server::event_bus(),
-        )
-        .run(username, "ci", days, &by(), Utc::now())
-        .await
-        .unwrap()
+        issue_scoped(db, username, days, &TokenScope::Inherit, &by()).await.unwrap()
+    }
+
+    fn issuer(db: &FakeDb) -> IssueToken {
+        IssueToken::new(IssueTokenDeps {
+            users: db.users(),
+            tokens: db.tokens(),
+            repos: db.repositories(),
+            ids: Arc::new(SeqIds::default()),
+            audit: db.audit(),
+            events: crate::server::event_bus(),
+            prefix: "trg_".to_string(),
+        })
+    }
+
+    async fn issue_scoped(
+        db: &FakeDb,
+        username: &str,
+        days: Option<i64>,
+        scope: &TokenScope,
+        by: &Actor<'_>,
+    ) -> AppResult<Issued> {
+        issuer(db)
+            .run(username, "ci", days, scope, by, Utc::now())
+            .await
+    }
+
+    fn refusal(got: AppResult<Issued>) -> AppError {
+        match got {
+            Err(e) => e,
+            Ok(_) => panic!("a token was issued"),
+        }
+    }
+
+    async fn repository(db: &FakeDb, name: &str) -> String {
+        let repo = db
+            .repositories()
+            .create(
+                &crate::domain::RepoSpec {
+                    name,
+                    kind: crate::domain::RepoKind::Hosted,
+                    format: crate::domain::Format::Npm,
+                    visibility: crate::domain::Visibility::Private,
+                    upstream: None,
+                    members: &[],
+                },
+                Utc::now(),
+            )
+            .await
+            .unwrap();
+        db.repositories()
+            .incarnation(repo.id)
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    fn repo_scope(pattern: &str, actions: &[crate::domain::ScopeAction]) -> TokenScope {
+        TokenScope::Limited {
+            grants: vec![crate::domain::Grant {
+                selector: crate::domain::Selector::Repo {
+                    repo: crate::domain::ScopePattern::parse(pattern).unwrap(),
+                },
+                actions: actions.to_vec(),
+                incarnations: Vec::new(),
+            }],
+        }
     }
 
     /// The raw value is returned once and never stored; what is stored is the
@@ -232,7 +334,7 @@ mod tests {
 
         let issued = issue(&db, "alice", None).await;
 
-        assert!(issued.token.starts_with(TOKEN_PREFIX));
+        assert!(issued.token.starts_with("trg_"));
         assert_eq!(issued.prefix, issued.token[..KEY_LEN]);
         let stored = db.tokens().by_prefix(&issued.prefix).await.unwrap().unwrap();
         assert!(credentials::verify_token(&issued.token, &stored.token_hash));
@@ -260,6 +362,79 @@ mod tests {
 
         assert!(matches!(refused, AppError::Forbidden(_)), "{refused:?}");
         assert!(db.tokens().by_id(&issued.id).await.unwrap().is_some());
+    }
+
+    /// The scoped credential takes a form of its own and freezes the
+    /// incarnations its pattern named, not the pattern.
+    #[tokio::test]
+    async fn a_scoped_token_carries_its_own_form_and_the_incarnations_it_resolved() {
+        let db = FakeDb::new();
+        account(&db, "alice").await;
+        let libs = repository(&db, "libs-a").await;
+        repository(&db, "prod").await;
+
+        let issued = issue_scoped(
+            &db,
+            "alice",
+            None,
+            &repo_scope("libs-*", &[crate::domain::ScopeAction::Read]),
+            &by(),
+        )
+        .await
+        .unwrap();
+
+        assert!(issued.token.starts_with("trgs_"), "{}", issued.token);
+        let stored = db.tokens().by_prefix(&issued.prefix).await.unwrap().unwrap();
+        assert!(credentials::verify_credential(
+            &issued.token,
+            &stored.token_hash,
+            "trg_"
+        ));
+        assert_eq!(stored.scope.grants()[0].incarnations, [libs]);
+        assert!(
+            !credentials::verify_token(&issued.token, &stored.token_hash),
+            "a binary without scopes cannot verify it"
+        );
+    }
+
+    /// Invariant 4: whatever the route and whatever the target, a scoped
+    /// credential never makes another credential.
+    #[tokio::test]
+    async fn a_scoped_caller_issues_nothing() {
+        let db = FakeDb::new();
+        account(&db, "alice").await;
+        let scoped = Actor {
+            user_id: Some(1),
+            username: "root",
+            admin: true,
+            scoped: true,
+        };
+
+        let refused = refusal(issue_scoped(&db, "alice", None, &TokenScope::Inherit, &scoped).await);
+
+        assert!(matches!(refused, AppError::Forbidden(_)), "{refused:?}");
+        assert!(db.tokens().of_user(1).await.unwrap().is_empty());
+    }
+
+    /// The vocabulary is closed at creation: a subscription no repository
+    /// selector can narrow is not a scope anyone can be issued.
+    #[tokio::test]
+    async fn a_scope_the_vocabulary_refuses_is_refused_at_creation() {
+        let db = FakeDb::new();
+        account(&db, "alice").await;
+        let webhooks = TokenScope::Limited {
+            grants: vec![crate::domain::Grant {
+                selector: crate::domain::Selector::Admin {
+                    domain: crate::domain::AdminDomain::Webhooks,
+                },
+                actions: vec![crate::domain::ScopeAction::Write],
+                incarnations: Vec::new(),
+            }],
+        };
+
+        let refused = refusal(issue_scoped(&db, "alice", None, &webhooks, &by()).await);
+
+        assert!(matches!(refused, AppError::BadRequest(_)), "{refused:?}");
     }
 
     /// The expiry is the caller's clock plus their window, never the store's.

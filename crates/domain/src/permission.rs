@@ -69,6 +69,8 @@ pub enum RightsSource {
     Admin,
     Grant,
     Role,
+    /// The credential's own scope removed something the ladder allowed.
+    Scope,
 }
 
 impl RightsSource {
@@ -77,6 +79,7 @@ impl RightsSource {
             RightsSource::Admin => "admin",
             RightsSource::Grant => "grant",
             RightsSource::Role => "role",
+            RightsSource::Scope => "scope",
         }
     }
 }
@@ -99,11 +102,15 @@ pub fn effective_rights(role: &str, grant: Option<Rights>) -> (Rights, RightsSou
     }
 }
 
+/// A publisher deletes what a publisher publishes: the ladder never asked
+/// for `delete` before, so a publisher who could remove a manifest through
+/// the write rung keeps that power now that the routes ask for the verb.
 fn role_default(role: &str) -> Rights {
     match role {
         "publisher" => Rights {
             read: true,
             write: true,
+            delete: true,
             ..Rights::NONE
         },
         "reader" => Rights {
@@ -181,6 +188,7 @@ mod tests {
                 Rights {
                     read: true,
                     write: true,
+                    delete: true,
                     ..Rights::NONE
                 },
                 RightsSource::Role
@@ -220,5 +228,6 @@ mod tests {
         assert_eq!(RightsSource::Admin.as_str(), "admin");
         assert_eq!(RightsSource::Grant.as_str(), "grant");
         assert_eq!(RightsSource::Role.as_str(), "role");
+        assert_eq!(RightsSource::Scope.as_str(), "scope");
     }
 }

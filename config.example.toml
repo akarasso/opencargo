@@ -42,6 +42,17 @@ password = "admin"
 [auth.sso]
 password_mode = "enabled"
 
+[limits.publish]
+window = "1m"
+# per_window = 500
+
+[limits.publish.format]
+npm = 30
+pypi = 30
+
+# [limits.publish.repository]
+# npm-ci = { max = 2000, per = "1h" }
+
 [proxy]
 default_ttl = "24h"
 negative_cache_ttl = "1h"
@@ -75,3 +86,16 @@ visibility = "private"
 # probe_auth = "Authorization: Bearer ..."
 # gallery = true
 # headers_helper = "/usr/local/bin/opencargo-auth-header"
+# The rules below are written into an EMPTY rule table, once. Afterwards the
+# API owns them: a rule deleted through it does not come back, and a pattern
+# hardened here is not applied -- the startup log names the difference.
+[routing]
+refresh_secs = 30
+max_snapshot_age_secs = 300
+
+[[routing.rules]]
+name = "acme-internal"
+format = "npm"
+patterns = ["@acme/*"]
+effect = "allow_members"
+targets = ["npm-private"]

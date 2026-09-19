@@ -4,11 +4,14 @@
 
 use std::sync::Arc;
 
-use crate::domain::{CacheRepo, Format, Outcome};
+use chrono::Utc;
+
+use crate::app::search;
+use crate::domain::{CacheRepo, Format, Outcome, Sighting};
 use crate::policy::{self, Source};
 use crate::ports::pypi::{PypiFile, PypiFileStore};
 use crate::proxy::Payload;
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 use super::memo::{PageKey, PageMemo};
 use super::names::parse_filename;
@@ -73,6 +76,7 @@ pub async fn fetch_page(
     };
     if !cached.stale {
         if let Some(page) = memo.get(&key) {
+            remember(cx, member, cached.exchanged, &page, project).await;
             return Ok(Outcome::Found(page));
         }
     }
@@ -88,7 +92,37 @@ pub async fn fetch_page(
     if !cached.stale {
         memo.insert(key, page.clone());
     }
+    remember(cx, member, cached.exchanged, &page, project).await;
     Ok(Outcome::Found(page))
+}
+
+/// A simple-index page carries no description; the newest version it names is
+/// the one its filenames sort to.
+async fn remember(
+    cx: &Cx<'_>,
+    member: CacheRepo<'_>,
+    exchanged: bool,
+    page: &UpstreamPage,
+    project: &str,
+) {
+    let latest = newest(page, project);
+    let seen = Sighting {
+        repository_id: member.0.id,
+        format: Format::Pypi,
+        name: project,
+        description: None,
+        latest_version: latest.as_deref(),
+    };
+    search::remember(cx.cached, exchanged, &seen, Utc::now()).await;
+}
+
+fn newest(page: &UpstreamPage, project: &str) -> Option<String> {
+    page.files
+        .iter()
+        .filter_map(|f| parse_filename(&f.filename).ok())
+        .filter(|parsed| parsed.project == project)
+        .map(|parsed| parsed.version.normalized())
+        .max_by(|a, b| version::compare(a, b))
 }
 
 /// The files of an upstream page this server will serve: named for the
@@ -143,6 +177,10 @@ pub struct PageLeaf<'a> {
 
 #[async_trait::async_trait]
 impl Leaf for PageLeaf<'_> {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.project)
+    }
     type Out = Page;
 
     async fn hosted(&self, _cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Page>, ResolveError> {
@@ -193,6 +231,10 @@ pub struct FileLeaf<'a> {
 
 #[async_trait::async_trait]
 impl Leaf for FileLeaf<'_> {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.project)
+    }
     type Out = Served;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Served>, ResolveError> {
@@ -278,6 +320,12 @@ pub struct IndexLeaf<'a> {
 
 #[async_trait::async_trait]
 impl Leaf for IndexLeaf<'_> {
+
+    /// The simple index lists every project a member holds, with nothing
+    /// to narrow it: the merge is what filters.
+    fn subject(&self) -> Subject<'_> {
+        Subject::listing()
+    }
     type Out = Vec<String>;
 
     async fn hosted(&self, _cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Vec<String>>, ResolveError> {

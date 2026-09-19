@@ -52,7 +52,7 @@ fn require_user(auth: Option<axum::Extension<AuthUser>>) -> AppResult<AuthUser> 
 async fn writable(state: &AppState, repo_name: &str, user: &AuthUser) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Nuget)?;
-    crate::registry::ensure_can_write(&*state.permissions, &repo, user).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, user).await?;
     crate::registry::ensure_hosted(&repo)?;
     Ok(repo)
 }
@@ -120,6 +120,7 @@ pub async fn push(
     multipart: Multipart,
 ) -> AppResult<Response> {
     let user = require_user(auth)?;
+    crate::registry::meter_publish(&state, &user, Format::Nuget, &repo_name)?;
     let repo = writable(&state, &repo_name, &user).await?;
     let limits = Limits {
         cap: MAX_NUPKG_BYTES,

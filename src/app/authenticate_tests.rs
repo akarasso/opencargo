@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::TokenScope;
 use crate::ports::tokens::NewToken;
 use crate::ports::users::NewUser;
 use crate::registry::oci::token::TokenSigner;
@@ -54,7 +55,7 @@ async fn user(db: &FakeDb, name: &str) -> User {
 }
 
 async fn token_of(db: &FakeDb, user: &User, id: &str) -> String {
-    let (raw, hash) = tokens::generate_token("trg_");
+    let (raw, hash) = tokens::generate_token("trg_", false);
     db.tokens()
         .create(
             &NewToken {
@@ -64,6 +65,7 @@ async fn token_of(db: &FakeDb, user: &User, id: &str) -> String {
                 prefix: &raw[..16],
                 token_hash: &hash,
                 expires_at: None,
+                scope: &TokenScope::Inherit,
             },
             Utc::now(),
         )
@@ -178,6 +180,7 @@ async fn password_change_is_throttled() {
         user_id: Some(1),
         username: "dev",
         admin: false,
+        scoped: false,
     };
     let refused = ChangePassword::new(fx.store.users(), Arc::new(fx.auth))
         .run("dev", Some(PASSWORD), "new password!", &by, Utc::now())

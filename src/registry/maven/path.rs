@@ -99,6 +99,14 @@ impl MetadataLevel {
             _ => None,
         }
     }
+
+    /// The `groupId:artifactId` this directory is about, whichever level it is.
+    pub fn ga(&self) -> String {
+        match self {
+            MetadataLevel::Snapshot(gav) => gav.ga(),
+            MetadataLevel::Artifact { group, artifact } => format!("{group}:{artifact}"),
+        }
+    }
 }
 
 /// `yyyyMMdd.HHmmss-N`, the timestamped build of a snapshot file.

@@ -62,8 +62,9 @@ Before any byte moves, the run asserts on the target's own permission view
 hosted, has the planned format, and that the token can write it and read it.
 `--create-repos` creates missing ones with `OPENCARGO_IMPORT_TARGET_ADMIN_TOKEN`
 and grants the importing user. npm publishes are paced under the target's
-30-per-minute limit (`--target-rate`, 25); a target 429 or 503 parks every
-worker instead of failing items.
+publish limit (`--target-rate`, 25, against a shipped 30 a minute); a target
+429 or 503 parks every worker instead of failing items, and raising
+`[limits.publish]` on the target lets `--target-rate` follow.
 
 Every imported version is scanned by the target like any publish: turn
 `vuln_scan.block_on_critical` off for the import window if blocking is on,

@@ -33,10 +33,12 @@ use crate::ports::permissions::PermissionStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::pypi::PypiFileStore;
+use crate::ports::raw::RawFileStore;
 use crate::ports::reclaim::ReclaimStore;
 use crate::ports::referenced::ReferencedKeys;
 use crate::ports::repositories::RepositoryStore;
-use crate::ports::search::SearchIndex;
+use crate::ports::routing::RoutingRuleStore;
+use crate::ports::search::{CachedPackageIndex, SearchIndex};
 use crate::ports::tokens::TokenStore;
 use crate::ports::users::UserStore;
 use crate::ports::vulns::VulnStore;
@@ -44,6 +46,7 @@ use crate::ports::webhooks::WebhookStore;
 
 pub mod audit;
 pub mod backup;
+pub mod cached;
 pub mod dashboard;
 pub mod deps;
 pub mod maven;
@@ -60,9 +63,11 @@ pub mod permissions;
 pub mod policy;
 pub mod proxy_cache;
 pub mod pypi;
+pub mod raw;
 pub mod reclaim;
 pub mod rebuild;
 pub mod repositories;
+pub mod routing;
 pub mod rows;
 pub mod search;
 pub mod tokens;
@@ -97,6 +102,21 @@ pub(crate) fn read_ts(
     })
 }
 
+/// Pages of write-ahead log a commit may find before it checkpoints, 16 MiB
+/// at the 4 KiB page this schema uses.
+///
+/// A checkpoint copies each page the log holds **once**, whatever the window,
+/// so a publish rewriting the same hot leaf writes it to the log every time
+/// and to the database once per window: four times the default window is a
+/// quarter of the copies. It costs disk, not durability — every commit is
+/// still in the log, fsynced, before the client is answered.
+pub(crate) const WAL_AUTOCHECKPOINT_PAGES: &str = "4000";
+
+/// What the log file is truncated back to once a checkpoint has emptied it,
+/// four windows. The default is no limit, which leaves a burst's high-water
+/// mark on disk for the life of the installation.
+pub(crate) const WAL_SIZE_LIMIT_BYTES: &str = "67108864";
+
 /// Create a connection pool and enable WAL mode.
 pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
@@ -105,6 +125,8 @@ pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     let opts = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .pragma("wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)
+        .pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES)
         // Wait for a busy writer instead of failing immediately: instant
         // SQLITE_BUSY errors under load used to surface as spurious 401s in
         // the auth middleware.
@@ -290,6 +312,10 @@ impl SqliteStores {
         Arc::new(repositories::SqliteRepositoryStore::new(self.pool.clone()))
     }
 
+    pub fn routing(&self) -> Arc<dyn RoutingRuleStore> {
+        Arc::new(routing::SqliteRoutingRuleStore::new(self.pool.clone()))
+    }
+
     pub fn packages(&self) -> Arc<dyn PackageStore> {
         Arc::new(packages::SqlitePackageStore::new(self.pool.clone()))
     }
@@ -300,6 +326,10 @@ impl SqliteStores {
 
     pub fn search(&self) -> Arc<dyn SearchIndex> {
         Arc::new(search::SqliteSearchIndex::new(self.pool.clone()))
+    }
+
+    pub fn cached_packages(&self) -> Arc<dyn CachedPackageIndex> {
+        Arc::new(cached::SqliteCachedPackageIndex::new(self.pool.clone()))
     }
 
     pub fn oci(&self) -> Arc<dyn OciStore> {
@@ -328,6 +358,10 @@ impl SqliteStores {
 
     pub fn pypi(&self) -> Arc<dyn PypiFileStore> {
         Arc::new(pypi::SqlitePypiFileStore::new(self.pool.clone()))
+    }
+
+    pub fn raw(&self) -> Arc<dyn RawFileStore> {
+        Arc::new(raw::SqliteRawFileStore::new(self.pool.clone()))
     }
 
     pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {
@@ -384,3 +418,7 @@ impl SqliteStores {
         Arc::new(dashboard::SqliteDashboardRead::new(self.pool.clone()))
     }
 }
+
+#[cfg(test)]
+#[path = "connect_tests.rs"]
+mod connect_tests;

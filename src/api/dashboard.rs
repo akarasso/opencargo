@@ -9,6 +9,7 @@ use crate::auth::middleware::AuthUser;
 use crate::domain::Visibility;
 use crate::error::{AppError, AppResult};
 use crate::ports::dashboard::{PackageFilter, Reach};
+use crate::app::search::{Find, Hit, Source};
 use crate::ports::search::{SearchQuery as Tokens, SearchScope};
 use crate::server::AppState;
 use crate::wire::wire_ts;
@@ -101,6 +102,11 @@ struct SearchResultResponse {
     name: String,
     latest_version: String,
     description: String,
+    /// Where the client will have to fetch it: a package this server holds,
+    /// or one a proxy member was seen serving.
+    source: &'static str,
+    repository: String,
+    last_seen: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -144,7 +150,7 @@ type Caller = Option<Extension<AuthUser>>;
 /// Which packages a caller may count, list and search. Admins see every
 /// repository; everyone else, authenticated or not, sees the public ones.
 fn package_reach(caller: &Caller) -> Reach {
-    match caller.as_ref().map(|user| user.0.role == "admin") {
+    match caller.as_ref().map(|user| crate::api::admin_standing(&user.0)) {
         Some(true) => Reach::Everything,
         _ => Reach::PublicOnly,
     }
@@ -341,8 +347,8 @@ pub async fn search(
     }))
 }
 
-/// The search panel's rows: the index answers with packages, and what each
-/// was last released as is one more call, not one per row.
+/// The search panel's rows: the two indexes, merged by the use case, and what
+/// each hosted package was last released as is one call, not one per row.
 async fn hits(
     state: &AppState,
     query: &Tokens,
@@ -352,23 +358,36 @@ async fn hits(
         Reach::Everything => SearchScope::All,
         Reach::PublicOnly => SearchScope::PublicOnly,
     };
-    let found = state.search.search(scope, Some(query), SEARCH_RESULTS).await?;
-    let latest = state
-        .dashboard
-        .latest_versions(&found.iter().map(|pkg| pkg.id).collect::<Vec<_>>())
-        .await?;
-
-    Ok(found
+    let find = Find::new(
+        state.search.clone(),
+        state.cached.clone(),
+        state.dashboard.clone(),
+        state.repos.clone(),
+    );
+    Ok(find
+        .run(query, scope, SEARCH_RESULTS)
+        .await?
         .into_iter()
-        .map(|pkg| SearchResultResponse {
-            latest_version: latest
-                .get(&pkg.id)
-                .cloned()
-                .unwrap_or_else(|| NO_VERSION.to_string()),
-            name: pkg.name,
-            description: pkg.description.unwrap_or_default(),
-        })
+        .map(row)
         .collect())
+}
+
+fn wire_source(source: Source) -> &'static str {
+    match source {
+        Source::Hosted => "hosted",
+        Source::Cached => "cached",
+    }
+}
+
+fn row(hit: Hit) -> SearchResultResponse {
+    SearchResultResponse {
+        name: hit.name,
+        latest_version: hit.version.unwrap_or_else(|| NO_VERSION.to_string()),
+        description: hit.description.unwrap_or_default(),
+        source: wire_source(hit.source),
+        repository: hit.repository.unwrap_or_default(),
+        last_seen: hit.last_seen.map(wire_ts),
+    }
 }
 
 /// An absent filter box and an empty one are the same request.
@@ -388,6 +407,8 @@ mod tests {
             role: role.to_string(),
             must_change_password: false,
             token_name: None,
+            api_token_id: None,
+            scope: crate::domain::TokenScope::Inherit,
         }))
     }
 

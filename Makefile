@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget test-e2e-import clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget test-e2e-import clean frontend release docker deploy undeploy logs publish lint fmt bench bench-smoke 
 
 # Load .env if it exists
 -include .env
@@ -50,20 +50,27 @@ test: ## Lancer tous les tests
 	cargo test
 
 test-quick: ## Tests rapides (sans réseau ni client externe)
-	cargo test --test npm_test --test npm_proxy_test --test cargo_test --test cargo_proxy_test \
+	cargo test --test npm_test --test npm_proxy_test --test npm_memory_test --test cargo_test --test cargo_proxy_test \
 		--test go_test --test go_proxy_test --test oci_test --test oci_nested_test --test oci_proxy_test \
 		--test vuln_test --test group_resolver_test --test auth_test --test features_test \
-		--test promote_test --test permissions_test --test policy_test \
+		--test promote_test --test permissions_test --test policy_test --test publish_limits_test \
 		--test pypi_test --test pypi_store_test --test pypi_proxy_test \
 		--test maven_test --test maven_proxy_test \
 		--test nuget_test --test nuget_feed_store_test --test nuget_proxy_test --test nuget_group_test \
 		--test sso_test --test sso_store_test \
 		--test mcp_test --test mcp_sync_test --test mcp_probe_test --test mcp_policy_test --test mcp_client_test --test mcp_admin_test \
 		--test import_test --test import_managers_test --test import_oci_test \
-		--test instance_lease_test --test storage_cli_test --test shutdown_test --test backup_test
+		--test instance_lease_test --test storage_cli_test --test shutdown_test --test backup_test \
+		--test write_amplification_test --test bench_smoke_test --test search_cache_test --test token_store_test --test scopes_test --test routing_test --test raw_test --test raw_store_test --test raw_proxy_test
 
 test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
 	scripts/test-s3.sh
+
+bench: release ## Mesures de consommation, tous les scénarios (BENCH_ARGS pour les options)
+	scripts/bench.sh $(BENCH_ARGS)
+
+bench-smoke: ## Le scénario minimal du harnais de mesure (sans réseau ni Docker)
+	scripts/bench.sh --smoke
 
 test-load: ## Tests de charge : writer policy (5 000 evenements a 500/s, ~16 s), memo NuGet
 	cargo test --lib burst_over_cold_rate_drops_nothing -- --ignored
@@ -91,6 +98,9 @@ test-e2e-docker: ## E2E docker CLI (client docker requis, ou DOCKER_BIN)
 
 test-e2e-maven: ## E2E mvn et gradle (MVN_BIN, GRADLE_BIN pour un Gradle >= 8)
 	OPENCARGO_E2E_REQUIRE=1 cargo test --test maven_e2e_test
+
+test-e2e-raw: ## E2E raw avec curl (CURL_BIN)
+	OPENCARGO_E2E_REQUIRE=1 cargo test --test raw_e2e_test
 
 test-e2e-nuget: ## E2E dotnet (DOTNET_BIN, ou scripts/dotnet-in-docker)
 	DOTNET_BIN=$${DOTNET_BIN:-$(CURDIR)/scripts/dotnet-in-docker} OPENCARGO_E2E_REQUIRE=1 cargo test --test nuget_e2e_test dotnet

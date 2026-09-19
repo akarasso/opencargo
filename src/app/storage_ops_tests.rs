@@ -282,6 +282,7 @@ async fn hosted(fakes: &FakeDb, storage: &MemStorage, name: &str) -> String {
             user_id: Some(1),
             username: "root",
             admin: true,
+            scoped: false,
         },
         Utc::now(),
     )

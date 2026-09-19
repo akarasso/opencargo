@@ -97,6 +97,7 @@ pub fn web_routes() -> Router<AppState> {
         .route("/search", get(serve_spa))
         .route("/oci", get(serve_spa))
         .route("/go", get(serve_spa))
+        .route("/raw", get(serve_spa))
         .route("/login", get(serve_spa))
         .route("/login/sso/complete", get(serve_spa))
         .route("/login/sso/link", get(serve_spa))

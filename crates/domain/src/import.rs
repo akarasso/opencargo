@@ -356,9 +356,12 @@ mod tests {
             assert_eq!(f.as_str().parse::<SourceFormat>().unwrap(), f);
             let _ = f.target();
         }
-        // Mcp is a catalog of servers, not a store of artifacts: no source
-        // registry publishes one, so no source format maps onto it.
-        for format in Format::ALL.into_iter().filter(|f| *f != Format::Mcp) {
+        // Mcp is a catalog of servers, not a store of artifacts, so no source
+        // registry publishes one. Raw is served but no source adapter can read
+        // a raw repository yet: mapping onto it would announce an import path
+        // that does not exist, and a clean gap is the honest answer until one
+        // does.
+        for format in Format::ALL.into_iter().filter(|f| !matches!(f, Format::Mcp | Format::Raw)) {
             assert!(
                 SourceFormat::ALL.iter().any(|s| s.target() == Some(format)),
                 "{format:?} is served but no source format maps onto it"

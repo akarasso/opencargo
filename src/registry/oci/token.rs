@@ -104,18 +104,17 @@ pub async fn issue_token(
     if user.is_none() && !state.auth.anonymous_read {
         return Err(unauthorized("authentication required"));
     }
-    let api_token_id = match user.as_ref().and(bearer_value(headers)) {
-        Some(raw) if !raw.starts_with("ocr_") => {
-            crate::auth::middleware::live_api_token(&state.auth, raw)
-                .await
-                .map_err(|e| {
-                    tracing::warn!(error = %e, "store error during token endpoint authentication");
-                    AppError::ServiceUnavailable("authentication temporarily unavailable, try again".to_string()).into_response()
-                })?
-                .map(|t| t.id)
+    // The provenance is whatever authenticated, not whatever header carried
+    // it: `docker login -u alice -p <token>` is a Basic password, and reading
+    // the Authorization header for a Bearer value missed it entirely --
+    // buying an unrevocable, unscoped token with a scoped credential.
+    let api_token_id = user.as_ref().and_then(|u| u.api_token_id.clone());
+    if let Some(caller) = user.as_ref() {
+        if !caller.scope.is_inherit() && api_token_id.is_none() {
+            tracing::error!("a scoped credential with no resolved provenance");
+            return Err(AppError::Internal("internal server error".to_string()).into_response());
         }
-        _ => None,
-    };
+    }
     let issued_at = chrono::Utc::now();
     let claims = Claims {
         sub: user.as_ref().map(|u| u.username.clone()),
@@ -136,6 +135,7 @@ pub async fn issue_token(
     tracing::info!(
         subject = claims.sub.as_deref().unwrap_or("anonymous"),
         scope = ?claims.scope,
+        bought_with = claims.api_token_id.as_deref().unwrap_or("-"),
         "registry token issued"
     );
     let token = state.registry_tokens.sign(&claims);
@@ -146,13 +146,6 @@ pub async fn issue_token(
         "issued_at": issued_at.to_rfc3339_opts(SecondsFormat::Secs, true),
     }))
     .into_response())
-}
-
-fn bearer_value(headers: &HeaderMap) -> Option<&str> {
-    headers
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer "))
 }
 
 /// The user behind the `Authorization` header, `None` when there is none;

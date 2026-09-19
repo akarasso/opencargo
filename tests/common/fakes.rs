@@ -22,8 +22,9 @@ use chrono::{DateTime, Utc};
 use opencargo::domain::identity::{Authority, IdentityKey, LinkState, LoginState, Outage};
 use opencargo::domain::layout;
 use opencargo::domain::{
-    ApiToken, CacheEntry, CacheEntryId, DistTag, NewEntry, Package, RepoConfig, RepoId, RepoSpec,
-    Repository, Rights, ScanResult, User, Verdict, Version, Visibility, Webhook,
+    ApiToken, CacheEntry, CacheEntryId, CachedPackage, DistTag, NewEntry, Package, RepoConfig,
+    RepoId, RepoSpec, Repository, Rights, ScanResult, Sighting, User, Verdict, Version, Visibility,
+    Webhook,
 };
 use opencargo::error::StoreError;
 use opencargo::ports::audit::{AuditEntry, AuditStore, NewAuditEntry};
@@ -48,13 +49,14 @@ use opencargo::ports::policy::{
 };
 use opencargo::ports::proxy_cache::ProxyCacheStore;
 use opencargo::ports::pypi::{NewPypiFile, Published, PypiFile, PypiFileStore};
+use opencargo::ports::raw::{NewRawFile, RawFile, RawFileStore, Stored};
 use opencargo::ports::reclaim::{
     Backlog, Candidate, Claim, ClaimToken, Epoch, PinToken, Pinned, ReclaimStore, Renewal,
 };
 use opencargo::ports::referenced::{Referenced, ReferencedKeys, ReferencedStream};
 use opencargo::ports::repositories::{RepoPatch, RepositoryStore};
 use opencargo::ports::nuget::{FeedPage, FeedQuery, NugetFeedRead};
-use opencargo::ports::search::{SearchIndex, SearchQuery, SearchScope};
+use opencargo::ports::search::{CachedPackageIndex, SearchIndex, SearchQuery, SearchScope};
 use opencargo::ports::secrets::ServerSecretStore;
 use opencargo::ports::tokens::{NewToken, TokenStore};
 use opencargo::ports::users::{NewUser, UserPatch, UserStore};
@@ -68,6 +70,7 @@ pub enum PortId {
     Repositories,
     Packages,
     Search,
+    CachedPackages,
     ProxyCache,
     Users,
     Tokens,
@@ -79,6 +82,7 @@ pub enum PortId {
     Policy,
     Reclaim,
     Pypi,
+    Raw,
     Maven,
     Identities,
     Handoffs,
@@ -173,6 +177,7 @@ struct State {
     webhooks: Vec<Webhook>,
     repositories: Vec<Repository>,
     packages: Vec<Package>,
+    cached: Vec<CachedPackage>,
     versions: Vec<Version>,
     dist_tags: Vec<DistTag>,
     audit: Vec<AuditEntry>,
@@ -190,6 +195,7 @@ struct State {
     oci_uploads: Vec<UploadRow>,
     oci_segments: Vec<(String, Segment)>,
     pypi_files: Vec<PypiFile>,
+    raw_files: Vec<RawFile>,
     reclaim: ReclaimState,
     maven: MavenState,
     sso: SsoState,
@@ -239,6 +245,10 @@ impl FakeDb {
         Arc::new(Search(self.0.clone()))
     }
 
+    pub fn cached_packages(&self) -> Arc<dyn CachedPackageIndex> {
+        Arc::new(CachedIndex(self.0.clone()))
+    }
+
     pub fn nuget_feed(&self) -> Arc<dyn NugetFeedRead> {
         Arc::new(NugetFeed(self.0.clone()))
     }
@@ -253,6 +263,10 @@ impl FakeDb {
 
     pub fn pypi(&self) -> Arc<dyn PypiFileStore> {
         Arc::new(Pypi(self.0.clone()))
+    }
+
+    pub fn raw(&self) -> Arc<dyn RawFileStore> {
+        Arc::new(Raw(self.0.clone()))
     }
 
     pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {
@@ -645,6 +659,7 @@ impl RepositoryStore for Repositories {
             let repo = found(state, name).ok_or(StoreError::NotFound)?.clone();
             if state.packages.iter().any(|pkg| pkg.repository_id == repo.id)
                 || state.maven.values.iter().any(|v| v.repository == repo.id)
+                || state.raw_files.iter().any(|f| f.repository == repo.id)
             {
                 return Err(StoreError::Conflict);
             }
@@ -1181,17 +1196,96 @@ impl SearchIndex for Search {
     }
 }
 
+struct CachedIndex(Arc<Mutex<State>>);
+
+#[async_trait]
+impl CachedPackageIndex for CachedIndex {
+    async fn remember(&self, seen: &Sighting<'_>, now: DateTime<Utc>) -> Result<(), StoreError> {
+        with(&self.0, PortId::CachedPackages, |state| {
+            match state
+                .cached
+                .iter_mut()
+                .find(|row| row.repository_id == seen.repository_id && row.name == seen.name)
+            {
+                Some(row) => {
+                    row.format = seen.format;
+                    row.description = seen
+                        .description
+                        .map(str::to_string)
+                        .or(row.description.take());
+                    row.latest_version = seen
+                        .latest_version
+                        .map(str::to_string)
+                        .or(row.latest_version.take());
+                    row.last_seen_at = now;
+                }
+                None => state.cached.push(CachedPackage {
+                    repository_id: seen.repository_id,
+                    format: seen.format,
+                    name: seen.name.to_string(),
+                    description: seen.description.map(str::to_string),
+                    latest_version: seen.latest_version.map(str::to_string),
+                    first_seen_at: now,
+                    last_seen_at: now,
+                }),
+            }
+            Ok(())
+        })
+    }
+
+    async fn search(
+        &self,
+        scope: SearchScope,
+        query: Option<&SearchQuery>,
+        limit: u32,
+    ) -> Result<Vec<CachedPackage>, StoreError> {
+        with(&self.0, PortId::CachedPackages, |state| {
+            let public: Vec<i64> = state
+                .repositories
+                .iter()
+                .filter(|repo| repo.visibility == Visibility::Public)
+                .map(|repo| repo.id)
+                .collect();
+            let hits = state
+                .cached
+                .iter()
+                .filter(|row| match scope {
+                    SearchScope::Repo(repo) => row.repository_id == repo,
+                    SearchScope::PublicOnly => public.contains(&row.repository_id),
+                    SearchScope::All => true,
+                })
+                .filter(|row| {
+                    query.is_none_or(|q| matches_words(&row.name, row.description.as_deref(), q))
+                })
+                .take(limit as usize)
+                .cloned()
+                .collect();
+            Ok(hits)
+        })
+    }
+
+    async fn forget_repo(&self, repo: i64) -> Result<u64, StoreError> {
+        with(&self.0, PortId::CachedPackages, |state| {
+            let before = state.cached.len();
+            state.cached.retain(|row| row.repository_id != repo);
+            Ok((before - state.cached.len()) as u64)
+        })
+    }
+}
+
+
 /// Every token has to appear, which is what FTS5's implicit `AND` of quoted
 /// phrases does; the ranking a real index adds is not something a fake can
 /// stand in for, so the contract never asserts a full ordering.
 fn matches_tokens(package: &Package, query: &SearchQuery) -> bool {
+    matches_words(&package.name, package.description.as_deref(), query)
+}
+
+fn matches_words(name: &str, description: Option<&str>, query: &SearchQuery) -> bool {
     query.tokens().iter().all(|token| {
         let token = token.to_lowercase();
-        package.name.to_lowercase().contains(&token)
-            || package
-                .description
-                .as_deref()
-                .is_some_and(|text| text.to_lowercase().contains(&token))
+        name.to_lowercase().contains(&token)
+            || description.is_some_and(|text| text.to_lowercase().contains(&token))
     })
 }
 
@@ -1344,6 +1438,7 @@ impl TokenStore for Tokens {
                 expires_at: token.expires_at,
                 last_used_at: None,
                 created_at: now,
+                scope: token.scope.clone(),
             };
             state.tokens.push(stored.clone());
             Ok(stored)
@@ -2705,6 +2800,119 @@ impl PypiFileStore for Pypi {
     }
 }
 
+struct Raw(Arc<Mutex<State>>);
+
+impl Raw {
+    fn with<T>(
+        &self,
+        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        with(&self.0, PortId::Raw, act)
+    }
+}
+
+/// `path` itself, or anything under it as a segment.
+fn under_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
+    prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+#[async_trait]
+impl RawFileStore for Raw {
+    async fn put_file(&self, file: &NewRawFile<'_>) -> Result<Stored, StoreError> {
+        self.with(|state| {
+            let Some(pin) = file.pins.first() else {
+                return Err(StoreError::Other("a raw file row needs its pin".into()));
+            };
+            state.reclaim.live_pins(file.pins)?;
+            let held = state
+                .raw_files
+                .iter()
+                .position(|f| f.repository == file.repository && f.path == file.path);
+            let row = RawFile {
+                repository: file.repository,
+                path: file.path.to_string(),
+                physical_key: pin.physical_key.clone(),
+                size: file.size,
+                sha256: file.sha256.to_string(),
+                content_type: file.content_type.map(str::to_string),
+                uploaded_by: file.uploaded_by.to_string(),
+                uploaded_at: file.now,
+            };
+            let mut released = Vec::new();
+            let created = match held {
+                Some(at) => {
+                    let old = std::mem::replace(&mut state.raw_files[at], row.clone());
+                    if old.physical_key != pin.physical_key {
+                        released.push(old.physical_key);
+                    }
+                    false
+                }
+                None => {
+                    state.raw_files.push(row.clone());
+                    true
+                }
+            };
+            for key in &released {
+                state.reclaim.enqueue(key, false, file.now);
+            }
+            state.reclaim.spend(file.pins);
+            Ok(Stored {
+                file: row,
+                created,
+                released,
+            })
+        })
+    }
+
+    async fn file(&self, repository: i64, path: &str) -> Result<Option<RawFile>, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .raw_files
+                .iter()
+                .find(|f| f.repository == repository && f.path == path)
+                .cloned())
+        })
+    }
+
+    async fn list(
+        &self,
+        repository: i64,
+        prefix: &str,
+        limit: i64,
+    ) -> Result<Vec<RawFile>, StoreError> {
+        self.with(|state| {
+            let mut found: Vec<RawFile> = state
+                .raw_files
+                .iter()
+                .filter(|f| f.repository == repository && under_prefix(&f.path, prefix))
+                .cloned()
+                .collect();
+            found.sort_by(|a, b| a.path.cmp(&b.path));
+            found.truncate(limit.max(0) as usize);
+            Ok(found)
+        })
+    }
+
+    async fn delete_file(
+        &self,
+        repository: i64,
+        path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let at = state
+                .raw_files
+                .iter()
+                .position(|f| f.repository == repository && f.path == path)
+                .ok_or(StoreError::NotFound)?;
+            let gone = state.raw_files.remove(at);
+            state.reclaim.enqueue(&gone.physical_key, false, now);
+            Ok(vec![gone.physical_key])
+        })
+    }
+}
+
 struct PinRow {
     token: String,
     physical_key: String,
@@ -2831,6 +3039,12 @@ fn row_references(state: &State) -> Vec<(String, bool)> {
         refs.extend(f.metadata_key.clone().map(|k| (k, false)));
     }
     refs.extend(state.maven.keys().map(|k| (k.clone(), false)));
+    refs.extend(
+        state
+            .raw_files
+            .iter()
+            .map(|f| (f.physical_key.clone(), false)),
+    );
     refs
 }
 
@@ -3892,6 +4106,7 @@ impl IdentityStore for Identities {
                 expires_at: token.expires_at,
                 last_used_at: None,
                 created_at: now,
+                scope: token.scope.clone(),
             });
             state
                 .sso

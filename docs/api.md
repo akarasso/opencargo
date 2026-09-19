@@ -27,10 +27,14 @@ Through a proxy or a group, metadata and `dist-tags` come from the cached
 packument (`proxy.default_ttl`, revalidated with `If-None-Match`), tarballs
 are cached forever (a tarball over 100 MiB is refused with `502`) and their
 URLs point at the repository the client asked for; `search` covers hosted
-members only, nested groups included: proxied packages are not searchable.
+members and the packages a proxy member has already served, nested groups
+included -- a package this registry has never fetched is not in the index.
 `PUT`/`DELETE dist-tags` and publish are `400` on a proxy or a group. An unknown package is `404` and remembered for
 `proxy.negative_cache_ttl`; an unreachable upstream is `502`, or the stale
 cached copy with `Warning: 110`.
+
+A publish over the account's configured limit is `429` with `Retry-After`;
+[docs/operations.md](operations.md) has the limits and how to change them.
 
 ## Cargo (sparse index)
 
@@ -240,6 +244,38 @@ current set in one transaction; a pattern is an exact name or a prefix
 ending in `*` after a `/` or a `.`, and the first `allow` rule closes the
 repository to everything it does not match. `opencargo mcp sync [--repo R]
 [--full]` runs the same code from the command line.
+## Raw (generic files)
+
+```
+GET    /raw/{repo}/{path}                          Also HEAD
+PUT    /raw/{repo}/{path}                          Store the body at that path
+DELETE /raw/{repo}/{path}
+GET    /api/v1/raw/{repo}/files?prefix=&page=      Listing, 50 per page
+```
+
+No protocol: one path, one file, any client that speaks HTTP.
+`curl -u user:token -T ./tool.tar.gz {base_url}/raw/{repo}/dist/tool.tar.gz` stores it,
+`curl -O {base_url}/raw/{repo}/dist/tool.tar.gz` reads it back. A path is a
+`/`-separated list of non-empty segments, at most 450 bytes (the bound the
+physical key leaves, not a round number), with no `.`, `..` or first
+segment starting with `_`; anything else is `400`.
+
+A PUT into a `hosted` repository answers `201` when it stores bytes and `200` when the
+path already held exactly those bytes; other bytes replace the file, and the ones it held
+are queued for reclamation rather than deleted under a reader. Bodies are streamed and
+capped at 5 GiB. The `Content-Type` sent is kept and served back, defaulting to
+`application/octet-stream`; since the uploader chooses it, every read also carries
+`Content-Disposition: attachment`, so stored bytes are downloaded and never rendered on
+the registry's own origin. `X-Checksum-Sha256` on a PUT is checked against the body
+before anything is recorded (`400` on a mismatch); every read answers with that header and
+with the digest as its `ETag`. Writing needs `write` on the repository, deleting needs
+`delete` — the matrix column no other format uses, so a publisher can add a file without
+being able to remove one. A `401` carries `WWW-Authenticate: Basic`.
+
+A `proxy` relays its upstream, keeping a body for five minutes and verifying it against the
+`X-Checksum-Sha256` the upstream announced, if any. A `group` serves the first member that
+holds the path, and its listing merges its hosted members the same way. The listing reads
+at most 1000 paths per member and says `truncated` when a member had more.
 
 ## Administration
 
@@ -258,7 +294,7 @@ PUT    /api/v1/users/{username}
 DELETE /api/v1/users/{username}
 PUT    /api/v1/users/{username}/password           {current_password, new_password}
 GET    /api/v1/users/{username}/tokens
-POST   /api/v1/users/{username}/tokens             {name, expires_in_days}  -> one-time token
+POST   /api/v1/users/{username}/tokens             {name, expires_in_days, scope?}  -> one-time token
 DELETE /api/v1/users/{username}/tokens/{id}
 GET    /api/v1/users/{username}/permissions
 PUT    /api/v1/users/{username}/permissions/{repo} {can_read, can_write, can_delete, can_admin}
@@ -273,11 +309,31 @@ POST   /api/v1/webhooks/{id}/test
 
 GET    /api/v1/system/audit?page=1&size=50
 
+GET    /api/v1/routing-rules                       {rules[], snapshot_version}
+POST   /api/v1/routing-rules                       {name, format, patterns[], except[], effect, targets[]}
+GET    /api/v1/routing-rules/{name}
+PUT    /api/v1/routing-rules/{name}
+DELETE /api/v1/routing-rules/{name}                -> {deleted, still_refused_by[]}
+POST   /api/v1/routing-rules/explain               {repository, name, candidate?}
+
 GET    /api/v1/policy/report?since=24h&repo=&rule=&page=1&size=50   Policy report (admin)
 DELETE /api/v1/policy/report?user=alice | ?user_id=17            Erase one user's rows -> {deleted}
 GET    /api/v1/policy/rules                                       Effective rules of every proxy
 GET    /api/v1/me/policy?since=&repo=&rule=&page=&size=           The caller's own rows
 ```
+
+Routing rules: which members of a group may answer for a name, admin only.
+`effect` is `allow_members` (the hosted repositories in `targets`),
+`allow_hosted` (any hosted repository of the format, present and future) or
+`deny`. A rule applies to every repository of its format: a request carrying a
+scope field is refused, not ignored. `patterns` are compared on a coarsened key
+(case folded, plus the format's own equivalences), `except` on exact store
+identity and never as a glob. `explain` answers the members the resolver would
+consult, each `admitted` or `refused_by` naming **every** rule that refuses,
+with `match_key`, `ident_key` and `snapshot_version`; `candidate` tries a rule
+that is not stored. A refusal is never visible to a registry client: the group
+answers its usual 404 and no header, body or status names a rule. See
+[routing.md](routing.md).
 
 Policy report: a proxy repository with at least one rule enabled in
 `[policy.<repo>]` records every artifact it serves (actor, artifact, time)
@@ -299,6 +355,49 @@ named alike keeps its rows. The erasure is audited as `policy.erase` with
 `deleted=N` as its target, never the name. `/me/policy` is forced to the
 caller's own rows (a DB user's, every token included, or the config token's)
 whatever the query says.
+
+## Scoped tokens
+
+A token carries a scope. Without one it is `{"kind":"inherit"}`: every right
+its bearer holds, which is what every token was before scopes. With one it is
+`{"kind":"limited","grants":[...]}`, and each grant is a selector plus the
+actions it allows there:
+
+```json
+{ "on": "repo",    "repo": "libs-*",            "actions": ["read", "write"] }
+{ "on": "package", "repo": "npm", "package": "@acme/*", "actions": ["read"] }
+{ "on": "admin",   "domain": "repos",           "actions": ["read"] }
+{ "on": "account", "account": "ci",             "actions": ["read"] }
+```
+
+A scope only ever removes: the effective right is what the bearer may do at
+that instant, intersected with what the token allows, so a scope never
+outlives a revoked grant and never exceeds the role behind it. `*` is the only
+metacharacter and covers any substring, `/` included, because four of the
+seven formats put `/` inside a name. Repository names are compared in
+lowercase on both sides. Actions are `read`, `write`, `delete` and `admin`
+(the rung promotion and cache purge ask for).
+
+Patterns are resolved to repositories once, when the token is issued: a
+repository created afterwards is outside the scope, and a name retired and
+recreated is a different repository that no earlier scope reaches. A scope is
+immutable — changing one means revoking the token and issuing another.
+
+A scoped token is refused on the whole administrative API, including on its
+own account, and it issues no credential of any kind. `admin:*` grants
+therefore exist in read only, and `webhooks` even in read is not a write:
+a subscription is a standing read of every repository that no repository
+selector can narrow. Out of scope the answer is `403` with
+`{"code":"insufficient_scope"}`, never the `401` that would send a client
+looking for credentials it already has.
+
+Scoped tokens carry a form of their own (`trgs_` beside `trg_`). A binary
+that predates scopes does not recognise it and refuses it, so rolling an image
+back never turns a restricted credential into a full one.
+
+**Configuration tokens (`auth.static_tokens`) have no scope**: they are
+operations keys, not identities. To scope a CI, give it an account and a
+token, not a configuration key.
 
 Repository names match `[a-z0-9][a-z0-9._-]{0,63}` without `..`. `type` is
 `hosted`, `proxy` (requires `upstream`, an `http(s)` URL) or `group`
@@ -378,6 +477,11 @@ GET    /api/v1/packages?q=&repo=&page=
 GET    /api/v1/packages/{name}
 GET    /api/v1/search?q=
 ```
+
+A search result carries `source`: `hosted` for a package this server holds,
+`cached` for one a proxy member served, with the `repository` that answers for
+it and `last_seen`. A hosted package wins a name a proxy also serves, and a
+cached row has no package page: it is fetched through its repository.
 
 ## WebSocket events
 

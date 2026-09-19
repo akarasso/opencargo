@@ -199,12 +199,7 @@ async fn storage(cfg: &config::Config, command: StorageCommand) -> anyhow::Resul
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "opencargo=info,tower_http=info".into()),
-        )
-        .init();
+    opencargo::telemetry::logging::init();
 
     let cli = Cli::parse();
 
@@ -279,6 +274,10 @@ async fn main() -> anyhow::Result<()> {
                 .to_std()
                 .unwrap_or(std::time::Duration::from_secs(60));
             tokio::spawn(server::start_sso_probe(app_state.sso.clone(), probe_every));
+            tokio::spawn(server::start_routing_refresh(
+                app_state.routing.clone(),
+                cfg.routing.refresh(),
+            ));
 
             // Spawn the periodic cleanup/GC task before the router consumes
             // app_state: the pre-release sweep needs cleanup.enabled, the proxy

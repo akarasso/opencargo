@@ -9,6 +9,7 @@ use chrono::{DateTime, Duration, TimeZone, Utc};
 use common::fakes::FakeDb;
 use opencargo::adapters::sqlite::SqliteStores;
 use opencargo::domain::identity::{Authority, IdentityKey, Outage};
+use opencargo::domain::TokenScope;
 use opencargo::error::StoreError;
 use opencargo::ports::handoffs::{Consumption, LoginHandoffStore, NewHandoff};
 use opencargo::ports::identities::{Admission, DisabledBy, IdentityStore};
@@ -437,6 +438,7 @@ fn new_token<'a>(user: i64, id: &'a str, prefix: &'a str) -> NewToken<'a> {
         prefix,
         token_hash: "h",
         expires_at: None,
+        scope: &TokenScope::Inherit,
     }
 }
 

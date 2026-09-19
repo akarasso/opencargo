@@ -4,7 +4,7 @@
 //! generated client config is keyed on it, so a record whose name does not
 //! have that shape is refused rather than stored.
 
-use crate::domain::{DomainError, FormatRules};
+use crate::domain::{compile_pattern, DomainError, FormatRules, Pattern};
 
 pub struct McpRules;
 
@@ -24,6 +24,20 @@ fn invalid(what: &str, value: &str) -> DomainError {
 }
 
 impl FormatRules for McpRules {
+    /// A server name is already its own canonical spelling: the namespace and
+    /// the leaf are matched byte for byte, so the three keys are the name.
+    fn ident_key(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn match_key(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn canonical_pattern(&self, pattern: &str) -> Result<Pattern, DomainError> {
+        compile_pattern(pattern, str::to_string)
+    }
+
     fn validate(&self, name: &str) -> Result<(), DomainError> {
         let Some((namespace, leaf)) = name.split_once('/') else {
             return Err(invalid("name", name));

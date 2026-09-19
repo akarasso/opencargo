@@ -32,7 +32,7 @@ pub async fn get_dist_tags(
 
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
 
     let leaf = DistTagsLeaf { name: package_name };
     let tags = first_hit(&cx(&state, auth, &repo), &repo, &leaf).await?;
@@ -44,10 +44,11 @@ struct TagTarget {
     tag: String,
 }
 
-async fn writable_tag_target(
+async fn tag_target(
     state: &AppState,
     params: &HashMap<String, String>,
     auth_user: Option<axum::Extension<AuthUser>>,
+    action: crate::domain::RepoAction,
 ) -> AppResult<TagTarget> {
     let user = auth_user
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?
@@ -59,7 +60,7 @@ async fn writable_tag_target(
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Npm)?;
-    crate::registry::ensure_can_write(&*state.permissions, &repo, &user).await?;
+    crate::registry::ensure_action(&state.authorize(), &repo, &user, action).await?;
 
     let package = state
         .packages
@@ -81,7 +82,7 @@ pub async fn put_dist_tag(
     // Body is the version string, JSON-encoded (e.g., "\"1.0.0\"")
     let version: String = serde_json::from_slice(&body)
         .map_err(|_| AppError::BadRequest("invalid version string".to_string()))?;
-    let target = writable_tag_target(&state, &params, auth_user).await?;
+    let target = tag_target(&state, &params, auth_user, crate::domain::RepoAction::Write).await?;
 
     SetDistTag::new(state.packages.clone())
         .run(target.package.id, &target.tag, &version)
@@ -95,7 +96,7 @@ pub async fn delete_dist_tag(
     Path(params): Path<HashMap<String, String>>,
     auth_user: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<impl IntoResponse> {
-    let target = writable_tag_target(&state, &params, auth_user).await?;
+    let target = tag_target(&state, &params, auth_user, crate::domain::RepoAction::Delete).await?;
 
     ClearDistTag::new(state.packages.clone())
         .run(target.package.id, &target.tag)

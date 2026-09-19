@@ -2,6 +2,7 @@
 //! registry written in any language. Nothing here performs I/O, and nothing
 //! here names a transport, a driver or a storage format.
 
+pub mod cached;
 pub mod error;
 pub mod events;
 pub mod format_rules;
@@ -10,16 +11,20 @@ pub mod identity;
 pub mod import;
 pub mod kinds;
 pub mod layout;
+pub mod limits;
 pub mod names;
 pub mod permission;
 pub mod policy;
 pub mod proxy;
 pub mod repository;
 pub mod resolve;
+pub mod scope;
+pub mod routing;
 pub mod user;
 pub mod vulns;
 pub mod webhook;
 
+pub use cached::{CachedPackage, Sighting};
 pub use error::{Action, DomainError, Resource};
 pub use events::{
     announce, Audience, DomainEvent, PackagePromotion, PackageRelease, ResolutionCounts,
@@ -28,6 +33,7 @@ pub use format_rules::FormatRules;
 pub use governance::{AllowRule, Decision, Drift, Effect, Fingerprint, GateMode};
 pub use identity::CredentialKind;
 pub use kinds::{Format, RepoKind, Visibility};
+pub use limits::{LimitScope, PublishLimit, PublishLimits};
 pub use names::{
     validate_npm_read_name, validate_oci_tag, validate_package_name, validate_version,
 };
@@ -39,6 +45,15 @@ pub use proxy::{
 };
 pub use repository::{DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version};
 pub use resolve::{CacheRepo, Miss, Outcome, UrlRepo, Visit, Walk, MAX_GROUP_DEPTH};
+pub use routing::{
+    compile_pattern, Decision as RouteDecision, Effect as RouteEffect, MemberRef, Pattern,
+    RefusalSet, RouteSet, RoutingRule,
+};
+pub use scope::{
+    narrow, narrowed_source, normalize_account, normalize_repo_name, AdminDomain, Grant,
+    Incarnation, Pattern as ScopePattern, ScopeAction, ScopeError, Selector, Subject, TokenScope,
+    MAX_GRANTS,
+};
 pub use user::{ApiToken, User};
 pub use vulns::{ScanResult, Severity, VulnDetail};
 pub use webhook::{Subscription, Webhook};

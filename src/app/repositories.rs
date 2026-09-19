@@ -313,6 +313,7 @@ mod tests {
             user_id: Some(1),
             username: "root",
             admin: true,
+            scoped: false,
         }
     }
 

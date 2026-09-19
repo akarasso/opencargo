@@ -63,11 +63,12 @@ jobs:
       - name: Build frontend
         run: cd frontend && pnpm build
 
-      - name: Build
-        run: cargo build
-
+      # No `cargo build`: the three suites that need the binary take it from
+      # CARGO_BIN_EXE_opencargo, which `cargo test` builds itself. There is no
+      # [features] block either, so --all-features named a matrix that does not
+      # exist.
       - name: Clippy (deny warnings)
-        run: cargo clippy --all-targets --all-features -- -D warnings
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Install PyPI clients
         run: |

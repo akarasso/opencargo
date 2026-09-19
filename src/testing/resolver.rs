@@ -18,6 +18,7 @@ use crate::domain::UrlRepo;
 use crate::policy::{Pending, ResolutionRecorder};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamCreds};
 use crate::registry::resolve::Cx;
+use crate::registry::routing::{NoRefusals, RoutingRegistry};
 use crate::storage::{
     CheckReport, ObjectList, ObjectMeta, ObjectWriter, ReadStream, StorageBackend, StorageError,
     StoreIdentity, UploadPlan,
@@ -64,12 +65,17 @@ pub struct Resolver {
     pub creds: HashMap<String, UpstreamCreds>,
     pub policy: Recorder,
     pub base_url: String,
+    /// The rules a test scripts; empty unless it says otherwise.
+    pub routing: RoutingRegistry,
+    refusals: NoRefusals,
     repos: Arc<dyn crate::ports::repositories::RepositoryStore>,
     perms: Arc<dyn crate::ports::permissions::PermissionStore>,
     packages: Arc<dyn crate::ports::packages::PackageStore>,
     oci: Arc<dyn crate::ports::oci::OciStore>,
     maven: Arc<dyn crate::ports::maven::MavenFileStore>,
+    raw: Arc<dyn crate::ports::raw::RawFileStore>,
     search: Arc<dyn crate::ports::search::SearchIndex>,
+    cached: Arc<dyn crate::ports::search::CachedPackageIndex>,
     nuget: Arc<dyn crate::ports::nuget::NugetFeedRead>,
     proxy: ProxyEngine,
 }
@@ -98,12 +104,16 @@ impl Resolver {
             creds: HashMap::new(),
             policy,
             base_url: "http://localhost:8080".to_string(),
+            routing: RoutingRegistry::default(),
+            refusals: NoRefusals,
             repos: db.repositories(),
             perms: db.perms(),
             packages: db.packages(),
             oci: db.oci(),
             maven: db.maven(),
+            raw: db.raw(),
             search: db.search(),
+            cached: db.cached_packages(),
             nuget: db.nuget_feed(),
             proxy,
             fakes: db,
@@ -117,12 +127,17 @@ impl Resolver {
             packages: self.packages.as_ref(),
             oci: self.oci.as_ref(),
             maven: self.maven.as_ref(),
+            raw: self.raw.as_ref(),
             search: self.search.as_ref(),
+            cached: self.cached.as_ref(),
             nuget: self.nuget.as_ref(),
             proxy: &self.proxy,
             policy: &self.policy,
             creds: &self.creds,
             auth,
+            anonymous_read: true,
+            routing: &self.routing,
+            refusals: &self.refusals,
             url: UrlRepo(url),
             base_url: &self.base_url,
         }
@@ -215,5 +230,7 @@ pub fn user(id: i64, role: &str) -> AuthUser {
         role: role.to_string(),
         must_change_password: false,
         token_name: None,
+        api_token_id: None,
+        scope: crate::domain::TokenScope::Inherit,
     }
 }

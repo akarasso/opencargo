@@ -5,7 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
-<<<<<<< HEAD
+- `[limits.publish]`: the publish limiter is configurable per format and per
+  repository, and a refused publish answers `429` with `Retry-After` and the
+  limit it hit. The defaults are what was hard-coded before -- thirty npm
+  publishes and thirty PyPI uploads a minute per account -- and Cargo, Go and
+  NuGet publishes can now be metered too. See `docs/operations.md`.
 - Governance of MCP servers and agent skills, a preview. The `mcp` repository
   format mirrors the MCP registry (`proxy`), hosts internal servers and
   skills (`hosted`) and merges both for a team (`group`); migration 023
@@ -28,7 +32,6 @@ All notable changes to this project will be documented in this file.
   report whose kinds set the exit code. See `docs/import.md`.
 - The cargo sparse index now carries `v` and `rust_version` when a publish
   declared them.
-=======
 - One instance per database: a writer lease taken before any migration, so a
   second process on the same database refuses to start and names the holder.
   `opencargo migrate`, `storage migrate` and `storage reclaim` take it too.
@@ -40,7 +43,36 @@ All notable changes to this project will be documented in this file.
   `[backup]` schedule, an optional `[backup.sink]`, and a restore Job in
   the Helm chart and `k8s/restore-job.yaml`.
 - `GET /api/v1/system/instance` and an Instance tile on the System page.
->>>>>>> 76095200d22b5fddcab8eaddee6e9f65b4de4ccd
+- Group routing rules against dependency confusion: a rule says which members
+  of a group may answer for which names, applies to every repository of its
+  format present and future, and only ever removes members. Patterns are
+  compared on a coarsened key so a spelling (`@ACME/foo`, `Acme_Lib`,
+  `Acme.Lib`, `github.com/!acme/tool`) cannot walk around one; exceptions are
+  compared on exact store identity so they reopen no spelling but the one
+  written. A refused member receives no request and no cache entry, a client
+  gets the group's usual 404 with no rule named on the wire, and the first
+  refusal of a (name, repository, member) is audited with every rule that
+  refused. `POST /api/v1/routing-rules/explain` tries a rule, stored or not,
+  through the same decision the resolver makes. Migration 031, `[routing]` in
+  the configuration, a Routing admin screen. See `docs/routing.md`.
+- Scoped API tokens: a credential carries read-only or read/write, the
+  repositories it names by pattern, and an expiry. The effective right is the
+  intersection with what its bearer may do at that instant, so a token can
+  neither outlive a revoked grant nor exceed the role behind it; a scoped
+  credential is never an administrator and never mints another credential.
+  The scope decides in one place, on every registry route and on the event
+  stream. Migration 030 makes every existing token inherit its bearer's
+  rights, so nothing changes for a token issued before it.
+- Raw repositories (`hosted`, `proxy`, `group`): one path, one file, any
+  client that speaks HTTP — toolchains, firmware, build artifacts, anything
+  with no protocol of its own. `GET`/`PUT`/`DELETE /raw/{repo}/{path}`, a
+  listing at `GET /api/v1/raw/{repo}/files?prefix=`, a Raw files page, and
+  migration 032, which refuses to run while a repository is named `raw`
+  because the mount would shadow it.
+- Search covers what the server has served: a package fetched through a proxy
+  member is findable in the UI and in `npm search` from that moment, and a
+  search never leaves the process — no upstream is asked for its catalogue or
+  its ranking. Migration 029.
 - S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
   validated against MinIO, not yet against a hosted provider. Credentials
   come only from an allowlisted environment; TLS trusts the compiled-in
@@ -70,6 +102,10 @@ All notable changes to this project will be documented in this file.
   revoked at once and every credential it holds is refused.
 
 ### Changed
+- A proxied packument is rendered a version at a time and served from its
+  cached rendering, never built as a tree: a warm `pnpm install` of 109
+  packages used to peak at 146.7 MiB of resident memory and keep it for the
+  whole settle window; it now peaks at 44.7 and settles back to 17.3.
 - OCI: a `PATCH` whose `Content-Range` does not start where the upload
   stands is `416` with the current `Range`; an unknown upload id, or one
   started in another repository, is `404 BLOB_UPLOAD_UNKNOWN`; more than
@@ -107,6 +143,26 @@ All notable changes to this project will be documented in this file.
   database. Removing a token from `[auth].static_tokens` still revokes every
   registry token bought with it; a static-token registry token minted before
   this version is refused once and re-requested by the client.
+- A publish writes 37% fewer bytes to the disk. Migrations 027 and 028 rebuild
+  the placement-pin table as its own expiry index and drop the two indexes a
+  unique constraint already carried; the write-ahead log is checkpointed every
+  16 MiB instead of 4 and is truncated back afterwards. Durability is
+  unchanged. See `docs/write-amplification.md`.
+- The log is plain text unless stdout is a terminal, and the default
+  `RUST_LOG` is `opencargo=info` (`tower_http` logged nothing).
+
+### Security
+- A raw file is served with `Content-Disposition: attachment`: it is the only
+  body whose content type its uploader chooses, and an uploaded `text/html`
+  used to render as a document on the registry's own origin, where the CSP
+  allows a same-origin script and the admin's token lives in the SPA's
+  storage.
+- `/v2/token` resolves provenance from the credential that authenticated, not
+  from a re-read of the `Authorization` header. `docker login -u alice -p
+  trg_…` — a CI's ordinary gesture — used to buy a registry token with no
+  provenance and no scope, valid for an hour, that revoking the API token did
+  not kill. A scoped credential whose provenance does not resolve now issues
+  nothing rather than something wider.
 
 ## [0.1.0-rc.1] - 2026-09-17
 

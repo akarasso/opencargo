@@ -100,6 +100,10 @@ the System page shows it. No route names the endpoint, bucket or prefix.
   several instances against one prefix.
 - A cold proxy transfer is stored before it is served and read back to
   serve it; outside R2 the egress is billed twice.
+- An npm packument is cached twice: the upstream document, and the answer
+  rendered from it for the repository name and the `Accept` a client asked
+  under. The rendering is keyed by the document's digest, so a refreshed
+  packument leaves the old one for the idle sweep rather than replacing it.
 - The largest OCI blob is 5 GiB, the single-copy ceiling of CopyObject.
 - Running the suite on S3: `make test-s3` starts a pinned MinIO in Docker and
   runs `cargo test` with `OPENCARGO_TEST_STORAGE=s3`.

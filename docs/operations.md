@@ -63,6 +63,48 @@ The ownership pass is the kubelet's `fsGroup` walk plus, in `k8s/base`, a
 `[backup].to` under `/data` adds its snapshots to that walk, a `to` outside it
 does not. No measured figures are published yet.
 
+## Publish limits
+
+Publishing is counted per account in a sliding window. A refusal is a `429`
+carrying `Retry-After` and the limit it hit:
+
+```
+{"error":"publish rate limit reached for npm: 30 per 60s, retry in 41s"}
+```
+
+Out of the box that is thirty npm publishes and thirty PyPI uploads a minute
+per account, and nothing else. Cargo, Go and NuGet publishes are metered only
+once you configure them; OCI pushes and Maven deploys are never metered here,
+since both are several requests per artifact and a request count would not be
+an artifact count.
+
+One limit applies to a publish -- the most specific one configured:
+
+| entry | applies to |
+|---|---|
+| `[limits.publish.repository]` `<repo>` | every publish into that repository |
+| `[limits.publish.format]` `<format>` | every publish of that format elsewhere |
+| `[limits.publish]` `per_window` | every format with no entry of its own, and it drops the two shipped defaults |
+
+A repository entry replaces its format's rather than adding to it, and each
+entry counts in a window of its own: an account publishing into two
+repositories that both carry an entry has each allowance separately.
+
+### A CI account that publishes a batch
+
+Give the repository CI publishes into its own allowance and leave the rest of
+the server where it is:
+
+```toml
+[limits.publish.repository]
+npm-ci = { max = 2000, per = "1h" }
+```
+
+A limit is finite by construction: `0`, and a window over 24h, are refused at
+startup with every other problem in the config. Raise a limit rather than
+lift it -- there is no value that turns the meter off, because the meter is
+what keeps a stolen token from flooding the store.
+
 ## Backups
 
 ```toml
@@ -151,3 +193,49 @@ Litestream (pinned `v0.5.17`) can replicate the database off the volume; it is
 the operator's choice, not something opencargo ships. It replicates the
 database only: pair it with an object-storage `[storage]` backend or a storage
 sync, or a restore brings back rows whose objects were never copied.
+
+opencargo needs no setting for it, and that is a measured answer rather than an
+assumption: a drill of 7 985 publishes at `sync-interval: 1s`, killed with
+`kill -9`, restored every publish the server had acknowledged — including the
+ones acknowledged in the last second — and the `-wal` rose to a 6.1 MiB working
+set in the first thirty seconds and stayed there for the rest of the run.
+A write-ahead log that checkpoints is reused in place and never truncated, so a
+flat plateau is the healthy shape; the failure to watch for is a file still
+climbing when the process dies, which is what a replicator holding a read lock
+would produce.
+
+```yaml
+# litestream.yml, as a sidecar beside the server
+dbs:
+  - path: /data/db/opencargo.db
+    replicas:
+      - type: s3
+        bucket: registry-dr
+        path: opencargo
+        sync-interval: 1s
+```
+
+Restoring: stop the server first — `restore` needs `{db}.lock` exclusively, and
+restoring under a live instance is the one way to get two writers on two
+diverging databases sharing one artifact store. `litestream restore` produces a
+bare database file, while `opencargo restore --from <dir>` expects a snapshot
+directory, so the file is wrapped in one:
+
+```sh
+litestream restore -o /tmp/restored/db.sqlite /data/db/opencargo.db
+sha=$(sha256sum /tmp/restored/db.sqlite | cut -d' ' -f1)
+cat > /tmp/restored/manifest.json <<JSON
+{"version":1,"taken_at":"$(date -u +%Y-%m-%dT%H:%M:%SZ)","db_sha256":"$sha",
+ "storage":false,"storage_keys":0,"storage_bytes":0}
+JSON
+opencargo restore --from /tmp/restored --force
+```
+
+`--force` is what accepts a database-only snapshot. Taking this door rather than
+copying the file into place is what draws a fresh restore epoch and makes the
+server owe a `storage verify` before it reclaims anything again.
+
+Replaying the drill on your own instance: raise `[limits.publish].per_window`
+first. The shipped limiter caps a synthetic load at thirty publishes a minute,
+and a run that small never reaches the checkpoint window — the `-wal` then looks
+flat for a reason that has nothing to do with replication.

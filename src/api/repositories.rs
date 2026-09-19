@@ -97,7 +97,7 @@ pub async fn get_repository(
 
     // A private repo the caller cannot read must be indistinguishable from a
     // missing one, so the permission denial maps to the same 404.
-    crate::registry::ensure_can_read(&*state.permissions, &repo, Some(&caller))
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&caller))
         .await
         .map_err(|_| AppError::NotFound(format!("repository not found: {name}")))?;
 
@@ -175,7 +175,8 @@ pub async fn purge_cache(
     if repo.fmt()? == crate::domain::Format::Mcp && repo.kind()? == crate::domain::RepoKind::Proxy {
         state.mcp.purge(repo.id).await?;
     }
-    purge_repository(&state.proxy, state.repos.as_ref(), &repo).await?;
+    let purged = purge_repository(&state.proxy, state.repos.as_ref(), &repo).await?;
+    crate::app::search::forget(state.cached.as_ref(), &purged).await?;
 
     crate::api::record_audit(&state, &caller, "repo.purge_cache", Some(&name)).await;
 

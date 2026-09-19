@@ -10,6 +10,7 @@ import PackageDetail from './pages/PackageDetail.tsx';
 import Search from './pages/Search.tsx';
 import OciImages from './pages/OciImages.tsx';
 import GoModules from './pages/GoModules.tsx';
+import RawFiles from './pages/RawFiles.tsx';
 import Login from './pages/Login.tsx';
 import MyAccess from './pages/MyAccess.tsx';
 import SsoAccount from './pages/SsoAccount.tsx';
@@ -23,6 +24,7 @@ import PackageManagement from './pages/admin/PackageManagement.tsx';
 import AuditLog from './pages/admin/AuditLog.tsx';
 import PolicyReport from './pages/admin/PolicyReport.tsx';
 import McpGovernance from './pages/admin/McpGovernance.tsx';
+import Routing from './pages/admin/Routing.tsx';
 import System from './pages/admin/System.tsx';
 import PasswordChange from './pages/admin/PasswordChange.tsx';
 import Webhooks from './pages/admin/Webhooks.tsx';
@@ -75,6 +77,7 @@ render(
           <Route path="/search" component={Search} />
           <Route path="/oci" component={OciImages} />
           <Route path="/go" component={GoModules} />
+          <Route path="/raw" component={RawFiles} />
           <Route path="/account/access" component={MyAccess} />
           <Route path="/account/sso" component={SsoAccount} />
           <Route path="/login/sso/link" component={SsoLink} />
@@ -86,6 +89,7 @@ render(
           <Route path="/admin/audit" component={AuditLog} />
           <Route path="/admin/policy" component={PolicyReport} />
           <Route path="/admin/mcp" component={McpGovernance} />
+          <Route path="/admin/routing" component={Routing} />
           <Route path="/admin/system" component={System} />
           <Route path="/admin/password" component={PasswordChange} />
           <Route path="/admin/webhooks" component={Webhooks} />

@@ -134,6 +134,10 @@ pub enum Source {
         body: Cached,
         published: Option<DateTime<Utc>>,
     },
+    /// A path served through a raw proxy: nothing dates it.
+    Raw {
+        digest: Option<String>,
+    },
     Oci {
         body: Cached,
         served: Option<Cached>,

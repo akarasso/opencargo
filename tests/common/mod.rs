@@ -64,6 +64,8 @@ pub struct SpawnOpts {
     pub static_tokens: Vec<String>,
     /// `[server].endpoint_drain`.
     pub endpoint_drain: String,
+    /// `[limits]`.
+    pub limits: opencargo::config::LimitsConfig,
 }
 
 impl Default for SpawnOpts {
@@ -82,6 +84,7 @@ impl Default for SpawnOpts {
             lease: false,
             static_tokens: vec![STATIC_TOKEN.to_string()],
             endpoint_drain: "0s".to_string(),
+            limits: Default::default(),
         }
     }
 }
@@ -173,6 +176,7 @@ fn test_config(tmp: &TempDir, base_url: &str, opts: SpawnOpts) -> Config {
         proxy: opts.proxy,
         repositories: opts.repositories,
         vuln_scan: opts.vuln,
+        limits: opts.limits,
         policy: opts.policy,
         mcp: opts.mcp,
         ..Default::default()
@@ -605,6 +609,14 @@ pub struct ProxyOpts {
     pub upstream_auth: Option<UpstreamAuth>,
     pub token_realms: Vec<String>,
     pub file_hosts: Vec<String>,
+}
+
+/// A `[limits]` section as an operator would write it, read through the real
+/// loader so a test never bypasses the rules a config file goes through.
+pub fn limits(section: &str) -> opencargo::config::LimitsConfig {
+    let config: Config = toml::from_str(section).expect("a readable [limits] section");
+    config.validate().expect("a valid [limits] section");
+    config.limits
 }
 
 pub fn hosted(name: &str, fmt: RepositoryFormat, vis: Visibility) -> RepositoryConfig {

@@ -15,6 +15,10 @@ use super::super::strategy::CacheKey;
 pub struct Cached {
     pub entry: CacheEntry,
     pub stale: bool,
+    /// Whether this answer cost an upstream exchange -- a fill or a
+    /// revalidation -- rather than being served from a fresh row. A caller
+    /// that writes on what it learned keeps the write off the warm path.
+    pub exchanged: bool,
 }
 
 impl Cached {

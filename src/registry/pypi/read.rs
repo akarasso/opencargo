@@ -19,7 +19,7 @@ use super::{PypiError, PypiResult};
 
 async fn open(state: &AppState, repo_name: &str, auth: Option<&AuthUser>) -> Result<Repository, AppError> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
-    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
     crate::registry::ensure_format(&repo, Format::Pypi)?;
     Ok(repo)
 }

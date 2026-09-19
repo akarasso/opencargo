@@ -2,6 +2,8 @@
 
 use chrono::{DateTime, Utc};
 
+use super::scope::TokenScope;
+
 /// An account. The password hash travels with it because checking a login is
 /// the only thing anything ever does with the account, and neither the hash
 /// nor this type ever reaches a response body.
@@ -33,6 +35,9 @@ pub struct ApiToken {
     pub expires_at: Option<DateTime<Utc>>,
     pub last_used_at: Option<DateTime<Utc>>,
     pub created_at: DateTime<Utc>,
+    /// What the credential narrows its bearer to; `Inherit` is every right
+    /// the bearer holds, which is what every token was before scopes.
+    pub scope: TokenScope,
 }
 
 impl ApiToken {
@@ -62,6 +67,7 @@ mod tests {
             expires_at,
             last_used_at: None,
             created_at: at(9),
+            scope: TokenScope::Inherit,
         }
     }
 

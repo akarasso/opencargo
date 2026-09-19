@@ -92,8 +92,15 @@ fn backup(tmp: &tempfile::TempDir, busy_for: usize) -> (Backup, Arc<Db>, Arc<Sta
 }
 
 fn plan(tmp: &tempfile::TempDir) -> BackupPlan {
+    plan_into(tmp, "to")
+}
+
+/// Two runs of one test land in the same millisecond on an idle machine, and
+/// a snapshot directory is named to the millisecond: each run gets its own
+/// destination rather than racing the clock for a name.
+fn plan_into(tmp: &tempfile::TempDir, dir: &str) -> BackupPlan {
     BackupPlan {
-        to: tmp.path().join("to"),
+        to: tmp.path().join(dir),
         storage: false,
         force: false,
         keep: 3,
@@ -113,7 +120,7 @@ async fn a_busy_checkpoint_is_retried_and_recorded() {
     assert!(state.get(LAST_BACKUP_AT).await.unwrap().is_some());
 
     let (brief, _, state) = backup(&tmp, 2);
-    let snapshot = brief.run(&plan(&tmp)).await.unwrap();
+    let snapshot = brief.run(&plan_into(&tmp, "to-second")).await.unwrap();
     assert!(snapshot.wal_truncated);
     assert_eq!(snapshot.checkpoint_attempts, 3);
     assert_eq!(state.get(LAST_BACKUP_WAL).await.unwrap().as_deref(), Some("truncated"));

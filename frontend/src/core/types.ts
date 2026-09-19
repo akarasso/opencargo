@@ -34,7 +34,7 @@ export interface RecentVersion {
 }
 
 export type RepoType = 'hosted' | 'proxy' | 'group';
-export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go' | 'pypi' | 'maven' | 'nuget' | 'mcp';
+export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go' | 'pypi' | 'maven' | 'nuget' | 'mcp' | 'raw';
 export type RepoVisibility = 'public' | 'private';
 
 export interface Repository {
@@ -97,6 +97,10 @@ export interface SearchResult {
   name: string;
   latest_version: string;
   description: string;
+  /** 'hosted': a package this server holds; 'cached': one a proxy member served. */
+  source: 'hosted' | 'cached';
+  repository: string;
+  last_seen: string | null;
 }
 
 export interface SearchResponse {
@@ -429,4 +433,62 @@ export interface InstanceStatus {
   shutdown_grace_secs: number;
   endpoint_drain_secs: number;
   open_http_connections: number;
+}
+
+// --- Routing rules -------------------------------------------------------------
+
+/** One rule as the admin API returns it; targets are repository incarnations. */
+export interface RoutingRule {
+  name: string;
+  format: string;
+  patterns: string[];
+  except: string[];
+  effect: 'deny' | 'allow_hosted' | 'allow_members';
+  targets: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RoutingRules {
+  rules: RoutingRule[];
+  snapshot_version: number;
+}
+
+export interface ExplainedMember {
+  name: string;
+  kind: string;
+  admitted: boolean;
+  /** Every rule that refuses, in name order — never one chosen out of them. */
+  refused_by: string[];
+  /** Refused because this node has not refreshed its rules within the bound. */
+  stale: boolean;
+}
+
+export interface Explanation {
+  match_key: string;
+  ident_key: string;
+  snapshot_version: number;
+  members: ExplainedMember[];
+}
+
+// --- Raw files -----------------------------------------------------------------
+
+/** One path of a raw repository, as `GET /api/v1/raw/{repo}/files` lists it. */
+export interface RawFileRow {
+  path: string;
+  repository: string;
+  size: number;
+  sha256: string;
+  contentType: string | null;
+  uploadedBy: string;
+  uploadedAt: string;
+}
+
+export interface RawFilesResponse {
+  files: RawFileRow[];
+  total: number;
+  page: number;
+  pageSize: number;
+  hasNext: boolean;
+  truncated: boolean;
 }

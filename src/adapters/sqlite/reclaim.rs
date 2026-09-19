@@ -38,9 +38,10 @@ pub(crate) const REFERENCED: &str = "
 /// Every port's contribution, as one union.
 fn referenced() -> String {
     format!(
-        "{REFERENCED} UNION ALL {} UNION ALL {}",
+        "{REFERENCED} UNION ALL {} UNION ALL {} UNION ALL {}",
         super::pypi::REFERENCED,
-        super::mcp::REFERENCED
+        super::mcp::REFERENCED,
+        super::raw::REFERENCED
     )
 }
 
@@ -129,8 +130,11 @@ pub(crate) async fn spend_pins(
         return Ok(Err(revoked));
     }
     for pin in tokens {
-        sqlx::query("DELETE FROM reclaim_pins WHERE token = ?1")
+        // Keyed on the physical key, which is the pin's only index since 027;
+        // the token stays in the predicate because it is what fences.
+        sqlx::query("DELETE FROM reclaim_pins WHERE physical_key = ?2 AND token = ?1")
             .bind(&pin.token)
+            .bind(&pin.physical_key)
             .execute(&mut **tx)
             .await?;
     }
@@ -630,8 +634,8 @@ impl ReclaimStore for SqliteReclaimStore {
         limit: u32,
     ) -> Result<u64, StoreError> {
         let done = sqlx::query(
-            "DELETE FROM reclaim_pins WHERE token IN (
-                 SELECT token FROM reclaim_pins WHERE until <= ?1 ORDER BY until LIMIT ?2)",
+            "DELETE FROM reclaim_pins WHERE (until, token) IN (
+                 SELECT until, token FROM reclaim_pins WHERE until <= ?1 ORDER BY until LIMIT ?2)",
         )
         .bind(bind_ts(cutoff(grace, now)))
         .bind(i64::from(limit))

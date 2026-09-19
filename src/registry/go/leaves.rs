@@ -1,11 +1,13 @@
 use bytes::Bytes;
+use chrono::Utc;
 use serde_json::Value;
 
-use crate::domain::{CacheRepo, Format, Outcome, Package, Version};
+use crate::app::search;
+use crate::domain::{CacheRepo, Format, Outcome, Package, Sighting, Version};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
 use crate::proxy::{IntoPayload, Payload};
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 use super::escape::unescape;
 use super::upstream::{FileKind, GoArtifact, GoUpstream};
@@ -43,9 +45,49 @@ async fn fetch_bytes(
 ) -> Result<Outcome<Bytes>, ResolveError> {
     let engine = cx.proxy;
     Ok(match engine.fetch(&GoUpstream, up, member, a).await? {
-        Outcome::Found(cached) => Outcome::Found(engine.bytes(&cached).await?),
+        Outcome::Found(cached) => {
+            let bytes = engine.bytes(&cached).await?;
+            remember(cx, member, cached.exchanged, a, &bytes).await;
+            Outcome::Found(bytes)
+        }
         Outcome::NotFound => Outcome::NotFound,
     })
+}
+
+/// A module proxy serves no description, and only the two documents that are
+/// about the module as a whole say which version is newest: a file fetch names
+/// a version the client asked for, which is not that.
+async fn remember(
+    cx: &Cx<'_>,
+    member: CacheRepo<'_>,
+    exchanged: bool,
+    a: &GoArtifact,
+    body: &Bytes,
+) {
+    let module = match a {
+        GoArtifact::List { module } | GoArtifact::Latest { module } => module,
+        GoArtifact::File { module, .. } => module,
+    };
+    let latest = match a {
+        GoArtifact::List { .. } => String::from_utf8_lossy(body)
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty())
+            .map(String::from),
+        GoArtifact::Latest { .. } => serde_json::from_slice::<Value>(body)
+            .ok()
+            .and_then(|doc| doc.get("Version").and_then(Value::as_str).map(String::from)),
+        GoArtifact::File { .. } => None,
+    };
+    let name = unescape(module);
+    let seen = Sighting {
+        repository_id: member.0.id,
+        format: Format::Go,
+        name: &name,
+        description: None,
+        latest_version: latest.as_deref(),
+    };
+    search::remember(cx.cached, exchanged, &seen, Utc::now()).await;
 }
 
 /// `Found` only when the member knows the module, even with no versions.
@@ -55,6 +97,10 @@ pub struct ListLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for ListLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::built(unescape(&self.module))
+    }
     type Out = Vec<String>;
 
     async fn hosted(
@@ -98,6 +144,10 @@ pub struct LatestLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for LatestLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::built(unescape(&self.module))
+    }
     type Out = Value;
 
     async fn hosted(
@@ -140,6 +190,10 @@ pub struct FileLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for FileLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::built(unescape(&self.module))
+    }
     type Out = Payload;
 
     async fn hosted(

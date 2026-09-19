@@ -533,6 +533,49 @@ async fn test_ws_reader_gets_hint_not_payload_for_private_repo() {
     assert_eq!(ev["data"]["package"], "@pub/open");
 }
 
+/// A scoped credential caps the stream the way it caps the API: its bearer is
+/// an administrator, and the connection still hears an authenticated feed —
+/// the anonymized hint for a private repository, never its payload.
+#[tokio::test]
+async fn test_ws_a_scoped_credential_does_not_hear_the_admin_feed() {
+    let (base_url, _handle, _tmp) = setup(true).await;
+    let client = reqwest::Client::new();
+
+    create_user(&client, &base_url, "test-token", "robot", "admin").await;
+    let scoped = client
+        .post(format!("{base_url}/api/v1/users/robot/tokens"))
+        .bearer_auth("test-token")
+        .json(&json!({
+            "name": "ws",
+            "scope": {
+                "kind": "limited",
+                "grants": [{ "on": "repo", "repo": "npm-pub", "actions": ["read"] }]
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let scoped = scoped["token"].as_str().expect("a token").to_string();
+
+    let mut ws = ws_connect(&base_url).await;
+    let hello = ws_auth(&mut ws, Some(&scoped)).await;
+    assert_eq!(hello["type"], "hello", "got {hello:?}");
+    assert_eq!(hello["role"], "admin", "the role is unchanged");
+    settle().await;
+
+    publish_package(&client, &base_url, "test-token", "npm-secret", "@sec/hidden", "1.0.0").await;
+
+    let frame = recv_json(&mut ws).await;
+    assert_eq!(
+        frame["type"], "registry.changed",
+        "a scoped credential hears the hint, not the private payload: {frame:?}"
+    );
+    assert!(frame["data"].get("package").is_none(), "{frame:?}");
+}
+
 // ---------------------------------------------------------------------------
 // (e) application-level keepalive
 // ---------------------------------------------------------------------------

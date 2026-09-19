@@ -39,6 +39,7 @@ use crate::ports::leases::ServerStateStore;
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::ports::secrets::ServerSecretStore;
 use crate::ports::signing::RegistryTokenSigner;
+use crate::auth::publish_limit::PublishMeter;
 use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
@@ -56,8 +57,9 @@ use crate::ports::permissions::PermissionStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::pypi::PypiFileStore;
+use crate::ports::raw::RawFileStore;
 use crate::ports::repositories::RepositoryStore;
-use crate::ports::search::SearchIndex;
+use crate::ports::search::{CachedPackageIndex, SearchIndex};
 use crate::ports::tokens::{NewToken, TokenStore};
 use crate::ports::users::{NewUser, UserPatch, UserStore};
 use crate::ports::webhooks::{NewWebhook, WebhookStore};
@@ -97,7 +99,8 @@ pub struct AppState {
     pub base_url: String,
     pub metrics_handle: PrometheusHandle,
     pub registry_tokens: Arc<dyn RegistryTokenSigner>,
-    pub publish_rate_limiter: Arc<RateLimiter>,
+    /// Every metered publish is counted here, against the configured limits.
+    pub publish_meter: Arc<PublishMeter>,
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
     pub webhooks: Arc<dyn WebhookStore>,
@@ -107,9 +110,16 @@ pub struct AppState {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub cached: Arc<dyn CachedPackageIndex>,
     pub nuget_feed: Arc<dyn crate::ports::nuget::NugetFeedRead>,
     /// NuGet's registration memo, per server: its keys are repository ids.
     pub nuget_documents: Arc<crate::registry::nuget::merged::Documents>,
+    /// The compiled routing rules every member enumeration decides against.
+    pub routing: Arc<crate::registry::routing::RoutingRegistry>,
+    pub routing_rules: Arc<dyn crate::ports::routing::RoutingRuleStore>,
+    /// Where a refused member goes: one audit line per first sighting, then
+    /// counters.
+    pub refusals: Arc<dyn crate::registry::routing::RefusalRecorder>,
     pub oci: Arc<dyn OciStore>,
     pub pypi: Arc<dyn PypiFileStore>,
     /// Bounds the archives inspected at once; inspection is CPU on a blocking thread.
@@ -117,6 +127,7 @@ pub struct AppState {
     /// Parsed upstream PyPI pages, shared by the leaves and the policy facts.
     pub pypi_pages: Arc<crate::registry::pypi::memo::PageMemo>,
     pub maven: Arc<dyn MavenFileStore>,
+    pub raw: Arc<dyn RawFileStore>,
     pub reclaim: Arc<dyn ReclaimStore>,
     pub referenced: Arc<dyn ReferencedKeys>,
     pub multipart: Arc<dyn MultipartLedger>,
@@ -183,6 +194,16 @@ pub struct Started {
 }
 
 impl AppState {
+    /// The one authority on what a caller may do, built per request from the
+    /// two stores it reads and the anonymous-read setting.
+    pub fn authorize(&self) -> crate::app::authorize::Authorize<'_> {
+        crate::app::authorize::Authorize {
+            perms: &*self.permissions,
+            repos: &*self.repos,
+            anonymous_read: self.auth.anonymous_read,
+        }
+    }
+
     /// The gate every publish passes before its first write.
     pub fn publish_gate(&self) -> PublishGate {
         PublishGate::new(self.vuln_scanner.clone(), self.vuln_scan_config.clone())
@@ -210,6 +231,19 @@ impl AppState {
 
     pub fn publish_pypi_file(&self) -> PublishPypiFile {
         PublishPypiFile::new(self.pypi.clone(), self.repos.clone(), self.placer())
+    }
+
+    pub fn put_raw_file(&self) -> crate::app::raw::PutRawFile {
+        crate::app::raw::PutRawFile::new(
+            self.raw.clone(),
+            self.repos.clone(),
+            self.storage.clone(),
+            self.placer(),
+        )
+    }
+
+    pub fn delete_raw_file(&self) -> crate::app::raw::DeleteRawFile {
+        crate::app::raw::DeleteRawFile::new(self.raw.clone())
     }
 
     pub fn promote_version(&self) -> PromoteVersion {
@@ -345,7 +379,10 @@ const MAVEN_PROMOTION_WINDOW: chrono::Duration = chrono::Duration::minutes(10);
 
 /// The path prefixes the protocol adapters mount under the root, which no
 /// new repository may be named after.
-pub const RESERVED_NAMES: &[&str] = &[crate::registry::maven::MOUNT];
+pub const RESERVED_NAMES: &[&str] = &[
+    crate::registry::maven::MOUNT,
+    crate::registry::raw::MOUNT,
+];
 
 /// Migrate a database and nothing else: the `opencargo migrate` subcommand.
 /// It takes the writer lease first, so it never replays migrations under a
@@ -739,6 +776,11 @@ pub async fn build_state(
 ) -> anyhow::Result<Started> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     config.validate()?;
+    let publish_limits = config
+        .limits
+        .publish
+        .resolve()
+        .map_err(|problems| anyhow::anyhow!(problems.join("\n  ")))?;
     let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
     ensure_directories(config)?;
     let lock = shared_lock(config)?;
@@ -796,6 +838,34 @@ pub async fn build_state(
     let vuln_scanner: Arc<dyn VulnFeed> = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
     let events = event_bus();
+    let routing_rules = stores.routing();
+    let routing = Arc::new(
+        crate::registry::routing::RoutingRegistry::load(
+            routing_rules.clone(),
+            config.routing.max_snapshot_age(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("routing rules: {e}"))?,
+    );
+    seed_routing_rules(
+        &crate::app::routing::RoutingRules::new(
+            routing_rules.clone(),
+            repos.clone(),
+            routing.clone(),
+            stores.audit(),
+            events.clone(),
+        ),
+        &config.routing.rules,
+    )
+    .await?;
+
+    let refusals: Arc<dyn crate::registry::routing::RefusalRecorder> =
+        Arc::new(crate::app::refusals::RefusalLog::new(
+            stores.audit(),
+            events.clone(),
+            config.routing.refusal_window(),
+        ));
+
     let policy_store = stores.policy();
     let policy = PolicyEngine::new(
         policy_store.clone(),
@@ -817,7 +887,7 @@ pub async fn build_state(
         base_url: config.server.base_url.clone(),
         metrics_handle,
         registry_tokens,
-        publish_rate_limiter: Arc::new(RateLimiter::new(30, 60)),
+        publish_meter: Arc::new(PublishMeter::new(publish_limits)),
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
         webhooks,
@@ -827,13 +897,18 @@ pub async fn build_state(
         repos,
         packages: stores.packages(),
         search: stores.search(),
+        cached: stores.cached_packages(),
         nuget_feed: stores.nuget_feed(),
         nuget_documents: Arc::new(crate::registry::nuget::merged::documents()),
+        routing,
+        routing_rules,
+        refusals,
         oci: stores.oci(),
         pypi: stores.pypi(),
         archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
         pypi_pages: Arc::new(crate::registry::pypi::memo::PageMemo::default()),
         maven: stores.maven(),
+        raw: stores.raw(),
         reclaim: stores.reclaim(),
         referenced: stores.referenced(),
         multipart: stores.multipart(),
@@ -1112,6 +1187,7 @@ fn auth_state(
             Arc::new(crate::registry::cargo::auth_rules::CargoRouteRules),
             Arc::new(crate::registry::pypi::auth_rules::PypiRouteRules),
             Arc::new(crate::registry::maven::auth_rules::MavenRouteRules),
+            Arc::new(crate::registry::raw::auth_rules::RawRouteRules),
             Arc::new(crate::registry::nuget::auth_rules::NugetRouteRules {
                 token_shaped: {
                     let authenticate = authenticate.clone();
@@ -1347,6 +1423,65 @@ pub async fn start_sso_probe(sso: Arc<crate::app::sso::Sso>, every: std::time::D
         sso.probe_all().await;
         if let Err(e) = sso.purge().await {
             warn!(error = %e, "failed to purge expired SSO handoffs");
+        }
+    }
+}
+
+/// Write the configured rules into an empty table, and say when the file and
+/// the table disagree — the one case where the file's silence would otherwise
+/// look like an applied change (D11).
+async fn seed_routing_rules(
+    rules: &crate::app::routing::RoutingRules,
+    configured: &[crate::config::RoutingRuleConfig],
+) -> anyhow::Result<()> {
+    if configured.is_empty() {
+        return Ok(());
+    }
+    let drafts: Vec<crate::app::routing::RuleDraft<'_>> = configured
+        .iter()
+        .map(|r| {
+            Ok(crate::app::routing::RuleDraft {
+                name: &r.name,
+                format: r.format.parse()?,
+                patterns: &r.patterns,
+                except: &r.except,
+                effect: &r.effect,
+                targets: &r.targets,
+                confirm_catch_all: r.confirm_catch_all,
+            })
+        })
+        .collect::<Result<Vec<_>, crate::domain::DomainError>>()
+        .map_err(|e| anyhow::anyhow!("routing.rules: {e}"))?;
+    let seeded = rules
+        .seed(&drafts, Utc::now())
+        .await
+        .map_err(|e| anyhow::anyhow!("routing.rules: {e}"))?;
+    if seeded.written > 0 {
+        tracing::info!(rules = seeded.written, "seeded the routing rules from the configuration");
+    }
+    if !seeded.drifted.is_empty() {
+        warn!(
+            rules = ?seeded.drifted,
+            "routing.rules in the configuration differ from the stored rules and are NOT applied:              the file seeds an empty table only; change them through the API"
+        );
+    }
+    Ok(())
+}
+
+/// Re-read the routing rules on a timer. A failure keeps the last valid
+/// snapshot and lets its age run: past `routing.max_snapshot_age` the node
+/// closes the surface the rules protect rather than serve the state from
+/// before a rule it may not have seen.
+pub async fn start_routing_refresh(
+    routing: Arc<crate::registry::routing::RoutingRegistry>,
+    every: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(every.max(std::time::Duration::from_secs(1)));
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        if let Err(e) = routing.refresh().await {
+            warn!(error = %e, "failed to refresh the routing rules");
         }
     }
 }
@@ -1708,6 +1843,20 @@ pub fn build_router(state: AppState) -> Router {
             "/api/v1/webhooks/{id}/test",
             post(crate::api::webhooks::test_webhook),
         )
+        .route(
+            "/api/v1/routing-rules",
+            get(crate::api::routing::list_rules).post(crate::api::routing::create_rule),
+        )
+        .route(
+            "/api/v1/routing-rules/{name}",
+            get(crate::api::routing::get_rule)
+                .put(crate::api::routing::update_rule)
+                .delete(crate::api::routing::delete_rule),
+        )
+        .route(
+            "/api/v1/routing-rules/explain",
+            post(crate::api::routing::explain_route),
+        )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
         .route("/api/v1/system/storage", get(crate::api::storage::storage_status))
         .route("/api/v1/system/instance", get(crate::api::system::instance_status))
@@ -1727,6 +1876,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/mcp/{repo}/servers", get(crate::api::mcp_admin::servers))
         .route("/api/v1/mcp/{repo}/evidence", get(crate::api::mcp_admin::evidence))
         .route("/api/v1/mcp/{repo}/approvals", post(crate::api::mcp_admin::decide))
+        .route("/api/v1/raw/{repo}/files", get(crate::api::raw::list_files))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),
@@ -1833,6 +1983,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(crate::registry::pypi::routes::routes())
         .merge(crate::registry::oci::routes::routes())
         .merge(crate::registry::maven::routes::routes())
+        .merge(crate::registry::raw::routes::routes())
         .merge(crate::registry::nuget::routes::routes())
         .merge(crate::registry::mcp::routes::routes())
         // Dashboard / frontend API + dependency graph — INSIDE the auth layer
@@ -2070,7 +2221,7 @@ async fn issue_login_token(
     state: &AppState,
     user_id: i64,
 ) -> Result<String, crate::error::StoreError> {
-    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_");
+    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_", false);
     let now = state.clock.now();
     state
         .tokens
@@ -2082,6 +2233,7 @@ async fn issue_login_token(
                 prefix: &raw_token[..16],
                 token_hash: &token_hash,
                 expires_at: Some(now + chrono::Duration::days(30)),
+                scope: &crate::domain::TokenScope::Inherit,
             },
             now,
         )

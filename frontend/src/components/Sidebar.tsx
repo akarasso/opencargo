@@ -54,6 +54,10 @@ export default function Sidebar() {
               <Icon name="code" />
               <span>Go modules</span>
             </A>
+            <A class="nav-link" href="/raw" activeClass="active" onClick={close}>
+              <Icon name="layers" />
+              <span>Raw files</span>
+            </A>
           </nav>
         </div>
 
@@ -123,6 +127,10 @@ export default function Sidebar() {
               <A class="nav-link" href="/admin/mcp" activeClass="active" onClick={close}>
                 <Icon name="terminal" />
                 <span>MCP governance</span>
+              </A>
+              <A class="nav-link" href="/admin/routing" activeClass="active" onClick={close}>
+                <Icon name="anchor" />
+                <span>Routing</span>
               </A>
               <A class="nav-link" href="/admin/system" activeClass="active" onClick={close}>
                 <Icon name="settings" />

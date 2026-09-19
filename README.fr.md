@@ -2,10 +2,13 @@
 
 Registry de packages universel, leger et auto-heberge, ecrit en Rust.
 
-- **Multi-format** : npm, Cargo, OCI/Docker, Go modules
-- **Binaire unique**, ~10 Mo, ~20 Mo de RAM
+- **Multi-format** : npm, Cargo, OCI/Docker, Go modules, PyPI, Maven, NuGet, fichiers bruts
+- **Binaire unique**, 17 Mio sur disque, 16 Mio de RAM au repos — [mesure](docs/performance.md)
 - **Zero JVM**, zero GC — SQLite embarque
-- **Proxy + cache** : cache transparent vers npmjs.org (Cargo, Go et OCI : hosted uniquement pour l'instant)
+- **Proxy + cache** : cache transparent vers les registres publics, pour les huit formats
+- **Recherche sur le cache** : un paquet proxifie est trouvable des qu'il a ete servi une fois
+- **Regles de routage** : un nom qui ne doit jamais sortir est refuse a la frontiere du group
+- **Jetons a portee** : lecture seule, depots nommes, expiration — l'intersection avec les droits du porteur
 - **Repos group** : un seul endpoint pour packages prives + publics
 - **Promotion de packages** : workflow dev → prod avec audit trail
 - **Permissions granulaires** : par utilisateur × par repository
@@ -111,6 +114,16 @@ username = "admin"
 # password genere automatiquement au premier lancement
 # Pour forcer : password = "mon-mdp"
 # En k8s : variable d'env OPENCARGO_ADMIN_PASSWORD
+
+[limits.publish]                   # limites de publication, docs/operations.md
+window = "1m"
+per_window = 500                   # par defaut : absent, seuls les formats ci-dessous sont limites
+
+[limits.publish.format]            # par defaut : npm = 30, pypi = 30
+npm = 500
+
+[limits.publish.repository]        # l'emporte sur l'entree de format, pour ce depot
+npm-ci = { max = 2000, per = "1h" }
 
 [proxy]
 default_ttl = "24h"

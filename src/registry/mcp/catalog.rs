@@ -19,7 +19,7 @@ use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
 use crate::ports::mcp::{CatalogRow, PageQuery};
 use crate::registry::cx;
-use crate::registry::resolve::view;
+use crate::registry::resolve::{view, Subject};
 use crate::server::AppState;
 
 const DEFAULT_LIMIT: i64 = 30;
@@ -30,14 +30,14 @@ const MAX_SEARCH_BATCHES: usize = 2;
 
 pub async fn open(state: &AppState, name: &str, auth: Option<&AuthUser>) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), name).await?;
-    crate::registry::ensure_can_read(&*state.permissions, &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
     crate::registry::ensure_format(&repo, Format::Mcp)?;
     Ok(repo)
 }
 
 /// The members a read walks, in group order, and the gate over them.
 pub async fn scope(state: &AppState, repo: &Repository, auth: Option<&AuthUser>) -> AppResult<(Vec<Repository>, Gates)> {
-    let members = view(&cx(state, auth, repo), repo).await?;
+    let members = view(&cx(state, auth, repo), repo, &Subject::listing()).await?;
     let gates = Gates::load(state.repos.as_ref(), state.mcp.as_ref(), &state.mcp_settings, repo).await?;
     Ok((members, gates))
 }

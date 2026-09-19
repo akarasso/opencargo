@@ -37,9 +37,7 @@ pub async fn list_audit(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    if caller.role != "admin" {
-        return Err(AppError::Forbidden("admin access required".to_string()));
-    }
+    crate::api::require_admin(&caller)?;
 
     let page = query.page.unwrap_or(1).max(1);
     let size = query.size.unwrap_or(50).clamp(1, 200);

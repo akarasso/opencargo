@@ -13,7 +13,6 @@ use base64::Engine;
 use serde_json::json;
 
 use crate::app::authenticate::{Authenticate, Credential, Presented, Refusal, Transport};
-use crate::domain::ApiToken;
 use crate::error::StoreError;
 
 pub use crate::app::authenticate::AuthUser;
@@ -286,13 +285,6 @@ pub(crate) async fn authenticate_bearer(
         Err(Refusal::Unavailable) => Err(StoreError::Unavailable),
         Err(Refusal::Invalid | Refusal::Throttled) => Ok(None),
     }
-}
-
-pub(crate) async fn live_api_token(
-    state: &AuthState,
-    raw_token: &str,
-) -> Result<Option<ApiToken>, StoreError> {
-    state.authenticate.live_api_token(raw_token).await
 }
 
 #[cfg(test)]

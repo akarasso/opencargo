@@ -341,6 +341,72 @@ async fn basic_credentials_buy_a_token_that_pushes() {
     );
 }
 
+/// `docker login -u user -p <scoped token>` is a Basic password, and the
+/// provenance has to survive it: the bought token carries the scope of the
+/// credential that paid for it, and dies with it.
+#[tokio::test]
+async fn a_scoped_token_presented_as_a_password_buys_a_token_that_keeps_its_scope() {
+    let s = spawn(true).await;
+    publisher(&s.base_url).await;
+    let client = Client::new();
+    let issued: Value = client
+        .post(format!("{}/api/v1/users/{USER}/tokens", s.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&json!({
+            "name": "robot",
+            "scope": {
+                "kind": "limited",
+                "grants": [{
+                    "on": "repo",
+                    "repo": "oci-private",
+                    "actions": ["read", "write"]
+                }]
+            }
+        }))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let scoped = issued["token"].as_str().expect("a token");
+    let id = issued["id"].as_str().expect("an id").to_string();
+
+    let bought = token(&s.base_url, Some(&basic_auth_header(USER, scoped)), "").await;
+    assert_eq!(
+        start_upload(&s.base_url, "oci-private/app", &bought)
+            .await
+            .status(),
+        StatusCode::ACCEPTED,
+        "in scope"
+    );
+    assert_eq!(
+        start_upload(&s.base_url, "oci-public/app", &bought)
+            .await
+            .status(),
+        StatusCode::FORBIDDEN,
+        "out of scope, and never a push it could not make with the credential"
+    );
+
+    let removed = client
+        .delete(format!(
+            "{}/api/v1/users/{USER}/tokens/{id}",
+            s.base_url
+        ))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::OK);
+    assert_eq!(
+        start_upload(&s.base_url, "oci-private/app", &bought)
+            .await
+            .status(),
+        StatusCode::UNAUTHORIZED,
+        "the bought token dies with the credential that paid for it"
+    );
+}
+
 #[tokio::test]
 async fn wrong_credentials_get_no_token() {
     let s = spawn(true).await;

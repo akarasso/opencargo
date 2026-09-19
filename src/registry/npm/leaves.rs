@@ -1,36 +1,78 @@
+use bytes::Bytes;
+use chrono::Utc;
 use serde_json::Value;
 
-use crate::domain::{CacheRepo, Format, Outcome};
+use crate::app::search;
+use crate::domain::{CacheRepo, Format, Outcome, Sighting};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
+use crate::proxy::strategy::CacheKey;
 use crate::proxy::{IntoPayload, Payload};
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
-use super::packument::{
-    dist_tags_map, hosted_packument, strip_versions_to_abbreviated, Packument,
-};
-use super::search::search_in_repo;
+use super::packument::{dist_tags_map, hosted_packument};
+use super::render::{self, Flavor};
+use super::search::{cached_in_repo, search_in_repo};
 use super::upstream::{NpmArtifact, NpmUpstream};
 
+/// The packument a client is served: already rendered, so nothing above
+/// this leaf holds the document as a tree.
 pub struct PackumentLeaf {
     pub name: String,
     pub abbreviated: bool,
 }
 
+impl PackumentLeaf {
+    fn flavor(&self) -> Flavor {
+        Flavor::of(self.abbreviated)
+    }
+
+    fn served(&self, body: Vec<u8>) -> Payload {
+        let mut payload = Payload::bytes(Bytes::from(body));
+        payload.content_type = Some(self.flavor().content_type().to_string());
+        payload
+    }
+
+    /// What a rendering is remembered under: everything it depends on, the
+    /// document it came from included. A packument that changes upstream,
+    /// or a server that moves, lands under a new key, so a rendering is
+    /// never invalidated -- only left behind for the sweep.
+    fn rendering(&self, cx: &Cx<'_>, source: Option<&str>) -> Option<CacheKey> {
+        Some(CacheKey {
+            kind: "npm-packument-rendered",
+            key: format!(
+                "{}|{}|{}|{}|{}",
+                cx.base_url,
+                cx.url.0,
+                self.name,
+                self.flavor().tag(),
+                source?
+            ),
+        })
+    }
+}
+
 #[async_trait::async_trait]
 impl Leaf for PackumentLeaf {
-    type Out = Packument;
+    type Out = Payload;
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
 
     async fn hosted(
         &self,
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
-    ) -> Result<Outcome<Packument>, ResolveError> {
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let built = hosted_packument(cx.packages, member, &self.name, self.abbreviated).await?;
-        Ok(match built {
-            Outcome::Found(json) => Outcome::Found(Packument { json, stale: false }),
-            Outcome::NotFound => Outcome::NotFound,
-        })
+        let Outcome::Found(mut json) = built else {
+            return Ok(Outcome::NotFound);
+        };
+        render::rewrite_tarball_urls(&mut json, cx.base_url, cx.url.0, &self.name);
+        let body = serde_json::to_vec(&json)
+            .map_err(|e| ResolveError::Internal(format!("packument is not serializable: {e}")))?;
+        Ok(Outcome::Found(self.served(body)))
     }
 
     async fn proxy(
@@ -38,7 +80,7 @@ impl Leaf for PackumentLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> Result<Outcome<Packument>, ResolveError> {
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let artifact = NpmArtifact::Metadata {
             name: self.name.clone(),
         };
@@ -46,17 +88,50 @@ impl Leaf for PackumentLeaf {
         let Outcome::Found(cached) = engine.fetch(&NpmUpstream, up, member, &artifact).await? else {
             return Ok(Outcome::NotFound);
         };
-        let bytes = engine.bytes(&cached).await?;
-        let mut json: serde_json::Value = serde_json::from_slice(&bytes)
-            .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
-        if self.abbreviated {
-            strip_versions_to_abbreviated(&mut json);
+        let key = self.rendering(cx, cached.entry.digest.as_deref());
+        if let Some(key) = &key {
+            if let Some(mut payload) = engine.derived(member, key).await? {
+                payload.stale = cached.stale;
+                return Ok(Outcome::Found(payload));
+            }
         }
-        Ok(Outcome::Found(Packument {
-            json,
-            stale: cached.stale,
-        }))
+        let raw = engine.bytes(&cached).await?;
+        let body = render::render(&raw, self.flavor(), cx.base_url, cx.url.0, &self.name)
+            .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
+        remember(cx, member, cached.exchanged, &raw, &self.name).await;
+        drop(raw);
+        let content_type = self.flavor().content_type();
+        let mut payload = match &key {
+            Some(key) => {
+                engine
+                    .put_derived(member, key, Bytes::from(body), content_type)
+                    .await?
+            }
+            None => self.served(body),
+        };
+        payload.stale = cached.stale;
+        Ok(Outcome::Found(payload))
     }
+}
+
+/// What a packument says about the package itself, so that a search answers
+/// for it: npm is the one format whose document carries a description.
+/// Two fields out of the packument's bytes, never a tree over the whole of
+/// it: the rendering path deliberately never builds one.
+async fn remember(cx: &Cx<'_>, member: CacheRepo<'_>, exchanged: bool, raw: &[u8], name: &str) {
+    let description = render::field(raw, "description").ok().flatten();
+    let tags = render::field(raw, "dist-tags").ok().flatten();
+    let seen = Sighting {
+        repository_id: member.0.id,
+        format: Format::Npm,
+        name,
+        description: description.as_ref().and_then(Value::as_str),
+        latest_version: tags
+            .as_ref()
+            .and_then(|t| t.get("latest"))
+            .and_then(Value::as_str),
+    };
+    search::remember(cx.cached, exchanged, &seen, Utc::now()).await;
 }
 
 pub struct TarballLeaf {
@@ -67,6 +142,10 @@ pub struct TarballLeaf {
 #[async_trait::async_trait]
 impl Leaf for TarballLeaf {
     type Out = Payload;
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
 
     async fn hosted(
         &self,
@@ -126,6 +205,10 @@ pub struct DistTagsLeaf {
 impl Leaf for DistTagsLeaf {
     type Out = Value;
 
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
+
     async fn hosted(
         &self,
         cx: &Cx<'_>,
@@ -145,30 +228,33 @@ impl Leaf for DistTagsLeaf {
         Ok(Outcome::Found(json))
     }
 
+    /// One field of the cached packument, never the document as a tree:
+    /// a tag list is a handful of strings whatever the packument weighs.
     async fn proxy(
         &self,
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
     ) -> Result<Outcome<Value>, ResolveError> {
-        let packument = PackumentLeaf {
+        let artifact = NpmArtifact::Metadata {
             name: self.name.clone(),
-            abbreviated: true,
         };
-        Ok(match packument.proxy(cx, member, up).await? {
-            Outcome::Found(mut p) => Outcome::Found(
-                p.json
-                    .get_mut("dist-tags")
-                    .map(Value::take)
-                    .unwrap_or_else(|| Value::Object(Default::default())),
-            ),
-            Outcome::NotFound => Outcome::NotFound,
-        })
+        let engine = cx.proxy;
+        let Outcome::Found(cached) = engine.fetch(&NpmUpstream, up, member, &artifact).await? else {
+            return Ok(Outcome::NotFound);
+        };
+        let raw = engine.bytes(&cached).await?;
+        let tags = render::field(&raw, "dist-tags")
+            .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
+        Ok(Outcome::Found(
+            tags.unwrap_or_else(|| Value::Object(Default::default())),
+        ))
     }
 }
 
-/// The first `limit` local search objects of a member; a proxy member has no
-/// searchable index and contributes nothing.
+/// The first `limit` search objects of a member: what it hosts, or what it has
+/// been seen serving. Neither asks an upstream -- a search is answered from
+/// what this server holds, never from an upstream's own catalogue and ranking.
 pub struct SearchLeaf {
     pub text: String,
     pub limit: i64,
@@ -176,6 +262,12 @@ pub struct SearchLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for SearchLeaf {
+
+    /// A search enumerates: the term is what D7 decides on, and the merge
+    /// filters what comes back.
+    fn subject(&self) -> Subject<'_> {
+        Subject::searching(&self.text)
+    }
     type Out = Vec<Value>;
 
     async fn hosted(
@@ -190,10 +282,11 @@ impl Leaf for SearchLeaf {
 
     async fn proxy(
         &self,
-        _cx: &Cx<'_>,
-        _member: CacheRepo<'_>,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
         _up: &Upstream,
     ) -> Result<Outcome<Vec<Value>>, ResolveError> {
-        Ok(Outcome::NotFound)
+        let objects = cached_in_repo(cx.cached, member.0.id, &self.text, self.limit).await?;
+        Ok(Outcome::Found(objects))
     }
 }
