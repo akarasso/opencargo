@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- Group routing rules against dependency confusion: a rule says which members
+  of a group may answer for which names, applies to every repository of its
+  format present and future, and only ever removes members. Patterns are
+  compared on a coarsened key so a spelling (`@ACME/foo`, `Acme_Lib`,
+  `Acme.Lib`, `github.com/!acme/tool`) cannot walk around one; exceptions are
+  compared on exact store identity so they reopen no spelling but the one
+  written. A refused member receives no request and no cache entry, a client
+  gets the group's usual 404 with no rule named on the wire, and the first
+  refusal of a (name, repository, member) is audited with every rule that
+  refused. `POST /api/v1/routing-rules/explain` tries a rule, stored or not,
+  through the same decision the resolver makes. Migration 026, `[routing]` in
+  the configuration, a Routing admin screen. See `docs/routing.md`.
 - S3-compatible artifact storage (`[storage] backend = "s3"`), a preview:
   validated against MinIO, not yet against a hosted provider. Credentials
   come only from an allowlisted environment; TLS trusts the compiled-in
