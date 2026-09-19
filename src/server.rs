@@ -51,6 +51,7 @@ use crate::ports::permissions::PermissionStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::pypi::PypiFileStore;
+use crate::ports::raw::RawFileStore;
 use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::SearchIndex;
 use crate::ports::tokens::{NewToken, TokenStore};
@@ -112,6 +113,7 @@ pub struct AppState {
     /// Parsed upstream PyPI pages, shared by the leaves and the policy facts.
     pub pypi_pages: Arc<crate::registry::pypi::memo::PageMemo>,
     pub maven: Arc<dyn MavenFileStore>,
+    pub raw: Arc<dyn RawFileStore>,
     pub reclaim: Arc<dyn ReclaimStore>,
     pub referenced: Arc<dyn ReferencedKeys>,
     pub multipart: Arc<dyn MultipartLedger>,
@@ -170,6 +172,19 @@ impl AppState {
 
     pub fn publish_pypi_file(&self) -> PublishPypiFile {
         PublishPypiFile::new(self.pypi.clone(), self.repos.clone(), self.placer())
+    }
+
+    pub fn put_raw_file(&self) -> crate::app::raw::PutRawFile {
+        crate::app::raw::PutRawFile::new(
+            self.raw.clone(),
+            self.repos.clone(),
+            self.storage.clone(),
+            self.placer(),
+        )
+    }
+
+    pub fn delete_raw_file(&self) -> crate::app::raw::DeleteRawFile {
+        crate::app::raw::DeleteRawFile::new(self.raw.clone())
     }
 
     pub fn promote_version(&self) -> PromoteVersion {
@@ -591,6 +606,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
         pypi_pages: Arc::new(crate::registry::pypi::memo::PageMemo::default()),
         maven: stores.maven(),
+        raw: stores.raw(),
         reclaim: stores.reclaim(),
         referenced: stores.referenced(),
         multipart: stores.multipart(),
