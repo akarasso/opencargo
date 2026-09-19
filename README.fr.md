@@ -890,13 +890,13 @@ cargo test --test auth_test          # Auth, users, tokens, rate limit
 cargo test --test features_test      # UI, metrics, Cargo
 cargo test --test promote_test       # Promotion de packages
 cargo test --test oci_test           # OCI push/pull/tags
-cargo test --test docker_e2e_test    # Docker Basic Auth E2E
+cargo test --test oci_basic_auth_test  # Basic Auth sur le point OCI (HTTP, sans client docker)
 cargo test --test go_test            # Go modules
 cargo test --test deps_test          # Dependency graph
 cargo test --test webhook_test       # Webhooks
 cargo test --test vuln_test          # Vulnerability scanning (reseau)
 cargo test --test tls_test           # TLS natif
-cargo test --test e2e_scoped_test    # E2E packages scoped
+cargo test --test npm_scoped_test     # Paquets npm scoped (@scope/name)
 cargo test --test permissions_test   # Permissions granulaires
 ```
 

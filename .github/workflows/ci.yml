@@ -99,7 +99,7 @@ jobs:
       - name: Run tests
         env:
           OPENCARGO_E2E_REQUIRE: '1'
-        run: cargo test
+        run: cargo test --all-features
 
   test-s3:
     runs-on: ubuntu-latest
