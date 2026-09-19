@@ -39,6 +39,7 @@ use crate::ports::leases::ServerStateStore;
 use crate::auth::middleware::{auth_middleware, AuthState};
 use crate::ports::secrets::ServerSecretStore;
 use crate::ports::signing::RegistryTokenSigner;
+use crate::auth::publish_limit::PublishMeter;
 use crate::auth::rate_limit::RateLimiter;
 use crate::config::{Config, RepositoryConfig, WebhookConfig};
 use crate::domain::Subscription;
@@ -97,7 +98,8 @@ pub struct AppState {
     pub base_url: String,
     pub metrics_handle: PrometheusHandle,
     pub registry_tokens: Arc<dyn RegistryTokenSigner>,
-    pub publish_rate_limiter: Arc<RateLimiter>,
+    /// Every metered publish is counted here, against the configured limits.
+    pub publish_meter: Arc<PublishMeter>,
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
     pub webhooks: Arc<dyn WebhookStore>,
@@ -739,6 +741,11 @@ pub async fn build_state(
 ) -> anyhow::Result<Started> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     config.validate()?;
+    let publish_limits = config
+        .limits
+        .publish
+        .resolve()
+        .map_err(|problems| anyhow::anyhow!(problems.join("\n  ")))?;
     let policy_notes = crate::policy::startup::startup_notes(config).map_err(anyhow::Error::msg)?;
     ensure_directories(config)?;
     let lock = shared_lock(config)?;
@@ -817,7 +824,7 @@ pub async fn build_state(
         base_url: config.server.base_url.clone(),
         metrics_handle,
         registry_tokens,
-        publish_rate_limiter: Arc::new(RateLimiter::new(30, 60)),
+        publish_meter: Arc::new(PublishMeter::new(publish_limits)),
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
         webhooks,

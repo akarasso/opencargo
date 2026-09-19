@@ -46,12 +46,12 @@ impl Admission {
     }
 }
 
-pub struct PublishGate {
+pub struct PublishMeter {
     limits: PublishLimits,
     windows: Mutex<HashMap<String, Vec<DateTime<Utc>>>>,
 }
 
-impl PublishGate {
+impl PublishMeter {
     pub fn new(limits: PublishLimits) -> Self {
         Self {
             limits,
@@ -110,8 +110,8 @@ mod tests {
         PublishLimit::new(max, 60).expect("a valid limit")
     }
 
-    fn gate(limits: PublishLimits) -> PublishGate {
-        PublishGate::new(limits)
+    fn meter(limits: PublishLimits) -> PublishMeter {
+        PublishMeter::new(limits)
     }
 
     fn per_format(max: u32) -> PublishLimits {
@@ -120,11 +120,11 @@ mod tests {
 
     #[test]
     fn the_limit_is_the_last_publish_admitted() {
-        let gate = gate(per_format(3));
+        let meter = meter(per_format(3));
         for _ in 0..3 {
-            assert_eq!(gate.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
+            assert_eq!(meter.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
         }
-        let refused = gate.admit("ci", Format::Npm, "npm-private", at(0));
+        let refused = meter.admit("ci", Format::Npm, "npm-private", at(0));
         assert!(matches!(refused, Admission::Refused { .. }));
         assert_eq!(
             refused.message().as_deref(),
@@ -134,42 +134,42 @@ mod tests {
 
     #[test]
     fn a_refusal_records_nothing() {
-        let gate = gate(per_format(1));
-        assert_eq!(gate.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
+        let meter = meter(per_format(1));
+        assert_eq!(meter.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
         for second in 1..30 {
-            let refused = gate.admit("ci", Format::Npm, "npm-private", at(second));
+            let refused = meter.admit("ci", Format::Npm, "npm-private", at(second));
             let Admission::Refused { retry_after_secs, .. } = refused else {
                 panic!("the window is full until t+60");
             };
             assert_eq!(retry_after_secs, (60 - second) as u64 + 1);
         }
-        assert_eq!(gate.admit("ci", Format::Npm, "npm-private", at(61)), Admission::Allowed);
+        assert_eq!(meter.admit("ci", Format::Npm, "npm-private", at(61)), Admission::Allowed);
     }
 
     #[test]
     fn the_window_slides() {
-        let gate = gate(per_format(2));
-        assert_eq!(gate.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
-        assert_eq!(gate.admit("ci", Format::Npm, "npm-private", at(30)), Admission::Allowed);
+        let meter = meter(per_format(2));
+        assert_eq!(meter.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
+        assert_eq!(meter.admit("ci", Format::Npm, "npm-private", at(30)), Admission::Allowed);
         assert!(matches!(
-            gate.admit("ci", Format::Npm, "npm-private", at(59)),
+            meter.admit("ci", Format::Npm, "npm-private", at(59)),
             Admission::Refused { .. }
         ));
         // t+61 has dropped the publish of t+0 only.
-        assert_eq!(gate.admit("ci", Format::Npm, "npm-private", at(61)), Admission::Allowed);
+        assert_eq!(meter.admit("ci", Format::Npm, "npm-private", at(61)), Admission::Allowed);
         assert!(matches!(
-            gate.admit("ci", Format::Npm, "npm-private", at(62)),
+            meter.admit("ci", Format::Npm, "npm-private", at(62)),
             Admission::Refused { .. }
         ));
     }
 
     #[test]
     fn one_account_never_spends_another() {
-        let gate = gate(per_format(1));
-        assert_eq!(gate.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
-        assert_eq!(gate.admit("dev", Format::Npm, "npm-private", at(0)), Admission::Allowed);
+        let meter = meter(per_format(1));
+        assert_eq!(meter.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
+        assert_eq!(meter.admit("dev", Format::Npm, "npm-private", at(0)), Admission::Allowed);
         assert!(matches!(
-            gate.admit("ci", Format::Npm, "npm-private", at(0)),
+            meter.admit("ci", Format::Npm, "npm-private", at(0)),
             Admission::Refused { .. }
         ));
     }
@@ -181,16 +181,16 @@ mod tests {
             HashMap::from([(Format::Npm, limit(1))]),
             HashMap::from([("npm-ci".to_string(), limit(2))]),
         );
-        let gate = gate(limits);
-        assert_eq!(gate.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
+        let meter = meter(limits);
+        assert_eq!(meter.admit("ci", Format::Npm, "npm-private", at(0)), Admission::Allowed);
         assert!(matches!(
-            gate.admit("ci", Format::Npm, "npm-private", at(0)),
+            meter.admit("ci", Format::Npm, "npm-private", at(0)),
             Admission::Refused { .. }
         ));
         for _ in 0..2 {
-            assert_eq!(gate.admit("ci", Format::Npm, "npm-ci", at(0)), Admission::Allowed);
+            assert_eq!(meter.admit("ci", Format::Npm, "npm-ci", at(0)), Admission::Allowed);
         }
-        let refused = gate.admit("ci", Format::Npm, "npm-ci", at(0));
+        let refused = meter.admit("ci", Format::Npm, "npm-ci", at(0));
         assert_eq!(
             refused.message().as_deref(),
             Some("publish rate limit reached for repository npm-ci: 2 per 60s, retry in 61s")
@@ -199,21 +199,21 @@ mod tests {
 
     #[test]
     fn a_format_with_no_limit_is_never_refused() {
-        let gate = gate(per_format(1));
+        let meter = meter(per_format(1));
         for _ in 0..100 {
-            assert_eq!(gate.admit("ci", Format::Cargo, "crates", at(0)), Admission::Allowed);
+            assert_eq!(meter.admit("ci", Format::Cargo, "crates", at(0)), Admission::Allowed);
         }
         assert_eq!(Admission::Allowed.message(), None);
     }
 
     #[test]
     fn the_map_is_swept_once_it_grows() {
-        let gate = gate(PublishLimits::new(Some(limit(1)), HashMap::new(), HashMap::new()));
+        let meter = meter(PublishLimits::new(Some(limit(1)), HashMap::new(), HashMap::new()));
         for n in 0..=SWEEP_ABOVE {
-            assert_eq!(gate.admit(&format!("ci{n}"), Format::Npm, "npm-private", at(0)), Admission::Allowed);
+            assert_eq!(meter.admit(&format!("ci{n}"), Format::Npm, "npm-private", at(0)), Admission::Allowed);
         }
-        assert_eq!(gate.admit("late", Format::Npm, "npm-private", at(120)), Admission::Allowed);
-        let held = gate.windows.lock().expect("the counter").len();
+        assert_eq!(meter.admit("late", Format::Npm, "npm-private", at(120)), Admission::Allowed);
+        let held = meter.windows.lock().expect("the counter").len();
         assert_eq!(held, 1, "the expired windows are gone, the fresh one stays");
     }
 }

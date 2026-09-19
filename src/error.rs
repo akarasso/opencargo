@@ -35,6 +35,11 @@ pub enum AppError {
     #[error("{0}")]
     TooManyRequests(String),
 
+    /// A configured limit was reached: the same 429, plus the `Retry-After`
+    /// a client needs to pace itself instead of guessing.
+    #[error("{message}")]
+    RateLimited { message: String, retry_after_secs: u64 },
+
     /// Transient backend failure (e.g. the DB is unavailable during an authz
     /// check): retryable 503, consistent with the auth middleware's treatment
     /// of DB errors — never a 4xx that would misreport the caller's rights.
@@ -63,6 +68,9 @@ impl IntoResponse for AppError {
             AppError::Forbidden(msg) => (StatusCode::FORBIDDEN, msg.clone()),
             AppError::Conflict(msg) => (StatusCode::CONFLICT, msg.clone()),
             AppError::TooManyRequests(msg) => (StatusCode::TOO_MANY_REQUESTS, msg.clone()),
+            AppError::RateLimited { message, .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, message.clone())
+            }
             AppError::ServiceUnavailable(msg) => (StatusCode::SERVICE_UNAVAILABLE, msg.clone()),
             AppError::BadGateway(msg) => (StatusCode::BAD_GATEWAY, msg.clone()),
             AppError::Internal(msg) => (StatusCode::INTERNAL_SERVER_ERROR, msg.clone()),
@@ -77,8 +85,15 @@ impl IntoResponse for AppError {
         };
 
         let body = Json(json!({ "error": message }));
-
-        (status, body).into_response()
+        let mut response = (status, body).into_response();
+        if let AppError::RateLimited { retry_after_secs, .. } = &self {
+            if let Ok(value) = axum::http::HeaderValue::try_from(retry_after_secs.to_string()) {
+                response
+                    .headers_mut()
+                    .insert(axum::http::header::RETRY_AFTER, value);
+            }
+        }
+        response
     }
 }
 
