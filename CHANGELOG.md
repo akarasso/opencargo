@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 ## [Unreleased]
 
 ### Added
+- `[limits.publish]`: the publish limiter is configurable per format and per
+  repository, and a refused publish answers `429` with `Retry-After` and the
+  limit it hit. The defaults are what was hard-coded before -- thirty npm
+  publishes and thirty PyPI uploads a minute per account -- and Cargo, Go and
+  NuGet publishes can now be metered too. See `docs/operations.md`.
 <<<<<<< HEAD
 - Governance of MCP servers and agent skills, a preview. The `mcp` repository
   format mirrors the MCP registry (`proxy`), hosts internal servers and

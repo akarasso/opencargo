@@ -32,6 +32,9 @@ members only, nested groups included: proxied packages are not searchable.
 `proxy.negative_cache_ttl`; an unreachable upstream is `502`, or the stale
 cached copy with `Warning: 110`.
 
+A publish over the account's configured limit is `429` with `Retry-After`;
+[docs/operations.md](operations.md) has the limits and how to change them.
+
 ## Cargo (sparse index)
 
 ```

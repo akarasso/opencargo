@@ -112,6 +112,16 @@ username = "admin"
 # Pour forcer : password = "mon-mdp"
 # En k8s : variable d'env OPENCARGO_ADMIN_PASSWORD
 
+[limits.publish]                   # limites de publication, docs/operations.md
+window = "1m"
+per_window = 500                   # par defaut : absent, seuls les formats ci-dessous sont limites
+
+[limits.publish.format]            # par defaut : npm = 30, pypi = 30
+npm = 500
+
+[limits.publish.repository]        # l'emporte sur l'entree de format, pour ce depot
+npm-ci = { max = 2000, per = "1h" }
+
 [proxy]
 default_ttl = "24h"
 negative_cache_ttl = "1h"
