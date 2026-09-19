@@ -48,6 +48,7 @@ use opencargo::ports::policy::{
 };
 use opencargo::ports::proxy_cache::ProxyCacheStore;
 use opencargo::ports::pypi::{NewPypiFile, Published, PypiFile, PypiFileStore};
+use opencargo::ports::raw::{NewRawFile, RawFile, RawFileStore, Stored};
 use opencargo::ports::reclaim::{
     Backlog, Candidate, Claim, ClaimToken, PinToken, Pinned, ReclaimStore, Renewal,
 };
@@ -79,6 +80,7 @@ pub enum PortId {
     Policy,
     Reclaim,
     Pypi,
+    Raw,
     Maven,
     Identities,
     Handoffs,
@@ -190,6 +192,7 @@ struct State {
     oci_uploads: Vec<UploadRow>,
     oci_segments: Vec<(String, Segment)>,
     pypi_files: Vec<PypiFile>,
+    raw_files: Vec<RawFile>,
     reclaim: ReclaimState,
     maven: MavenState,
     sso: SsoState,
@@ -253,6 +256,10 @@ impl FakeDb {
 
     pub fn pypi(&self) -> Arc<dyn PypiFileStore> {
         Arc::new(Pypi(self.0.clone()))
+    }
+
+    pub fn raw(&self) -> Arc<dyn RawFileStore> {
+        Arc::new(Raw(self.0.clone()))
     }
 
     pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {
@@ -645,6 +652,7 @@ impl RepositoryStore for Repositories {
             let repo = found(state, name).ok_or(StoreError::NotFound)?.clone();
             if state.packages.iter().any(|pkg| pkg.repository_id == repo.id)
                 || state.maven.values.iter().any(|v| v.repository == repo.id)
+                || state.raw_files.iter().any(|f| f.repository == repo.id)
             {
                 return Err(StoreError::Conflict);
             }
@@ -2705,6 +2713,118 @@ impl PypiFileStore for Pypi {
     }
 }
 
+struct Raw(Arc<Mutex<State>>);
+
+impl Raw {
+    fn with<T>(
+        &self,
+        act: impl FnOnce(&mut State) -> Result<T, StoreError>,
+    ) -> Result<T, StoreError> {
+        with(&self.0, PortId::Raw, act)
+    }
+}
+
+/// `path` itself, or anything under it as a segment.
+fn under_prefix(path: &str, prefix: &str) -> bool {
+    prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
+}
+
+#[async_trait]
+impl RawFileStore for Raw {
+    async fn put_file(&self, file: &NewRawFile<'_>) -> Result<Stored, StoreError> {
+        self.with(|state| {
+            let Some(pin) = file.pins.first() else {
+                return Err(StoreError::Other("a raw file row needs its pin".into()));
+            };
+            state.reclaim.live_pins(file.pins)?;
+            let held = state
+                .raw_files
+                .iter()
+                .position(|f| f.repository == file.repository && f.path == file.path);
+            let row = RawFile {
+                repository: file.repository,
+                path: file.path.to_string(),
+                physical_key: pin.physical_key.clone(),
+                size: file.size,
+                sha256: file.sha256.to_string(),
+                content_type: file.content_type.map(str::to_string),
+                uploaded_by: file.uploaded_by.to_string(),
+                uploaded_at: file.now,
+            };
+            let mut released = Vec::new();
+            let created = match held {
+                Some(at) => {
+                    let old = std::mem::replace(&mut state.raw_files[at], row.clone());
+                    if old.physical_key != pin.physical_key {
+                        released.push(old.physical_key);
+                    }
+                    false
+                }
+                None => {
+                    state.raw_files.push(row.clone());
+                    true
+                }
+            };
+            for key in &released {
+                state.reclaim.enqueue(key, false, file.now);
+            }
+            state.reclaim.spend(file.pins);
+            Ok(Stored {
+                file: row,
+                created,
+                released,
+            })
+        })
+    }
+
+    async fn file(&self, repository: i64, path: &str) -> Result<Option<RawFile>, StoreError> {
+        self.with(|state| {
+            Ok(state
+                .raw_files
+                .iter()
+                .find(|f| f.repository == repository && f.path == path)
+                .cloned())
+        })
+    }
+
+    async fn list(
+        &self,
+        repository: i64,
+        prefix: &str,
+        limit: i64,
+    ) -> Result<Vec<RawFile>, StoreError> {
+        self.with(|state| {
+            let mut found: Vec<RawFile> = state
+                .raw_files
+                .iter()
+                .filter(|f| f.repository == repository && under_prefix(&f.path, prefix))
+                .cloned()
+                .collect();
+            found.sort_by(|a, b| a.path.cmp(&b.path));
+            found.truncate(limit.max(0) as usize);
+            Ok(found)
+        })
+    }
+
+    async fn delete_file(
+        &self,
+        repository: i64,
+        path: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Vec<String>, StoreError> {
+        self.with(|state| {
+            let at = state
+                .raw_files
+                .iter()
+                .position(|f| f.repository == repository && f.path == path)
+                .ok_or(StoreError::NotFound)?;
+            let gone = state.raw_files.remove(at);
+            state.reclaim.enqueue(&gone.physical_key, false, now);
+            Ok(vec![gone.physical_key])
+        })
+    }
+}
+
 struct PinRow {
     token: String,
     physical_key: String,
@@ -2821,6 +2941,12 @@ fn row_references(state: &State) -> Vec<(String, bool)> {
         refs.extend(f.metadata_key.clone().map(|k| (k, false)));
     }
     refs.extend(state.maven.keys().map(|k| (k.clone(), false)));
+    refs.extend(
+        state
+            .raw_files
+            .iter()
+            .map(|f| (f.physical_key.clone(), false)),
+    );
     refs
 }
 

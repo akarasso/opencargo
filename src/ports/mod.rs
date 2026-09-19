@@ -21,6 +21,7 @@ pub mod permissions;
 pub mod policy;
 pub mod proxy_cache;
 pub mod pypi;
+pub mod raw;
 pub mod reclaim;
 pub mod referenced;
 pub mod repositories;

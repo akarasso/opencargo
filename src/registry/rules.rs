@@ -11,6 +11,7 @@ pub struct CargoRules;
 pub struct GoRules;
 pub struct OciRules;
 pub struct MavenRules;
+pub struct RawRules;
 
 impl FormatRules for NpmRules {
     fn validate(&self, name: &str) -> Result<(), DomainError> {
@@ -147,6 +148,52 @@ impl FormatRules for MavenRules {
     }
 }
 
+/// A raw "name" is the whole path the client asked for, case-sensitive and
+/// compared as published. The first segment may not start with `_`: the
+/// incarnation's own segments (`_drafts`, `_uploads`, `_proxy`, `_blobs`)
+/// live there.
+impl FormatRules for RawRules {
+    fn validate(&self, path: &str) -> Result<(), DomainError> {
+        let invalid = || DomainError::InvalidName(format!("invalid raw path: '{path}'"));
+        if path.is_empty() || path.len() > 1024 || path.starts_with('_') {
+            return Err(invalid());
+        }
+        let segment = |s: &str| {
+            !s.is_empty()
+                && s != "."
+                && s != ".."
+                && !s.bytes().any(|b| b.is_ascii_control() || matches!(b, b'\\' | b'"'))
+        };
+        if !path.split('/').all(segment) {
+            return Err(invalid());
+        }
+        Ok(())
+    }
+
+    fn normalize(&self, path: &str) -> String {
+        path.to_string()
+    }
+
+    fn reserved(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// A raw repository holds paths, not versions.
+    fn validate_version(&self, version: &str) -> Result<(), DomainError> {
+        if version.is_empty() {
+            Ok(())
+        } else {
+            Err(DomainError::InvalidName(format!(
+                "a raw repository has no versions: '{version}'"
+            )))
+        }
+    }
+
+    fn normalize_version(&self, _version: &str) -> String {
+        String::new()
+    }
+}
+
 /// Every format has its rules; `Option` keeps the table total.
 pub fn rules(format: Format) -> Option<&'static dyn FormatRules> {
     match format {
@@ -157,6 +204,7 @@ pub fn rules(format: Format) -> Option<&'static dyn FormatRules> {
         Format::Pypi => Some(&super::pypi::names::PypiRules),
         Format::Maven => Some(&MavenRules),
         Format::Nuget => Some(&super::nuget::rules::NugetRules),
+        Format::Raw => Some(&RawRules),
     }
 }
 
@@ -238,6 +286,21 @@ mod tests {
         for bad in ["", "1/0", "..", ".1", "1 0"] {
             assert!(r.validate_version(bad).is_err(), "{bad}");
         }
+    }
+
+    #[test]
+    fn a_raw_path_is_a_name_and_has_no_version() {
+        let r = rules_of(Format::Raw).unwrap();
+        assert!(r.validate("dist/linux-amd64/tool-1.2.3.tar.gz").is_ok());
+        assert!(r.validate("tool.bin").is_ok());
+        assert!(!same(r, "Tool.bin", "tool.bin"));
+        for bad in ["", "/a", "a/", "a//b", "a/../b", "a/./b", "..", "_drafts/x", "a/b\\c"] {
+            assert!(r.validate(bad).is_err(), "{bad}");
+        }
+        assert!(r.validate(&"a".repeat(1025)).is_err());
+        assert!(r.validate_version("").is_ok());
+        assert!(r.validate_version("1.0.0").is_err());
+        assert_eq!(r.normalize_version("1.0.0"), "");
     }
 
     #[test]

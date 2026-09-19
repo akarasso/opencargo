@@ -572,7 +572,15 @@ async fn migration_019_is_order_independent_of_025_and_idempotent() {
 
 /// Every migration but `id`, in order.
 fn without(id: &str) -> Vec<Migration> {
-    MIGRATIONS.iter().filter(|m| m.id != id).copied().collect()
+    without_all(&[id])
+}
+
+fn without_all(ids: &[&str]) -> Vec<Migration> {
+    MIGRATIONS
+        .iter()
+        .filter(|m| !ids.contains(&m.id))
+        .copied()
+        .collect()
 }
 
 fn only(id: &str) -> Vec<Migration> {
@@ -695,6 +703,52 @@ async fn migration_024_refuses_a_repository_named_maven_and_changes_nothing() {
     assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
 }
 
+/// A repository already named `raw` would be shadowed by the mount: 026
+/// refuses with a message naming it, and changes nothing.
+#[tokio::test]
+async fn migration_026_refuses_a_repository_named_raw_and_changes_nothing() {
+    let (_tmp, pool) = pool().await;
+    run(&pool, &without("026")).await.unwrap();
+    insert_repository(&pool, "raw", "hosted", "npm").await.unwrap();
+    let ddl = repositories_ddl(&pool).await;
+
+    let err = run_all(&pool).await.unwrap_err().to_string();
+    assert!(err.contains("'raw'") && err.contains("/raw/"), "{err}");
+    assert_eq!(repositories_ddl(&pool).await, ddl);
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'raw%'").await,
+        0
+    );
+    assert!(!applied(&pool).await.unwrap().iter().any(|id| id == "026"));
+    assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
+}
+
+/// 026 alone on a database that predates 018 and 025, and again after them:
+/// the format is admitted, the table lands once, and a second run is a
+/// no-op.
+#[tokio::test]
+async fn migration_026_runs_alone_on_a_legacy_database_and_before_025() {
+    let (_tmp, pool) = pool().await;
+    let pre_018: Vec<Migration> = MIGRATIONS.iter().filter(|m| m.id < "018").copied().collect();
+    run(&pool, &pre_018).await.unwrap();
+    insert_repository(&pool, "npm-hosted", "hosted", "npm").await.unwrap();
+
+    let ran = run(&pool, &only("026")).await.unwrap();
+    assert_eq!(ran, vec![("026", Outcome::Applied)]);
+    assert!(admits(&pool).await.contains("raw"));
+    insert_repository(&pool, "files", "hosted", "raw").await.unwrap();
+
+    let ran = run_all(&pool).await.unwrap();
+    assert!(ran.contains(&("025", Outcome::Applied)), "{ran:?}");
+    assert_eq!(incarnations(&pool).await.len(), 2);
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'raw_files'").await,
+        1
+    );
+    assert!(run_all(&pool).await.unwrap().is_empty());
+    assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
+}
+
 /// 024 alone on a database that predates 018 and 025; 025 after it still
 /// gives every repository an incarnation.
 #[tokio::test]
@@ -720,15 +774,23 @@ async fn migration_024_runs_alone_on_a_legacy_database_and_before_025() {
 #[tokio::test]
 async fn format_widenings_end_with_the_union_in_every_order() {
     type StepFn = fn(&mut SqliteConnection) -> StepFuture<'_>;
-    let steps: [(&'static str, StepFn); 3] =
-        [("020", widen_nuget), ("023", widen_mcp), ("024", maven)];
-    let orders = [[0, 1, 2], [0, 2, 1], [1, 0, 2], [1, 2, 0], [2, 0, 1], [2, 1, 0]];
+    let steps: [(&'static str, StepFn); 4] =
+        [("020", widen_nuget), ("023", widen_mcp), ("024", maven), ("026", raw)];
+    // Six of the twenty-four orders, chosen so every step runs in every position.
+    let orders = [
+        [0, 1, 2, 3],
+        [1, 2, 3, 0],
+        [2, 3, 0, 1],
+        [3, 0, 1, 2],
+        [3, 2, 1, 0],
+        [0, 3, 2, 1],
+    ];
     let mut want: BTreeSet<String> = Format::ALL.iter().map(|f| f.as_str().to_string()).collect();
     want.insert("nuget".to_string());
     want.insert("mcp".to_string());
     for order in orders {
         let (_tmp, pool) = pool().await;
-        run(&pool, &without("024")).await.unwrap();
+        run(&pool, &without_all(&["024", "026"])).await.unwrap();
         insert_repository(&pool, "keep", "hosted", "npm").await.unwrap();
         let kept = incarnations(&pool).await;
         let list: Vec<Migration> = order
@@ -964,7 +1026,7 @@ async fn a_fully_migrated_database_admits_every_format_together() {
     }
     assert_eq!(
         admits(&pool).await,
-        set(["npm", "cargo", "oci", "go", "pypi", "maven", "nuget"])
+        set(["npm", "cargo", "oci", "go", "pypi", "maven", "nuget", "raw"])
     );
     assert!(insert_repository(&pool, "deb", "hosted", "deb").await.is_err());
 }

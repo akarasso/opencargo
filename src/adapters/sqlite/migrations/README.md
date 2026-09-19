@@ -44,11 +44,13 @@ checksum in the same commit.
 | 023 | - | mcp-governance.md (mcp, reusing 020's rebuild) | - |
 | 024 | 024_maven.sql | maven.md (maven format through the shared rebuild helper `rebuild::widen_formats`, port 18 tables) | 58ca2fdd771fe0dc453d1c21499855df9f303d520f85451b7b508c907170b95d |
 | 025 | 025_reclaim.sql | s3.md S2r (reclamation, incarnations, retired prefixes) | aec372d3addae7af66c944632d4296f5041b659c5971a5f97569eef8aa8f2654 |
+| 026 | 026_raw.sql | raw (the `raw` format through the shared rebuild `rebuild::widen_formats`, port 24's table) | 44d05815b12174f43041904752b76ae7f80866eb765078a371469428973c4269 |
 
 A `Step::Rust` migration has no file and so no checksum: `020` is the
 `repositories` CHECK widened by `migrate::widen_format_check`, the one helper
-`023` and `024` reuse (existing formats plus one, never a literal list).
+`023`, `024` and `026` reuse (existing formats plus one, never a literal
+list). `024` and `026` run their own file from that step, so they keep one.
 
 Ids from 018 on are order-independent: none reads or alters a table another
-of them creates, and `025` ships before `018`-`024`. The Postgres side of
+of them creates, and `025` ships before `018`-`026`. The Postgres side of
 this directory is `src/adapters/postgres/migrations/`, and it is empty.
