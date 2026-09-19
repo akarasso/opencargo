@@ -4062,6 +4062,15 @@ macro_rules! raw_contract {
                 let under: Vec<String> =
                     h.raw.list(r.id, "dist", 50).await.unwrap().into_iter().map(|f| f.path).collect();
                 assert_eq!(under, ["dist", "dist/a.bin", "dist/b.bin"], "a sibling prefix is another path");
+                let trailing: Vec<String> = h
+                    .raw
+                    .list(r.id, "dist/", 50)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|f| f.path)
+                    .collect();
+                assert_eq!(trailing, under, "a prefix spelled with its separator names the same directory");
                 assert_eq!(h.raw.list(r.id, "", 2).await.unwrap().len(), 2, "the limit is honoured");
                 assert!(h.raw.list(r.id, "nothing", 50).await.unwrap().is_empty());
             }

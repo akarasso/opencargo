@@ -256,7 +256,8 @@ GET    /api/v1/raw/{repo}/files?prefix=&page=      Listing, 50 per page
 No protocol: one path, one file, any client that speaks HTTP.
 `curl -u user:token -T ./tool.tar.gz {base_url}/raw/{repo}/dist/tool.tar.gz` stores it,
 `curl -O {base_url}/raw/{repo}/dist/tool.tar.gz` reads it back. A path is a
-`/`-separated list of non-empty segments, at most 1024 bytes, with no `.`, `..` or first
+`/`-separated list of non-empty segments, at most 450 bytes (the bound the
+physical key leaves, not a round number), with no `.`, `..` or first
 segment starting with `_`; anything else is `400`.
 
 A PUT into a `hosted` repository answers `201` when it stores bytes and `200` when the

@@ -41,9 +41,12 @@ fn file_of(row: FileRow) -> Result<RawFile, StoreError> {
 }
 
 /// Every `_` and `%` in `prefix` is a literal here, so the escape character
-/// the `LIKE` is given has to be declared.
+/// the `LIKE` is given has to be declared. A trailing `/` is the same prefix
+/// spelled with its separator: `dist` and `dist/` name one directory, and a
+/// pattern built from the second would be `dist//%`, which matches nothing.
 fn like_prefix(prefix: &str) -> String {
     let escaped = prefix
+        .trim_end_matches('/')
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");

@@ -18,6 +18,11 @@ pub struct CargoRules;
 pub struct GoRules;
 pub struct OciRules;
 pub struct MavenRules;
+/// The largest raw path whose physical key always fits `MAX_KEY_BYTES`:
+/// `r/{32}/{path}/{64}/{last segment}~{generation}` frames it in 101 bytes,
+/// and a single-segment path is written twice, so `2n + 101 + 16 <= 1024`.
+pub const MAX_RAW_PATH: usize = 450;
+
 pub struct RawRules;
 
 impl FormatRules for NpmRules {
@@ -246,7 +251,13 @@ impl FormatRules for RawRules {
 
     fn validate(&self, path: &str) -> Result<(), DomainError> {
         let invalid = || DomainError::InvalidName(format!("invalid raw path: '{path}'"));
-        if path.is_empty() || path.len() > 1024 || path.starts_with('_') {
+        // The physical key is `r/{incarnation}/{path}/{sha256}/{last segment}`
+        // plus a generation suffix: 101 bytes of frame, and the path counted
+        // twice when it has one segment. A bound the storage port would refuse
+        // later is not a bound, so this one is the largest that always fits
+        // MAX_KEY_BYTES, and the refusal names the path rather than a key the
+        // caller never wrote.
+        if path.is_empty() || path.len() > MAX_RAW_PATH || path.starts_with('_') {
             return Err(invalid());
         }
         let segment = |s: &str| {
@@ -389,7 +400,8 @@ mod tests {
         for bad in ["", "/a", "a/", "a//b", "a/../b", "a/./b", "..", "_drafts/x", "a/b\\c"] {
             assert!(r.validate(bad).is_err(), "{bad}");
         }
-        assert!(r.validate(&"a".repeat(1025)).is_err());
+        assert!(r.validate(&"a".repeat(MAX_RAW_PATH)).is_ok());
+        assert!(r.validate(&"a".repeat(MAX_RAW_PATH + 1)).is_err());
         assert!(r.validate_version("").is_ok());
         assert!(r.validate_version("1.0.0").is_err());
         assert_eq!(r.normalize_version("1.0.0"), "");

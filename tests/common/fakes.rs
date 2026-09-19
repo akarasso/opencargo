@@ -2813,6 +2813,7 @@ impl Raw {
 
 /// `path` itself, or anything under it as a segment.
 fn under_prefix(path: &str, prefix: &str) -> bool {
+    let prefix = prefix.trim_end_matches('/');
     prefix.is_empty() || path == prefix || path.starts_with(&format!("{prefix}/"))
 }
 

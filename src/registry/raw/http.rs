@@ -12,7 +12,7 @@ use super::leaves::{FileLeaf, DEFAULT_CONTENT_TYPE};
 use crate::app::publish_tail::{PreScan, Published};
 use crate::app::raw::{Deposit, Deposited};
 use crate::auth::middleware::AuthUser;
-use crate::domain::{Format, Repository};
+use crate::domain::{DomainEvent, Format, Repository};
 use crate::error::{AppError, AppResult};
 use crate::registry::resolve::first_hit;
 use crate::server::AppState;
@@ -165,6 +165,15 @@ pub async fn delete(
         .delete_raw_file()
         .run(repo.id, &path, state.clock.now())
         .await?;
+    // A deletion is the one change a listing cannot infer: the page refetches
+    // on `registry.changed`, and nothing else would tell it the path is gone.
+    state
+        .announce()
+        .package_event(
+            DomainEvent::RegistryChanged { repository: repo.name.clone() },
+            &repo.name,
+        )
+        .await;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
