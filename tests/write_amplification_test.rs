@@ -1,10 +1,10 @@
-//! What a publish costs the write-ahead log.
+//! What a publish costs the disk beyond the bytes it keeps.
 //!
-//! Every page a transaction dirties is appended to the WAL whole, so the
-//! frames one publish adds — not the bytes it keeps — are the write
-//! amplification of a registry that publishes all day. The ceilings below are
-//! counted from the file, which makes a table or an index added to the publish
-//! path visible here before it is visible in a benchmark.
+//! Every page a transaction dirties is appended to the write-ahead log whole,
+//! so the frames one publish adds are its amplification in the database; the
+//! log the process writes is the rest of it. Both are counted from the files,
+//! which makes an index added to the publish path, or a line that renders for
+//! nobody, visible here before it is visible in a benchmark.
 
 mod common;
 
@@ -89,5 +89,43 @@ async fn a_publish_dirties_at_most_eight_database_pages() {
         dirtied <= 8 * PUBLISHES,
         "{dirtied} pages for {PUBLISHES} publishes, {} each",
         dirtied as f64 / PUBLISHES as f64
+    );
+}
+
+/// The shipped log, as a server that is not a terminal writes it: the default
+/// level says what happened, and nothing in the line is an escape sequence —
+/// they were 38% of the benchmark's 2.5 MiB of log, rendered by nothing.
+#[tokio::test]
+async fn the_shipped_log_is_plain_text_at_the_default_level() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let config = tmp.path().join("opencargo.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[server]\nstorage_path = \"{}\"\n[database]\nurl = \"sqlite:{}?mode=rwc\"\n",
+            tmp.path().join("storage").display(),
+            tmp.path().join("opencargo.db").display()
+        ),
+    )
+    .unwrap();
+
+    let run = tokio::process::Command::new(env!("CARGO_BIN_EXE_opencargo"))
+        .args(["--config", config.to_str().unwrap(), "migrate"])
+        .env_remove("RUST_LOG")
+        .env_remove("OPENCARGO_CONFIG")
+        .output()
+        .await
+        .expect("the built binary runs");
+    assert!(run.status.success(), "migrate failed: {run:?}");
+
+    let logged = String::from_utf8_lossy(&run.stdout).to_string()
+        + &String::from_utf8_lossy(&run.stderr);
+    assert!(
+        logged.contains("Database migrations applied"),
+        "the default level says what happened: {logged}"
+    );
+    assert!(
+        !logged.contains('\u{1b}'),
+        "a log nobody colours carries no escape: {logged:?}"
     );
 }
