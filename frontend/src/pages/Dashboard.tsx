@@ -10,6 +10,8 @@ import { createLiveResource } from '../core/stores/live.ts';
 import { session } from '../core/stores/session.ts';
 import { onEvent, wsStatus } from '../core/ws.ts';
 import { timeAgo } from '../core/format.ts';
+import { connectLine, endpointOf, exampleRepo } from '../core/quickstart.ts';
+import type { RepoFormat } from '../core/types.ts';
 
 interface ManifestRow {
   key: string;
@@ -88,7 +90,21 @@ export default function Dashboard() {
     return [...live, ...seeded.filter((r) => !seen.has(`${r.pkg}@${r.version}`))].slice(0, 12);
   };
 
-  const base = () => `${location.protocol}//${location.host}`;
+  // One line per format the user can actually reach, named after a real
+  // repository of that format when there is one.
+  const connectLines = () => {
+    const visible = repos()?.repositories ?? [];
+    const order: RepoFormat[] = ['npm', 'cargo', 'oci', 'go', 'pypi', 'maven', 'nuget', 'mcp'];
+    const at = endpointOf(location);
+    return order.map((format) => {
+      const owned = visible.find((r) => r.format === format);
+      return {
+        format,
+        repo: owned?.name,
+        line: connectLine(format, owned?.name ?? exampleRepo(format), at),
+      };
+    });
+  };
 
   return (
     <div class="page-enter">
@@ -269,29 +285,22 @@ export default function Dashboard() {
                 Connect a client
               </div>
               <div class="col" style={{ gap: '10px' }}>
-                <div>
-                  <div class="side-label">npm / pnpm</div>
-                  <div class="code-line">
-                    <code>
-                      <span class="accent">registry=</span>{base()}/npm-all/
-                    </code>
-                    <CopyButton text={`registry=${base()}/npm-all/`} label="" />
-                  </div>
-                </div>
-                <div>
-                  <div class="side-label">docker</div>
-                  <div class="code-line">
-                    <code>docker login {location.host}</code>
-                    <CopyButton text={`docker login ${location.host}`} label="" />
-                  </div>
-                </div>
-                <div>
-                  <div class="side-label">go</div>
-                  <div class="code-line">
-                    <code>GOPROXY={base()}/go-private,direct</code>
-                    <CopyButton text={`GOPROXY=${base()}/go-private,direct`} label="" />
-                  </div>
-                </div>
+                <For each={connectLines()}>
+                  {(entry) => (
+                    <div>
+                      <div class="row" style={{ 'justify-content': 'space-between' }}>
+                        <div class="side-label">{entry.format}</div>
+                        <Show when={!entry.repo}>
+                          <span class="dim small">example</span>
+                        </Show>
+                      </div>
+                      <div class="code-line">
+                        <code class="truncate">{entry.line}</code>
+                        <CopyButton text={entry.line} label="" />
+                      </div>
+                    </div>
+                  )}
+                </For>
               </div>
             </div>
           </div>
