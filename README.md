@@ -1,11 +1,12 @@
 # opencargo
 
-**A self-hosted package registry for npm, Cargo, Docker/OCI and Go modules, in one 10 MB binary.**
+**A self-hosted package registry for npm, Cargo, Docker/OCI, Go, PyPI, Maven,
+NuGet and raw files, in one binary.**
 
-Host your private packages, proxy and cache npmjs.org, crates.io, the Go
-module proxy and Docker Hub, promote releases from dev to prod, one binary for
-the whole team.
-No JVM, no Postgres, no telemetry. SQLite inside, about 20 MB of RAM at rest.
+Host your private packages, proxy and cache the public registries, promote
+releases from dev to prod, one binary for the whole team. No JVM, no Postgres,
+no telemetry. SQLite inside: 16 MiB of RAM at rest and 17 MiB on disk —
+[measured](docs/performance.md), not estimated.
 
 [![CI](https://github.com/akarasso/opencargo/actions/workflows/ci.yml/badge.svg)](https://github.com/akarasso/opencargo/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
@@ -78,19 +79,32 @@ Teams of 5 to 60 developers usually end up with one of these:
 - **Verdaccio + Harbor + a Go proxy**: three services, three auth systems,
   three things to upgrade.
 
-opencargo is the fourth option: one static binary that serves the four
-formats a polyglot team actually uses, with the features the "light" options
-lack (proxy, group, promotion, per-user permissions) and without the weight of
-the enterprise ones.
+opencargo is the fourth option: one static binary that serves the eight formats
+a polyglot team actually uses, with the features the "light" options lack
+(proxy, group, promotion, per-user permissions, scoped tokens, routing rules)
+and without the weight of the enterprise ones.
 
 ## What it does today
 
-- **Formats**: npm (incl. scoped packages, dist-tags, `npm login`), Cargo
-  (sparse index, yank/unyank), OCI Distribution v2 (Docker push/pull),
-  Go modules (GOPROXY).
+- **Formats**: npm (scoped packages, dist-tags, `npm login`), Cargo (sparse
+  index, yank/unyank), OCI Distribution v2 (Docker push/pull), Go modules
+  (GOPROXY), PyPI (PEP 503/691 and the legacy upload), Maven (releases and
+  snapshots), NuGet v3, and raw files for everything with no protocol of its
+  own.
+- **Search over what this server has served**: a proxied package is findable as
+  soon as it has been fetched once, in the UI and in `npm search`. A search
+  never leaves the process.
+- **Routing rules**: a name that must never leave — `@acme/*` — is refused at
+  the group boundary instead of being asked upstream. A rule only ever *removes*
+  members from a resolution: it can never open a path, only close one. See
+  [docs/routing.md](docs/routing.md).
+- **Scoped tokens**: a credential carries read-only or read/write, the
+  repositories it names, and an expiry. The effective right is the intersection
+  with what its bearer may do at that instant, so a token can neither outlive a
+  revoked grant nor exceed the role behind it.
 - **Repository types**: `hosted` (you publish), `proxy` (transparent cache of
   an upstream) and `group` (one URL in front of several repos, ordered
-  resolution), for all four formats. Metadata is cached for a TTL and
+  resolution), for all eight formats. Metadata is cached for a TTL and
   revalidated with ETags, immutable artifacts (tarballs, crates, module zips,
   blobs) forever; a stale copy is served with `Warning: 110` when the
   upstream is down, and an unreachable upstream is a `502`, never a silent
@@ -130,6 +144,23 @@ the enterprise ones.
 Argon2 for passwords, hashed API tokens, path-traversal guards and the
 permission matrix are covered by integration tests. See [SECURITY.md](SECURITY.md).
 
+## Migrating in
+
+You are probably already running something. `opencargo import` copies it over,
+resumable, without asking the old server to stop:
+
+```bash
+opencargo import verdaccio    --from /var/lib/verdaccio/storage --into npm-private
+opencargo import nexus        --url https://nexus.example.com --repo npm-hosted --into npm-private
+opencargo import artifactory  --url https://artifactory.example.com --repo libs-release --into maven-releases
+opencargo import github       --owner acme --into npm-private
+opencargo import distribution --url https://registry.example.com --into oci-private
+```
+
+The five importers are tested in CI against Verdaccio 6, Nexus OSS 3.76 and
+`registry:2`; nothing else has been exercised yet. Each run writes a gap report
+of what it could not take. See [docs/import.md](docs/import.md).
+
 ## Where it is going
 
 The registry is the foundation. The next layer is a **dependency policy
@@ -139,9 +170,7 @@ engine, in audit mode first**: rules versioned with your code
 internal packages are not judged like public ones. The first deliverable is a
 weekly report of *what would have been blocked*, before anything is actually
 blocked. Governance of MCP servers and agent skills is the second layer and
-landed in preview (see above), as did migration importers from Nexus /
-Artifactory / Verdaccio / GitHub Packages (`opencargo import`, see
-[docs/import.md](docs/import.md)).
+landed in preview (see above), as did the migration importers (see above).
 
 The registry, audit mode and OIDC SSO are and will stay MIT. Organisation-level
 enforcement (quarantine, approvals, audit exports, compliance reports)
@@ -151,25 +180,64 @@ issue or write to the address in `SECURITY.md`.
 
 ## Comparison
 
+Every competitor cell was read on its vendor's own documentation on
+**19 September 2026**; the sources are listed under the table. Editions compared
+are the ones you can run yourself without paying: Nexus Repository **Community
+Edition**, Artifactory's **non-commercial** edition, Harbor and Verdaccio (both
+fully open source), Forgejo/Gitea Packages. A cell reading "paid" names the tier.
+
 | | opencargo | Forgejo / Gitea Packages | Nexus Repository CE | Verdaccio | Harbor | JFrog Artifactory |
 |---|---|---|---|---|---|---|
-| Formats | npm, Cargo, OCI, Go | 20+ | 15+ | npm only | OCI, Helm | 30+ |
-| Upstream proxy + cache | npm, Cargo, Go, OCI | no | yes | yes | yes | yes |
-| Group / virtual repos | npm, Cargo, Go, OCI | no | yes | n/a | no | yes |
-| Promotion dev → prod | yes | no | paid | no | replication | yes |
+| Formats | 8: npm, Cargo, OCI, Go, PyPI, Maven, NuGet, raw | 24 [11] | ~26, identical in every edition [1] | npm only | OCI, and Helm through OCI | ~55 in the paid tiers; the non-commercial editions are narrow (JCR: Docker, Helm, OCI, generic — OSS: Maven, Gradle, Ivy, SBT, generic) [2] |
+| Usage cap | none | none | **40 000 components or 100 000 requests/day**, then new components are refused [3]; Pro raises the cap to 50 000 components / 15 M requests per month, it does not remove it [14] | none | none | none |
+| Upstream proxy + cache | all 8 formats | no | yes | yes | yes | yes |
+| Group / virtual repos | all 8 formats | no | yes | n/a | no | yes |
+| Promotion dev → prod | yes | no | no (staging is Pro [4]) | no | replication | yes, Pro X and up |
 | Per-user × per-repo permissions | yes | per forge repo | yes | basic | project-level | yes |
-| Vulnerability scan | OSV, built in | no | paid (Firewall) | no | Trivy | paid (Xray) |
-| Footprint | 1 binary, SQLite, ~20 MB RAM | part of a forge | JVM, 2 GB+ RAM | Node.js | 8+ containers, Postgres, Redis | JVM, 4 GB+ RAM |
-| License | MIT | MIT | EPL, usage caps | MIT | Apache-2.0 | proprietary |
+| Scoped tokens (read-only, named repos, expiry) | yes, and the right is the **intersection** with what the bearer may do now, so a token cannot outlive a revoked grant | `read:package` / `write:package`, not per repository [12] | *user tokens*, **Pro** [4] | no | robot accounts, free | yes |
+| Search covers proxied packages | yes, what this server has served | no | yes, once cached [15] | hosted only | OCI only | yes |
+| Routing rules (block a name from leaving) | yes | no | *routing rules*, CE [5] | no | no | patterns |
+| Vulnerability scan | OSV, built in, at publish | no | separate product (Repository Firewall), works with CE [6] | no | Trivy, free | Xray, **Pro X** and up |
+| Block at resolution (quarantine) | **no** (audit mode only) | no | Repository Firewall [6] | no | yes, free, by severity | Xray, Pro X and up |
+| OIDC SSO | yes, MIT | yes | no (SAML is **Pro** [4]) | third-party auth plugin [13] | yes, free | **Pro X** [2] |
+| LDAP / Active Directory | **no** | yes | yes, CE (absent from the Pro-only list) [4] | third-party auth plugin [13] | yes, free | yes, non-commercial [2] |
+| Retention / cleanup policies | **no** (proxy cache TTL only) | no | by age and downloads in CE; "keep N versions" is Pro [4] | no | 15 rules per project, free | yes |
+| Storage quotas | **no** | no | soft quota per blob store | no | per project, free | yes |
+| Tag immutability / version protection | **no** | no | *tags*, Pro [4] | no | yes, free | yes |
+| SBOM generation | **no** (opencargo signs its own releases) | no | no | no | Trivy SBOM since 2.11, free | Xray |
+| Backup / restore | `opencargo backup` / `restore`, S3 sink | forge backup | filesystem backup; the import/export task is **Pro** [4] | file copy | yes | yes |
+| High availability | **no**: one writer, a second instance refuses to start | no | **Pro** [7] | no | free via Helm, but requires external HA Postgres + Redis + RWX/S3 storage [8] | **Enterprise X** [2]; JFrog publishes no self-managed annual price [9] |
+| Footprint | one binary, SQLite: **16 MiB RSS idle, ~140 MiB peak on a warm npm install** [10] | part of a forge | JVM, 2 GB+ RAM | Node.js | 8+ containers, Postgres, Redis | JVM, 4 GB+ RAM |
+| License | MIT | MIT | EPL + usage caps | MIT | Apache-2.0 | proprietary |
+
+The two rows that matter most against opencargo are **formats** and
+**retention**: 26 free formats against 8, and no cleanup policy at all here.
+Read [Known limitations](#known-limitations) before the table sells you anything.
+
+Sources, all read on 19 September 2026:
+[1] https://help.sonatype.com/en/formats.html ·
+[2] https://docs.jfrog.com/installation/docs/feature-comparison-matrix-for-self-mangaged-jpds (JFrog's own spelling) ·
+[3] https://help.sonatype.com/en/ce-onboarding.html and https://help.sonatype.com/en/usage-center.html ·
+[4] https://help.sonatype.com/en/nexus-repository-pro-features.html and https://help.sonatype.com/en/staging.html ·
+[5] https://help.sonatype.com/en/routing-rules.html (no edition restriction stated, and absent from the Pro feature list) ·
+[6] https://help.sonatype.com/en/repository-firewall-getting-started.html ·
+[7] https://help.sonatype.com/en/high-availability-deployment.html ·
+[8] https://goharbor.io/docs/2.15.0/install-config/harbor-ha-helm/ ·
+[9] https://jfrog.com/pricing/ — self-managed Pro is monthly, Pro X and Enterprise X are quoted by sales; no annual figure is published ·
+[10] measured, [docs/performance.md](docs/performance.md) ·
+[11] https://forgejo.org/docs/latest/user/packages/ ·
+[12] https://forgejo.org/docs/latest/user/token-scope/ ·
+[13] https://verdaccio.org/docs/plugins/ — authentication is a plugin type; the built-in one is htpasswd ·
+[14] https://www.sonatype.com/products/pricing ·
+[15] https://help.sonatype.com/en/searching-for-components.html — components appear once cached locally, not from the remote directly.
 
 ## Known limitations
 
 Read this before the comparison table sells you anything.
 
-- PyPI, Maven and NuGet (hosted, proxy, group), S3-compatible storage,
-  OIDC SSO and MCP governance are new and in preview: tested in CI, not yet
-  validated on a second deployment. The comparison table above does not count
-  them yet.
+- PyPI, Maven, NuGet, raw files (hosted, proxy, group), S3-compatible storage,
+  OIDC SSO, MCP governance, routing rules, scoped tokens and search over the
+  proxy cache are new: tested in CI, not yet validated on a second deployment.
 - MCP: the one client that enforces a catalog today is VS Code
   (`chat.mcp.gallery.serviceUrl` with `chat.mcp.access = "registry"`). Neither
   the setting's value shape nor its API version is documented and no automated
@@ -181,10 +249,6 @@ Read this before the comparison table sells you anything.
   servers (never private addresses unless the repository opts in) and takes
   attested snapshots for stdio servers, and never runs a package to harvest
   them.
-- PyPI, Maven, NuGet and raw/generic files (hosted, proxy, group),
-  S3-compatible storage and OIDC SSO are new and in preview: tested in CI,
-  not yet validated on a second deployment. The comparison table above does
-  not count them yet.
 - The Go checksum database is not proxied: exclude private modules with
   `GONOSUMDB` or run with `GOSUMDB=off`. `go` gets a `404` for an unknown
   module and moves on to the next `GOPROXY` entry, but a `502` (upstream down)
@@ -214,6 +278,12 @@ Read this before the comparison table sells you anything.
   refuses such a publish before anything is written; `vuln_scan.fail_closed`
   turns an OSV outage into a 503 instead of an unscanned publish. Advisories
   with only CVSS 2 data (or none) are reported as `unknown` and never block.
+- No retention or cleanup policy beyond the proxy cache TTL, no storage quota,
+  no tag immutability, no LDAP, no SAML, no SBOM generation, and no signature
+  verification of what is ingested. Each of these is designed or on the list;
+  none of them exists today.
+- Blocking is at publish time only. The policy engine runs in audit mode, so a
+  vulnerable package already cached is still served.
 - One maintainer, pre-1.0. Pin the image by digest and back up with
   `opencargo backup` ([docs/operations.md](docs/operations.md)).
 
@@ -334,6 +404,93 @@ minutes. The checksum database is not proxied: exclude private modules with
 
 Publish with `PUT /go-private/{module}/@v/{version}` (zip body, raw module
 path); see [docs/api.md](docs/api.md).
+
+### Python / PyPI
+
+```ini
+# ~/.config/pip/pip.conf
+[global]
+index-url = https://__token__:trg_...@registry.example.com/pypi-all/simple/
+```
+
+```bash
+twine upload --repository-url https://registry.example.com/pypi-private/legacy/ \
+  -u __token__ -p trg_... dist/*
+uv pip install --index-url "https://__token__:trg_...@registry.example.com/pypi-all/simple/" demo
+```
+
+The Basic username is the literal `__token__` and the password is an API token.
+A `proxy` takes an index base as `upstream` (`https://pypi.org/simple`); files
+are fetched only from `files.pythonhosted.org`, the index's own host, or the
+repository's `file_hosts` list, and verified against the sha256 the page
+announced. `GET /{repo}/simple/` enumerates hosted members only — an upstream
+index is never walked. See [docs/pypi.md](docs/pypi.md).
+
+### Maven / Gradle
+
+```xml
+<settings>
+  <servers>
+    <server><id>oc</id><username>dev1</username><password>trg_...</password></server>
+  </servers>
+</settings>
+```
+
+```xml
+<repositories>
+  <repository><id>oc</id><url>https://registry.example.com/maven/maven-all/</url>
+    <releases><enabled>true</enabled></releases>
+    <snapshots><enabled>true</enabled></snapshots>
+  </repository>
+</repositories>
+<distributionManagement>
+  <repository><id>oc</id><url>https://registry.example.com/maven/maven-releases/</url></repository>
+  <snapshotRepository><id>oc</id><url>https://registry.example.com/maven/maven-snapshots/</url></snapshotRepository>
+</distributionManagement>
+```
+
+Gradle takes the same URLs in `maven { url = uri("...") ; credentials { ... } }`.
+Deploy is `mvn deploy`, read is `GET /maven/{repo}/{group path}/{artifact}/{version}/{file}`;
+`maven-metadata.xml` is generated for hosted members and merged across a group.
+A `proxy` takes a repository base as `upstream` (`https://repo1.maven.org/maven2`).
+
+### NuGet / .NET
+
+```xml
+<configuration>
+  <packageSources>
+    <add key="oc" value="https://registry.example.com/nuget-all/v3/index.json" />
+  </packageSources>
+  <packageSourceCredentials>
+    <oc><add key="Username" value="dev1" /><add key="ClearTextPassword" value="trg_..." /></oc>
+  </packageSourceCredentials>
+</configuration>
+```
+
+```bash
+dotnet nuget push Greeter.1.0.0.nupkg --source oc --api-key trg_...
+dotnet restore
+```
+
+The service index is read before a push, so a private repository needs
+`packageSourceCredentials` even when `--api-key` is given. A key that is
+neither an API token nor a static token is not treated as a credential, so
+Azure Artifacts' `-k az` beside Basic credentials pushes with the Basic
+credential alone. Delete is an unlist: the version leaves search and stays
+restorable by exact version.
+
+### Raw / generic files
+
+```bash
+curl -u dev1:trg_... -T ./toolchain.tar.gz \
+  https://registry.example.com/raw/raw-private/dist/toolchain.tar.gz
+curl -O https://registry.example.com/raw/raw-all/dist/toolchain.tar.gz
+```
+
+Anything with no protocol of its own: toolchains, firmware, build artifacts.
+A `proxy` mirrors a static file tree under its `upstream`, a `group` serves the
+first member holding the path. `GET /api/v1/raw/{repo}/files?prefix=` lists what
+a repository holds, 50 entries per page.
 
 ---
 
@@ -603,6 +760,10 @@ group whose proxy member fronts another instance; locally they print
 
 - [docs/api.md](docs/api.md): every HTTP route, the WebSocket protocol, webhook
   payloads and Prometheus metrics.
+- [docs/maven.md](docs/maven.md): the Maven layout, how a version is assembled
+  from the files a deploy sends, and what a group merges.
+- [docs/pypi.md](docs/pypi.md): the Simple API, the upload route and what a
+  proxy verifies.
 - [docs/mcp.md](docs/mcp.md): MCP servers and agent skills — the mirror, the
   approvals, the scan and the client files.
 - [docs/import.md](docs/import.md): `opencargo import`, copying Nexus,
