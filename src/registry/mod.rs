@@ -7,6 +7,7 @@ pub mod archive;
 pub mod nuget;
 pub mod oci;
 pub mod pypi;
+pub mod raw;
 pub mod resolve;
 pub mod routing;
 pub mod rules;
@@ -17,7 +18,7 @@ use crate::app::authorize::Authorize;
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
 use crate::auth::publish_limit::Admission;
-use crate::domain::{Format, RepoAction, RepoKind, Repository, UrlRepo, Visibility};
+use crate::domain::{Format, RepoAction, RepoKind, Repository, UrlRepo};
 use crate::error::{AppError, AppResult};
 use crate::ports::repositories::RepositoryStore;
 use crate::registry::resolve::Cx;
@@ -45,6 +46,7 @@ pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Reposit
         packages: state.packages.as_ref(),
         oci: state.oci.as_ref(),
         maven: state.maven.as_ref(),
+        raw: state.raw.as_ref(),
         search: state.search.as_ref(),
         cached: state.cached.as_ref(),
         nuget: state.nuget_feed.as_ref(),
@@ -122,6 +124,17 @@ pub async fn ensure_action(
             },
             "authentication required to write to this repository",
         )
+}
+
+/// Enforce delete access, the matrix column no protocol used before raw: a
+/// publisher may add a file without being able to remove one, and an admin
+/// or an explicit grant may.
+pub async fn ensure_can_delete(
+    authz: &Authorize<'_>,
+    repo: &Repository,
+    auth_user: &AuthUser,
+) -> AppResult<()> {
+    ensure_action(authz, repo, auth_user, RepoAction::Delete).await
 }
 
 /// Ensure the repository's declared format matches the protocol being used.

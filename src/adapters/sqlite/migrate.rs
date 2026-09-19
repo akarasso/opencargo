@@ -180,6 +180,7 @@ pub const MIGRATIONS: &[Migration] = &[
         Sentinel::Column { table: "api_tokens", column: "scope" }
     ),
     sql_migration!("031", "031_routing.sql", Sentinel::Object("idx_routing_rules_format")),
+    sql_migration!("032", "032_raw.sql", Sentinel::Object("idx_raw_files_key")),
 ];
 
 /// 020: the `nuget` format, through the shared rebuild; no table of its own.
@@ -235,6 +236,37 @@ async fn maven_step(conn: &mut SqliteConnection) -> Result<(), StoreError> {
     }
     super::rebuild::widen_formats(conn, "maven").await?;
     statements(conn, MAVEN_TABLES).await
+}
+
+const RAW_TABLES: &str = include_str!("migrations/032_raw.sql");
+
+/// 032: the `raw` format and port 24's table, under the same guard as 024:
+/// a repository already named `raw` would be shadowed by the `/raw/` mount.
+fn raw(conn: &mut SqliteConnection) -> StepFuture<'_> {
+    Box::pin(raw_step(conn))
+}
+
+async fn raw_step(conn: &mut SqliteConnection) -> Result<(), StoreError> {
+    let taken: Option<i64> = sqlx::query_scalar("SELECT id FROM repositories WHERE name = 'raw'")
+        .fetch_optional(&mut *conn)
+        .await
+        .map_err(other)?;
+    if taken.is_some() {
+        return Err(StoreError::Other(
+            "migration 032: a repository is named 'raw', which the raw endpoint \
+             now mounts at /raw/; delete or recreate it under another name with the \
+             previous release, then upgrade (nothing was changed)"
+                .into(),
+        ));
+    }
+    super::rebuild::widen_formats(conn, "raw").await?;
+    for statement in RAW_TABLES.split(';').map(str::trim).filter(|s| !s.is_empty()) {
+        sqlx::query(statement)
+            .execute(&mut *conn)
+            .await
+            .map_err(other)?;
+    }
+    Ok(())
 }
 
 /// Bring a database up to date with every migration this binary carries.

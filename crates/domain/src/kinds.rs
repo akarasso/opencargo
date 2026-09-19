@@ -48,10 +48,11 @@ pub enum Format {
     Maven,
     Nuget,
     Mcp,
+    Raw,
 }
 
 impl Format {
-    pub const ALL: [Format; 8] = [
+    pub const ALL: [Format; 9] = [
         Format::Npm,
         Format::Cargo,
         Format::Oci,
@@ -60,6 +61,7 @@ impl Format {
         Format::Maven,
         Format::Nuget,
         Format::Mcp,
+        Format::Raw,
     ];
 
     pub const fn as_str(self) -> &'static str {
@@ -72,6 +74,7 @@ impl Format {
             Format::Maven => "maven",
             Format::Nuget => "nuget",
             Format::Mcp => "mcp",
+            Format::Raw => "raw",
         }
     }
 
@@ -83,7 +86,7 @@ impl Format {
             Format::Pypi => Some("PyPI"),
             Format::Maven => Some("Maven"),
             Format::Nuget => Some("NuGet"),
-            Format::Oci | Format::Mcp => None,
+            Format::Oci | Format::Mcp | Format::Raw => None,
         }
     }
 
@@ -162,6 +165,7 @@ mod tests {
         assert_eq!(Format::Maven.osv_ecosystem(), Some("Maven"));
         assert_eq!(Format::Nuget.osv_ecosystem(), Some("NuGet"));
         assert_eq!(Format::Mcp.osv_ecosystem(), None, "the package behind a server is scanned in its own format");
+        assert_eq!(Format::Raw.osv_ecosystem(), None);
 
         for visibility in Visibility::ALL {
             assert_eq!(

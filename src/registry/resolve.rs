@@ -15,6 +15,7 @@ use crate::policy::ResolutionRecorder;
 use crate::ports::maven::MavenFileStore;
 use crate::ports::oci::OciStore;
 use crate::ports::packages::PackageStore;
+use crate::ports::raw::RawFileStore;
 use crate::ports::permissions::PermissionStore;
 use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::{CachedPackageIndex, SearchIndex};
@@ -107,6 +108,7 @@ pub struct Cx<'a> {
     pub packages: &'a dyn PackageStore,
     pub oci: &'a dyn OciStore,
     pub maven: &'a dyn MavenFileStore,
+    pub raw: &'a dyn RawFileStore,
     pub search: &'a dyn SearchIndex,
     pub cached: &'a dyn CachedPackageIndex,
     pub nuget: &'a dyn crate::ports::nuget::NugetFeedRead,

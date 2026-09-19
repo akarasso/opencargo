@@ -85,6 +85,10 @@ pub(crate) async fn gather(shared: &Shared, cfg: &PolicyConfig, p: Pending) -> R
             let at = cfg.min_release_age.as_ref().and(at);
             (digest, version, at)
         }
+        Source::Raw { digest } => {
+            facts.date_source = "none";
+            (digest, version, None)
+        }
         Source::Nuget { body, published } => {
             facts.install_scripts = nuget_install_assets(&shared.proxy, &body).await;
             facts.date_source = if published.is_some() { "registration" } else { "none" };

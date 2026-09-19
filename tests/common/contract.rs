@@ -3851,3 +3851,269 @@ macro_rules! nuget_feed_contract {
 
 #[allow(unused_imports)]
 pub(crate) use nuget_feed_contract;
+
+/// What `raw_contract!` needs: port 24 and the ports its rows answer to.
+pub struct RawHandles {
+    pub repos: Arc<dyn RepositoryStore>,
+    pub raw: Arc<dyn opencargo::ports::raw::RawFileStore>,
+    pub reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+    pub referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+    _keep: Box<dyn Any + Send>,
+}
+
+impl RawHandles {
+    pub fn new(
+        repos: Arc<dyn RepositoryStore>,
+        raw: Arc<dyn opencargo::ports::raw::RawFileStore>,
+        reclaim: Arc<dyn opencargo::ports::reclaim::ReclaimStore>,
+        referenced: Arc<dyn opencargo::ports::referenced::ReferencedKeys>,
+        keep: Box<dyn Any + Send>,
+    ) -> Self {
+        Self {
+            repos,
+            raw,
+            reclaim,
+            referenced,
+            _keep: keep,
+        }
+    }
+}
+
+/// `raw_contract!(name, opener)`: port 24 answers alike on every adapter,
+/// and the key each row references is the one port 22 refuses to claim and
+/// port 23 lists.
+#[allow(unused_macros)]
+macro_rules! raw_contract {
+    ($suite:ident, $open:path) => {
+        mod $suite {
+            use super::*;
+            use ::chrono::{DateTime, TimeZone, Utc};
+            use ::futures_util::TryStreamExt;
+            use ::opencargo::domain::{layout, Format, RepoKind, RepoSpec, Repository, Visibility};
+            use ::opencargo::error::StoreError;
+            use ::opencargo::ports::raw::{NewRawFile, RawFile};
+            use ::opencargo::ports::reclaim::{Claim, PinToken, Pinned};
+            use ::std::time::Duration;
+
+            const GRACE: Duration = Duration::from_secs(3600);
+
+            fn at(hour: u32) -> DateTime<Utc> {
+                Utc.with_ymd_and_hms(2026, 9, 19, hour, 0, 0).unwrap()
+            }
+
+            async fn repo(h: &RawHandles, name: &str) -> (Repository, String) {
+                let repo = h
+                    .repos
+                    .create(
+                        &RepoSpec {
+                            name,
+                            kind: RepoKind::Hosted,
+                            format: Format::Raw,
+                            visibility: Visibility::Public,
+                            upstream: None,
+                            members: &[],
+                        },
+                        at(1),
+                    )
+                    .await
+                    .unwrap();
+                let incarnation = h.repos.incarnation(repo.id).await.unwrap().unwrap();
+                (repo, layout::incarnation_prefix(&incarnation))
+            }
+
+            async fn pin(h: &RawHandles, prefix: &str, path: &str, sha256: &str) -> Vec<PinToken> {
+                pin_until(h, prefix, path, sha256, at(9)).await
+            }
+
+            async fn pin_until(
+                h: &RawHandles,
+                prefix: &str,
+                path: &str,
+                sha256: &str,
+                until: DateTime<Utc>,
+            ) -> Vec<PinToken> {
+                let name = path.rsplit('/').next().unwrap();
+                let keys = vec![layout::hosted_key(prefix, path, sha256, name)];
+                match h.reclaim.pin(prefix, &keys, until).await.unwrap() {
+                    Pinned::Tokens(tokens) => tokens,
+                    Pinned::Retired => panic!("{prefix} is live"),
+                }
+            }
+
+            fn row<'a>(
+                repo: i64,
+                path: &'a str,
+                sha256: &'a str,
+                pins: &'a [PinToken],
+            ) -> NewRawFile<'a> {
+                NewRawFile {
+                    repository: repo,
+                    path,
+                    size: 3,
+                    sha256,
+                    content_type: Some("application/octet-stream"),
+                    uploaded_by: "ci",
+                    pins,
+                    now: at(2),
+                }
+            }
+
+            async fn put(h: &RawHandles, repo: i64, prefix: &str, path: &str, sha256: &str) -> RawFile {
+                let tokens = pin(h, prefix, path, sha256).await;
+                h.raw.put_file(&row(repo, path, sha256, &tokens)).await.unwrap().file
+            }
+
+            async fn listed(h: &RawHandles) -> Vec<String> {
+                h.referenced
+                    .referenced(GRACE, at(5))
+                    .map_ok(|r| r.key)
+                    .try_collect()
+                    .await
+                    .unwrap()
+            }
+
+            async fn due(h: &RawHandles) -> Vec<String> {
+                h.reclaim
+                    .due(GRACE, at(5), 50)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|c| c.key)
+                    .collect()
+            }
+
+            #[tokio::test]
+            async fn a_file_records_the_key_it_was_given_and_reads_back_as_given() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "files").await;
+                let tokens = pin(&h, &prefix, "dist/tool.bin", "ab").await;
+                let stored = h
+                    .raw
+                    .put_file(&row(r.id, "dist/tool.bin", "ab", &tokens))
+                    .await
+                    .unwrap();
+                assert!(stored.created);
+                assert!(stored.released.is_empty());
+                assert_eq!(stored.file.physical_key, tokens[0].physical_key);
+                assert_eq!(stored.file.uploaded_at, at(2), "the caller's clock");
+                assert_eq!(stored.file.sha256, "ab");
+                assert_eq!(stored.file.uploaded_by, "ci");
+                let found = h.raw.file(r.id, "dist/tool.bin").await.unwrap().unwrap();
+                assert_eq!(found, stored.file);
+                assert!(h.raw.file(r.id, "dist/other.bin").await.unwrap().is_none());
+            }
+
+            #[tokio::test]
+            async fn replacing_a_path_releases_the_key_it_held_and_deletes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "files").await;
+                let first = put(&h, r.id, &prefix, "dist/tool.bin", "ab").await;
+                let tokens = pin(&h, &prefix, "dist/tool.bin", "cd").await;
+                let again = h
+                    .raw
+                    .put_file(&row(r.id, "dist/tool.bin", "cd", &tokens))
+                    .await
+                    .unwrap();
+                assert!(!again.created);
+                assert_eq!(again.released, vec![first.physical_key.clone()]);
+                assert_eq!(again.file.physical_key, tokens[0].physical_key);
+                assert_eq!(h.raw.list(r.id, "", 50).await.unwrap().len(), 1, "one path, one row");
+                assert_eq!(due(&h).await, vec![first.physical_key.clone()], "enqueued in the write's transaction");
+                assert!(matches!(
+                    h.reclaim.claim(&first.physical_key, GRACE, at(5), at(6)).await.unwrap(),
+                    Claim::Claimed(_)
+                ));
+            }
+
+            #[tokio::test]
+            async fn a_revoked_pin_is_superseded_and_writes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "files").await;
+                // Expired for longer than the grace: a dead placer's pin no longer protects.
+                let tokens = pin_until(&h, &prefix, "dist/tool.bin", "ab", at(2)).await;
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&tokens[0].physical_key), at(1))
+                    .await
+                    .unwrap();
+                assert!(matches!(
+                    h.reclaim.claim(&tokens[0].physical_key, GRACE, at(5), at(6)).await.unwrap(),
+                    Claim::Claimed(_)
+                ));
+                let refused = h.raw.put_file(&row(r.id, "dist/tool.bin", "ab", &tokens)).await;
+                match refused {
+                    Err(StoreError::Superseded(keys)) => {
+                        assert_eq!(keys, vec![tokens[0].physical_key.clone()])
+                    }
+                    other => panic!("{other:?}"),
+                }
+                assert!(h.raw.file(r.id, "dist/tool.bin").await.unwrap().is_none());
+            }
+
+            #[tokio::test]
+            async fn a_listing_is_by_path_and_its_prefix_is_a_segment() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "files").await;
+                for path in ["dist/b.bin", "dist/a.bin", "dist-old/c.bin", "dist", "notes.txt"] {
+                    put(&h, r.id, &prefix, path, "ab").await;
+                }
+                let all: Vec<String> =
+                    h.raw.list(r.id, "", 50).await.unwrap().into_iter().map(|f| f.path).collect();
+                assert_eq!(all, ["dist", "dist-old/c.bin", "dist/a.bin", "dist/b.bin", "notes.txt"]);
+                let under: Vec<String> =
+                    h.raw.list(r.id, "dist", 50).await.unwrap().into_iter().map(|f| f.path).collect();
+                assert_eq!(under, ["dist", "dist/a.bin", "dist/b.bin"], "a sibling prefix is another path");
+                assert_eq!(h.raw.list(r.id, "", 2).await.unwrap().len(), 2, "the limit is honoured");
+                assert!(h.raw.list(r.id, "nothing", 50).await.unwrap().is_empty());
+            }
+
+            #[tokio::test]
+            async fn a_key_this_port_references_is_referenced_for_claim_and_listed() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "files").await;
+                let file = put(&h, r.id, &prefix, "dist/tool.bin", "ab").await;
+                assert!(listed(&h).await.contains(&file.physical_key));
+                h.reclaim
+                    .enqueue(std::slice::from_ref(&file.physical_key), at(1))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    h.reclaim.claim(&file.physical_key, GRACE, at(5), at(6)).await.unwrap(),
+                    Claim::Referenced
+                );
+            }
+
+            #[tokio::test]
+            async fn deleting_a_path_enqueues_its_key_and_deletes_nothing() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "files").await;
+                let file = put(&h, r.id, &prefix, "dist/tool.bin", "ab").await;
+                let kept = put(&h, r.id, &prefix, "dist/keep.bin", "cd").await;
+                let released = h.raw.delete_file(r.id, "dist/tool.bin", at(3)).await.unwrap();
+                assert_eq!(released, vec![file.physical_key.clone()]);
+                assert!(matches!(
+                    h.raw.delete_file(r.id, "dist/tool.bin", at(3)).await,
+                    Err(StoreError::NotFound)
+                ));
+                assert_eq!(due(&h).await, vec![file.physical_key.clone()]);
+                assert!(matches!(
+                    h.reclaim.claim(&file.physical_key, GRACE, at(5), at(6)).await.unwrap(),
+                    Claim::Claimed(_)
+                ));
+                assert_eq!(h.raw.list(r.id, "", 50).await.unwrap(), vec![kept]);
+            }
+
+            #[tokio::test]
+            async fn a_repository_holding_files_refuses_to_retire() {
+                let h = $open().await;
+                let (r, prefix) = repo(&h, "files").await;
+                put(&h, r.id, &prefix, "dist/tool.bin", "ab").await;
+                assert!(matches!(h.repos.retire("files", at(3)).await, Err(StoreError::Conflict)));
+                h.raw.delete_file(r.id, "dist/tool.bin", at(3)).await.unwrap();
+                assert!(h.repos.retire("files", at(4)).await.is_ok());
+            }
+        }
+    };
+}
+
+#[allow(unused_imports)]
+pub(crate) use raw_contract;

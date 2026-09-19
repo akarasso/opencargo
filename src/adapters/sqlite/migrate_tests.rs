@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "022", "023", "024", "025", "026", "027", "028", "029", "030", "031"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "022", "023", "024", "025", "026", "027", "028", "029", "030", "031", "032"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "022", "023", "024", "025", "026", "027", "028", "029", "030", "031"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "022", "023", "024", "025", "026", "027", "028", "029", "030", "031", "032"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "022", "023", "024", "025", "026", "027", "028", "029", "030", "031"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "022", "023", "024", "025", "026", "027", "028", "029", "030", "031", "032"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.
@@ -592,12 +592,17 @@ async fn migration_026_is_order_independent_of_025_and_idempotent() {
 
 /// Every migration but `id`, in order.
 fn without(id: &str) -> Vec<Migration> {
-    MIGRATIONS.iter().filter(|m| m.id != id).copied().collect()
+    without_all(&[id])
 }
 
 fn without_all(ids: &[&str]) -> Vec<Migration> {
-    MIGRATIONS.iter().filter(|m| !ids.contains(&m.id)).copied().collect()
+    MIGRATIONS
+        .iter()
+        .filter(|m| !ids.contains(&m.id))
+        .copied()
+        .collect()
 }
+
 
 fn only(id: &str) -> Vec<Migration> {
     MIGRATIONS.iter().filter(|m| m.id == id).copied().collect()
@@ -712,6 +717,52 @@ async fn migration_024_refuses_a_repository_named_maven_and_changes_nothing() {
         0
     );
     assert!(!applied(&pool).await.unwrap().iter().any(|id| id == "024"));
+    assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
+}
+
+/// A repository already named `raw` would be shadowed by the mount: 026
+/// refuses with a message naming it, and changes nothing.
+#[tokio::test]
+async fn migration_026_refuses_a_repository_named_raw_and_changes_nothing() {
+    let (_tmp, pool) = pool().await;
+    run(&pool, &without("026")).await.unwrap();
+    insert_repository(&pool, "raw", "hosted", "npm").await.unwrap();
+    let ddl = repositories_ddl(&pool).await;
+
+    let err = run_all(&pool).await.unwrap_err().to_string();
+    assert!(err.contains("'raw'") && err.contains("/raw/"), "{err}");
+    assert_eq!(repositories_ddl(&pool).await, ddl);
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'raw%'").await,
+        0
+    );
+    assert!(!applied(&pool).await.unwrap().iter().any(|id| id == "026"));
+    assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
+}
+
+/// 026 alone on a database that predates 018 and 025, and again after them:
+/// the format is admitted, the table lands once, and a second run is a
+/// no-op.
+#[tokio::test]
+async fn migration_026_runs_alone_on_a_legacy_database_and_before_025() {
+    let (_tmp, pool) = pool().await;
+    let pre_018: Vec<Migration> = MIGRATIONS.iter().filter(|m| m.id < "018").copied().collect();
+    run(&pool, &pre_018).await.unwrap();
+    insert_repository(&pool, "npm-hosted", "hosted", "npm").await.unwrap();
+
+    let ran = run(&pool, &only("026")).await.unwrap();
+    assert_eq!(ran, vec![("026", Outcome::Applied)]);
+    assert!(admits(&pool).await.contains("raw"));
+    insert_repository(&pool, "files", "hosted", "raw").await.unwrap();
+
+    let ran = run_all(&pool).await.unwrap();
+    assert!(ran.contains(&("025", Outcome::Applied)), "{ran:?}");
+    assert_eq!(incarnations(&pool).await.len(), 2);
+    assert_eq!(
+        count(&pool, "SELECT COUNT(*) FROM sqlite_master WHERE name = 'raw_files'").await,
+        1
+    );
+    assert!(run_all(&pool).await.unwrap().is_empty());
     assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
 }
 

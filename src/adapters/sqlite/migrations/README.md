@@ -50,10 +50,12 @@ checksum in the same commit.
 | 029 | 029_cached_packages.sql | search-over-cache.md (port 24: what the proxy has served) | aed68ab685f6da77542314245529a8e4e5d8ca2c6d153d73021057a62f4c57b3 |
 | 030 | 030_token_scopes.sql | scopes (api_tokens.scope) | 359b691e29795d97e768c3c469d5e93b777b07673ebf380631aa8721199e39e9 |
 | 031 | 031_routing.sql | routing.v2 (group routing rules and their version) | c5c7017ee5820ba5e2539384a14d3fd03305f5669ea3b880f43dcd2c67330e95 |
+| 032 | 032_raw.sql | raw.v2 (raw_files, the raw mount reserved) | 44d05815b12174f43041904752b76ae7f80866eb765078a371469428973c4269 |
 
 A `Step::Rust` migration has no file and so no checksum: `020` is the
 `repositories` CHECK widened by `migrate::widen_format_check`, the one helper
-`023` and `024` reuse (existing formats plus one, never a literal list).
+`023`, `024` and `026` reuse (existing formats plus one, never a literal
+list). `024` and `026` run their own file from that step, so they keep one.
 
 Ids from 018 on are order-independent with one exception: none reads or alters
 a table another of them creates, and `025` ships before `018`-`024`; `026`

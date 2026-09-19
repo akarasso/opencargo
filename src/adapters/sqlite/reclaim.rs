@@ -38,9 +38,10 @@ pub(crate) const REFERENCED: &str = "
 /// Every port's contribution, as one union.
 fn referenced() -> String {
     format!(
-        "{REFERENCED} UNION ALL {} UNION ALL {}",
+        "{REFERENCED} UNION ALL {} UNION ALL {} UNION ALL {}",
         super::pypi::REFERENCED,
-        super::mcp::REFERENCED
+        super::mcp::REFERENCED,
+        super::raw::REFERENCED
     )
 }
 

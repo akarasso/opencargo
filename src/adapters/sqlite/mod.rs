@@ -33,6 +33,7 @@ use crate::ports::permissions::PermissionStore;
 use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::pypi::PypiFileStore;
+use crate::ports::raw::RawFileStore;
 use crate::ports::reclaim::ReclaimStore;
 use crate::ports::referenced::ReferencedKeys;
 use crate::ports::repositories::RepositoryStore;
@@ -62,6 +63,7 @@ pub mod permissions;
 pub mod policy;
 pub mod proxy_cache;
 pub mod pypi;
+pub mod raw;
 pub mod reclaim;
 pub mod rebuild;
 pub mod repositories;
@@ -356,6 +358,10 @@ impl SqliteStores {
 
     pub fn pypi(&self) -> Arc<dyn PypiFileStore> {
         Arc::new(pypi::SqlitePypiFileStore::new(self.pool.clone()))
+    }
+
+    pub fn raw(&self) -> Arc<dyn RawFileStore> {
+        Arc::new(raw::SqliteRawFileStore::new(self.pool.clone()))
     }
 
     pub fn reclaim(&self) -> Arc<dyn ReclaimStore> {

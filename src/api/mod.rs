@@ -9,6 +9,7 @@ pub mod me;
 pub mod permissions;
 pub mod policy;
 pub mod promote;
+pub mod raw;
 pub mod repositories;
 pub mod routing;
 pub mod storage;

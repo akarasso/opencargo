@@ -244,6 +244,37 @@ current set in one transaction; a pattern is an exact name or a prefix
 ending in `*` after a `/` or a `.`, and the first `allow` rule closes the
 repository to everything it does not match. `opencargo mcp sync [--repo R]
 [--full]` runs the same code from the command line.
+## Raw (generic files)
+
+```
+GET    /raw/{repo}/{path}                          Also HEAD
+PUT    /raw/{repo}/{path}                          Store the body at that path
+DELETE /raw/{repo}/{path}
+GET    /api/v1/raw/{repo}/files?prefix=&page=      Listing, 50 per page
+```
+
+No protocol: one path, one file, any client that speaks HTTP.
+`curl -u user:token -T ./tool.tar.gz {base_url}/raw/{repo}/dist/tool.tar.gz` stores it,
+`curl -O {base_url}/raw/{repo}/dist/tool.tar.gz` reads it back. A path is a
+`/`-separated list of non-empty segments, at most 1024 bytes, with no `.`, `..` or first
+segment starting with `_`; anything else is `400`.
+
+A PUT into a `hosted` repository answers `201` when it stores bytes and `200` when the
+path already held exactly those bytes; other bytes replace the file, and the ones it held
+are queued for reclamation rather than deleted under a reader. Bodies are streamed and
+capped at 5 GiB. The `Content-Type` sent is kept and served back, defaulting to
+`application/octet-stream`; since the uploader chooses it, every read also carries
+`Content-Disposition: attachment`, so stored bytes are downloaded and never rendered on
+the registry's own origin. `X-Checksum-Sha256` on a PUT is checked against the body
+before anything is recorded (`400` on a mismatch); every read answers with that header and
+with the digest as its `ETag`. Writing needs `write` on the repository, deleting needs
+`delete` — the matrix column no other format uses, so a publisher can add a file without
+being able to remove one. A `401` carries `WWW-Authenticate: Basic`.
+
+A `proxy` relays its upstream, keeping a body for five minutes and verifying it against the
+`X-Checksum-Sha256` the upstream announced, if any. A `group` serves the first member that
+holds the path, and its listing merges its hosted members the same way. The listing reads
+at most 1000 paths per member and says `truncated` when a member had more.
 
 ## Administration
 
