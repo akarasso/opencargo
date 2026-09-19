@@ -117,7 +117,7 @@ async fn a_file_is_put_read_back_with_its_checksum_and_deleted() {
 }
 
 #[tokio::test]
-async fn the_content_type_the_client_sent_is_the_one_served() {
+async fn the_content_type_is_served_back_but_the_bytes_are_a_download() {
     let s = server(Visibility::Public).await;
     let stored = reqwest::Client::new()
         .put(url(&s, "notes/readme.txt"))
@@ -130,10 +130,51 @@ async fn the_content_type_the_client_sent_is_the_one_served() {
     assert_eq!(stored.status(), StatusCode::CREATED);
     let served = get(&s, "notes/readme.txt").await;
     assert_eq!(served.headers()["content-type"], "text/plain; charset=utf-8");
+    assert_eq!(
+        served.headers()["content-disposition"],
+        "attachment; filename=\"readme.txt\""
+    );
 
     put(&s, "dist/blob.bin", b"bytes").await;
     let served = get(&s, "dist/blob.bin").await;
     assert_eq!(served.headers()["content-type"], "application/octet-stream");
+}
+
+/// An uploader chooses the type its bytes are served with, so the bytes must
+/// not be rendered on this origin: a stored page is a download, never a
+/// document able to read a token out of the SPA's storage.
+#[tokio::test]
+async fn a_page_a_client_uploads_is_never_rendered_on_this_origin() {
+    let s = server(Visibility::Public).await;
+    let uploaded = reqwest::Client::new()
+        .put(url(&s, "report.html"))
+        .bearer_auth(STATIC_TOKEN)
+        .header("content-type", "text/html")
+        .body("<script>fetch('/api/v1/users')</script>")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    let served = get(&s, "report.html").await;
+    assert_eq!(
+        served.headers()["content-disposition"],
+        "attachment; filename=\"report.html\"",
+        "an uploaded document is downloaded, not rendered"
+    );
+
+    let uploaded = reqwest::Client::new()
+        .put(url(&s, "steal.js"))
+        .bearer_auth(STATIC_TOKEN)
+        .header("content-type", "application/javascript")
+        .body("alert(1)")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(uploaded.status(), StatusCode::CREATED);
+    assert_eq!(
+        get(&s, "steal.js").await.headers()["content-disposition"],
+        "attachment; filename=\"steal.js\""
+    );
 }
 
 #[tokio::test]

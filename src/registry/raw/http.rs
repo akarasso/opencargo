@@ -52,6 +52,14 @@ fn declared_sha256(headers: &HeaderMap) -> AppResult<Option<String>> {
     Ok(Some(value))
 }
 
+/// A raw body is the only one whose type its uploader chooses, so a read is
+/// a download: nothing a client stored is ever rendered on this origin.
+fn disposition(path: &str) -> HeaderValue {
+    let name = crate::domain::layout::file_name(path);
+    HeaderValue::from_str(&format!("attachment; filename=\"{name}\""))
+        .unwrap_or_else(|_| HeaderValue::from_static("attachment"))
+}
+
 fn digest_headers(digest: Option<&str>) -> Vec<(HeaderName, HeaderValue)> {
     let Some(digest) = digest else {
         return Vec::new();
@@ -79,11 +87,13 @@ pub async fn read(
     let repo = open(&state, &repo_name).await?;
     crate::registry::ensure_can_read(state.permissions.as_ref(), &repo, auth).await?;
     let cx = crate::registry::cx(&state, auth, &repo);
+    let attachment = disposition(&path);
     let mut payload = first_hit(&cx, &repo, &FileLeaf { path }).await?;
     if payload.content_type.is_none() {
         payload.content_type = Some(DEFAULT_CONTENT_TYPE.to_string());
     }
-    let extra = digest_headers(payload.digest.as_deref());
+    let mut extra = digest_headers(payload.digest.as_deref());
+    extra.push((header::CONTENT_DISPOSITION, attachment));
     state.proxy.stream_response(&payload, extra).await
 }
 

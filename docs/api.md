@@ -207,7 +207,9 @@ A PUT into a `hosted` repository answers `201` when it stores bytes and `200` wh
 path already held exactly those bytes; other bytes replace the file, and the ones it held
 are queued for reclamation rather than deleted under a reader. Bodies are streamed and
 capped at 5 GiB. The `Content-Type` sent is kept and served back, defaulting to
-`application/octet-stream`. `X-Checksum-Sha256` on a PUT is checked against the body
+`application/octet-stream`; since the uploader chooses it, every read also carries
+`Content-Disposition: attachment`, so stored bytes are downloaded and never rendered on
+the registry's own origin. `X-Checksum-Sha256` on a PUT is checked against the body
 before anything is recorded (`400` on a mismatch); every read answers with that header and
 with the digest as its `ETag`. Writing needs `write` on the repository, deleting needs
 `delete` — the matrix column no other format uses, so a publisher can add a file without
