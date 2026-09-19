@@ -83,7 +83,7 @@ impl Format {
     /// so a request count would not be an artifact count; an OCI push is
     /// counted at its manifest put, the request that makes the image exist.
     pub const fn metered_publish(self) -> bool {
-        !matches!(self, Format::Maven)
+        self.coverage().metered_publish.yes()
     }
 
     pub const fn osv_ecosystem(self) -> Option<&'static str> {
@@ -143,6 +143,138 @@ impl FromStr for Visibility {
             .into_iter()
             .find(|visibility| visibility.as_str() == s)
             .ok_or_else(|| DomainError::InvalidName(format!("invalid visibility: {s}")))
+    }
+}
+
+/// What a format answers for one of the lists that enumerate formats.
+///
+/// A list nobody holds is how eight defects reached `main` at once: a format
+/// arrives, a dozen lists must learn it, and the ones that are a `Vec` rather
+/// than a `match` stay silent. Every such list is a column here, every format
+/// a row, and `No` carries the reason so an absence is a decision on the
+/// record rather than an oversight.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Cell {
+    Yes,
+    No(&'static str),
+}
+
+impl Cell {
+    pub const fn yes(self) -> bool {
+        matches!(self, Cell::Yes)
+    }
+
+    pub const fn why(self) -> Option<&'static str> {
+        match self {
+            Cell::No(reason) => Some(reason),
+            Cell::Yes => None,
+        }
+    }
+}
+
+/// One row of the matrix. Adding a column here makes every format answer it;
+/// adding a format makes `Format::coverage` fail to compile until it does.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Coverage {
+    /// A publish has one request the meter counts.
+    pub metered_publish: Cell,
+    /// A publish is judged by the policy gate before anything is written.
+    pub publish_gate: Cell,
+    /// A proxy resolution is recorded for the policy report.
+    pub policy_record: Cell,
+    /// A published version's dependencies can be read for a vulnerability scan.
+    pub scannable: Cell,
+    /// Deleting the repository counts this format's rows before it tries.
+    pub emptiness_probe: Cell,
+    /// This format's keys are in the reclaimer's reference union.
+    pub reclaim_referenced: Cell,
+    /// A download is recorded against the version it served.
+    pub download_signal: Cell,
+    /// "Pre-release" is a notion this format defines.
+    pub prerelease: Cell,
+}
+
+impl Format {
+    /// The matrix, one row per format. Exhaustive on purpose: a tenth format
+    /// does not compile until every column has an answer.
+    pub const fn coverage(self) -> Coverage {
+        const NO_DOC: &str = "no package document: nothing declares dependencies";
+        const SESSION: &str = "a push is a session, not one request that completes it";
+        match self {
+            Format::Npm | Format::Cargo | Format::Nuget => Coverage {
+                metered_publish: Cell::Yes,
+                publish_gate: Cell::Yes,
+                policy_record: Cell::Yes,
+                scannable: Cell::Yes,
+                emptiness_probe: Cell::Yes,
+                reclaim_referenced: Cell::Yes,
+                download_signal: Cell::Yes,
+                prerelease: Cell::Yes,
+            },
+            Format::Go => Coverage {
+                metered_publish: Cell::Yes,
+                publish_gate: Cell::Yes,
+                policy_record: Cell::Yes,
+                scannable: Cell::Yes,
+                emptiness_probe: Cell::Yes,
+                reclaim_referenced: Cell::Yes,
+                download_signal: Cell::Yes,
+                prerelease: Cell::No(
+                    "a pseudo-version carries a hyphen while being permanent, so the two \
+                     cannot be told apart",
+                ),
+            },
+            Format::Pypi => Coverage {
+                metered_publish: Cell::Yes,
+                publish_gate: Cell::Yes,
+                policy_record: Cell::Yes,
+                scannable: Cell::Yes,
+                emptiness_probe: Cell::Yes,
+                reclaim_referenced: Cell::Yes,
+                download_signal: Cell::Yes,
+                prerelease: Cell::Yes,
+            },
+            Format::Maven => Coverage {
+                metered_publish: Cell::No(SESSION),
+                publish_gate: Cell::Yes,
+                policy_record: Cell::Yes,
+                scannable: Cell::Yes,
+                emptiness_probe: Cell::Yes,
+                reclaim_referenced: Cell::Yes,
+                download_signal: Cell::No("no read path records against a version"),
+                prerelease: Cell::No("a snapshot is not a pre-release"),
+            },
+            Format::Oci => Coverage {
+                metered_publish: Cell::Yes,
+                publish_gate: Cell::Yes,
+                policy_record: Cell::Yes,
+                scannable: Cell::No(NO_DOC),
+                emptiness_probe: Cell::Yes,
+                reclaim_referenced: Cell::Yes,
+                download_signal: Cell::No("a pull is a manifest and blobs, not a version"),
+                prerelease: Cell::No("a tag carrying a hyphen is a tag, not a pre-release"),
+            },
+            Format::Mcp => Coverage {
+                metered_publish: Cell::Yes,
+                publish_gate: Cell::No("governance judges a server, the policy engine does not"),
+                policy_record: Cell::Yes,
+                scannable: Cell::No(NO_DOC),
+                emptiness_probe: Cell::Yes,
+                reclaim_referenced: Cell::Yes,
+                download_signal: Cell::No("a catalog read is not a download"),
+                prerelease: Cell::No("a server version is not semver by contract"),
+            },
+            Format::Raw => Coverage {
+                metered_publish: Cell::Yes,
+                publish_gate: Cell::No("a file declares nothing a rule could judge"),
+                policy_record: Cell::Yes,
+                scannable: Cell::No(NO_DOC),
+                emptiness_probe: Cell::Yes,
+                reclaim_referenced: Cell::Yes,
+                download_signal: Cell::No("a path is not a version"),
+                prerelease: Cell::No("a path carries no version"),
+            },
+        }
     }
 }
 
@@ -209,5 +341,52 @@ mod tests {
             serde_json::to_string(&Visibility::Private).unwrap(),
             "\"private\""
         );
+    }
+}
+
+#[cfg(test)]
+mod coverage_tests {
+    use super::*;
+
+    /// Every cell of every row is stated. The compiler already refuses a
+    /// missing row; this refuses a row that answers `No` with nothing to say,
+    /// because "no" without a reason is the oversight the matrix exists to end.
+    #[test]
+    fn every_absence_carries_its_reason() {
+        for format in Format::ALL {
+            let c = format.coverage();
+            for (column, cell) in [
+                ("metered_publish", c.metered_publish),
+                ("publish_gate", c.publish_gate),
+                ("policy_record", c.policy_record),
+                ("scannable", c.scannable),
+                ("emptiness_probe", c.emptiness_probe),
+                ("reclaim_referenced", c.reclaim_referenced),
+                ("download_signal", c.download_signal),
+                ("prerelease", c.prerelease),
+            ] {
+                if let Some(why) = cell.why() {
+                    assert!(
+                        why.len() > 20,
+                        "{format:?}.{column} says no without saying why: {why:?}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The column a format declares and the ecosystem it names must agree: a
+    /// format that says it is scannable has somewhere to send the scan, and
+    /// one that names an ecosystem is scanned. PyPI held both halves apart —
+    /// it named `PyPI` and read no dependency — and answered clean forever.
+    #[test]
+    fn scannable_and_its_ecosystem_are_one_statement() {
+        for format in Format::ALL {
+            assert_eq!(
+                format.coverage().scannable.yes(),
+                format.osv_ecosystem().is_some(),
+                "{format:?}: scannable and osv_ecosystem disagree"
+            );
+        }
     }
 }
