@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget test-e2e-raw clean frontend release docker deploy undeploy logs publish lint fmt
 
 # Load .env if it exists
 -include .env
@@ -88,6 +88,9 @@ test-e2e-docker: ## E2E docker CLI (client docker requis, ou DOCKER_BIN)
 
 test-e2e-maven: ## E2E mvn et gradle (MVN_BIN, GRADLE_BIN pour un Gradle >= 8)
 	OPENCARGO_E2E_REQUIRE=1 cargo test --test maven_e2e_test
+
+test-e2e-raw: ## E2E raw avec curl (CURL_BIN)
+	OPENCARGO_E2E_REQUIRE=1 cargo test --test raw_e2e_test
 
 test-e2e-nuget: ## E2E dotnet (DOTNET_BIN, ou scripts/dotnet-in-docker)
 	DOTNET_BIN=$${DOTNET_BIN:-$(CURDIR)/scripts/dotnet-in-docker} OPENCARGO_E2E_REQUIRE=1 cargo test --test nuget_e2e_test dotnet

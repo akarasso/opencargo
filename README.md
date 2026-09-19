@@ -150,9 +150,10 @@ issue or write to the address in `SECURITY.md`.
 
 Read this before the comparison table sells you anything.
 
-- PyPI, Maven and NuGet (hosted, proxy, group), S3-compatible storage and
-  OIDC SSO are new and in preview: tested in CI, not yet validated on a
-  second deployment. The comparison table above does not count them yet.
+- PyPI, Maven, NuGet and raw/generic files (hosted, proxy, group),
+  S3-compatible storage and OIDC SSO are new and in preview: tested in CI,
+  not yet validated on a second deployment. The comparison table above does
+  not count them yet.
 - The Go checksum database is not proxied: exclude private modules with
   `GONOSUMDB` or run with `GOSUMDB=off`. `go` gets a `404` for an unknown
   module and moves on to the next `GOPROXY` entry, but a `502` (upstream down)
