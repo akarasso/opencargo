@@ -485,6 +485,27 @@ async fn a_scoped_token_reaches_no_administrative_route() {
     assert_eq!(allowed.status(), StatusCode::OK, "the scope is what refused");
 }
 
+/// The instance report is administrative like the rest: an admin's scoped
+/// token does not read it, the same admin's session does.
+#[tokio::test]
+async fn a_scoped_admin_token_does_not_read_the_instance_report() {
+    let s = setup().await;
+    s.account("root", "admin").await;
+    let scoped = s
+        .token("root", "robot", Some(repo_scope("npm-*", &["read", "write"])))
+        .await;
+    let full = s.token("root", "session", None).await;
+    let url = format!("{}/api/v1/system/instance", s.url);
+
+    let refused = s.client.get(&url).bearer_auth(&scoped).send().await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(refused).await["code"], "insufficient_scope");
+
+    let served = s.client.get(&url).bearer_auth(&full).send().await.unwrap();
+    assert_eq!(served.status(), StatusCode::OK);
+    assert!(body(served).await["owner"].is_string());
+}
+
 /// Promotion asks for the repository action `admin`, on both repositories,
 /// and a scope that does not name it does not promote.
 #[tokio::test]
