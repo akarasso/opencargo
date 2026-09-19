@@ -216,6 +216,51 @@ pub fn subject(format: Format, n: usize) -> Subject {
     Subject { name, version }
 }
 
+/// The request a client makes to obtain what `publish` created. Exhaustive
+/// too, so a format cannot answer a download column without a download.
+pub async fn fetch(client: &Client, base_url: &str, format: Format, n: usize) -> Response {
+    let repo = repo_of(format);
+    let s = subject(format, n);
+    let url = match format {
+        Format::Npm => format!("{base_url}/{repo}/{0}/-/{0}-{1}.tgz", s.name, s.version),
+        Format::Cargo => format!(
+            "{base_url}/{repo}/api/v1/crates/{}/{}/download",
+            s.name, s.version
+        ),
+        Format::Go => format!("{base_url}/{repo}/{}/@v/{}.zip", s.name, s.version),
+        Format::Pypi => format!(
+            "{base_url}/{repo}/files/{}/{}",
+            s.name,
+            pypi::wheel_name(&s.name, &s.version)
+        ),
+        Format::Nuget => format!(
+            "{base_url}/{repo}/v3/flatcontainer/{0}/{1}/{0}.{1}.nupkg",
+            s.name.to_ascii_lowercase(),
+            s.version
+        ),
+        Format::Maven => format!(
+            "{base_url}/maven/{repo}/org/example/{0}/{1}/{0}-{1}.jar",
+            s.name, s.version
+        ),
+        Format::Oci => format!("{base_url}/v2/{repo}/{}/manifests/{}", s.name, s.version),
+        Format::Mcp => format!(
+            "{base_url}/{repo}/v0.1/servers/{}/versions/{}",
+            s.name.replace('/', "%2F"),
+            s.version
+        ),
+        Format::Raw => format!("{base_url}/raw/{repo}/{}", s.name),
+    };
+    let request = client.get(url).bearer_auth(STATIC_TOKEN);
+    let request = match format {
+        Format::Oci => request.header(
+            "accept",
+            "application/vnd.oci.image.manifest.v1+json",
+        ),
+        _ => request,
+    };
+    request.send().await.unwrap()
+}
+
 fn refusal(response: Response) -> Option<Response> {
     (!response.status().is_success()).then_some(response)
 }

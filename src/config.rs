@@ -945,6 +945,9 @@ impl Default for ProxyConfig {
 #[serde(default)]
 pub struct CleanupConfig {
     pub enabled: bool,
+    /// Covers every format that defines a pre-release: npm, Cargo and NuGet
+    /// read the SemVer hyphen, PyPI reads PEP 440. A Go pseudo-version and a
+    /// Maven snapshot are not pre-releases and are never swept.
     pub prerelease_older_than_days: Option<u64>,
     /// Proxy cache rows idle this long are evicted; runs regardless of `enabled`.
     pub proxy_cache_older_than_days: Option<u64>,

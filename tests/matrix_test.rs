@@ -168,3 +168,43 @@ async fn every_published_byte_is_claimed_by_the_reference_union() {
         "the sweeper would delete these live bytes: {orphans:#?}"
     );
 }
+
+/// `download_signal`: the count on the dashboard is the assertion. Nine
+/// publishes, nine downloads, and the total is the number of formats whose
+/// row says the read is recorded against the version it served.
+#[tokio::test]
+async fn the_download_count_is_exactly_the_formats_that_declare_the_signal() {
+    let s = server().await;
+    let client = reqwest::Client::new();
+    for format in Format::ALL {
+        let published = publish::publish(&client, &s.base_url, format, 1).await;
+        assert!(published.status().is_success(), "{format:?} publish failed");
+        let fetched = publish::fetch(&client, &s.base_url, format, 1).await;
+        assert!(
+            fetched.status().is_success(),
+            "{format:?} download answered {}: {:?}",
+            fetched.status(),
+            fetched.text().await
+        );
+    }
+
+    let declared = Format::ALL
+        .into_iter()
+        .filter(|f| f.coverage().download_signal.yes())
+        .count();
+    let dashboard: serde_json::Value = client
+        .get(format!("{}/api/v1/dashboard", s.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(
+        dashboard["total_downloads"].as_i64(),
+        Some(declared as i64),
+        "{declared} formats declare a download signal; the dashboard counted {}",
+        dashboard["total_downloads"]
+    );
+}

@@ -285,6 +285,8 @@ mod tests {
         /// the npm proxy whose answers the cache rows belong to.
         npm: i64,
         go: i64,
+        nuget: i64,
+        pypi: i64,
         proxy: i64,
     }
 
@@ -296,6 +298,8 @@ mod tests {
         for (name, kind, format, upstream) in [
             ("npmrepo", RepoKind::Hosted, Format::Npm, None),
             ("gorepo", RepoKind::Hosted, Format::Go, None),
+            ("nugetrepo", RepoKind::Hosted, Format::Nuget, None),
+            ("pypirepo", RepoKind::Hosted, Format::Pypi, None),
             (
                 "p",
                 RepoKind::Proxy,
@@ -324,7 +328,9 @@ mod tests {
             _tmp: tmp,
             npm: ids[0],
             go: ids[1],
-            proxy: ids[2],
+            nuget: ids[2],
+            pypi: ids[3],
+            proxy: ids[4],
         }
     }
 
@@ -510,6 +516,34 @@ mod tests {
             fx.left(fx.go, "gomod").await,
             (1, 1),
             "go pseudo-version must be spared (cross-format data-loss guard)"
+        );
+    }
+
+    /// Every format that declares the notion is swept in its own spelling,
+    /// and the lookalikes survive: a PyPI post release is a release, and a
+    /// NuGet stable version carries no hyphen to be mistaken for one.
+    #[tokio::test]
+    async fn the_sweep_reaches_every_format_that_declares_a_pre_release() {
+        let fx = fixture().await;
+        fx.publish(fx.nuget, "Acme.Lib", "1.0.0-beta", days_ago(10)).await;
+        fx.publish(fx.nuget, "Acme.Lib", "1.0.0", days_ago(10)).await;
+        fx.publish(fx.pypi, "widget", "1.0rc1", days_ago(10)).await;
+        fx.publish(fx.pypi, "widget", "1.0.post1", days_ago(10)).await;
+
+        let deleted = sweep_prereleases(fx.packages.as_ref(), 0, now())
+            .await
+            .unwrap();
+
+        assert_eq!(deleted, 2, "the NuGet beta and the PyPI rc, and those two only");
+        assert_eq!(
+            fx.left(fx.nuget, "Acme.Lib").await,
+            (1, 1),
+            "the stable NuGet version stays"
+        );
+        assert_eq!(
+            fx.left(fx.pypi, "widget").await,
+            (1, 1),
+            "a post release is a release, not a pre-release"
         );
     }
 

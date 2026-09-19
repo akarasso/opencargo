@@ -97,6 +97,57 @@ impl Format {
     pub const fn supports_kind(self, _kind: RepoKind) -> bool {
         true
     }
+
+    /// Whether every version this format calls a pre-release carries a
+    /// hyphen, which lets a store narrow its scan before the predicate
+    /// decides. False for PEP 440, where `1.0rc1` has none.
+    pub const fn prerelease_implies_hyphen(self) -> bool {
+        match self {
+            Format::Npm | Format::Cargo | Format::Nuget => true,
+            Format::Pypi => false,
+            // No pre-release at all, so the implication holds vacuously.
+            Format::Go | Format::Maven | Format::Oci | Format::Mcp | Format::Raw => true,
+        }
+    }
+
+    /// Whether this format calls `version` a pre-release. A format whose row
+    /// says `No` never does, so the retention sweep cannot reach it.
+    pub fn is_prerelease(self, version: &str) -> bool {
+        match self {
+            // SemVer: everything after the first hyphen is the pre-release.
+            Format::Npm | Format::Cargo | Format::Nuget => version.contains('-'),
+            // PEP 440: a, b, rc and dev segments, with or without separators.
+            Format::Pypi => pep440_prerelease(version),
+            Format::Go
+            | Format::Maven
+            | Format::Oci
+            | Format::Mcp
+            | Format::Raw => false,
+        }
+    }
+}
+
+/// PEP 440 spells a pre-release `1.0a1`, `1.0.b2`, `1.0-rc1` or `1.0.dev3`,
+/// and accepts `alpha`, `beta`, `c`, `pre` and `preview` as aliases. A `post`
+/// release is not one, and the local segment after `+` is not read: `1.0+abc1`
+/// is a final release built somewhere.
+fn pep440_prerelease(version: &str) -> bool {
+    const MARKERS: [&str; 9] = ["alpha", "beta", "preview", "pre", "rc", "dev", "a", "b", "c"];
+    let lower = version.to_ascii_lowercase();
+    let public = lower.split('+').next().unwrap_or_default();
+    for (at, _) in public.char_indices().filter(|(_, c)| c.is_ascii_alphabetic()) {
+        let tail = &public[at..];
+        for marker in MARKERS {
+            let Some(after) = tail.strip_prefix(marker) else {
+                continue;
+            };
+            let after = after.trim_start_matches(['-', '_', '.']);
+            if after.is_empty() || after.starts_with(|c: char| c.is_ascii_digit()) {
+                return true;
+            }
+        }
+    }
+    false
 }
 
 impl FromStr for Format {
@@ -372,5 +423,75 @@ mod coverage_tests {
                 "{format:?}: scannable and osv_ecosystem disagree"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod prerelease_tests {
+    use super::*;
+
+    /// A format that declares the notion recognises its own spellings, and a
+    /// format that declares none says no to all of them. The sweep reads this,
+    /// so a `Yes` with a predicate that never fires would delete nothing and
+    /// look healthy.
+    #[test]
+    fn each_format_reads_the_versions_it_calls_pre_releases() {
+        for format in Format::ALL {
+            let spellings: &[&str] = match format {
+                Format::Npm | Format::Cargo | Format::Nuget => &["1.0.0-beta", "2.0.0-rc.1"],
+                Format::Pypi => &["1.0a1", "1.0.b2", "1.0-rc1", "1.0.dev3", "2.0alpha"],
+                _ => &[],
+            };
+            for version in spellings {
+                assert!(
+                    format.is_prerelease(version),
+                    "{format:?} does not read {version} as a pre-release"
+                );
+            }
+            if !format.coverage().prerelease.yes() {
+                for version in ["1.0.0-beta", "1.0a1", "v0.0.0-20200101000000-abcdef"] {
+                    assert!(
+                        !format.is_prerelease(version),
+                        "{format:?} says no to the notion and yes to {version}"
+                    );
+                }
+            }
+            for stable in ["1.0.0", "2.1.3"] {
+                assert!(!format.is_prerelease(stable), "{format:?}: {stable}");
+            }
+        }
+    }
+
+    /// The three that would cost a user an artifact. A Go pseudo-version
+    /// carries a hyphen and is permanent; a PyPI post release is a release;
+    /// a local segment is where a build writes its own name.
+    #[test]
+    fn the_lookalikes_are_not_pre_releases() {
+        assert!(!Format::Go.is_prerelease("v0.0.0-20200101000000-abcdef"));
+        assert!(!Format::Pypi.is_prerelease("1.0.post1"));
+        assert!(!Format::Pypi.is_prerelease("1.0+abc1"));
+        assert!(!Format::Pypi.is_prerelease("1.0+ubuntu22.04"));
+        assert!(!Format::Nuget.is_prerelease("1.0.0"));
+        assert!(!Format::Maven.is_prerelease("1.0-SNAPSHOT"));
+    }
+
+    /// The hint a store pre-filters on, held against the predicate that
+    /// decides: a format claiming the implication must never call a
+    /// hyphen-free version a pre-release, or the narrowed scan loses it.
+    #[test]
+    fn the_hyphen_hint_never_drops_what_the_predicate_would_keep() {
+        for format in Format::ALL.into_iter().filter(|f| f.prerelease_implies_hyphen()) {
+            for version in ["1.0.0", "1.0.0+build", "2024.1.1", "1.0.0rc1", "1.0a1", "1.0.dev3"] {
+                assert!(
+                    !format.is_prerelease(version),
+                    "{format:?} claims every pre-release carries a hyphen and calls \
+                     {version} one, so a hyphen pre-filter would lose it"
+                );
+            }
+        }
+        assert!(
+            !Format::Pypi.prerelease_implies_hyphen(),
+            "PEP 440 spells 1.0rc1 without one, so PyPI cannot be narrowed that way"
+        );
     }
 }
