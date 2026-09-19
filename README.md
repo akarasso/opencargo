@@ -529,6 +529,8 @@ group whose proxy member fronts another instance; locally they print
 
 - [docs/api.md](docs/api.md): every HTTP route, the WebSocket protocol, webhook
   payloads and Prometheus metrics.
+- [docs/performance.md](docs/performance.md): what one process costs per
+  workload, how it was measured, and what was not.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).
