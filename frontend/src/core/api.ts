@@ -17,8 +17,11 @@ import type {
   PolicyQuery,
   PolicyReport,
   PolicyRules,
+  Explanation,
   RepositoriesResponse,
   RepositoryDetail,
+  RoutingRule,
+  RoutingRules,
   SearchResponse,
   StorageStatus,
   Token,
@@ -289,4 +292,30 @@ export function promotePackage(
   to: string,
 ): Promise<{ ok: boolean }> {
   return http.post(`/api/v1/promote/${name}/${enc(version)}`, { from, to });
+}
+
+// --- Routing rules -------------------------------------------------------------
+
+export function fetchRoutingRules(): Promise<RoutingRules> {
+  return http.get('/api/v1/routing-rules');
+}
+
+export function createRoutingRule(rule: {
+  name: string;
+  format: string;
+  patterns: string[];
+  except: string[];
+  effect: string;
+  targets: string[];
+}): Promise<RoutingRule> {
+  return http.post('/api/v1/routing-rules', rule);
+}
+
+export function deleteRoutingRule(name: string): Promise<{ deleted: string; still_refused_by: string[] }> {
+  return http.del(`/api/v1/routing-rules/${enc(name)}`);
+}
+
+/** The dry run: the same verdict the resolver reaches, on the same snapshot. */
+export function explainRoute(repository: string, name: string): Promise<Explanation> {
+  return http.post('/api/v1/routing-rules/explain', { repository, name });
 }

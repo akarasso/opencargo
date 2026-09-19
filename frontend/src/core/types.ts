@@ -329,3 +329,39 @@ export interface StorageStatus {
   reclaim_candidates: number;
   reclaim_prefixes: number;
 }
+
+// --- Routing rules -------------------------------------------------------------
+
+/** One rule as the admin API returns it; targets are repository incarnations. */
+export interface RoutingRule {
+  name: string;
+  format: string;
+  patterns: string[];
+  except: string[];
+  effect: 'deny' | 'allow_hosted' | 'allow_members';
+  targets: string[];
+  created_at: string;
+  updated_at: string;
+}
+
+export interface RoutingRules {
+  rules: RoutingRule[];
+  snapshot_version: number;
+}
+
+export interface ExplainedMember {
+  name: string;
+  kind: string;
+  admitted: boolean;
+  /** Every rule that refuses, in name order — never one chosen out of them. */
+  refused_by: string[];
+  /** Refused because this node has not refreshed its rules within the bound. */
+  stale: boolean;
+}
+
+export interface Explanation {
+  match_key: string;
+  ident_key: string;
+  snapshot_version: number;
+  members: ExplainedMember[];
+}
