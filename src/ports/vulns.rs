@@ -12,12 +12,17 @@ use chrono::{DateTime, Utc};
 use crate::domain::{ScanResult, VulnDetail};
 use crate::error::StoreError;
 
-/// How a scan fails. A feed only ever produces `Upstream`; `Store` is here so
-/// the use case that does both has one vocabulary.
+/// How a scan fails. A feed produces `Upstream` or `Unscannable`; `Store` is
+/// here so the use case that does both has one vocabulary.
 #[derive(Debug, thiserror::Error)]
 pub enum ScanError {
     #[error("OSV query failed: {0}")]
     Upstream(String),
+
+    /// The document cannot say what the version depends on, so no result
+    /// exists to record: a clean row would claim a set that was never seen.
+    #[error("dependencies unknown: {0}")]
+    Unscannable(String),
 
     #[error(transparent)]
     Store(#[from] StoreError),

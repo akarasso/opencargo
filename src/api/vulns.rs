@@ -12,6 +12,7 @@ use crate::app::scan::ScanVersion;
 use crate::auth::middleware::AuthUser;
 use crate::domain::Repository;
 use crate::error::{AppError, AppResult};
+use crate::ports::vulns::ScanError;
 use crate::registry::extract_package_name;
 use crate::server::AppState;
 use crate::wire::wire_ts;
@@ -187,7 +188,10 @@ async fn rescan_impl(
     let result = scan
         .run(version.id, &version.metadata_json, ecosystem, Utc::now())
         .await
-        .map_err(|e| AppError::ServiceUnavailable(format!("scan failed: {e}")))?;
+        .map_err(|e| match e {
+            ScanError::Unscannable(why) => AppError::BadRequest(format!("cannot scan: {why}")),
+            other => AppError::ServiceUnavailable(format!("scan failed: {other}")),
+        })?;
 
     Ok(Json(json!({
         "package": name,

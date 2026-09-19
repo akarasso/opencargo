@@ -85,7 +85,7 @@ pub(crate) async fn gather(shared: &Shared, cfg: &PolicyConfig, p: Pending) -> R
             let at = cfg.min_release_age.as_ref().and(at);
             (digest, version, at)
         }
-        Source::Raw { digest } => {
+        Source::Raw { digest } | Source::Maven { digest } => {
             facts.date_source = "none";
             (digest, version, None)
         }

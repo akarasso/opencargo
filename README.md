@@ -570,10 +570,11 @@ max_snapshot_age_secs = 300        # past it, the proxy members a rule speaks fo
 refusal_window_secs = 3600         # how long one refused (name, repo, member) stays deduplicated
 
 [policy.npm-proxy]                 # per proxy repository, all rules off by default
-min_release_age = "48h"            # Ns | Nm | Nh | Nd
+min_release_age = "48h"            # Ns | Nm | Nh | Nd; not for Maven, whose upstream dates no version
 osv_severity = "high"              # low | medium | high | critical; needs vuln_scan.enabled
-install_scripts = true             # npm only
-typosquat = true                   # not for OCI
+install_scripts = true             # npm and NuGet
+typosquat = true                   # npm, Cargo, Go and PyPI, the formats a name list ships for
+                                   # a rule that cannot fire on a member's format is named in a startup warning
 fetch_missing_facts = true         # false: cache-only facts, no recorder-initiated upstream request
 
 # Optional seed; managed via API afterwards

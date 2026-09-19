@@ -9,6 +9,10 @@ use crate::policy::Resolution;
 /// scripts and MSBuild imports, gathered from the served package.
 pub struct InstallScripts;
 
+pub fn applies(format: Format) -> bool {
+    matches!(format, Format::Npm | Format::Nuget)
+}
+
 impl Rule for InstallScripts {
     fn name(&self) -> &'static str {
         "install_scripts"
@@ -19,7 +23,7 @@ impl Rule for InstallScripts {
     }
 
     fn evaluate(&self, _: &PolicyConfig, r: &Resolution, _: DateTime<Utc>) -> Option<RuleVerdict> {
-        let (verdict, reason) = if !matches!(r.format, Format::Npm | Format::Nuget) {
+        let (verdict, reason) = if !applies(r.format) {
             (
                 Verdict::NotApplicable,
                 format!("{}: install scripts are an npm and NuGet notion", r.format.as_str()),
