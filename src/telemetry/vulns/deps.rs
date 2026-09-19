@@ -1,24 +1,28 @@
 use serde_json::Value;
 
+use crate::domain::Format;
 use crate::registry::pypi::names::normalize;
 
-/// Dependency name/version pairs of a published version: npm, cargo, Maven,
-/// NuGet and PyPI store JSON metadata, Go stores the raw go.mod. `Err` names
-/// why the document cannot say what it depends on.
-pub fn extract_dependencies(metadata: &str, ecosystem: &str) -> Result<Vec<(String, String)>, String> {
-    if ecosystem == "Go" {
+/// Dependency name/version pairs of a published version. Exhaustive on
+/// `Format`: a format that declares itself scannable reads its own document,
+/// and one that does not says so in its row rather than falling through a
+/// default arm that answers "no dependencies". `Err` names why a document
+/// cannot say what it depends on.
+pub fn extract_dependencies(metadata: &str, format: Format) -> Result<Vec<(String, String)>, String> {
+    if matches!(format, Format::Go) {
         return Ok(parse_go_mod(metadata));
     }
     let Ok(meta) = serde_json::from_str::<Value>(metadata) else {
         return Ok(Vec::new());
     };
-    Ok(match ecosystem {
-        "npm" => npm_dependencies(&meta),
-        "crates.io" => cargo_dependencies(&meta),
-        "Maven" => maven_dependencies(&meta),
-        "NuGet" => nuget_dependencies(&meta),
-        "PyPI" => pypi_dependencies(&meta)?,
-        _ => Vec::new(),
+    Ok(match format {
+        Format::Npm => npm_dependencies(&meta),
+        Format::Cargo => cargo_dependencies(&meta),
+        Format::Maven => maven_dependencies(&meta),
+        Format::Nuget => nuget_dependencies(&meta),
+        Format::Pypi => pypi_dependencies(&meta)?,
+        Format::Go => unreachable!("read above, before the document is parsed as JSON"),
+        Format::Oci | Format::Mcp | Format::Raw => Vec::new(),
     })
 }
 
@@ -238,7 +242,7 @@ mod tests {
             {"target_framework": "netstandard2.0", "dependencies": [{"id": "Newtonsoft.Json", "range": "[13.0.1, )"}, {"id": "A", "range": "1.2.3"}, {"id": "B"}]}
         ]}}"#;
         assert_eq!(
-            extract_dependencies(meta, "NuGet").unwrap(),
+            extract_dependencies(meta, Format::Nuget).unwrap(),
             vec![
                 ("Newtonsoft.Json".to_string(), "13.0.1".to_string()),
                 ("A".to_string(), "1.2.3".to_string())
@@ -260,7 +264,7 @@ mod tests {
             }
         }"#;
 
-        let deps = extract_dependencies(meta, "npm").unwrap();
+        let deps = extract_dependencies(meta, Format::Npm).unwrap();
         assert_eq!(deps.len(), 3);
         assert!(deps.iter().any(|(n, v)| n == "lodash" && v == "4.17.20"));
         assert!(deps.iter().any(|(n, v)| n == "axios" && v == "0.21.0"));
@@ -278,7 +282,7 @@ mod tests {
             ]
         }"#;
 
-        let deps = extract_dependencies(meta, "crates.io").unwrap();
+        let deps = extract_dependencies(meta, Format::Cargo).unwrap();
         assert_eq!(deps.len(), 2);
         assert!(deps.iter().any(|(n, v)| n == "serde" && v == "1.0"));
         assert!(deps.iter().any(|(n, v)| n == "tokio" && v == "1.0"));
@@ -292,7 +296,7 @@ mod tests {
             \tgolang.org/x/text v0.3.7\n)\n\n\
             replace (\n\tgithub.com/two/block => ../local\n)\n\
             exclude github.com/bad/one v0.9.0\n";
-        let deps = extract_dependencies(go_mod, "Go").unwrap();
+        let deps = extract_dependencies(go_mod, Format::Go).unwrap();
         assert_eq!(
             deps,
             vec![
@@ -306,7 +310,7 @@ mod tests {
     #[test]
     fn maven_dependencies_are_the_pom_map() {
         let meta = r#"{"groupId": "g", "dependencies": {"com.x:y": "2.1", "a:b": "[1.0,2.0)", "c:d": "${lib.version}", "e:f": "*"}}"#;
-        let mut deps = extract_dependencies(meta, "Maven").unwrap();
+        let mut deps = extract_dependencies(meta, Format::Maven).unwrap();
         deps.sort();
         assert_eq!(
             deps,
@@ -331,7 +335,7 @@ mod tests {
             "requests (>=2.31)"
         ]}"#;
         assert_eq!(
-            extract_dependencies(meta, "PyPI").unwrap(),
+            extract_dependencies(meta, Format::Pypi).unwrap(),
             vec![
                 ("requests".to_string(), "2.31".to_string()),
                 ("django-rest-framework".to_string(), "3.14".to_string()),
@@ -339,17 +343,17 @@ mod tests {
                 ("pyyaml".to_string(), "6.0".to_string()),
             ]
         );
-        assert!(extract_dependencies(r#"{"name": "bare"}"#, "PyPI").unwrap().is_empty());
+        assert!(extract_dependencies(r#"{"name": "bare"}"#, Format::Pypi).unwrap().is_empty());
     }
 
     #[test]
     fn pypi_dynamic_requires_dist_is_unscannable_not_clean() {
         let meta = r#"{"name": "demo", "requires_dist": [], "dynamic": ["Requires-Dist", "Requires-Python"]}"#;
-        let why = extract_dependencies(meta, "PyPI").unwrap_err();
+        let why = extract_dependencies(meta, Format::Pypi).unwrap_err();
         assert!(why.contains("Requires-Dist dynamic"), "{why}");
         let other = r#"{"name": "demo", "requires_dist": ["idna==3.4"], "dynamic": ["Description"]}"#;
         assert_eq!(
-            extract_dependencies(other, "PyPI").unwrap(),
+            extract_dependencies(other, Format::Pypi).unwrap(),
             vec![("idna".to_string(), "3.4".to_string())]
         );
     }
@@ -366,8 +370,8 @@ mod tests {
     #[test]
     fn test_extract_no_deps() {
         let meta = r#"{"name": "empty", "version": "1.0.0"}"#;
-        let deps = extract_dependencies(meta, "npm").unwrap();
+        let deps = extract_dependencies(meta, Format::Npm).unwrap();
         assert!(deps.is_empty());
-        assert!(extract_dependencies("module x\n\ngo 1.22\n", "Go").unwrap().is_empty());
+        assert!(extract_dependencies("module x\n\ngo 1.22\n", Format::Go).unwrap().is_empty());
     }
 }

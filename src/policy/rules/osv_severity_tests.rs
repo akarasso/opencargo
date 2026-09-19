@@ -123,11 +123,7 @@ async fn memo_hit_is_not_deferred() {
     let osv = FakeOsv::start().await;
     let (rule, memo) = rule(Some(&osv));
     let now = Utc::now();
-    let key = (
-        "npm".to_string(),
-        "lodash".to_string(),
-        "4.17.21".to_string(),
-    );
+    let key = (Format::Npm, "lodash".to_string(), "4.17.21".to_string());
     memo.lock()
         .unwrap()
         .insert(key.clone(), finding(Some(("GHSA-x", Severity::High)), now));
@@ -207,18 +203,18 @@ async fn batch_groups_by_ecosystem_and_dedupes() {
         }
     }
     let now = Utc::now();
-    let top = |eco: &str, name: &str, version: &str| {
-        memo_hit(&memo, &(eco.into(), name.into(), version.into()), now)
+    let top = |format: Format, name: &str, version: &str| {
+        memo_hit(&memo, &(format, name.into(), version.into()), now)
             .expect("memoised")
             .top
     };
     assert_eq!(
-        top("npm", "lodash", "1.0.0"),
+        top(Format::Npm, "lodash", "1.0.0"),
         Some(("GHSA-a".into(), Severity::Critical))
     );
-    assert_eq!(top("npm", "lodash", "1.0.1"), None);
+    assert_eq!(top(Format::Npm, "lodash", "1.0.1"), None);
     assert_eq!(
-        top("crates.io", "serde", "1.0.2"),
+        top(Format::Cargo, "serde", "1.0.2"),
         Some(("GHSA-b".into(), Severity::Medium))
     );
     let (_, mut again) = batch_rows(&osv);
@@ -241,5 +237,5 @@ async fn batch_error_marks_every_row_unknown() {
         assert!(v.reason.starts_with("osv unreachable: "), "{}", v.reason);
     }
     let now = Utc::now();
-    assert!(memo_hit(&memo, &("npm".into(), "lodash".into(), "1.0.0".into()), now).is_none());
+    assert!(memo_hit(&memo, &(Format::Npm, "lodash".into(), "1.0.0".into()), now).is_none());
 }

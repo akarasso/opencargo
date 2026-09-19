@@ -8,7 +8,7 @@ use super::{PolicyConfig, Rule};
 use crate::policy::memo::Memo;
 use crate::domain::{RuleVerdict, Verdict};
 use crate::policy::Resolution;
-use crate::domain::Severity;
+use crate::domain::{Format, Severity};
 use crate::domain::VulnDetail;
 use crate::ports::vulns::VulnFeed;
 
@@ -38,7 +38,7 @@ impl OsvFinding {
     }
 }
 
-pub type Triple = (String, String, String);
+pub type Triple = (Format, String, String);
 pub type OsvMemo = Mutex<Memo<Triple, OsvFinding>>;
 
 pub fn new_memo() -> Arc<OsvMemo> {
@@ -54,11 +54,8 @@ fn memo_hit(memo: &OsvMemo, key: &Triple, now: DateTime<Utc>) -> Option<OsvFindi
 }
 
 fn triple(r: &Resolution) -> Option<Triple> {
-    Some((
-        r.format.osv_ecosystem()?.to_string(),
-        r.name.clone(),
-        r.version.clone()?,
-    ))
+    r.format.osv_ecosystem()?;
+    Some((r.format, r.name.clone(), r.version.clone()?))
 }
 
 /// The one verdict both stages compute from a finding.
@@ -139,7 +136,7 @@ pub async fn evaluate_batch(
     rows: &mut [Row],
 ) {
     let now = Utc::now();
-    let mut groups: HashMap<String, Vec<(String, String)>> = HashMap::new();
+    let mut groups: HashMap<Format, Vec<(String, String)>> = HashMap::new();
     let mut seen = HashSet::new();
     for (r, _) in rows.iter().filter(|(_, v)| v.contains(&None)) {
         let Some(key) = triple(r) else { continue };
@@ -147,20 +144,20 @@ pub async fn evaluate_batch(
             groups.entry(key.0).or_default().push((key.1, key.2));
         }
     }
-    let mut failed: HashMap<String, String> = HashMap::new();
-    for (ecosystem, deps) in groups {
-        match scanner.assess_batch(&ecosystem, &deps).await {
+    let mut failed: HashMap<Format, String> = HashMap::new();
+    for (format, deps) in groups {
+        match scanner.assess_batch(format, &deps).await {
             Ok(findings) => {
                 let mut memo = memo.lock().unwrap();
                 for ((name, version), details) in deps.into_iter().zip(findings) {
                     memo.insert(
-                        (ecosystem.clone(), name, version),
+                        (format, name, version),
                         OsvFinding::from_details(&details, now),
                     );
                 }
             }
             Err(e) => {
-                failed.insert(ecosystem, e.to_string());
+                failed.insert(format, e.to_string());
             }
         }
     }
