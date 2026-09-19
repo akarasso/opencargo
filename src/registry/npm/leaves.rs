@@ -1,3 +1,4 @@
+use bytes::Bytes;
 use serde_json::Value;
 
 use crate::domain::{CacheRepo, Format, Outcome};
@@ -6,31 +7,47 @@ use crate::ports::packages::NameMatch;
 use crate::proxy::{IntoPayload, Payload};
 use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
-use super::packument::{
-    dist_tags_map, hosted_packument, strip_versions_to_abbreviated, Packument,
-};
+use super::packument::{dist_tags_map, hosted_packument};
+use super::render::{self, Flavor};
 use super::search::search_in_repo;
 use super::upstream::{NpmArtifact, NpmUpstream};
 
+/// The packument a client is served: already rendered, so nothing above
+/// this leaf holds the document as a tree.
 pub struct PackumentLeaf {
     pub name: String,
     pub abbreviated: bool,
 }
 
+impl PackumentLeaf {
+    fn flavor(&self) -> Flavor {
+        Flavor::of(self.abbreviated)
+    }
+
+    fn served(&self, body: Vec<u8>) -> Payload {
+        let mut payload = Payload::bytes(Bytes::from(body));
+        payload.content_type = Some(self.flavor().content_type().to_string());
+        payload
+    }
+}
+
 #[async_trait::async_trait]
 impl Leaf for PackumentLeaf {
-    type Out = Packument;
+    type Out = Payload;
 
     async fn hosted(
         &self,
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
-    ) -> Result<Outcome<Packument>, ResolveError> {
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let built = hosted_packument(cx.packages, member, &self.name, self.abbreviated).await?;
-        Ok(match built {
-            Outcome::Found(json) => Outcome::Found(Packument { json, stale: false }),
-            Outcome::NotFound => Outcome::NotFound,
-        })
+        let Outcome::Found(mut json) = built else {
+            return Ok(Outcome::NotFound);
+        };
+        render::rewrite_tarball_urls(&mut json, cx.base_url, cx.url.0, &self.name);
+        let body = serde_json::to_vec(&json)
+            .map_err(|e| ResolveError::Internal(format!("packument is not serializable: {e}")))?;
+        Ok(Outcome::Found(self.served(body)))
     }
 
     async fn proxy(
@@ -38,7 +55,7 @@ impl Leaf for PackumentLeaf {
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
-    ) -> Result<Outcome<Packument>, ResolveError> {
+    ) -> Result<Outcome<Payload>, ResolveError> {
         let artifact = NpmArtifact::Metadata {
             name: self.name.clone(),
         };
@@ -46,16 +63,13 @@ impl Leaf for PackumentLeaf {
         let Outcome::Found(cached) = engine.fetch(&NpmUpstream, up, member, &artifact).await? else {
             return Ok(Outcome::NotFound);
         };
-        let bytes = engine.bytes(&cached).await?;
-        let mut json: serde_json::Value = serde_json::from_slice(&bytes)
+        let raw = engine.bytes(&cached).await?;
+        let body = render::render(&raw, self.flavor(), cx.base_url, cx.url.0, &self.name)
             .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
-        if self.abbreviated {
-            strip_versions_to_abbreviated(&mut json);
-        }
-        Ok(Outcome::Found(Packument {
-            json,
-            stale: cached.stale,
-        }))
+        drop(raw);
+        let mut payload = self.served(body);
+        payload.stale = cached.stale;
+        Ok(Outcome::Found(payload))
     }
 }
 
@@ -145,25 +159,27 @@ impl Leaf for DistTagsLeaf {
         Ok(Outcome::Found(json))
     }
 
+    /// One field of the cached packument, never the document as a tree:
+    /// a tag list is a handful of strings whatever the packument weighs.
     async fn proxy(
         &self,
         cx: &Cx<'_>,
         member: CacheRepo<'_>,
         up: &Upstream,
     ) -> Result<Outcome<Value>, ResolveError> {
-        let packument = PackumentLeaf {
+        let artifact = NpmArtifact::Metadata {
             name: self.name.clone(),
-            abbreviated: true,
         };
-        Ok(match packument.proxy(cx, member, up).await? {
-            Outcome::Found(mut p) => Outcome::Found(
-                p.json
-                    .get_mut("dist-tags")
-                    .map(Value::take)
-                    .unwrap_or_else(|| Value::Object(Default::default())),
-            ),
-            Outcome::NotFound => Outcome::NotFound,
-        })
+        let engine = cx.proxy;
+        let Outcome::Found(cached) = engine.fetch(&NpmUpstream, up, member, &artifact).await? else {
+            return Ok(Outcome::NotFound);
+        };
+        let raw = engine.bytes(&cached).await?;
+        let tags = render::field(&raw, "dist-tags")
+            .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
+        Ok(Outcome::Found(
+            tags.unwrap_or_else(|| Value::Object(Default::default())),
+        ))
     }
 }
 

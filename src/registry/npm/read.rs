@@ -3,21 +3,18 @@ use std::collections::HashMap;
 use axum::{
     extract::{Path, State},
     http::{header, HeaderMap, HeaderValue},
-    response::{IntoResponse, Response},
-    Json,
+    response::Response,
 };
 
 use crate::auth::middleware::AuthUser;
 use crate::error::{AppError, AppResult};
-use crate::proxy;
 use crate::registry::resolve::first_hit;
 use crate::registry::{cx, extract_package_name};
 use crate::server::AppState;
 
 use super::leaves::{PackumentLeaf, TarballLeaf};
 use super::param;
-
-const ABBREVIATED_TYPE: &str = "application/vnd.npm.install-v1+json";
+use super::render::ABBREVIATED_TYPE;
 
 /// `{name}-{version}.tgz`: one path segment of version characters, so it is
 /// safe in a cache key and an upstream URL.
@@ -55,26 +52,11 @@ pub async fn get_package(
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.contains(ABBREVIATED_TYPE));
     let leaf = PackumentLeaf {
-        name: package_name.clone(),
+        name: package_name,
         abbreviated,
     };
-    let cx = cx(&state, auth, &repo);
-    let mut packument = first_hit(&cx, &repo, &leaf).await?;
-    proxy::rewrite_tarball_urls(&mut packument.json, &state.base_url, cx.url.0, &package_name);
-
-    let mut response = Json(packument.json).into_response();
-    if abbreviated {
-        response
-            .headers_mut()
-            .insert(header::CONTENT_TYPE, HeaderValue::from_static(ABBREVIATED_TYPE));
-    }
-    if packument.stale {
-        response.headers_mut().insert(
-            header::WARNING,
-            HeaderValue::from_static("110 - \"Response is Stale\""),
-        );
-    }
-    Ok(response)
+    let packument = first_hit(&cx(&state, auth, &repo), &repo, &leaf).await?;
+    state.proxy.stream_response(&packument, Vec::new()).await
 }
 
 pub async fn download_tarball(

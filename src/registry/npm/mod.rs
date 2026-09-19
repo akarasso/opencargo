@@ -3,6 +3,7 @@ pub mod leaves;
 pub mod packument;
 pub mod publish;
 pub mod read;
+pub mod render;
 pub mod routes;
 pub mod search;
 pub mod upstream;
