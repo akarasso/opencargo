@@ -6,7 +6,9 @@
 
 use serde::{Deserialize, Serialize};
 
+use super::format_rules::FormatRules;
 use super::permission::{Rights, RightsSource};
+use super::routing::compile_pattern;
 
 /// Bounds a hot path pays on every request, and a token nobody can reason
 /// about is a token nobody can audit.
@@ -34,6 +36,8 @@ pub enum ScopeError {
     WriteForbidden(&'static str),
     #[error("only a repository selector resolves to incarnations")]
     IncarnationsNotOnSelector,
+    #[error("package pattern: {0}")]
+    PackagePattern(String),
     #[error("unreadable scope: {0}")]
     Unreadable(String),
 }
@@ -217,15 +221,19 @@ pub enum Selector {
 
 /// What a request is being judged against. `Repository` and `Package` carry
 /// the repository's incarnation, never only its name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy)]
 pub enum Subject<'a> {
     Repository {
         incarnation: &'a str,
     },
-    /// `package` is the name its format already normalized.
+    /// `package` as the route named it. The format's rules key the name and
+    /// canonicalize the line's pattern, the seam routing patterns go
+    /// through, so `my_*` reaches the crate served as `my-crate` and
+    /// `@Acme/*` reaches `@acme/x`.
     Package {
         incarnation: &'a str,
         package: &'a str,
+        rules: &'a dyn FormatRules,
     },
     Admin {
         domain: AdminDomain,
@@ -268,7 +276,13 @@ impl Grant {
             return Err(ScopeError::NoAction);
         }
         match &self.selector {
-            Selector::Repo { .. } | Selector::Package { .. } => Ok(()),
+            Selector::Repo { .. } => Ok(()),
+            // Stored as written, compiled per format at each request: what
+            // the routing language refuses would be a line that matches
+            // nothing, so it is refused here instead.
+            Selector::Package { package, .. } => compile_pattern(package.as_str(), str::to_string)
+                .map(drop)
+                .map_err(|e| ScopeError::PackagePattern(e.to_string())),
             Selector::Admin { domain } => {
                 if !self.incarnations.is_empty() {
                     return Err(ScopeError::IncarnationsNotOnSelector);
@@ -308,8 +322,14 @@ impl Grant {
                 Subject::Package {
                     incarnation,
                     package: name,
+                    rules,
                 },
-            ) => self.holds(incarnation) && package.matches(name),
+            ) => {
+                self.holds(incarnation)
+                    && rules
+                        .canonical_pattern(package.as_str())
+                        .is_ok_and(|pattern| pattern.matches(&rules.match_key(name)))
+            }
             (Selector::Admin { domain }, Subject::Admin { domain: asked }) => domain == asked,
             (Selector::Account { account }, Subject::Account { username }) => {
                 account.matches_account(username)
@@ -442,6 +462,7 @@ pub fn narrowed_source(held: Rights, effective: Rights, source: RightsSource) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::DomainError;
 
     fn pat(raw: &str) -> Pattern {
         Pattern::parse(raw).unwrap()
@@ -457,6 +478,44 @@ mod tests {
 
     fn limited(grants: Vec<Grant>) -> TokenScope {
         TokenScope::Limited { grants }
+    }
+
+    /// A format that keys a name the way cargo does: case folded, `_` as `-`.
+    struct Folded;
+
+    impl FormatRules for Folded {
+        fn validate(&self, _: &str) -> Result<(), DomainError> {
+            Ok(())
+        }
+        fn normalize(&self, name: &str) -> String {
+            name.to_string()
+        }
+        fn reserved(&self) -> &'static [&'static str] {
+            &[]
+        }
+        fn validate_version(&self, _: &str) -> Result<(), DomainError> {
+            Ok(())
+        }
+        fn normalize_version(&self, version: &str) -> String {
+            version.to_string()
+        }
+        fn ident_key(&self, name: &str) -> String {
+            self.match_key(name)
+        }
+        fn match_key(&self, name: &str) -> String {
+            name.to_ascii_lowercase().replace('_', "-")
+        }
+        fn canonical_pattern(&self, pattern: &str) -> Result<super::super::routing::Pattern, DomainError> {
+            compile_pattern(pattern, |p| self.match_key(p))
+        }
+    }
+
+    fn package_in(incarnation: &'static str, package: &'static str) -> Subject<'static> {
+        Subject::Package {
+            incarnation,
+            package,
+            rules: &Folded,
+        }
     }
 
     /// `/` is an ordinary character: the four formats whose names carry one
@@ -590,11 +649,7 @@ mod tests {
     #[test]
     fn a_repository_line_covers_the_packages_of_that_repository() {
         let scope = limited(vec![repo_grant("builds", &["inc-1"], &[ScopeAction::Read])]);
-        let subject = Subject::Package {
-            incarnation: "inc-1",
-            package: "@acme/httpclient",
-        };
-        assert!(narrow(Rights::FULL, &scope, &subject).read);
+        assert!(narrow(Rights::FULL, &scope, &package_in("inc-1", "@acme/httpclient")).read);
     }
 
     /// A package line is not a repository line: an admin route that names a
@@ -615,18 +670,39 @@ mod tests {
             &Subject::Repository { incarnation: "inc-1" }
         )
         .read);
-        assert!(narrow(
-            Rights::FULL,
-            &scope,
-            &Subject::Package { incarnation: "inc-1", package: "@acme/httpclient" }
-        )
-        .read);
-        assert!(!narrow(
-            Rights::FULL,
-            &scope,
-            &Subject::Package { incarnation: "inc-1", package: "@other/thing" }
-        )
-        .read);
+        assert!(narrow(Rights::FULL, &scope, &package_in("inc-1", "@acme/httpclient")).read);
+        assert!(!narrow(Rights::FULL, &scope, &package_in("inc-1", "@other/thing")).read);
+    }
+
+    /// Pattern and name go through the format's key, as a routing pattern
+    /// does: a spelling difference the format ignores, the line ignores.
+    #[test]
+    fn a_package_line_is_compared_on_the_format_key() {
+        let scope = limited(vec![Grant {
+            selector: Selector::Package {
+                repo: pat("crates"),
+                package: pat("My_*"),
+            },
+            actions: vec![ScopeAction::Write],
+            incarnations: vec!["inc-1".to_string()],
+        }]);
+        assert!(narrow(Rights::FULL, &scope, &package_in("inc-1", "my-crate")).write);
+        assert!(narrow(Rights::FULL, &scope, &package_in("inc-1", "MY_CRATE")).write);
+        assert!(!narrow(Rights::FULL, &scope, &package_in("inc-1", "their-crate")).write);
+    }
+
+    /// What the routing language refuses would be stored and match nothing.
+    #[test]
+    fn a_package_pattern_outside_the_routing_language_is_refused_at_creation() {
+        let grant = Grant {
+            selector: Selector::Package {
+                repo: pat("crates"),
+                package: pat("a\\*"),
+            },
+            actions: vec![ScopeAction::Read],
+            incarnations: vec![],
+        };
+        assert!(matches!(grant.validate(), Err(ScopeError::PackagePattern(_))));
     }
 
     #[test]

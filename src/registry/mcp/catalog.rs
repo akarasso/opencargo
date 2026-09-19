@@ -28,9 +28,14 @@ const BATCH: i64 = 100;
 const MAX_BATCHES: usize = 20;
 const MAX_SEARCH_BATCHES: usize = 2;
 
-pub async fn open(state: &AppState, name: &str, auth: Option<&AuthUser>) -> AppResult<Repository> {
+pub async fn open(
+    state: &AppState,
+    name: &str,
+    server: Option<&str>,
+    auth: Option<&AuthUser>,
+) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), name).await?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, server, auth).await?;
     crate::registry::ensure_format(&repo, Format::Mcp)?;
     Ok(repo)
 }
@@ -220,7 +225,7 @@ pub async fn list_servers(
     Query(params): Query<HashMap<String, String>>,
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, None, auth).await?;
     let (members, gates) = scope(&state, &repo, auth).await?;
     let include_deleted = include_deleted(&params);
     let version = params.get("version").cloned();
@@ -258,7 +263,7 @@ pub async fn list_versions(
     Query(params): Query<HashMap<String, String>>,
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&server), auth).await?;
     let (members, gates) = scope(&state, &repo, auth).await?;
     let include_deleted = include_deleted(&params);
     let mut seen = std::collections::HashSet::new();
@@ -311,7 +316,7 @@ pub async fn get_version(
     Query(params): Query<HashMap<String, String>>,
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&server), auth).await?;
     let include_deleted = include_deleted(&params);
     let (member, row, visibility, gates) = resolve_version(&state, &repo, auth, &server, &version, include_deleted).await?;
     super::record::served(&state, &repo, &member, &row, &gates, auth).await;

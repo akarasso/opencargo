@@ -36,7 +36,7 @@ pub async fn list_tags(
     let r = OciRef::parse(&params)?;
     let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&r.name), auth).await?;
 
     let leaf = TagsLeaf {
         name: r.name.clone(),

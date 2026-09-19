@@ -324,6 +324,7 @@ async fn promote_impl(
         crate::registry::ensure_action(
             &state.authorize(),
             repo,
+            Some(&name),
             &auth_user,
             crate::domain::RepoAction::Admin,
         )

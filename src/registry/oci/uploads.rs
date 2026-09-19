@@ -27,7 +27,7 @@ async fn writable_repo(
         .map(|e| e.0)
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
     let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth_user).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&r.name), &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
     Ok((repo, auth_user))

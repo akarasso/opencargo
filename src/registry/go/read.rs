@@ -16,7 +16,7 @@ use crate::registry::resolve::{collect, first_hit, Collected};
 use crate::server::AppState;
 
 use super::compare_versions;
-use super::escape::{validate_escaped_module, validate_escaped_version};
+use super::escape::{unescape, validate_escaped_module, validate_escaped_version};
 use super::leaves::{FileLeaf, LatestLeaf, ListLeaf};
 use super::upstream::FileKind;
 
@@ -31,7 +31,8 @@ async fn open(
 ) -> AppResult<Repository> {
     validate_escaped_module(module)?;
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    let unescaped = unescape(module);
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&unescaped), auth).await?;
     Ok(repo)
 }
 

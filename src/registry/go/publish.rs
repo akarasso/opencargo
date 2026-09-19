@@ -48,7 +48,7 @@ pub async fn publish_module(
     crate::registry::rules::rules_of(crate::domain::Format::Go)?.validate_version(version_str)?;
 
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth_user).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(module_name), &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Go)?;
 

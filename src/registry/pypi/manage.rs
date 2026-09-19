@@ -22,6 +22,7 @@ use super::PypiResult;
 async fn gate(
     state: &AppState,
     repo_name: &str,
+    project: &str,
     auth: Option<axum::Extension<AuthUser>>,
     action: crate::domain::RepoAction,
 ) -> PypiResult<Repository> {
@@ -31,7 +32,7 @@ async fn gate(
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Pypi)?;
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_action(&state.authorize(), &repo, &auth, action).await?;
+    crate::registry::ensure_action(&state.authorize(), &repo, Some(project), &auth, action).await?;
     Ok(repo)
 }
 
@@ -70,7 +71,7 @@ pub async fn yank(
     auth: Option<axum::Extension<AuthUser>>,
     body: Bytes,
 ) -> PypiResult<Response> {
-    let repo = gate(&state, &repo_name, auth, crate::domain::RepoAction::Write).await?;
+    let repo = gate(&state, &repo_name, &project, auth, crate::domain::RepoAction::Write).await?;
     let reason = serde_json::from_slice::<Value>(&body)
         .ok()
         .and_then(|v| v.get("reason").and_then(Value::as_str).map(str::to_string));
@@ -82,7 +83,7 @@ pub async fn unyank(
     Path((repo_name, project, version)): Path<(String, String, String)>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> PypiResult<Response> {
-    let repo = gate(&state, &repo_name, auth, crate::domain::RepoAction::Write).await?;
+    let repo = gate(&state, &repo_name, &project, auth, crate::domain::RepoAction::Write).await?;
     set_yanked(&state, &repo, &project, &version, None, false).await
 }
 
@@ -91,7 +92,7 @@ pub async fn delete_release(
     Path((repo_name, project, version)): Path<(String, String, String)>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> PypiResult<Response> {
-    let repo = gate(&state, &repo_name, auth, crate::domain::RepoAction::Delete).await?;
+    let repo = gate(&state, &repo_name, &project, auth, crate::domain::RepoAction::Delete).await?;
     let (project, version) = canonical(&project, Some(&version))?;
     let released = DeleteRelease::new(state.pypi.clone())
         .run(repo.id, &project, version.as_deref(), chrono::Utc::now())
@@ -104,7 +105,7 @@ pub async fn delete_project(
     Path((repo_name, project)): Path<(String, String)>,
     auth: Option<axum::Extension<AuthUser>>,
 ) -> PypiResult<Response> {
-    let repo = gate(&state, &repo_name, auth, crate::domain::RepoAction::Delete).await?;
+    let repo = gate(&state, &repo_name, &project, auth, crate::domain::RepoAction::Delete).await?;
     let (project, _) = canonical(&project, None)?;
     let released = DeleteRelease::new(state.pypi.clone())
         .run(repo.id, &project, None, chrono::Utc::now())

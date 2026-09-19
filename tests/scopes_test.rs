@@ -56,6 +56,13 @@ async fn setup() -> Server {
                 members: Some(vec!["npm-dev".to_string()]),
                 ..Default::default()
             },
+            RepositoryConfig {
+                name: "cargo-dev".to_string(),
+                repo_type: RepositoryType::Hosted,
+                format: RepositoryFormat::Cargo,
+                visibility: Visibility::Private,
+                ..Default::default()
+            },
         ],
         ..Default::default()
     };
@@ -161,6 +168,28 @@ impl Server {
             .unwrap()
     }
 
+    async fn search(&self, repo: &str, token: &str) -> reqwest::Response {
+        self.client
+            .get(format!("{}/{repo}/-/v1/search?text=widget", self.url))
+            .bearer_auth(token)
+            .send()
+            .await
+            .unwrap()
+    }
+
+    async fn publish_crate(&self, repo: &str, name: &str, token: &str) -> reqwest::Response {
+        let meta = format!(
+            r#"{{"name":"{name}","vers":"0.1.0","deps":[],"features":{{}},"authors":[],"description":"t","license":"MIT"}}"#
+        );
+        self.client
+            .put(format!("{}/{repo}/api/v1/crates/new", self.url))
+            .bearer_auth(token)
+            .body(common::build_cargo_publish_body(&meta, &common::build_crate_data()))
+            .send()
+            .await
+            .unwrap()
+    }
+
     async fn clear_tag(&self, repo: &str, package: &str, token: &str) -> reqwest::Response {
         self.client
             .delete(format!(
@@ -178,6 +207,13 @@ fn repo_scope(pattern: &str, actions: &[&str]) -> Value {
     json!({
         "kind": "limited",
         "grants": [{ "on": "repo", "repo": pattern, "actions": actions }],
+    })
+}
+
+fn package_scope(repo: &str, package: &str, actions: &[&str]) -> Value {
+    json!({
+        "kind": "limited",
+        "grants": [{ "on": "package", "repo": repo, "package": package, "actions": actions }],
     })
 }
 
@@ -308,6 +344,124 @@ async fn a_write_scope_without_delete_publishes_and_removes_nothing() {
         s.clear_tag("npm-dev", "widget", &remover).await.status(),
         StatusCode::OK
     );
+}
+
+/// A package line covers the packages its pattern names and nothing wider,
+/// in the repository it names and nowhere else: the same bearer, unscoped,
+/// publishes everything here.
+#[tokio::test]
+async fn a_package_line_reaches_its_packages_and_nothing_else() {
+    let s = setup().await;
+    s.account("ci", "publisher").await;
+    let scoped = s
+        .token(
+            "ci",
+            "robot",
+            Some(package_scope("npm-dev", "@acme/*", &["read", "write"])),
+        )
+        .await;
+    let full = s.token("ci", "session", None).await;
+
+    assert_eq!(
+        s.publish("npm-dev", "@acme/widget", Some(&scoped)).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        s.read("npm-dev", "@acme/widget", Some(&scoped)).await.status(),
+        StatusCode::OK
+    );
+    assert_eq!(
+        s.set_tag("npm-dev", "@acme/widget", &scoped).await.status(),
+        StatusCode::OK
+    );
+
+    let other_name = s.publish("npm-dev", "widget", Some(&scoped)).await;
+    assert_eq!(other_name.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(other_name).await["code"], "insufficient_scope");
+    let other_repo = s.publish("npm-prod", "@acme/widget", Some(&scoped)).await;
+    assert_eq!(other_repo.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(other_repo).await["code"], "insufficient_scope");
+
+    assert_eq!(
+        s.publish("npm-dev", "widget", Some(&full)).await.status(),
+        StatusCode::OK,
+        "the bearer holds the right the line removed"
+    );
+}
+
+/// A route that names no package is judged on the repository, which a
+/// package line does not cover: a search enumerates, and a package line
+/// that covered it would read what it never named.
+#[tokio::test]
+async fn a_route_that_names_no_package_is_outside_a_package_line() {
+    let s = setup().await;
+    s.account("ci", "publisher").await;
+    let full = s.token("ci", "session", None).await;
+    s.publish("npm-dev", "widget", Some(&full)).await;
+    let by_package = s
+        .token("ci", "package", Some(package_scope("npm-dev", "*", &["read"])))
+        .await;
+    let by_repo = s
+        .token("ci", "repo", Some(repo_scope("npm-dev", &["read"])))
+        .await;
+
+    let refused = s.search("npm-dev", &by_package).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(refused).await["code"], "insufficient_scope");
+    assert_eq!(
+        s.read("npm-dev", "widget", Some(&by_package)).await.status(),
+        StatusCode::OK,
+        "the package itself is read"
+    );
+    assert_eq!(s.search("npm-dev", &by_repo).await.status(), StatusCode::OK);
+}
+
+/// Pattern and name are compared under the format's key: a line written in
+/// another case reaches the package all the same.
+#[tokio::test]
+async fn a_package_pattern_is_compared_on_the_format_key() {
+    let s = setup().await;
+    s.account("ci", "publisher").await;
+    let scoped = s
+        .token(
+            "ci",
+            "robot",
+            Some(package_scope("npm-dev", "@Acme/*", &["read", "write"])),
+        )
+        .await;
+    let published = s.publish("npm-dev", "@acme/widget", Some(&scoped)).await;
+    assert_eq!(published.status(), StatusCode::OK, "{:?}", published.text().await);
+}
+
+/// Cargo names its crate in the body, so the body is read before the right
+/// is judged; the line is compared under cargo's key, where `_` is `-`, and
+/// a yank is a write on the same crate.
+#[tokio::test]
+async fn a_package_line_judges_a_crate_named_in_the_body() {
+    let s = setup().await;
+    s.account("ci", "publisher").await;
+    let scoped = s
+        .token(
+            "ci",
+            "robot",
+            Some(package_scope("cargo-dev", "my_*", &["read", "write"])),
+        )
+        .await;
+
+    let published = s.publish_crate("cargo-dev", "my-crate", &scoped).await;
+    assert_eq!(published.status(), StatusCode::OK, "{:?}", published.text().await);
+    let refused = s.publish_crate("cargo-dev", "other", &scoped).await;
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(refused).await["code"], "insufficient_scope");
+
+    let yanked = s
+        .client
+        .delete(format!("{}/cargo-dev/api/v1/crates/my-crate/0.1.0/yank", s.url))
+        .bearer_auth(&scoped)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(yanked.status(), StatusCode::OK, "{:?}", yanked.text().await);
 }
 
 /// Invariant 4: whatever the target, including its own account, a scoped

@@ -65,8 +65,8 @@ pub async fn publish_crate(
 ) -> AppResult<impl IntoResponse> {
     let user = require_user(auth_user)?;
     crate::registry::meter_publish(&state, &user, Format::Cargo, &repo_name)?;
-    let repo = load_hosted(&state, &repo_name, &user).await?;
     let (meta, crate_data) = parse_publish_body(&body)?;
+    let repo = load_hosted(&state, &repo_name, &meta.name, &user).await?;
     crate::registry::rules::rules_of(crate::domain::Format::Cargo)?.validate(&meta.name)?;
     crate::registry::rules::rules_of(crate::domain::Format::Cargo)?.validate_version(&meta.vers)?;
 
@@ -159,7 +159,7 @@ async fn set_yanked(
     yanked: bool,
 ) -> AppResult<Json<Value>> {
     let user = require_user(auth_user)?;
-    let repo = load_hosted(state, repo_name, &user).await?;
+    let repo = load_hosted(state, repo_name, name, &user).await?;
     Yank::new(state.packages.clone())
         .run(repo.id, name, version, yanked)
         .await?;
@@ -174,12 +174,17 @@ fn require_user(auth_user: Option<axum::Extension<AuthUser>>) -> AppResult<AuthU
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))
 }
 
-/// Writes go to hosted cargo repositories the caller may write to.
-async fn load_hosted(state: &AppState, repo_name: &str, user: &AuthUser) -> AppResult<Repository> {
+/// Writes go to hosted cargo repositories the caller may write `package` to.
+async fn load_hosted(
+    state: &AppState,
+    repo_name: &str,
+    package: &str,
+    user: &AuthUser,
+) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Cargo)?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, user).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(package), user).await?;
     Ok(repo)
 }
 

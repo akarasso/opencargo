@@ -378,6 +378,18 @@ seven formats put `/` inside a name. Repository names are compared in
 lowercase on both sides. Actions are `read`, `write`, `delete` and `admin`
 (the rung promotion and cache purge ask for).
 
+A `package` line covers the routes that name a package: a packument and its
+tarballs, a crate, a module, a project page and its files, an image's
+manifests, tags and blobs, an artifact's files and metadata, a server, a
+skill, a raw path. Pattern and name are compared under the format's own key,
+the one routing patterns use, so `my_*` reaches the crate served as
+`my-crate` and `@Acme/*` reaches `@acme/x`. A route that names no package is
+judged on the repository, which a package line does not cover: a search, an
+index of every project, a listing, cargo's `config.json`, and the OCI blob
+delete, since a blob belongs to the repository and not to one image. Where
+the name travels in the body (cargo, PyPI, NuGet, MCP) the body is read
+before the right is judged.
+
 Patterns are resolved to repositories once, when the token is issued: a
 repository created afterwards is outside the scope, and a name retired and
 recreated is a different repository that no earlier scope reaches. A scope is

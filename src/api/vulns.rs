@@ -49,7 +49,7 @@ async fn ensure_readable_or_not_found(
     auth_user: Option<&AuthUser>,
     name: &str,
 ) -> AppResult<()> {
-    crate::registry::ensure_can_read(authz, repo, auth_user)
+    crate::registry::ensure_can_read(authz, repo, Some(name), auth_user)
         .await
         .map_err(|_| AppError::NotFound(format!("package not found: {name}")))
 }
@@ -170,7 +170,7 @@ async fn rescan_impl(
     let caller = auth_user
         .as_ref()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, caller).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&name), caller).await?;
 
     let version = version_of(&state, pkg.id, &name, &version_str).await?;
 

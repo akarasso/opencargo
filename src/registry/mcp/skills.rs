@@ -205,13 +205,14 @@ fn caller(request: &axum::http::Request<Body>) -> AppResult<AuthUser> {
 async fn hosted_mcp(
     state: &AppState,
     name: &str,
+    skill: &str,
     auth: &AuthUser,
     action: RepoAction,
 ) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), name).await?;
     crate::registry::ensure_format(&repo, Format::Mcp)?;
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_action(&state.authorize(), &repo, auth, action).await?;
+    crate::registry::ensure_action(&state.authorize(), &repo, Some(skill), auth, action).await?;
     Ok(repo)
 }
 
@@ -224,7 +225,7 @@ pub async fn upload(
     let auth = caller(&request)?;
     validate_name(&name)?;
     McpRules.validate_version(&version)?;
-    let repo = hosted_mcp(&state, &repo_name, &auth, RepoAction::Write).await?;
+    let repo = hosted_mcp(&state, &repo_name, &name, &auth, RepoAction::Write).await?;
     let bytes = axum::body::to_bytes(request.into_body(), MAX_ARCHIVE_BYTES)
         .await
         .map_err(|e| AppError::BadRequest(format!("skill archive over {MAX_ARCHIVE_BYTES} bytes or unreadable: {e}")))?;
@@ -255,7 +256,7 @@ pub async fn delete(
     request: axum::http::Request<Body>,
 ) -> AppResult<StatusCode> {
     let auth = caller(&request)?;
-    let repo = hosted_mcp(&state, &repo_name, &auth, RepoAction::Delete).await?;
+    let repo = hosted_mcp(&state, &repo_name, &name, &auth, RepoAction::Delete).await?;
     state.mcp.delete_skill(repo.id, &name, &version, state.clock.now()).await?;
     crate::api::record_audit(&state, &auth, "mcp.skill.delete", Some(&format!("{name}@{version}"))).await;
     Ok(StatusCode::NO_CONTENT)
@@ -288,7 +289,7 @@ pub async fn download(
     auth: Option<Extension<AuthUser>>,
 ) -> AppResult<Response> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&name), auth).await?;
     let (members, gates) = scope(&state, &repo, auth).await?;
     for member in &members {
         let Some(skill) = state.mcp.skill(member.id, repo.id, &name, &version).await? else {
@@ -310,7 +311,7 @@ pub async fn marketplace(
     auth: Option<Extension<AuthUser>>,
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, None, auth).await?;
     let helper = state.mcp_settings.get(&repo.name).and_then(|c| c.headers_helper.clone());
     let plugins: Vec<Value> = distributed(&state, &repo, auth)
         .await?

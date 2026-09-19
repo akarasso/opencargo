@@ -39,11 +39,12 @@ pub(super) fn key_of(raw: &str) -> AppResult<String> {
 pub(super) async fn open(
     state: &AppState,
     repo_name: &str,
+    id: Option<&str>,
     auth: Option<&AuthUser>,
 ) -> AppResult<Repository> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Nuget)?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, id, auth).await?;
     match probe_access(&cx(state, auth, &repo), &repo).await {
         Ok(()) => Ok(repo),
         Err(ResolveError::Domain(DomainError::Forbidden(_))) => Err(AppError::Unauthorized(
@@ -139,7 +140,7 @@ pub async fn service_index(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, None, auth).await?;
     Ok(Json(base(&state, &repo).service_index()))
 }
 
@@ -150,7 +151,7 @@ pub async fn flat_index(
 ) -> AppResult<Response> {
     let auth = auth.as_ref().map(|e| &e.0);
     let id = id_of(&id)?;
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&id), auth).await?;
     rendered(&state, &repo, auth, &id, "flat".to_string(), |entries| {
         Ok(render::flat_index(entries))
     })
@@ -171,7 +172,7 @@ pub async fn flat_file(
         id: id.clone(),
         key: Some(key.clone()),
     };
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&id), auth).await?;
     let cx = cx(&state, auth, &repo);
     let (mut payload, content_type) = if file == format!("{id}.{key}.nupkg") {
         (first_hit(&cx, &repo, &NupkgLeaf { at }).await?, "application/octet-stream")
@@ -191,7 +192,7 @@ pub async fn registration_index(
 ) -> AppResult<Response> {
     let auth = auth.as_ref().map(|e| &e.0);
     let id = id_of(&id)?;
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&id), auth).await?;
     let base = base(&state, &repo);
     rendered(&state, &repo, auth, &id, "index".to_string(), |entries| {
         Ok(base.registration_index_doc(&id, entries))
@@ -210,7 +211,7 @@ pub async fn registration_leaf(
         .strip_suffix(".json")
         .ok_or_else(|| AppError::NotFound(format!("no such document: {leaf}")))?;
     let key = key_of(version)?;
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&id), auth).await?;
     let base = base(&state, &repo);
     rendered(&state, &repo, auth, &id, format!("leaf/{key}"), |entries| {
         let entry = entries
@@ -232,7 +233,7 @@ pub async fn registration_page(
     let upper = upper
         .strip_suffix(".json")
         .ok_or_else(|| AppError::NotFound(format!("no such page: {upper}")))?;
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, Some(&id), auth).await?;
     let base = base(&state, &repo);
     rendered(&state, &repo, auth, &id, format!("page/{lower}/{upper}"), |entries| {
         base.registration_page_doc(&id, entries, &lower, upper)
