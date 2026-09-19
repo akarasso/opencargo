@@ -102,7 +102,7 @@ async fn a_fully_migrated_database_is_adopted_and_only_the_unseen_files_run() {
 
     let ran = run_all(&legacy).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025", "026"]);
 
     assert_alters_ran_once(&legacy).await;
 
@@ -145,7 +145,7 @@ async fn a_012_database_gains_the_missing_files_and_a_populated_index() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(12));
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["013", "014", "015", "017", "018", "019", "020", "021", "024", "025", "026"]);
 
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM proxy_cache_entries").await, 0);
     assert_eq!(count(&pool, "SELECT COUNT(*) FROM policy_resolutions").await, 0);
@@ -174,7 +174,7 @@ async fn an_interrupted_baseline_is_re_probed_on_the_next_boot() {
 
     let ran = run_all(&pool).await.unwrap();
     assert_eq!(outcomes(&ran, Outcome::Adopted), ids(14)[3..].to_vec());
-    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025"]);
+    assert_eq!(outcomes(&ran, Outcome::Applied), vec!["015", "017", "018", "019", "020", "021", "024", "025", "026"]);
     assert_alters_ran_once(&pool).await;
     // The marker is cleared by the run that finished the baseline, so the boot
     // after it is an ordinary strict one.

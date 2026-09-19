@@ -38,7 +38,9 @@ export default function RawFiles() {
   useLive(refetch, ['package.published', 'registry.changed']);
 
   const base = () => `${location.protocol}//${location.host}`;
-  const fileUrl = (path: string) => `${base()}/raw/${repo()}/${path}`;
+  /** A stored path may hold `#`, `?` or a space: each segment is a URL segment. */
+  const fileUrl = (path: string) =>
+    `${base()}/raw/${repo()}/${path.split('/').map(encodeURIComponent).join('/')}`;
   const totalPages = () => {
     const d = data();
     return d ? Math.max(1, Math.ceil(d.total / d.pageSize)) : 1;
