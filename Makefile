@@ -60,7 +60,8 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 		--test sso_test --test sso_store_test \
 		--test mcp_test --test mcp_sync_test --test mcp_probe_test --test mcp_policy_test --test mcp_client_test --test mcp_admin_test \
 		--test import_test --test import_managers_test --test import_oci_test \
-		--test instance_lease_test --test storage_cli_test --test shutdown_test --test backup_test
+		--test instance_lease_test --test storage_cli_test --test shutdown_test --test backup_test \
+		--test search_cache_test
 
 test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
 	scripts/test-s3.sh
