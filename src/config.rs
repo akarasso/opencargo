@@ -29,6 +29,43 @@ pub struct Config {
     /// Policy rules per proxy repository name; a member with none on records nothing.
     #[serde(default)]
     pub policy: HashMap<String, PolicyConfig>,
+    #[serde(default)]
+    pub routing: RoutingConfig,
+}
+
+// ---------------------------------------------------------------------------
+// Group routing rules
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// How often a node re-reads the rules.
+    pub refresh_secs: u64,
+    /// How long a node serves a snapshot nothing has refreshed. Past it the
+    /// proxy members of every format a rule speaks for are refused, rather
+    /// than serving the state from before a rule this node may not have seen.
+    /// Several refresh periods, so a single failed read is not an outage.
+    pub max_snapshot_age_secs: u64,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            refresh_secs: 30,
+            max_snapshot_age_secs: 300,
+        }
+    }
+}
+
+impl RoutingConfig {
+    pub fn refresh(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refresh_secs)
+    }
+
+    pub fn max_snapshot_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.max_snapshot_age_secs)
+    }
 }
 
 // ---------------------------------------------------------------------------

@@ -105,6 +105,8 @@ pub struct AppState {
     pub nuget_feed: Arc<dyn crate::ports::nuget::NugetFeedRead>,
     /// NuGet's registration memo, per server: its keys are repository ids.
     pub nuget_documents: Arc<crate::registry::nuget::merged::Documents>,
+    /// The compiled routing rules every member enumeration decides against.
+    pub routing: Arc<crate::registry::routing::RoutingRegistry>,
     pub oci: Arc<dyn OciStore>,
     pub pypi: Arc<dyn PypiFileStore>,
     /// Bounds the archives inspected at once; inspection is CPU on a blocking thread.
@@ -552,6 +554,15 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
 
     let vuln_scanner: Arc<dyn VulnFeed> = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
+    let routing = Arc::new(
+        crate::registry::routing::RoutingRegistry::load(
+            stores.routing(),
+            config.routing.max_snapshot_age(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("routing rules: {e}"))?,
+    );
+
     let events = event_bus();
     let policy_store = stores.policy();
     let policy = PolicyEngine::new(
@@ -586,6 +597,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         search: stores.search(),
         nuget_feed: stores.nuget_feed(),
         nuget_documents: Arc::new(crate::registry::nuget::merged::documents()),
+        routing,
         oci: stores.oci(),
         pypi: stores.pypi(),
         archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
@@ -883,6 +895,24 @@ pub async fn start_sso_probe(sso: Arc<crate::app::sso::Sso>, every: std::time::D
         sso.probe_all().await;
         if let Err(e) = sso.purge().await {
             warn!(error = %e, "failed to purge expired SSO handoffs");
+        }
+    }
+}
+
+/// Re-read the routing rules on a timer. A failure keeps the last valid
+/// snapshot and lets its age run: past `routing.max_snapshot_age` the node
+/// closes the surface the rules protect rather than serve the state from
+/// before a rule it may not have seen.
+pub async fn start_routing_refresh(
+    routing: Arc<crate::registry::routing::RoutingRegistry>,
+    every: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(every.max(std::time::Duration::from_secs(1)));
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        if let Err(e) = routing.refresh().await {
+            warn!(error = %e, "failed to refresh the routing rules");
         }
     }
 }

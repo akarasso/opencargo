@@ -3,7 +3,7 @@ use bytes::Bytes;
 use crate::domain::{CacheRepo, Outcome, Package, Version};
 use crate::ports::packages::NameMatch;
 use crate::proxy::Payload;
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 use super::model::{self, Entry, HostedFacts};
 
@@ -68,6 +68,10 @@ pub struct EntriesLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for EntriesLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.id)
+    }
     type Out = Vec<Entry>;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Vec<Entry>>, ResolveError> {
@@ -90,6 +94,10 @@ pub struct NupkgLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for NupkgLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.at.id)
+    }
     type Out = Payload;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Payload>, ResolveError> {
@@ -112,6 +120,10 @@ pub struct NuspecLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for NuspecLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.at.id)
+    }
     type Out = Payload;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Payload>, ResolveError> {

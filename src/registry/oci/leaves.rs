@@ -2,7 +2,7 @@ use crate::domain::{CacheRepo, Format, Outcome};
 use crate::policy::{self, Source};
 use crate::proxy::engine::{Cached, IntoPayload};
 use crate::proxy::Payload;
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 use super::manifests::resolve_hosted_digest;
 use super::upstream::{upstream_name, OciArtifact, OciUpstream};
@@ -53,6 +53,10 @@ pub struct BlobLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for BlobLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
     type Out = Payload;
 
     async fn hosted(
@@ -105,6 +109,10 @@ pub struct ManifestLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for ManifestLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
     type Out = Payload;
 
     async fn hosted(
@@ -184,6 +192,10 @@ pub struct TagsLeaf {
 /// so an image no member knows stays an empty listing without a false hit.
 #[async_trait::async_trait]
 impl Leaf for TagsLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
     type Out = Vec<String>;
 
     async fn hosted(

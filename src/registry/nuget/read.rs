@@ -11,7 +11,7 @@ use crate::auth::middleware::AuthUser;
 use crate::domain::{CacheRepo, DomainError, Format, RepoKind, Repository};
 use crate::error::{AppError, AppResult};
 use crate::registry::cx;
-use crate::registry::resolve::{collect, first_hit, probe_access, view, Collected, ResolveError};
+use crate::registry::resolve::{collect, first_hit, probe_access, view, Collected, ResolveError, Subject};
 use crate::server::AppState;
 
 use super::leaves::{hosted_stamp, Coordinates, EntriesLeaf, NupkgLeaf, NuspecLeaf};
@@ -102,7 +102,7 @@ where
     F: FnOnce(&[Entry]) -> AppResult<Value>,
 {
     let cx = cx(state, auth, repo);
-    let members = view(&cx, repo).await?;
+    let members = view(&cx, repo, &Subject::of(id)).await?;
     let mut sources = Sources::default();
     for member in &members {
         match member.kind()? {
@@ -116,6 +116,7 @@ where
         id: id.to_string(),
         view: members.iter().map(|m| m.id).collect(),
         doc,
+        routes: state.routing.version(),
     };
     let mut degraded = None;
     let body = state

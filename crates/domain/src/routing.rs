@@ -57,6 +57,12 @@ impl Pattern {
         self.literals.join("*")
     }
 
+    /// The literal a pattern starts with, before its first star: the class of
+    /// keys it can possibly filter, as far as a prefix can tell.
+    pub fn head(&self) -> &str {
+        &self.literals[0]
+    }
+
     /// True when the pattern filters every key of its format.
     pub fn is_catch_all(&self) -> bool {
         self.literals.len() == 2 && self.literals.iter().all(String::is_empty)
@@ -215,6 +221,21 @@ impl RoutingRule {
         self.format == format && self.covers(match_key, ident_key) && !self.admits(member)
     }
 
+    /// D7: whether this rule has anything to say about an enumeration *term*.
+    ///
+    /// A term is not a name, it is a prefix of the names that will come back,
+    /// so the comparison runs both ways: `acme.internal` under `acme.*` — the
+    /// term is inside the covered class — and `acme` under `acme.*` — the
+    /// term completes into it. Only the first would stop a whole internal
+    /// name being handed to a public search; only the second stops it being
+    /// reconstructed by completion.
+    fn touches_term(&self, term_key: &str) -> bool {
+        self.patterns.iter().any(|p| {
+            let head = p.head();
+            head.starts_with(term_key) || term_key.starts_with(head)
+        })
+    }
+
     fn admits(&self, member: MemberRef<'_>) -> bool {
         match &self.effect {
             Effect::Deny => false,
@@ -293,7 +314,7 @@ pub struct RouteSet {
     version: u64,
 }
 
-impl RouteSet {
+impl<'a> RouteSet {
     /// Rules are held in name order: the order a refusal is imputed in is
     /// total and deterministic, so `explain` and the walk name the same rule.
     pub fn new(mut rules: Vec<RoutingRule>, version: u64) -> Self {
@@ -324,10 +345,35 @@ impl RouteSet {
             .collect()
     }
 
+    /// Whether any rule of this format speaks about this enumeration term at
+    /// all: the caller asks before paying for what a decision costs.
+    pub fn touches_term(&self, format: Format, term_key: &str) -> bool {
+        self.rules
+            .iter()
+            .any(|r| r.format == format && r.touches_term(term_key))
+    }
+
+    /// The rules that refuse this member for an enumeration *term* (D7),
+    /// before any upstream call is made for it.
+    ///
+    /// `except[]` is not consulted: it names exact spellings, and no exact
+    /// spelling can reopen a prefix. That is the conservative side — a term
+    /// is refused a little more often than a name would be, never less.
+    pub fn term_refusers(
+        &'a self,
+        format: Format,
+        term_key: &'a str,
+        member: MemberRef<'a>,
+    ) -> impl Iterator<Item = &'a RoutingRule> + 'a {
+        self.rules.iter().filter(move |r| {
+            r.format == format && r.touches_term(term_key) && !r.admits(member)
+        })
+    }
+
     /// The whole decision: every covering rule applies, and the allowed set is
     /// their intersection, so deny wins by construction and adding a rule can
     /// never open a path. No allocation, no clock, no caller.
-    pub fn decide<'a>(
+    pub fn decide(
         &'a self,
         format: Format,
         match_key: &'a str,
@@ -551,6 +597,32 @@ mod tests {
             refusers(set.decide(Format::Npm, "@acme/public-ui", "@ACME/public-ui", proxy("i9"))),
             ["internal"],
             "a coarsening never reopens"
+        );
+    }
+
+    /// D7: a search term never leaves for an upstream that the rule would
+    /// refuse the answer from, and a prefix of the covered class is refused
+    /// too — otherwise the internal name comes back by completion.
+    #[test]
+    fn an_enumeration_term_is_decided_before_the_upstream_call() {
+        let set = RouteSet::new(
+            vec![rule("internal", &["acme.*"], Effect::AnyHosted)],
+            1,
+        );
+        let refused = |term: &str| {
+            set.term_refusers(Format::Npm, term, proxy("i2")).count() > 0
+        };
+        assert!(refused("acme.internal"), "the term is inside the covered class");
+        assert!(refused("acme"), "and a prefix of it, which would complete into it");
+        assert!(refused("a"), "as would any prefix, however short");
+        assert!(!refused("other"), "an unrelated term leaves as it always did");
+        assert!(
+            set.term_refusers(Format::Npm, "acme.internal", hosted("i1")).count() == 0,
+            "a hosted member is what the rule allows"
+        );
+        assert!(
+            set.term_refusers(Format::Cargo, "acme.internal", proxy("i2")).count() == 0,
+            "a rule speaks for its own format only"
         );
     }
 

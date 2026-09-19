@@ -56,6 +56,12 @@ pub struct DocKey {
     pub id: String,
     pub view: Vec<i64>,
     pub doc: String,
+    /// I9: the routing snapshot the view was filtered against. A rule moves
+    /// neither the members nor the hosted stamps, so without this component a
+    /// document merged before the rule goes on being served — for sixty
+    /// seconds with an upstream source in it, and with no bound at all
+    /// without one.
+    pub routes: u64,
 }
 
 pub type Documents = Memo<DocKey, bytes::Bytes>;

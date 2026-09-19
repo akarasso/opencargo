@@ -4,7 +4,7 @@ use crate::domain::{CacheRepo, Format, Outcome};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
 use crate::proxy::{IntoPayload, Payload, ProxyEngine};
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 use super::line_field;
 use super::upstream::{CargoArtifact, CargoUpstream};
@@ -21,6 +21,10 @@ pub struct IndexLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for IndexLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
     type Out = IndexLines;
 
     /// Cargo lowercases the index path; the line keeps the published case.
@@ -67,6 +71,10 @@ pub struct CrateLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for CrateLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
     type Out = Payload;
 
     async fn hosted(

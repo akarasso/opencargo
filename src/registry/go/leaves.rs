@@ -5,7 +5,7 @@ use crate::domain::{CacheRepo, Format, Outcome, Package, Version};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
 use crate::proxy::{IntoPayload, Payload};
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 use super::escape::unescape;
 use super::upstream::{FileKind, GoArtifact, GoUpstream};
@@ -55,6 +55,10 @@ pub struct ListLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for ListLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::built(unescape(&self.module))
+    }
     type Out = Vec<String>;
 
     async fn hosted(
@@ -98,6 +102,10 @@ pub struct LatestLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for LatestLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::built(unescape(&self.module))
+    }
     type Out = Value;
 
     async fn hosted(
@@ -140,6 +148,10 @@ pub struct FileLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for FileLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::built(unescape(&self.module))
+    }
     type Out = Payload;
 
     async fn hosted(
