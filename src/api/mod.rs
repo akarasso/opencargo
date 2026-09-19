@@ -54,6 +54,7 @@ pub(crate) fn actor(caller: &AuthUser) -> Actor<'_> {
         user_id: caller.user_id,
         username: &caller.username,
         admin: caller.role == "admin",
+        scoped: !caller.scope.is_inherit(),
     }
 }
 

@@ -38,8 +38,8 @@ pub use proxy::{
 pub use repository::{DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version};
 pub use resolve::{CacheRepo, Miss, Outcome, UrlRepo, Visit, Walk, MAX_GROUP_DEPTH};
 pub use scope::{
-    narrow, narrowed_source, normalize_account, normalize_repo_name, AdminDomain, Grant, Pattern,
-    ScopeAction, ScopeError, Selector, Subject, TokenScope, MAX_GRANTS,
+    narrow, narrowed_source, normalize_account, normalize_repo_name, AdminDomain, Grant,
+    Incarnation, Pattern, ScopeAction, ScopeError, Selector, Subject, TokenScope, MAX_GRANTS,
 };
 pub use user::{ApiToken, User};
 pub use vulns::{ScanResult, Severity, VulnDetail};

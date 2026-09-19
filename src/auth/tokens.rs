@@ -1,17 +1,49 @@
 use rand::Rng;
 use sha2::{Digest, Sha256};
 
-/// Generate a new API token with the given prefix.
+/// What a scoped credential is hashed with. A binary that predates scopes
+/// hashes the raw value alone, so it cannot verify one of these: rolling the
+/// image back refuses every scoped token instead of promoting it to a
+/// credential that carries every right of its bearer.
+const SCOPED_TAG: &str = "scoped:";
+
+/// The form a scoped credential takes, derived from the configured prefix so
+/// one setting still owns both: `trg_` issues `trgs_`.
+pub fn scoped_prefix(prefix: &str) -> String {
+    format!("{}s_", prefix.strip_suffix('_').unwrap_or(prefix))
+}
+
+/// Whether a presented value carries the scoped form.
+pub fn is_scoped_form(raw: &str, prefix: &str) -> bool {
+    raw.starts_with(&scoped_prefix(prefix))
+}
+
+/// Generate a new API token under the configured prefix, in the plain form or
+/// the scoped one.
 ///
 /// Returns `(raw_token, token_hash)`.
 /// Token format: `{prefix}{random_32_hex}` (e.g., `trg_a1b2c3d4...`).
-pub fn generate_token(prefix: &str) -> (String, String) {
+pub fn generate_token(prefix: &str, scoped: bool) -> (String, String) {
     let mut rng = rand::thread_rng();
     let random_bytes: [u8; 16] = rng.gen();
     let hex_part: String = random_bytes.iter().map(|b| format!("{b:02x}")).collect();
-    let raw_token = format!("{prefix}{hex_part}");
-    let hash = hash_token(&raw_token);
+    let form = if scoped {
+        scoped_prefix(prefix)
+    } else {
+        prefix.to_string()
+    };
+    let raw_token = format!("{form}{hex_part}");
+    let hash = hash_credential(&raw_token, prefix);
     (raw_token, hash)
+}
+
+/// The hash stored for a credential, which its form decides.
+pub fn hash_credential(token: &str, prefix: &str) -> String {
+    if is_scoped_form(token, prefix) {
+        hash_token(&format!("{SCOPED_TAG}{token}"))
+    } else {
+        hash_token(token)
+    }
 }
 
 /// Compute a SHA-256 hex hash of the given token.
@@ -20,9 +52,17 @@ pub fn hash_token(token: &str) -> String {
     digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Verify a presented credential of either form against its stored hash.
+pub fn verify_credential(token: &str, hash: &str, prefix: &str) -> bool {
+    constant_time(&hash_credential(token, prefix), hash)
+}
+
 /// Verify that a raw token matches a stored hash using constant-time comparison.
 pub fn verify_token(token: &str, hash: &str) -> bool {
-    let computed = hash_token(token);
+    constant_time(&hash_token(token), hash)
+}
+
+fn constant_time(computed: &str, hash: &str) -> bool {
     if computed.len() != hash.len() {
         return false;
     }
@@ -40,7 +80,7 @@ mod tests {
 
     #[test]
     fn generated_token_has_prefix_shape_and_verifies_against_its_hash() {
-        let (raw, hash) = generate_token("trg_");
+        let (raw, hash) = generate_token("trg_", false);
         assert!(raw.starts_with("trg_"));
         assert_eq!(raw.len(), "trg_".len() + 32, "16 random bytes → 32 hex chars");
         assert!(raw["trg_".len()..].bytes().all(|b| b.is_ascii_hexdigit()));
@@ -50,10 +90,26 @@ mod tests {
         assert!(verify_token(&raw, &hash));
     }
 
+    /// The rollback property: what a binary without scopes computes for a
+    /// scoped credential never matches what was stored for it, so the image
+    /// going back refuses the token instead of honouring it in full.
+    #[test]
+    fn a_scoped_credential_carries_a_form_and_a_hash_an_older_binary_refuses() {
+        let (raw, hash) = generate_token("trg_", true);
+        assert!(raw.starts_with("trgs_"));
+        assert!(!raw.starts_with("trg_"), "not the form an older binary looks for");
+        assert!(verify_credential(&raw, &hash, "trg_"));
+        assert!(!verify_token(&raw, &hash), "the untagged hash is not this one");
+
+        let (plain, plain_hash) = generate_token("trg_", false);
+        assert!(verify_credential(&plain, &plain_hash, "trg_"));
+        assert!(verify_token(&plain, &plain_hash), "the plain form is unchanged");
+    }
+
     #[test]
     fn two_generated_tokens_differ() {
-        let (raw1, hash1) = generate_token("trg_");
-        let (raw2, hash2) = generate_token("trg_");
+        let (raw1, hash1) = generate_token("trg_", false);
+        let (raw2, hash2) = generate_token("trg_", false);
         assert_ne!(raw1, raw2);
         assert_ne!(hash1, hash2);
     }
@@ -70,15 +126,15 @@ mod tests {
 
     #[test]
     fn wrong_token_is_rejected() {
-        let (_raw, hash) = generate_token("trg_");
-        let (other_raw, _) = generate_token("trg_");
+        let (_raw, hash) = generate_token("trg_", false);
+        let (other_raw, _) = generate_token("trg_", false);
         assert!(!verify_token(&other_raw, &hash));
         assert!(!verify_token("trg_deadbeef", &hash));
     }
 
     #[test]
     fn length_mismatch_is_rejected_without_panic() {
-        let (raw, hash) = generate_token("trg_");
+        let (raw, hash) = generate_token("trg_", false);
         assert!(!verify_token(&raw, ""));
         assert!(!verify_token(&raw, "abc"));
         assert!(!verify_token(&raw, &hash[..63]));
@@ -89,7 +145,7 @@ mod tests {
 
     #[test]
     fn single_character_flip_is_rejected() {
-        let (raw, hash) = generate_token("trg_");
+        let (raw, hash) = generate_token("trg_", false);
 
         // Flip the last character of the stored hash.
         let mut bad_hash = hash.clone().into_bytes();

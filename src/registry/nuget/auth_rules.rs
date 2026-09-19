@@ -71,9 +71,12 @@ impl RouteRules for NugetRouteRules {
 mod tests {
     use super::*;
 
+    /// Both forms, as the composition root hands them: the server asks
+    /// `Authenticate`, so a scoped credential in `X-NuGet-ApiKey` is a
+    /// credential and not a placeholder.
     fn rules() -> NugetRouteRules {
         NugetRouteRules {
-            token_shaped: Arc::new(|v| v.starts_with("trg_")),
+            token_shaped: Arc::new(|v| v.starts_with("trg_") || v.starts_with("trgs_")),
         }
     }
 
@@ -121,6 +124,8 @@ mod tests {
         assert!(r.extra_credentials(&headers).is_empty());
         headers.insert(API_KEY_HEADER, HeaderValue::from_static("trg_x"));
         assert_eq!(r.extra_credentials(&headers).len(), 1);
+        headers.insert(API_KEY_HEADER, HeaderValue::from_static("trgs_x"));
+        assert_eq!(r.extra_credentials(&headers).len(), 1, "the scoped form too");
     }
 
     #[test]

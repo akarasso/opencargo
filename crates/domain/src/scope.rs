@@ -66,6 +66,17 @@ impl Pattern {
         &self.0
     }
 
+    /// A repository name, in the one explicit form both sides are folded to:
+    /// nothing in the schema collates `repositories.name` for us.
+    pub fn matches_repo(&self, name: &str) -> bool {
+        Self(normalize_repo_name(&self.0)).matches(&normalize_repo_name(name))
+    }
+
+    /// An account name, folded the way the login limiter keys one.
+    pub fn matches_account(&self, name: &str) -> bool {
+        Self(normalize_account(&self.0)).matches(&normalize_account(name))
+    }
+
     /// Linear, with one fallback mark: no pattern makes this backtrack into
     /// an exponential walk.
     pub fn matches(&self, subject: &str) -> bool {
@@ -147,12 +158,19 @@ impl AdminDomain {
         }
     }
 
-    /// The four domains a scoped credential may only read: writing any of
-    /// them is how a restricted token would mint itself a new one.
+    /// The domains a scoped credential may only read: four through which a
+    /// restricted token would mint itself a new one, and `webhooks`, whose
+    /// write is a standing subscription to every repository — an exfiltration
+    /// channel no repository selector can narrow, because the route that
+    /// creates it names no repository at all.
     pub fn read_only_under_scope(self) -> bool {
         matches!(
             self,
-            AdminDomain::Users | AdminDomain::Tokens | AdminDomain::Permissions | AdminDomain::Sso
+            AdminDomain::Users
+                | AdminDomain::Tokens
+                | AdminDomain::Permissions
+                | AdminDomain::Sso
+                | AdminDomain::Webhooks
         )
     }
 }
@@ -294,7 +312,7 @@ impl Grant {
             ) => self.holds(incarnation) && package.matches(name),
             (Selector::Admin { domain }, Subject::Admin { domain: asked }) => domain == asked,
             (Selector::Account { account }, Subject::Account { username }) => {
-                account.matches(&normalize_account(username))
+                account.matches_account(username)
             }
             _ => false,
         }
@@ -350,6 +368,42 @@ impl TokenScope {
             TokenScope::Limited { grants } => grants,
         }
     }
+
+    /// The scope as it is frozen at issue: every repository pattern replaced
+    /// by the incarnations it named at that instant. A pattern never reaches
+    /// a repository created afterwards, and a name retired and recreated is
+    /// another incarnation, which no scope issued before it can hold.
+    pub fn resolved(&self, repositories: &[Incarnation<'_>]) -> TokenScope {
+        let TokenScope::Limited { grants } = self else {
+            return TokenScope::Inherit;
+        };
+        let resolved = grants
+            .iter()
+            .map(|grant| {
+                let pattern = match &grant.selector {
+                    Selector::Repo { repo } | Selector::Package { repo, .. } => repo,
+                    Selector::Admin { .. } | Selector::Account { .. } => return grant.clone(),
+                };
+                Grant {
+                    incarnations: repositories
+                        .iter()
+                        .filter(|r| pattern.matches_repo(r.name))
+                        .map(|r| r.incarnation.to_string())
+                        .collect(),
+                    ..grant.clone()
+                }
+            })
+            .collect();
+        TokenScope::Limited { grants: resolved }
+    }
+}
+
+/// A repository as the resolution sees it: the name a pattern is compared to
+/// and the incarnation the scope will actually hold.
+#[derive(Debug, Clone, Copy)]
+pub struct Incarnation<'a> {
+    pub name: &'a str,
+    pub incarnation: &'a str,
 }
 
 /// The effective right: what the bearer holds, intersected with what the
@@ -595,8 +649,8 @@ mod tests {
         assert!(writer.validate().is_err(), "an account line never writes");
     }
 
-    /// The four domains through which a restricted token would mint itself a
-    /// new credential exist in read only.
+    /// The domains through which a restricted token would mint itself a new
+    /// credential, or subscribe to what it may not read, exist in read only.
     #[test]
     fn the_escalation_domains_exist_in_read_only() {
         for domain in [
@@ -604,6 +658,7 @@ mod tests {
             AdminDomain::Tokens,
             AdminDomain::Permissions,
             AdminDomain::Sso,
+            AdminDomain::Webhooks,
         ] {
             let grant = Grant {
                 selector: Selector::Admin { domain },
@@ -616,7 +671,6 @@ mod tests {
             AdminDomain::Repos,
             AdminDomain::Policy,
             AdminDomain::Storage,
-            AdminDomain::Webhooks,
             AdminDomain::Audit,
         ] {
             let grant = Grant {
@@ -675,6 +729,63 @@ mod tests {
         assert_eq!(
             TokenScope::parse(&TokenScope::Inherit.to_json()),
             Ok(TokenScope::Inherit)
+        );
+    }
+
+    #[test]
+    fn resolution_freezes_the_incarnations_a_pattern_named_at_issue() {
+        let scope = limited(vec![
+            repo_grant("libs-*", &[], &[ScopeAction::Read]),
+            Grant {
+                selector: Selector::Package {
+                    repo: Pattern::parse("NPM").unwrap(),
+                    package: pat("@acme/*"),
+                },
+                actions: vec![ScopeAction::Write],
+                incarnations: Vec::new(),
+            },
+            Grant {
+                selector: Selector::Admin { domain: AdminDomain::Audit },
+                actions: vec![ScopeAction::Read],
+                incarnations: Vec::new(),
+            },
+        ]);
+        let world = [
+            Incarnation { name: "libs-a", incarnation: "inc-a" },
+            Incarnation { name: "Libs-B", incarnation: "inc-b" },
+            Incarnation { name: "prod", incarnation: "inc-p" },
+            Incarnation { name: "npm", incarnation: "inc-n" },
+        ];
+
+        let resolved = scope.resolved(&world);
+        let grants = resolved.grants();
+        assert_eq!(grants[0].incarnations, ["inc-a", "inc-b"], "case folds on both sides");
+        assert_eq!(grants[1].incarnations, ["inc-n"]);
+        assert!(grants[2].incarnations.is_empty(), "an admin line names no repository");
+
+        // The repository created after the issue is outside every scope
+        // already written, and so is a name retired and recreated.
+        let later = [
+            Incarnation { name: "libs-a", incarnation: "inc-a2" },
+            Incarnation { name: "libs-c", incarnation: "inc-c" },
+        ];
+        for repo in later {
+            assert!(
+                !grants[0].covers(&Subject::Repository { incarnation: repo.incarnation }),
+                "{}",
+                repo.incarnation
+            );
+        }
+    }
+
+    #[test]
+    fn a_pattern_that_names_nothing_resolves_to_an_inert_line() {
+        let scope = limited(vec![repo_grant("gone-*", &[], &[ScopeAction::Read])]);
+        let resolved = scope.resolved(&[Incarnation { name: "libs", incarnation: "inc" }]);
+        assert!(resolved.grants()[0].incarnations.is_empty());
+        assert_eq!(
+            narrow(Rights::FULL, &resolved, &Subject::Repository { incarnation: "inc" }),
+            Rights::NONE
         );
     }
 

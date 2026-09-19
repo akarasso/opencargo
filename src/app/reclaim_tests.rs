@@ -78,6 +78,7 @@ fn by() -> Actor<'static> {
         user_id: Some(1),
         username: "root",
         admin: true,
+        scoped: false,
     }
 }
 

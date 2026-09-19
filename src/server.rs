@@ -1532,7 +1532,7 @@ async fn issue_login_token(
     state: &AppState,
     user_id: i64,
 ) -> Result<String, crate::error::StoreError> {
-    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_");
+    let (raw_token, token_hash) = crate::auth::tokens::generate_token("trg_", false);
     let now = state.clock.now();
     state
         .tokens

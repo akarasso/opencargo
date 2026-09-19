@@ -682,7 +682,7 @@ impl Sso {
         }
         let now = self.clock.now();
         let id = self.ids.token_id();
-        let (token, hash) = credentials::generate_token(TOKEN_PREFIX);
+        let (token, hash) = credentials::generate_token(TOKEN_PREFIX, false);
         let expires_at = now + self.settings.session_ttl;
         let issued = self
             .identities

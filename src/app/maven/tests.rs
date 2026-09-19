@@ -662,6 +662,7 @@ async fn a_contested_unit_is_never_promoted_and_an_administrator_decides() {
         user_id: Some(1),
         username: "root",
         admin: true,
+        scoped: false,
     };
     let key = UnitKey {
         repository: fx.repo,

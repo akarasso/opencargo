@@ -8,7 +8,7 @@ use serde::Deserialize;
 use serde_json::json;
 
 use crate::api::{actor, require_admin_or_self, require_auth};
-use crate::app::tokens::{IssueToken, RevokeToken};
+use crate::app::tokens::{IssueToken, IssueTokenDeps, RevokeToken};
 use crate::domain::{TokenScope, User};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
@@ -22,6 +22,9 @@ use crate::wire::wire_ts;
 pub struct CreateTokenRequest {
     pub name: String,
     pub expires_in_days: Option<i64>,
+    /// Absent is `inherit`: the token every client had before scopes.
+    #[serde(default)]
+    pub scope: Option<TokenScope>,
 }
 
 // ---------------------------------------------------------------------------
@@ -50,6 +53,7 @@ pub async fn list_tokens(
                 "expires_at": t.expires_at.map(wire_ts),
                 "last_used_at": t.last_used_at.map(wire_ts),
                 "created_at": wire_ts(t.created_at),
+                "scope": t.scope,
             })
         })
         .collect();
@@ -81,18 +85,20 @@ pub async fn create_token(
         serde_json::from_slice(&bytes)?
     };
 
-    let issued = IssueToken::new(
-        state.users.clone(),
-        state.tokens.clone(),
-        state.ids.clone(),
-        state.audit.clone(),
-        state.events.clone(),
-    )
+    let issued = IssueToken::new(IssueTokenDeps {
+        users: state.users.clone(),
+        tokens: state.tokens.clone(),
+        repos: state.repos.clone(),
+        ids: state.ids.clone(),
+        audit: state.audit.clone(),
+        events: state.events.clone(),
+        prefix: state.auth.authenticate.token_prefix().to_string(),
+    })
     .run(
         &username,
         &body.name,
         body.expires_in_days,
-        &TokenScope::Inherit,
+        body.scope.as_ref().unwrap_or(&TokenScope::Inherit),
         &actor(&caller),
         state.clock.now(),
     )
@@ -106,6 +112,7 @@ pub async fn create_token(
             "token": issued.token,
             "prefix": issued.prefix,
             "expires_at": issued.expires_at.map(wire_ts),
+            "scope": issued.scope,
         })),
     ))
 }

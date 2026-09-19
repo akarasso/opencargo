@@ -20,6 +20,10 @@ pub struct Actor<'a> {
     pub user_id: Option<i64>,
     pub username: &'a str,
     pub admin: bool,
+    /// The credential they presented narrows them. It travels with the actor
+    /// rather than with the route, because the rule it carries is about every
+    /// route: a scoped credential never makes another credential.
+    pub scoped: bool,
 }
 
 pub async fn record(

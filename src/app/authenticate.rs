@@ -11,7 +11,7 @@ use chrono::{DateTime, Utc};
 
 use crate::auth::rate_limit::RateLimiter;
 use crate::auth::{tokens, users as passwords};
-use crate::domain::{ApiToken, User};
+use crate::domain::{ApiToken, TokenScope, User};
 use crate::error::StoreError;
 use crate::ports::clock::Clock;
 use crate::ports::signing::{Claims, RegistryTokenSigner};
@@ -28,21 +28,30 @@ pub struct AuthUser {
     pub must_change_password: bool,
     /// The API token's display name when one identified the caller.
     pub token_name: Option<String>,
+    /// The API token's id, whatever header carried it: the provenance a
+    /// derived registry token freezes, and the row a revocation removes.
+    /// Rediscovering it by reading a header again is the hole this closes.
+    pub api_token_id: Option<String>,
+    /// What the presented credential narrows its bearer to.
+    pub scope: TokenScope,
 }
 
 impl AuthUser {
-    fn from_user(user: User, token: &str, token_name: Option<String>) -> Self {
+    fn from_user(user: User, token: &str, credential: Option<&ApiToken>) -> Self {
         Self {
             token: token.to_string(),
             user_id: Some(user.id),
             username: user.username,
             role: user.role,
             must_change_password: user.must_change_password,
-            token_name,
+            token_name: credential.map(|t| t.name.clone()),
+            api_token_id: credential.map(|t| t.id.clone()),
+            scope: credential.map_or(TokenScope::Inherit, |t| t.scope.clone()),
         }
     }
 
-    /// The synthetic admin a static config token acts as.
+    /// The synthetic admin a static config token acts as. A configuration key
+    /// is an operations credential, not an identity, so it carries no scope.
     fn static_token(token: &str) -> Self {
         Self {
             token: token.to_string(),
@@ -51,6 +60,8 @@ impl AuthUser {
             role: "admin".to_string(),
             must_change_password: false,
             token_name: None,
+            api_token_id: None,
+            scope: TokenScope::Inherit,
         }
     }
 
@@ -194,7 +205,7 @@ impl Authenticate {
                 if let Some(user) = self.secret_token(password).await? {
                     return Ok(principal(user));
                 }
-                if password.starts_with(&self.token_prefix) {
+                if self.is_token_shaped(password) {
                     return Err(self.token_failure(source));
                 }
                 Ok(principal(self.password(username, password).await?))
@@ -269,13 +280,21 @@ impl Authenticate {
             return Ok(None);
         }
         let _ = self.tokens.touch(&stored.id, self.clock.now()).await;
-        Ok(Some(AuthUser::from_user(user, raw, Some(stored.name))))
+        Ok(Some(AuthUser::from_user(user, raw, Some(&stored))))
     }
 
     /// An API token or a configured static token, by form, before any
     /// lookup.
     pub fn is_token_shaped(&self, raw: &str) -> bool {
-        raw.starts_with(&self.token_prefix) || self.is_static(raw)
+        raw.starts_with(&self.token_prefix)
+            || tokens::is_scoped_form(raw, &self.token_prefix)
+            || self.is_static(raw)
+    }
+
+    /// The form the composition root issues under, for the use case that
+    /// mints credentials.
+    pub fn token_prefix(&self) -> &str {
+        &self.token_prefix
     }
 
     fn is_static(&self, raw: &str) -> bool {
@@ -295,10 +314,10 @@ impl Authenticate {
         let Some(claims) = self.signer.verify(raw) else {
             return Ok(None);
         };
-        let mut token_name = None;
+        let mut bought_with = None;
         if let Some(id) = claims.api_token_id.as_deref() {
             match self.live_api_token_by_id(id).await? {
-                Some(api_token) => token_name = Some(api_token.name),
+                Some(api_token) => bought_with = Some(api_token),
                 None => return Ok(None),
             }
         }
@@ -321,7 +340,7 @@ impl Authenticate {
             return Ok(None);
         }
         Ok(Some(Authenticated {
-            user: Some(AuthUser::from_user(user, raw, token_name)),
+            user: Some(AuthUser::from_user(user, raw, bought_with.as_ref())),
             claims: Some(claims),
         }))
     }
@@ -334,7 +353,9 @@ impl Authenticate {
         let Some(stored) = self.tokens.by_prefix(&raw[..16]).await? else {
             return Ok(None);
         };
-        if !tokens::verify_token(raw, &stored.token_hash) || !stored.is_live(self.clock.now()) {
+        if !tokens::verify_credential(raw, &stored.token_hash, &self.token_prefix)
+            || !stored.is_live(self.clock.now())
+        {
             return Ok(None);
         }
         Ok(Some(stored))
