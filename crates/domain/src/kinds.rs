@@ -194,7 +194,8 @@ impl Cell {
 pub struct Coverage {
     /// A publish has one request the meter counts.
     pub metered_publish: Cell,
-    /// A publish is judged by the policy gate before anything is written.
+    /// A critical finding in its dependencies refuses the publish, before any
+    /// file or row is written.
     pub publish_gate: Cell,
     /// A proxy resolution is recorded for the policy report.
     pub policy_record: Cell,
@@ -263,7 +264,7 @@ impl Format {
             },
             Format::Oci => Coverage {
                 metered_publish: Cell::Yes,
-                publish_gate: Cell::Yes,
+                publish_gate: Cell::No(NO_DOC),
                 policy_record: Cell::Yes,
                 scannable: Cell::No(NO_DOC),
                 emptiness_probe: Cell::Yes,

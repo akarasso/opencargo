@@ -285,3 +285,55 @@ async fn scanned(client: &reqwest::Client, base_url: &str, name: &str, version: 
     }
     last
 }
+
+/// `publish_gate`: a format that declares the gate is refused when its
+/// dependency is critical, before any file or row is written. One that does
+/// not carries the reason -- there is no document a rule could judge.
+#[tokio::test]
+async fn the_gate_refuses_every_format_that_declares_it() {
+    let osv = common::fake_osv::start().await;
+    for format in Format::ALL {
+        let (Some(dep), Some(ecosystem)) = (publish::dependency(format), format.osv_ecosystem())
+        else {
+            continue;
+        };
+        osv.affect(ecosystem, dep.name, dep.resolved, &["GHSA-critical"]);
+    }
+    osv.record(common::fake_osv::cvss_record(
+        "GHSA-critical",
+        "CVSS_V3",
+        "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H",
+    ));
+
+    let s = spawn_server(SpawnOpts {
+        repositories: publish::repositories(),
+        vuln: opencargo::config::VulnScanConfig {
+            enabled: true,
+            block_on_critical: true,
+            osv_base_url: osv.base_url.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    for format in Format::ALL {
+        let gated = format.coverage().publish_gate;
+        let (_, response) = publish::publish_with_dependency(&client, &s.base_url, format, 1).await;
+        let status = response.status();
+        if gated.yes() {
+            assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "{format:?} declares the gate and its critical publish answered {status}"
+            );
+        } else {
+            assert!(
+                status.is_success(),
+                "{format:?} says nothing can judge its publish ({:?}) and it was refused {status}",
+                gated.why()
+            );
+        }
+    }
+}
