@@ -108,6 +108,9 @@ pub struct AppState {
     /// The compiled routing rules every member enumeration decides against.
     pub routing: Arc<crate::registry::routing::RoutingRegistry>,
     pub routing_rules: Arc<dyn crate::ports::routing::RoutingRuleStore>,
+    /// Where a refused member goes: one audit line per first sighting, then
+    /// counters.
+    pub refusals: Arc<dyn crate::registry::routing::RefusalRecorder>,
     pub oci: Arc<dyn OciStore>,
     pub pypi: Arc<dyn PypiFileStore>,
     /// Bounds the archives inspected at once; inspection is CPU on a blocking thread.
@@ -577,6 +580,13 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
     )
     .await?;
 
+    let refusals: Arc<dyn crate::registry::routing::RefusalRecorder> =
+        Arc::new(crate::app::refusals::RefusalLog::new(
+            stores.audit(),
+            events.clone(),
+            config.routing.refusal_window(),
+        ));
+
     let policy_store = stores.policy();
     let policy = PolicyEngine::new(
         policy_store.clone(),
@@ -612,6 +622,7 @@ pub async fn build_state(config: &Config) -> anyhow::Result<AppState> {
         nuget_documents: Arc::new(crate::registry::nuget::merged::documents()),
         routing,
         routing_rules,
+        refusals,
         oci: stores.oci(),
         pypi: stores.pypi(),
         archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),

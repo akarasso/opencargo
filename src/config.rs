@@ -47,6 +47,9 @@ pub struct RoutingConfig {
     /// than serving the state from before a rule this node may not have seen.
     /// Several refresh periods, so a single failed read is not an outage.
     pub max_snapshot_age_secs: u64,
+    /// How long one refused (name, repository, member) stays deduplicated
+    /// before it is worth an audit line again.
+    pub refusal_window_secs: u64,
     /// Rules to write **into an empty table**, once. The file seeds a
     /// deployment; it never owns it afterwards, so a rule deleted here does
     /// not come back and a rule hardened here has no effect. A drift between
@@ -73,6 +76,7 @@ impl Default for RoutingConfig {
         Self {
             refresh_secs: 30,
             max_snapshot_age_secs: 300,
+            refusal_window_secs: 3600,
             rules: Vec::new(),
         }
     }
@@ -85,6 +89,10 @@ impl RoutingConfig {
 
     pub fn max_snapshot_age(&self) -> std::time::Duration {
         std::time::Duration::from_secs(self.max_snapshot_age_secs)
+    }
+
+    pub fn refusal_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refusal_window_secs)
     }
 }
 

@@ -19,7 +19,7 @@ use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::SearchIndex;
 use crate::proxy::auth::{default_token_realms, UpstreamAuth, UpstreamCredsSource};
 use crate::proxy::ProxyEngine;
-use crate::registry::routing::{Gate, RoutingRegistry, Verdict};
+use crate::registry::routing::{Gate, RefusalRecorder, Refused, RoutingRegistry, Verdict};
 use crate::storage::StorageError;
 
 /// How resolving a name refuses, in the resolver's own vocabulary.
@@ -104,6 +104,9 @@ pub struct Cx<'a> {
     /// opens a gate on it; a site that does not is the one way this control
     /// could be walked around.
     pub routing: &'a RoutingRegistry,
+    /// Where a refused member goes; the walk knows the fact and nothing else
+    /// about it.
+    pub refusals: &'a dyn RefusalRecorder,
     pub url: UrlRepo<'a>,
     pub base_url: &'a str,
 }
@@ -318,7 +321,7 @@ fn walk<'a, L: Leaf + 'a>(
                 // A refusal is a skip, never a failure: the walk goes on with
                 // the members a rule allows, and it removes no `Degraded` a
                 // member before it produced (D8).
-                refused(repo, &verdict);
+                refused(cx, gate, repo, &verdict);
                 w.record(Visit::Nothing);
                 return Ok(());
             }
@@ -341,20 +344,35 @@ fn walk<'a, L: Leaf + 'a>(
     })
 }
 
-/// What a refusal leaves behind here: a line an operator can grep. The client
-/// is told nothing, and the audit event is the application's to write.
-fn refused(member: &Repository, verdict: &Verdict) {
-    match verdict {
-        Verdict::Stale => warn!(
+/// What a refusal leaves behind. The client is told nothing (I6); an operator
+/// gets a line, and the application gets the fact.
+fn refused(cx: &Cx<'_>, gate: &Gate, member: &Repository, verdict: &Verdict) {
+    if matches!(verdict, Verdict::Stale) {
+        warn!(
             member = %member.name,
             "routing snapshot older than routing.max_snapshot_age; refusing a proxy member"
-        ),
-        _ => tracing::debug!(
-            member = %member.name,
-            rules = ?verdict.rules(),
-            "routing refused a member"
-        ),
+        );
     }
+    if !cx.refusals.records() {
+        return;
+    }
+    let Some((_, ident_key)) = gate.keys() else {
+        return;
+    };
+    cx.refusals.refused(Refused {
+        format: gate.format(),
+        addressed: cx.url.0,
+        member: &member.name,
+        ident_key,
+        rules: verdict.rules(),
+        stale: matches!(verdict, Verdict::Stale),
+        user_id: cx.auth.and_then(|a| a.user_id),
+        actor_kind: match cx.auth {
+            None => "anonymous",
+            Some(a) if a.user_id.is_none() => "token",
+            Some(_) => "user",
+        },
+    });
 }
 
 async fn walk_members<'a, L: Leaf + 'a>(

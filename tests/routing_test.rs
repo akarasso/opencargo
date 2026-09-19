@@ -460,3 +460,91 @@ async fn the_rules_are_admin_only() {
         );
     }
 }
+
+/// The audit entries whose action starts with `routing.refused`, on a
+/// deadline: the record is written off the read path, so the client's answer
+/// does not wait for it and neither does the assertion's first look.
+async fn refusal_entries(server: &TestServer, expected: usize) -> Vec<Value> {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let page: Value = reqwest::Client::new()
+            .get(format!("{}/api/v1/system/audit?size=200", server.base_url))
+            .bearer_auth(STATIC_TOKEN)
+            .send()
+            .await
+            .expect("request failed")
+            .json()
+            .await
+            .expect("invalid json");
+        let found: Vec<Value> = page["entries"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|e| {
+                e["action"]
+                    .as_str()
+                    .is_some_and(|a| a.starts_with("routing.refused"))
+            })
+            .collect();
+        if found.len() >= expected || tokio::time::Instant::now() >= deadline {
+            return found;
+        }
+        tokio::task::yield_now().await;
+    }
+}
+
+/// T9: a hundred refusals leave one audit line **per triplet** — the name,
+/// the repository addressed and the member left out — naming every rule that
+/// refused and the caller that asked, and nothing after that.
+#[tokio::test]
+async fn a_refusal_leaves_one_audit_line_per_triplet() {
+    let up = seed_upstream().await;
+    let server = spawn_group(&up).await;
+    create_rule(&server, pinned_to_internal()).await;
+    create_rule(
+        &server,
+        json!({
+            "name": "acme-deny",
+            "format": "npm",
+            "patterns": ["@acme/*"],
+            "effect": "deny",
+        }),
+    )
+    .await;
+
+    for _ in 0..20 {
+        assert_eq!(
+            status_of(&server, &format!("/all/{PINNED}")).await,
+            StatusCode::NOT_FOUND
+        );
+    }
+    // Both members of the group are refused for this name, so two triplets
+    // and two lines — twenty requests, not forty.
+    let entries = refusal_entries(&server, 2).await;
+    assert_eq!(entries.len(), 2, "one per triplet, then counters: {entries:?}");
+
+    let mut by_member: Vec<(String, Value)> = entries
+        .iter()
+        .map(|e| {
+            let details: Value =
+                serde_json::from_str(e["details_json"].as_str().expect("details json"))
+                    .expect("invalid details json");
+            assert_eq!(e["target"], "all", "the repository the client addressed");
+            assert_eq!(details["actor_kind"], "anonymous");
+            assert_eq!(details["ident_key"], PINNED);
+            (details["member"].as_str().unwrap().to_string(), details)
+        })
+        .collect();
+    by_member.sort_by(|a, b| a.0.cmp(&b.0));
+    assert_eq!(
+        by_member.iter().map(|(m, _)| m.as_str()).collect::<Vec<_>>(),
+        ["internal", "public"]
+    );
+    assert_eq!(by_member[0].1["rules"], json!(["acme-deny"]));
+    assert_eq!(
+        by_member[1].1["rules"],
+        json!(["acme-deny", "acme-internal"]),
+        "every rule that refuses, in name order"
+    );
+}

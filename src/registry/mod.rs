@@ -50,6 +50,7 @@ pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Reposit
         creds: state.upstream_auth.as_ref(),
         auth,
         routing: state.routing.as_ref(),
+        refusals: state.refusals.as_ref(),
         url: UrlRepo(&repo.name),
         base_url: &state.base_url,
     }

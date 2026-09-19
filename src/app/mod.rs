@@ -54,6 +54,7 @@ pub mod pypi;
 pub mod publish;
 pub mod publish_tail;
 pub mod reclaim;
+pub mod refusals;
 pub mod reconcile;
 pub mod releases;
 pub mod repo_spec;

@@ -157,6 +157,44 @@ impl Verdict {
     }
 }
 
+/// One refusal, as the walk knows it. Nothing here is a decision about what
+/// to do with it: whether it is the first of its kind, what it costs to
+/// record and what an operator is told are the application's to weigh.
+pub struct Refused<'a> {
+    pub format: Format,
+    /// The repository the client addressed, which is what an operator
+    /// recognises — not the member that was left out.
+    pub addressed: &'a str,
+    pub member: &'a str,
+    /// Store identity, so renaming a rule or adding one alphabetically before
+    /// it never re-fires the same alarm (D14).
+    pub ident_key: &'a str,
+    pub rules: &'a [String],
+    /// The refusal is the staleness bound rather than a rule.
+    pub stale: bool,
+    pub user_id: Option<i64>,
+    pub actor_kind: &'a str,
+}
+
+/// Where a refusal goes. Two methods and not a use case, for the reason
+/// `ResolutionRecorder` has two: a leaf must be walkable without a queue, an
+/// audit store and a database behind it.
+pub trait RefusalRecorder: Send + Sync {
+    fn records(&self) -> bool;
+    fn refused(&self, refusal: Refused<'_>);
+}
+
+/// The recorder a fixture and a walk with nothing to record use.
+pub struct NoRefusals;
+
+impl RefusalRecorder for NoRefusals {
+    fn records(&self) -> bool {
+        false
+    }
+
+    fn refused(&self, _refusal: Refused<'_>) {}
+}
+
 /// One request's routing decision: opened once, asked once per member.
 ///
 /// The two keys are computed here, at the entry of the resolution, and not
@@ -197,6 +235,10 @@ impl Gate {
 
     pub fn version(&self) -> u64 {
         self.snapshot.set.version()
+    }
+
+    pub fn format(&self) -> Format {
+        self.format
     }
 
     /// The two keys as `explain` shows them beside the name the caller typed,
