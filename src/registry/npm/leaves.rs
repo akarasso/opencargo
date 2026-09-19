@@ -11,7 +11,7 @@ use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 use super::packument::{
     dist_tags_map, hosted_packument, strip_versions_to_abbreviated, Packument,
 };
-use super::search::search_in_repo;
+use super::search::{cached_in_repo, search_in_repo};
 use super::upstream::{NpmArtifact, NpmUpstream};
 
 pub struct PackumentLeaf {
@@ -192,8 +192,9 @@ impl Leaf for DistTagsLeaf {
     }
 }
 
-/// The first `limit` local search objects of a member; a proxy member has no
-/// searchable index and contributes nothing.
+/// The first `limit` search objects of a member: what it hosts, or what it has
+/// been seen serving. Neither asks an upstream -- a search is answered from
+/// what this server holds, never from an upstream's own catalogue and ranking.
 pub struct SearchLeaf {
     pub text: String,
     pub limit: i64,
@@ -215,10 +216,11 @@ impl Leaf for SearchLeaf {
 
     async fn proxy(
         &self,
-        _cx: &Cx<'_>,
-        _member: CacheRepo<'_>,
+        cx: &Cx<'_>,
+        member: CacheRepo<'_>,
         _up: &Upstream,
     ) -> Result<Outcome<Vec<Value>>, ResolveError> {
-        Ok(Outcome::NotFound)
+        let objects = cached_in_repo(cx.cached, member.0.id, &self.text, self.limit).await?;
+        Ok(Outcome::Found(objects))
     }
 }
