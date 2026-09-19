@@ -39,10 +39,15 @@ fn announced_sha256(headers: &HeaderMap) -> ExpectedDigests {
 impl UpstreamStrategy for RawUpstream {
     type Artifact = RawArtifact;
 
+    /// Segment by segment: a `#`, a `?` or a space in a path is part of the
+    /// name asked for, never of the URL's syntax.
     fn upstream_url(&self, up: &Upstream, a: &RawArtifact) -> Result<url::Url, ResolveError> {
-        let url = format!("{}/{}", up.base.as_str().trim_end_matches('/'), a.path);
-        url::Url::parse(&url)
-            .map_err(|e| ResolveError::Upstream(format!("invalid upstream URL {url}: {e}")))
+        let mut url = up.base.clone();
+        url.path_segments_mut()
+            .map_err(|_| ResolveError::Upstream(format!("{} cannot be a base", up.base)))?
+            .pop_if_empty()
+            .extend(a.path.split('/'));
+        Ok(url)
     }
 
     fn cache_key(&self, a: &RawArtifact) -> CacheKey {
@@ -96,22 +101,52 @@ mod tests {
         assert_eq!(RawUpstream.cache_policy(&artifact), CachePolicy::Ttl(Ttl::Secs(TTL_SECS)));
     }
 
-    #[test]
-    fn an_upstream_url_is_the_base_and_the_path() {
-        let up = Upstream {
-            base: url::Url::parse("https://files.example.com/repo/").unwrap(),
+    fn upstream(base: &str) -> Upstream {
+        Upstream {
+            base: url::Url::parse(base).unwrap(),
             auth: None,
             token_realms: Vec::new(),
             dl_allow_private: false,
-        };
-        let url = RawUpstream
+        }
+    }
+
+    fn asked(base: &str, path: &str) -> String {
+        RawUpstream
             .upstream_url(
-                &up,
+                &upstream(base),
                 &RawArtifact {
-                    path: "dist/tool.bin".to_string(),
+                    path: path.to_string(),
                 },
             )
-            .unwrap();
-        assert_eq!(url.as_str(), "https://files.example.com/repo/dist/tool.bin");
+            .unwrap()
+            .to_string()
+    }
+
+    #[test]
+    fn an_upstream_url_is_the_base_and_the_path() {
+        assert_eq!(
+            asked("https://files.example.com/repo/", "dist/tool.bin"),
+            "https://files.example.com/repo/dist/tool.bin"
+        );
+        assert_eq!(
+            asked("https://files.example.com/repo", "dist/tool.bin"),
+            "https://files.example.com/repo/dist/tool.bin",
+            "a base without its trailing slash asks for the same file"
+        );
+    }
+
+    /// A path is a name, not URL syntax: what follows a `#` or a `?` is part
+    /// of the file asked for, so it may not become a fragment or a query.
+    #[test]
+    fn every_segment_of_a_path_is_encoded() {
+        let url = asked("https://files.example.com/repo/", "notes#draft.txt");
+        assert_eq!(url, "https://files.example.com/repo/notes%23draft.txt");
+        assert_eq!(
+            asked("https://files.example.com/repo/", "dist/a?b=c/tool bin"),
+            "https://files.example.com/repo/dist/a%3Fb=c/tool%20bin"
+        );
+        let parsed = url::Url::parse(&url).unwrap();
+        assert_eq!(parsed.fragment(), None);
+        assert_eq!(parsed.path(), "/repo/notes%23draft.txt");
     }
 }
