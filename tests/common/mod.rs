@@ -19,6 +19,7 @@ pub mod import;
 pub mod nuget;
 pub mod upstream_tap;
 pub mod publish;
+pub mod upstreams;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;

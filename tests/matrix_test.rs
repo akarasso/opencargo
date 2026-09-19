@@ -337,3 +337,41 @@ async fn the_gate_refuses_every_format_that_declares_it() {
         }
     }
 }
+
+/// `policy_record`: what an instance brings in from outside is on the record,
+/// whatever its format. The policy report is what the paid enforcement layer
+/// reads, so a format missing from it is a hole in the product, not a gap in
+/// a log.
+#[tokio::test]
+async fn every_format_records_what_it_brought_in() {
+    let up = common::upstreams::start().await;
+    let s = spawn_server(SpawnOpts {
+        repositories: up.repositories(),
+        policy: up.policy(),
+        ..Default::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    for format in Format::ALL {
+        let response = up.bring_in(&client, &s.base_url, format).await;
+        assert!(
+            response.status().is_success(),
+            "{format:?} could not reach its upstream: {} {:?}",
+            response.status(),
+            response.text().await
+        );
+        assert!(
+            format.coverage().policy_record.yes(),
+            "{format:?} declares it records nothing it brings in"
+        );
+    }
+
+    let rows = common::wait_for_policy_rows(&s, Format::ALL.len()).await;
+    let mut seen: Vec<&str> = rows.iter().map(|r| r.format.as_str()).collect();
+    seen.sort();
+    seen.dedup();
+    let mut want: Vec<&str> = Format::ALL.iter().map(|f| f.as_str()).collect();
+    want.sort();
+    assert_eq!(seen, want, "a format brought something in and left no row");
+}
