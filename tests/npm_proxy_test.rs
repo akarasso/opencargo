@@ -263,7 +263,18 @@ async fn packument_ttl_expiry_refetches() {
     assert_eq!(up.tap.count(&up.packument_path()), 2, "an expired row is refetched once");
     assert_eq!(refreshed, first);
     let rows = cache_rows(&a).await;
-    assert_eq!(rows, vec![("npm-metadata".to_string(), PKG.to_string(), 200)]);
+    let kinds: Vec<(&str, i64)> = rows.iter().map(|(k, _, s)| (k.as_str(), *s)).collect();
+    assert_eq!(
+        kinds,
+        vec![("npm-metadata", 200), ("npm-packument-rendered", 200)],
+        "the upstream document, and the answer rendered once from it"
+    );
+    assert_eq!(rows[0].1, PKG);
+    assert!(
+        rows[1].1.contains(&format!("|{PKG}|full|")),
+        "the rendering names its package and its flavour: {}",
+        rows[1].1
+    );
 }
 
 #[tokio::test]

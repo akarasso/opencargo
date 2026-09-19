@@ -4,6 +4,7 @@ use serde_json::Value;
 use crate::domain::{CacheRepo, Format, Outcome};
 use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
+use crate::proxy::strategy::CacheKey;
 use crate::proxy::{IntoPayload, Payload};
 use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
 
@@ -28,6 +29,24 @@ impl PackumentLeaf {
         let mut payload = Payload::bytes(Bytes::from(body));
         payload.content_type = Some(self.flavor().content_type().to_string());
         payload
+    }
+
+    /// What a rendering is remembered under: everything it depends on, the
+    /// document it came from included. A packument that changes upstream,
+    /// or a server that moves, lands under a new key, so a rendering is
+    /// never invalidated -- only left behind for the sweep.
+    fn rendering(&self, cx: &Cx<'_>, source: Option<&str>) -> Option<CacheKey> {
+        Some(CacheKey {
+            kind: "npm-packument-rendered",
+            key: format!(
+                "{}|{}|{}|{}|{}",
+                cx.base_url,
+                cx.url.0,
+                self.name,
+                self.flavor().tag(),
+                source?
+            ),
+        })
     }
 }
 
@@ -63,11 +82,26 @@ impl Leaf for PackumentLeaf {
         let Outcome::Found(cached) = engine.fetch(&NpmUpstream, up, member, &artifact).await? else {
             return Ok(Outcome::NotFound);
         };
+        let key = self.rendering(cx, cached.entry.digest.as_deref());
+        if let Some(key) = &key {
+            if let Some(mut payload) = engine.derived(member, key).await? {
+                payload.stale = cached.stale;
+                return Ok(Outcome::Found(payload));
+            }
+        }
         let raw = engine.bytes(&cached).await?;
         let body = render::render(&raw, self.flavor(), cx.base_url, cx.url.0, &self.name)
             .map_err(|e| ResolveError::Upstream(format!("invalid packument from upstream: {e}")))?;
         drop(raw);
-        let mut payload = self.served(body);
+        let content_type = self.flavor().content_type();
+        let mut payload = match &key {
+            Some(key) => {
+                engine
+                    .put_derived(member, key, Bytes::from(body), content_type)
+                    .await?
+            }
+            None => self.served(body),
+        };
         payload.stale = cached.stale;
         Ok(Outcome::Found(payload))
     }
