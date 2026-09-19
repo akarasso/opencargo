@@ -437,6 +437,101 @@ async fn a_group_is_judged_on_the_name_the_client_asked_for() {
     );
 }
 
+/// The administrative surface asks for a credential that is not narrowed:
+/// the same bearer, unscoped, does every one of these.
+#[tokio::test]
+async fn a_scoped_token_reaches_no_administrative_route() {
+    let s = setup().await;
+    s.account("root", "admin").await;
+    let scoped = s
+        .token("root", "robot", Some(repo_scope("npm-*", &["read", "write"])))
+        .await;
+    let full = s.token("root", "session", None).await;
+
+    let flip = json!({ "visibility": "public" });
+    let refused = s
+        .client
+        .put(format!("{}/api/v1/repositories/npm-prod", s.url))
+        .bearer_auth(&scoped)
+        .json(&flip)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(refused).await["code"], "insufficient_scope");
+
+    for (method, path) in [
+        ("DELETE", "/api/v1/repositories/npm-prod"),
+        ("GET", "/api/v1/system/audit"),
+        ("GET", "/api/v1/system/storage"),
+        ("GET", "/api/v1/users"),
+    ] {
+        let request = match method {
+            "DELETE" => s.client.delete(format!("{}{path}", s.url)),
+            _ => s.client.get(format!("{}{path}", s.url)),
+        };
+        let refused = request.bearer_auth(&scoped).send().await.unwrap();
+        assert_eq!(refused.status(), StatusCode::FORBIDDEN, "{method} {path}");
+    }
+
+    let allowed = s
+        .client
+        .put(format!("{}/api/v1/repositories/npm-prod", s.url))
+        .bearer_auth(&full)
+        .json(&flip)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK, "the scope is what refused");
+}
+
+/// Promotion asks for the repository action `admin`, on both repositories,
+/// and a scope that does not name it does not promote.
+#[tokio::test]
+async fn promotion_asks_for_the_admin_rung_on_both_repositories() {
+    let s = setup().await;
+    s.account("root", "admin").await;
+    let full = s.token("root", "session", None).await;
+    s.publish("npm-dev", "widget", Some(&full)).await;
+
+    let writer = s
+        .token(
+            "root",
+            "writer",
+            Some(repo_scope("npm-*", &["read", "write"])),
+        )
+        .await;
+    let promoter = s
+        .token(
+            "root",
+            "promoter",
+            Some(repo_scope("npm-*", &["read", "write", "admin"])),
+        )
+        .await;
+    let promote = json!({ "from": "npm-dev", "to": "npm-prod" });
+
+    let refused = s
+        .client
+        .post(format!("{}/api/v1/promote/widget/1.0.0", s.url))
+        .bearer_auth(&writer)
+        .json(&promote)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body(refused).await["code"], "insufficient_scope");
+
+    let done = s
+        .client
+        .post(format!("{}/api/v1/promote/widget/1.0.0", s.url))
+        .bearer_auth(&promoter)
+        .json(&promote)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(done.status(), StatusCode::OK, "{:?}", done.text().await);
+}
+
 /// The vocabulary is closed at creation, and a subscription no repository
 /// selector can narrow is not part of it.
 #[tokio::test]

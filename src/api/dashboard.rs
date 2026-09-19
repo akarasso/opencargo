@@ -144,7 +144,7 @@ type Caller = Option<Extension<AuthUser>>;
 /// Which packages a caller may count, list and search. Admins see every
 /// repository; everyone else, authenticated or not, sees the public ones.
 fn package_reach(caller: &Caller) -> Reach {
-    match caller.as_ref().map(|user| user.0.role == "admin") {
+    match caller.as_ref().map(|user| crate::api::admin_standing(&user.0)) {
         Some(true) => Reach::Everything,
         _ => Reach::PublicOnly,
     }

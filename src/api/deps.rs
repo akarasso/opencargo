@@ -16,7 +16,10 @@ use crate::server::AppState;
 /// `true` unless the caller is an admin — restricts dependency lookups to
 /// packages hosted in publicly-visible repositories.
 fn public_only(auth: &Option<axum::Extension<crate::auth::middleware::AuthUser>>) -> bool {
-    !auth.as_ref().map(|e| e.0.role == "admin").unwrap_or(false)
+    !auth
+        .as_ref()
+        .map(|e| crate::api::admin_standing(&e.0))
+        .unwrap_or(false)
 }
 
 /// The first package of that name anywhere, with its versions: these routes
