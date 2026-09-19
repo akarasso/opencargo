@@ -456,7 +456,7 @@ erases one user's rows, audited with the count and never the name.
 | `OPENCARGO_DL_ALLOW_PRIVATE_<REPO>` | `1` to allow that proxy's `dl`/token realm on a private IP (same as `dl_allow_private = true`) |
 | `OPENCARGO_OSV_BASE_URL` | OSV API base URL (also `--osv-base-url`) |
 | `OPENCARGO_LEASE_WAIT`, `OPENCARGO_SHUTDOWN_GRACE`, `OPENCARGO_ENDPOINT_DRAIN` | Override `[server]`; the Helm chart sets them from its values |
-| `RUST_LOG` | Log filter, default `opencargo=info,tower_http=info` |
+| `RUST_LOG` | Log filter, default `opencargo=info`. Colour follows the terminal, so a redirected log is plain text |
 
 ---
 
@@ -593,6 +593,8 @@ group whose proxy member fronts another instance; locally they print
   and the gap report.
 - [docs/operations.md](docs/operations.md): one instance, the writer lease,
   shutdown and upgrades, backups and the restore drill.
+- [docs/write-amplification.md](docs/write-amplification.md): what a publish
+  writes beyond what it keeps, measured, and what the database does about it.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).
