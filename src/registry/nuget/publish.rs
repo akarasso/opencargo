@@ -120,6 +120,7 @@ pub async fn push(
     multipart: Multipart,
 ) -> AppResult<Response> {
     let user = require_user(auth)?;
+    crate::registry::meter_publish(&state, &user, Format::Nuget, &repo_name)?;
     let repo = writable(&state, &repo_name, &user).await?;
     let limits = Limits {
         cap: MAX_NUPKG_BYTES,

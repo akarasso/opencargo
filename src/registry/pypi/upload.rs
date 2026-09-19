@@ -74,9 +74,7 @@ pub async fn upload(
         .get::<AuthUser>()
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    if !state.publish_rate_limiter.check(&format!("publish:{}", auth.username)) {
-        return Err(AppError::TooManyRequests("too many publish requests, try again later".to_string()).into());
-    }
+    crate::registry::meter_publish(&state, &auth, Format::Pypi, &repo_name)?;
     let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Pypi)?;
     crate::registry::ensure_hosted(&repo)?;

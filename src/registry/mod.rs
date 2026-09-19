@@ -14,6 +14,7 @@ use std::collections::HashMap;
 
 use crate::auth::middleware::AuthUser;
 use crate::auth::permissions::check_repo_permission;
+use crate::auth::publish_limit::Admission;
 use crate::domain::{Format, RepoKind, Repository, UrlRepo, Visibility};
 use crate::error::{AppError, AppResult};
 use crate::ports::permissions::PermissionStore;
@@ -134,6 +135,29 @@ pub fn ensure_format(repo: &Repository, expected: Format) -> AppResult<()> {
             format.as_str(),
             expected.as_str()
         )))
+    }
+}
+
+/// Count one publish against the account's configured limit, before the body
+/// is read: a refusal costs the server nothing and tells the client the limit
+/// it hit and when to come back.
+pub fn meter_publish(
+    state: &AppState,
+    auth_user: &AuthUser,
+    format: Format,
+    repo_name: &str,
+) -> AppResult<()> {
+    let verdict = state
+        .publish_meter
+        .admit(&auth_user.username, format, repo_name, state.clock.now());
+    match &verdict {
+        Admission::Allowed => Ok(()),
+        Admission::Refused {
+            retry_after_secs, ..
+        } => Err(AppError::RateLimited {
+            message: verdict.message().unwrap_or_default(),
+            retry_after_secs: *retry_after_secs,
+        }),
     }
 }
 

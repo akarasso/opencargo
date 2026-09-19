@@ -53,7 +53,7 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 	cargo test --test npm_test --test npm_proxy_test --test npm_memory_test --test cargo_test --test cargo_proxy_test \
 		--test go_test --test go_proxy_test --test oci_test --test oci_nested_test --test oci_proxy_test \
 		--test vuln_test --test group_resolver_test --test auth_test --test features_test \
-		--test promote_test --test permissions_test --test policy_test \
+		--test promote_test --test permissions_test --test policy_test --test publish_limits_test \
 		--test pypi_test --test pypi_store_test --test pypi_proxy_test \
 		--test maven_test --test maven_proxy_test \
 		--test nuget_test --test nuget_feed_store_test --test nuget_proxy_test --test nuget_group_test \

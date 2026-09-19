@@ -356,6 +356,17 @@ static_tokens = []                 # break-glass admin tokens; keep empty
 [auth.admin]
 username = "admin"                 # password: OPENCARGO_ADMIN_PASSWORD, or generated
 
+[limits.publish]                   # docs/operations.md
+window = "1m"
+per_window = 500                   # default: unset, only the formats below are metered
+
+[limits.publish.format]            # default: npm = 30, pypi = 30
+npm = 500
+cargo = { max = 1000, per = "5m" }
+
+[limits.publish.repository]        # wins over the format entry, for that repository
+npm-ci = { max = 2000, per = "1h" }
+
 [proxy]
 default_ttl = "24h"                # npm packuments, cargo config.json, OCI tags
                                    # (cargo index lines, Go queries and OCI tag lists: 10 min)
@@ -417,6 +428,15 @@ members = ["oci-private", "hub-proxy"]   # same format, resolved in order, nesti
 
 Pass it with `--config /path/config.toml` or `OPENCARGO_CONFIG`. Lookup order
 without a flag: `./config.toml`, `~/.opencargo/config.toml`, built-in defaults.
+
+Publishing is metered per account in a sliding window, and a refused publish
+answers `429` with `Retry-After` and the limit it hit. The shipped limits are
+thirty npm publishes and thirty PyPI uploads a minute per account, what
+opencargo has always enforced; Cargo, Go and NuGet are metered only once
+configured, and an OCI push or a Maven deploy is never metered here. A limit
+is always finite -- `0` is refused at startup -- so it is raised, never
+lifted. Resolution and the CI recipe are in
+[docs/operations.md](docs/operations.md).
 
 A `[policy.<repo>]` section with at least one rule on records the actor name
 (API token name or username), the artifact and the time of every download

@@ -64,6 +64,7 @@ pub async fn publish_crate(
     body: Bytes,
 ) -> AppResult<impl IntoResponse> {
     let user = require_user(auth_user)?;
+    crate::registry::meter_publish(&state, &user, Format::Cargo, &repo_name)?;
     let repo = load_hosted(&state, &repo_name, &user).await?;
     let (meta, crate_data) = parse_publish_body(&body)?;
     crate::registry::rules::rules_of(crate::domain::Format::Cargo)?.validate(&meta.name)?;

@@ -63,6 +63,48 @@ The ownership pass is the kubelet's `fsGroup` walk plus, in `k8s/base`, a
 `[backup].to` under `/data` adds its snapshots to that walk, a `to` outside it
 does not. No measured figures are published yet.
 
+## Publish limits
+
+Publishing is counted per account in a sliding window. A refusal is a `429`
+carrying `Retry-After` and the limit it hit:
+
+```
+{"error":"publish rate limit reached for npm: 30 per 60s, retry in 41s"}
+```
+
+Out of the box that is thirty npm publishes and thirty PyPI uploads a minute
+per account, and nothing else. Cargo, Go and NuGet publishes are metered only
+once you configure them; OCI pushes and Maven deploys are never metered here,
+since both are several requests per artifact and a request count would not be
+an artifact count.
+
+One limit applies to a publish -- the most specific one configured:
+
+| entry | applies to |
+|---|---|
+| `[limits.publish.repository]` `<repo>` | every publish into that repository |
+| `[limits.publish.format]` `<format>` | every publish of that format elsewhere |
+| `[limits.publish]` `per_window` | every format with no entry of its own, and it drops the two shipped defaults |
+
+A repository entry replaces its format's rather than adding to it, and each
+entry counts in a window of its own: an account publishing into two
+repositories that both carry an entry has each allowance separately.
+
+### A CI account that publishes a batch
+
+Give the repository CI publishes into its own allowance and leave the rest of
+the server where it is:
+
+```toml
+[limits.publish.repository]
+npm-ci = { max = 2000, per = "1h" }
+```
+
+A limit is finite by construction: `0`, and a window over 24h, are refused at
+startup with every other problem in the config. Raise a limit rather than
+lift it -- there is no value that turns the meter off, because the meter is
+what keeps a stolen token from flooding the store.
+
 ## Backups
 
 ```toml

@@ -73,12 +73,8 @@ pub async fn publish_package(
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
 
-    let rate_key = format!("publish:{}", auth_user.username);
-    if !state.publish_rate_limiter.check(&rate_key) {
-        return Err(AppError::TooManyRequests(
-            "too many publish requests, try again later".to_string(),
-        ));
-    }
+    let repo_name = super::param(&params, "repo")?;
+    crate::registry::meter_publish(&state, &auth_user, Format::Npm, repo_name)?;
 
     let body: PublishBody = {
         let bytes = axum::body::to_bytes(request.into_body(), 100 * 1024 * 1024)
@@ -87,7 +83,6 @@ pub async fn publish_package(
         serde_json::from_slice(&bytes)?
     };
 
-    let repo_name = super::param(&params, "repo")?;
     let package_name = extract_package_name(&params);
     crate::registry::rules::rules_of(crate::domain::Format::Npm)?.validate(&package_name)?;
     if body.name != package_name {
