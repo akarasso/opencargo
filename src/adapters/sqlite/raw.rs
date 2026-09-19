@@ -40,13 +40,19 @@ fn file_of(row: FileRow) -> Result<RawFile, StoreError> {
     })
 }
 
+/// A trailing `/` is the same prefix spelled with its separator: `dist` and
+/// `dist/` name one directory, so the separator is trimmed once and both the
+/// exact match and the pattern are built from the result. Trimming only the
+/// pattern would answer two different sets for one directory — a file named
+/// `dist` would be in one and not the other.
+fn normalize_prefix(prefix: &str) -> &str {
+    prefix.trim_end_matches('/')
+}
+
 /// Every `_` and `%` in `prefix` is a literal here, so the escape character
-/// the `LIKE` is given has to be declared. A trailing `/` is the same prefix
-/// spelled with its separator: `dist` and `dist/` name one directory, and a
-/// pattern built from the second would be `dist//%`, which matches nothing.
+/// the `LIKE` is given has to be declared.
 fn like_prefix(prefix: &str) -> String {
     let escaped = prefix
-        .trim_end_matches('/')
         .replace('\\', "\\\\")
         .replace('%', "\\%")
         .replace('_', "\\_");
@@ -147,6 +153,7 @@ impl RawFileStore for SqliteRawFileStore {
         prefix: &str,
         limit: i64,
     ) -> Result<Vec<RawFile>, StoreError> {
+        let prefix = normalize_prefix(prefix);
         let rows: Vec<FileRow> = if prefix.is_empty() {
             sqlx::query_as(&format!(
                 "SELECT {COLUMNS} FROM raw_files WHERE repository_id = ?1 ORDER BY path LIMIT ?2"
