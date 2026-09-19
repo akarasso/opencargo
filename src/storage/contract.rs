@@ -138,6 +138,23 @@ macro_rules! storage_contract {
             assert!(matches!(listed.as_slice(), [Err(StorageError::InvalidPath(_))]));
         }
 
+        /// The budget a store declares is the one it holds keys to: a key
+        /// at it is written, one segment over it is refused before any I/O.
+        #[tokio::test]
+        async fn the_key_budget_is_what_the_store_accepts() {
+            let (_g, s) = $make.await;
+            let budget = s.key_budget();
+            assert!(budget.segment <= budget.key && budget.key <= $crate::storage::keys::MAX_KEY_BYTES);
+            let at = format!("a/{}", "k".repeat(budget.segment.min(budget.key - 2)));
+            s.put(&at, Bytes::from_static(b"x")).await.unwrap();
+            assert_eq!(s.get(&at).await.unwrap(), Bytes::from_static(b"x"));
+            let over = format!("a/{}", "k".repeat(budget.segment + 1));
+            assert!(matches!(
+                s.put(&over, Bytes::new()).await,
+                Err(StorageError::InvalidPath(_))
+            ));
+        }
+
         #[tokio::test]
         async fn reserved_objects_are_never_listed() {
             let (_g, s) = $make.await;

@@ -333,7 +333,7 @@ pub async fn config(
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
     let renderer = renderer(&client).ok_or_else(|| AppError::NotFound(format!("unknown client: {client}")))?;
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, None, auth).await?;
     let (members, gates) = scope(&state, &repo, auth).await?;
     let mut seen = std::collections::HashSet::new();
     let mut details = Vec::new();

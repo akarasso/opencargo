@@ -570,10 +570,11 @@ max_snapshot_age_secs = 300        # past it, the proxy members a rule speaks fo
 refusal_window_secs = 3600         # how long one refused (name, repo, member) stays deduplicated
 
 [policy.npm-proxy]                 # per proxy repository, all rules off by default
-min_release_age = "48h"            # Ns | Nm | Nh | Nd
+min_release_age = "48h"            # Ns | Nm | Nh | Nd; not for Maven, whose upstream dates no version
 osv_severity = "high"              # low | medium | high | critical; needs vuln_scan.enabled
-install_scripts = true             # npm only
-typosquat = true                   # not for OCI
+install_scripts = true             # npm and NuGet
+typosquat = true                   # npm, Cargo, Go and PyPI, the formats a name list ships for
+                                   # a rule that cannot fire on a member's format is named in a startup warning
 fetch_missing_facts = true         # false: cache-only facts, no recorder-initiated upstream request
 
 # Optional seed; managed via API afterwards
@@ -607,10 +608,11 @@ without a flag: `./config.toml`, `~/.opencargo/config.toml`, built-in defaults.
 Publishing is metered per account in a sliding window, and a refused publish
 answers `429` with `Retry-After` and the limit it hit. The shipped limits are
 thirty npm publishes and thirty PyPI uploads a minute per account, what
-opencargo has always enforced; Cargo, Go and NuGet are metered only once
-configured, and an OCI push or a Maven deploy is never metered here. A limit
-is always finite -- `0` is refused at startup -- so it is raised, never
-lifted. Resolution and the CI recipe are in
+opencargo has always enforced; Cargo, Go, NuGet, MCP, raw and OCI (at the
+manifest put, so a count is an image count) are metered only once configured,
+and a Maven deploy is never metered here, since a deploy is a file per request
+with none that completes it. A limit is always finite -- `0` is refused at
+startup -- so it is raised, never lifted. Resolution and the CI recipe are in
 [docs/operations.md](docs/operations.md).
 
 A `[policy.<repo>]` section with at least one rule on records the actor name

@@ -14,7 +14,7 @@ pub mod rules;
 
 use std::collections::HashMap;
 
-use crate::app::authorize::Authorize;
+use crate::app::authorize::{Authorize, Verdict};
 use crate::auth::middleware::AuthUser;
 use crate::auth::publish_limit::Admission;
 use crate::domain::{Format, RepoAction, RepoKind, Repository, UrlRepo};
@@ -73,14 +73,18 @@ pub async fn load_repo(repos: &dyn RepositoryStore, name: &str) -> AppResult<Rep
 ///
 /// The decision is `Authorize`'s: the ladder, then the presented credential's
 /// scope, then the verdict that tells a 401 (nothing presented) from a 403
-/// (what was presented is not enough).
+/// (what was presented is not enough). `package` is what the route names,
+/// when it names one: a package line of a scope covers a package and nothing
+/// wider, so a route that enumerates (a search, an index, a listing) or acts
+/// on the repository's own content (a blob) passes `None` and lies outside a
+/// scope made of package lines.
 pub async fn ensure_can_read(
     authz: &Authorize<'_>,
     repo: &Repository,
+    package: Option<&str>,
     auth_user: Option<&AuthUser>,
 ) -> AppResult<()> {
-    authz
-        .repository(auth_user, repo, RepoAction::Read)
+    judge(authz, auth_user, repo, package, RepoAction::Read)
         .await
         .into_result(
             || format!("read access denied on repository '{}'", repo.name),
@@ -95,9 +99,10 @@ pub async fn ensure_can_read(
 pub async fn ensure_can_write(
     authz: &Authorize<'_>,
     repo: &Repository,
+    package: Option<&str>,
     auth_user: &AuthUser,
 ) -> AppResult<()> {
-    ensure_action(authz, repo, auth_user, RepoAction::Write).await
+    ensure_action(authz, repo, package, auth_user, RepoAction::Write).await
 }
 
 /// The verb a route really asks for. Deletion of content asks for `delete`,
@@ -106,11 +111,11 @@ pub async fn ensure_can_write(
 pub async fn ensure_action(
     authz: &Authorize<'_>,
     repo: &Repository,
+    package: Option<&str>,
     auth_user: &AuthUser,
     action: RepoAction,
 ) -> AppResult<()> {
-    authz
-        .repository(Some(auth_user), repo, action)
+    judge(authz, Some(auth_user), repo, package, action)
         .await
         .into_result(
             || {
@@ -131,9 +136,23 @@ pub async fn ensure_action(
 pub async fn ensure_can_delete(
     authz: &Authorize<'_>,
     repo: &Repository,
+    package: Option<&str>,
     auth_user: &AuthUser,
 ) -> AppResult<()> {
-    ensure_action(authz, repo, auth_user, RepoAction::Delete).await
+    ensure_action(authz, repo, package, auth_user, RepoAction::Delete).await
+}
+
+async fn judge(
+    authz: &Authorize<'_>,
+    caller: Option<&AuthUser>,
+    repo: &Repository,
+    package: Option<&str>,
+    action: RepoAction,
+) -> Verdict {
+    match package {
+        Some(package) => authz.package(caller, repo, package, action).await,
+        None => authz.repository(caller, repo, action).await,
+    }
 }
 
 /// Ensure the repository's declared format matches the protocol being used.

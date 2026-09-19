@@ -91,6 +91,7 @@ impl Inner {
 
     fn path(&self, key: &str) -> Result<Path, StorageError> {
         keys::validate(key, self.key_budget())?;
+        keys::validate_segments(key, keys::MAX_NAME_BYTES)?;
         self.raw_path(key)
     }
 
@@ -441,6 +442,15 @@ impl StorageBackend for S3Storage {
                 .map(|_| ())
                 .map_err(|e| fault("probe", e)),
         }
+    }
+
+    fn key_budget(&self) -> keys::KeyBudget {
+        // An S3 key is opaque to the protocol, but the server behind it may
+        // store each object as a file -- MinIO does -- and then every segment
+        // is a file name its own filesystem bounds. We cannot ask the remote,
+        // so the segment is the one a filesystem allows: exceeding it answers
+        // a fault, not a refusal the client can read.
+        keys::KeyBudget { key: self.inner.key_budget(), segment: keys::MAX_NAME_BYTES }
     }
 
     fn upload_plan(&self) -> UploadPlan {

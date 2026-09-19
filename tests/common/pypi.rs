@@ -75,13 +75,18 @@ pub fn wheel_name(name: &str, version: &str) -> String {
 
 /// An sdist whose `PKG-INFO` names `name` at `version`.
 pub fn sdist(name: &str, version: &str) -> Vec<u8> {
+    sdist_with(name, version, &core_metadata(name, version, None))
+}
+
+/// An sdist carrying `pkg_info` as its `PKG-INFO`.
+pub fn sdist_with(name: &str, version: &str, pkg_info: &str) -> Vec<u8> {
     let root = format!("{}-{version}", name.replace(['-', '.'], "_").to_lowercase());
     let mut out = Vec::new();
     {
         let gz = flate2::write::GzEncoder::new(&mut out, flate2::Compression::default());
         let mut tar = tar::Builder::new(gz);
         let pyproject = format!("[project]\nname = \"{name}\"\nversion = \"{version}\"\n");
-        for (member, body) in [("PKG-INFO", core_metadata(name, version, None)), ("pyproject.toml", pyproject)] {
+        for (member, body) in [("PKG-INFO", pkg_info.to_string()), ("pyproject.toml", pyproject)] {
             let mut header = tar::Header::new_gnu();
             header.set_path(format!("{root}/{member}")).unwrap();
             header.set_size(body.len() as u64);

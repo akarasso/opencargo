@@ -34,7 +34,7 @@ pub async fn config_json(
     crate::registry::ensure_format(&repo, Format::Cargo)?;
     let auth = auth.as_ref().map(|e| &e.0);
     if auth.is_some() {
-        crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+        crate::registry::ensure_can_read(&state.authorize(), &repo, None, auth).await?;
     }
     let cx = cx(&state, auth, &repo);
     Ok(Json(config_body(
@@ -72,7 +72,7 @@ pub async fn get_index_entry(
     }
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(name), auth).await?;
 
     let cx = cx(&state, auth, &repo);
     let leaf = IndexLeaf {

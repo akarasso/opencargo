@@ -43,7 +43,7 @@ pub struct Config {
 // ---------------------------------------------------------------------------
 
 /// What one account may do per window. Publishing is the only metered action
-/// today, and only on the formats whose publish is a single request.
+/// today, on every format with one request that makes an artifact exist.
 #[derive(Debug, Deserialize, Clone, Default)]
 #[serde(default, deny_unknown_fields)]
 pub struct LimitsConfig {
@@ -199,6 +199,12 @@ impl PublishLimitsConfig {
                 problems.push(format!("[limits.publish.format] {name:?} is not a format"));
                 continue;
             };
+            if !format.metered_publish() {
+                problems.push(format!(
+                    "[limits.publish.format] {name} is not metered: a deploy is a file per request, with none that completes it"
+                ));
+                continue;
+            }
             if let Some(limit) = entry.limit(default_window, "format", name, &mut problems) {
                 per_format.insert(format, limit);
             }
@@ -1135,6 +1141,20 @@ mod tests {
                 Err(_) => {}
                 Ok(config) => assert!(config.validate().is_err(), "{bad} should be refused"),
             }
+        }
+    }
+
+    /// A setting that would do nothing is refused rather than accepted: a
+    /// Maven deploy is a file per request, so no request of it is metered.
+    #[test]
+    fn an_entry_for_a_format_that_is_not_metered_is_refused_at_load() {
+        let config: Config = toml::from_str("[limits.publish.format]\nmaven = 10\n").unwrap();
+        let problems = config.limits.publish.resolve().expect_err("maven is not metered");
+        assert!(problems[0].contains("maven") && problems[0].contains("not metered"), "{problems:?}");
+        assert!(config.validate().is_err());
+        for metered in ["npm", "cargo", "go", "pypi", "nuget", "oci", "mcp", "raw"] {
+            let config: Config = toml::from_str(&format!("[limits.publish.format]\n{metered} = 10\n")).unwrap();
+            config.validate().unwrap_or_else(|e| panic!("{metered}: {e}"));
         }
     }
 

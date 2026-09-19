@@ -159,7 +159,7 @@ pub async fn search(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Json<Value>> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let repo = open(&state, &repo_name, auth).await?;
+    let repo = open(&state, &repo_name, None, auth).await?;
     let (skip, take) = (params.skip(), params.take());
     let leaf = SearchLeaf { params };
     let Collected { hits, .. } = collect(&cx(&state, auth, &repo), &repo, &leaf).await?;

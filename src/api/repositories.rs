@@ -97,7 +97,7 @@ pub async fn get_repository(
 
     // A private repo the caller cannot read must be indistinguishable from a
     // missing one, so the permission denial maps to the same 404.
-    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&caller))
+    crate::registry::ensure_can_read(&state.authorize(), &repo, None, Some(&caller))
         .await
         .map_err(|_| AppError::NotFound(format!("repository not found: {name}")))?;
 

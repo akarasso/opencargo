@@ -140,6 +140,15 @@ fn valid_segment(s: &str) -> bool {
 }
 
 impl MavenPath {
+    /// The `groupId:artifactId` the path is about, when it is about one: a
+    /// group-level directory names no artifact.
+    pub fn ga(&self) -> Option<String> {
+        match &self.target {
+            Target::File(file) => Some(file.gav.ga()),
+            Target::Metadata(dir) => MetadataLevel::of(dir).map(|level| level.ga()),
+        }
+    }
+
     pub fn parse(path: &str) -> AppResult<Self> {
         let segments: Vec<&str> = path.split('/').collect();
         if path.len() > 1024 || !segments.iter().all(|s| valid_segment(s)) {

@@ -1,9 +1,8 @@
 use axum::{extract::State, response::IntoResponse, Json};
 use serde_json::json;
 
-use crate::auth::middleware::AuthUser;
 use crate::backup::{incomplete_snapshots, LAST_BACKUP_AT, LAST_BACKUP_TO, LAST_BACKUP_WAL};
-use crate::error::{AppError, AppResult};
+use crate::error::AppResult;
 use crate::ports::leases::WRITER;
 use crate::server::AppState;
 use crate::telemetry::cleanup::LAST_SWEEP_AT;
@@ -16,14 +15,8 @@ pub async fn instance_status(
     State(state): State<AppState>,
     request: axum::http::Request<axum::body::Body>,
 ) -> AppResult<impl IntoResponse> {
-    let caller = request
-        .extensions()
-        .get::<AuthUser>()
-        .cloned()
-        .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    if caller.role != "admin" {
-        return Err(AppError::Forbidden("admin access required".to_string()));
-    }
+    let caller = super::require_auth(&request)?;
+    super::require_admin(&caller)?;
     let row = state.leases.current(WRITER).await?;
     let get = |name: &'static str| {
         let store = state.server_state.clone();

@@ -1,21 +1,111 @@
 use serde_json::Value;
 
-/// Dependency name/version pairs of a published version: npm, cargo and
-/// Maven store JSON metadata, Go stores the raw go.mod.
-pub fn extract_dependencies(metadata: &str, ecosystem: &str) -> Vec<(String, String)> {
+use crate::registry::pypi::names::normalize;
+
+/// Dependency name/version pairs of a published version: npm, cargo, Maven,
+/// NuGet and PyPI store JSON metadata, Go stores the raw go.mod. `Err` names
+/// why the document cannot say what it depends on.
+pub fn extract_dependencies(metadata: &str, ecosystem: &str) -> Result<Vec<(String, String)>, String> {
     if ecosystem == "Go" {
-        return parse_go_mod(metadata);
+        return Ok(parse_go_mod(metadata));
     }
     let Ok(meta) = serde_json::from_str::<Value>(metadata) else {
-        return Vec::new();
+        return Ok(Vec::new());
     };
-    match ecosystem {
+    Ok(match ecosystem {
         "npm" => npm_dependencies(&meta),
         "crates.io" => cargo_dependencies(&meta),
-        "Maven" => npm_dependencies(&meta),
+        "Maven" => maven_dependencies(&meta),
         "NuGet" => nuget_dependencies(&meta),
+        "PyPI" => pypi_dependencies(&meta)?,
         _ => Vec::new(),
+    })
+}
+
+/// Core metadata's `Requires-Dist` lines (PEP 508), each read as its
+/// lower bound, the PEP 503 name; a marker still names a dependency, a URL
+/// requirement names no version. A sdist whose `Requires-Dist` is
+/// `Dynamic` (PEP 643) carries no dependency set at all.
+fn pypi_dependencies(meta: &Value) -> Result<Vec<(String, String)>, String> {
+    let dynamic = meta
+        .get("dynamic")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+        .any(|field| field.eq_ignore_ascii_case("requires-dist"));
+    if dynamic {
+        return Err("the archive declares Requires-Dist dynamic: its dependencies are only known at build time".to_string());
     }
+    let mut deps: Vec<(String, String)> = Vec::new();
+    for req in meta
+        .get("requires_dist")
+        .and_then(|v| v.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|v| v.as_str())
+    {
+        let Some((name, version)) = pypi_requirement(req) else {
+            continue;
+        };
+        if !deps.iter().any(|(n, v)| *n == name && *v == version) {
+            deps.push((name, version));
+        }
+    }
+    Ok(deps)
+}
+
+fn pypi_requirement(req: &str) -> Option<(String, String)> {
+    let spec = req.split(';').next()?.trim();
+    if spec.contains('@') {
+        return None;
+    }
+    let name_end = spec
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-')))
+        .unwrap_or(spec.len());
+    let (name, rest) = spec.split_at(name_end);
+    if name.is_empty() {
+        return None;
+    }
+    let rest = match rest.trim_start().strip_prefix('[') {
+        Some(after) => after.split_once(']')?.1,
+        None => rest,
+    };
+    let specifiers = rest.trim().trim_start_matches('(').trim_end_matches(')');
+    let clauses: Vec<&str> = specifiers.split(',').map(str::trim).filter(|c| !c.is_empty()).collect();
+    let bound = |ops: &[&str]| {
+        clauses.iter().find_map(|c| {
+            ops.iter()
+                .find_map(|op| c.strip_prefix(op))
+                .map(|v| v.trim().trim_end_matches(".*").to_string())
+        })
+    };
+    let version = bound(&["===", "=="]).or_else(|| bound(&["~=", ">=", ">"]))?;
+    (!version.is_empty()).then(|| (normalize(name), version))
+}
+
+/// The POM's `groupId:artifactId` to requirement map, a range read as its
+/// lower bound; an unresolved property names no version.
+fn maven_dependencies(meta: &Value) -> Vec<(String, String)> {
+    meta.get("dependencies")
+        .and_then(|v| v.as_object())
+        .into_iter()
+        .flatten()
+        .filter_map(|(name, req)| {
+            let req = req.as_str().unwrap_or("*");
+            if req.contains("${") {
+                return None;
+            }
+            let lower = req
+                .trim_start_matches(['[', '('])
+                .split(',')
+                .next()
+                .unwrap_or("")
+                .trim_end_matches([']', ')']);
+            let clean = clean_version_string(lower);
+            (!clean.is_empty()).then(|| (name.clone(), clean))
+        })
+        .collect()
 }
 
 /// npm metadata stores dependencies as `{"name": "version_req"}` maps.
@@ -148,7 +238,7 @@ mod tests {
             {"target_framework": "netstandard2.0", "dependencies": [{"id": "Newtonsoft.Json", "range": "[13.0.1, )"}, {"id": "A", "range": "1.2.3"}, {"id": "B"}]}
         ]}}"#;
         assert_eq!(
-            extract_dependencies(meta, "NuGet"),
+            extract_dependencies(meta, "NuGet").unwrap(),
             vec![
                 ("Newtonsoft.Json".to_string(), "13.0.1".to_string()),
                 ("A".to_string(), "1.2.3".to_string())
@@ -170,7 +260,7 @@ mod tests {
             }
         }"#;
 
-        let deps = extract_dependencies(meta, "npm");
+        let deps = extract_dependencies(meta, "npm").unwrap();
         assert_eq!(deps.len(), 3);
         assert!(deps.iter().any(|(n, v)| n == "lodash" && v == "4.17.20"));
         assert!(deps.iter().any(|(n, v)| n == "axios" && v == "0.21.0"));
@@ -188,7 +278,7 @@ mod tests {
             ]
         }"#;
 
-        let deps = extract_dependencies(meta, "crates.io");
+        let deps = extract_dependencies(meta, "crates.io").unwrap();
         assert_eq!(deps.len(), 2);
         assert!(deps.iter().any(|(n, v)| n == "serde" && v == "1.0"));
         assert!(deps.iter().any(|(n, v)| n == "tokio" && v == "1.0"));
@@ -202,7 +292,7 @@ mod tests {
             \tgolang.org/x/text v0.3.7\n)\n\n\
             replace (\n\tgithub.com/two/block => ../local\n)\n\
             exclude github.com/bad/one v0.9.0\n";
-        let deps = extract_dependencies(go_mod, "Go");
+        let deps = extract_dependencies(go_mod, "Go").unwrap();
         assert_eq!(
             deps,
             vec![
@@ -215,10 +305,53 @@ mod tests {
 
     #[test]
     fn maven_dependencies_are_the_pom_map() {
-        let meta = r#"{"groupId": "g", "dependencies": {"com.x:y": "2.1", "a:b": "[1.0,2.0)"}}"#;
-        let mut deps = extract_dependencies(meta, "Maven");
+        let meta = r#"{"groupId": "g", "dependencies": {"com.x:y": "2.1", "a:b": "[1.0,2.0)", "c:d": "${lib.version}", "e:f": "*"}}"#;
+        let mut deps = extract_dependencies(meta, "Maven").unwrap();
         deps.sort();
-        assert!(deps.contains(&("com.x:y".to_string(), "2.1".to_string())), "{deps:?}");
+        assert_eq!(
+            deps,
+            vec![
+                ("a:b".to_string(), "1.0".to_string()),
+                ("com.x:y".to_string(), "2.1".to_string())
+            ],
+            "a range is its lower bound, a property and a wildcard name no version"
+        );
+    }
+
+    #[test]
+    fn pypi_requires_dist_reads_lower_bounds_and_pep_503_names() {
+        let meta = r#"{"name": "demo", "requires_dist": [
+            "requests (>=2.31)",
+            "Django_Rest.Framework>=3.14,<4; python_version >= \"3.8\"",
+            "cryptography[ssh]==41.0.*",
+            "idna",
+            "numpy!=1.25.0",
+            "tool @ https://example.com/tool.zip",
+            "pyyaml~=6.0",
+            "requests (>=2.31)"
+        ]}"#;
+        assert_eq!(
+            extract_dependencies(meta, "PyPI").unwrap(),
+            vec![
+                ("requests".to_string(), "2.31".to_string()),
+                ("django-rest-framework".to_string(), "3.14".to_string()),
+                ("cryptography".to_string(), "41.0".to_string()),
+                ("pyyaml".to_string(), "6.0".to_string()),
+            ]
+        );
+        assert!(extract_dependencies(r#"{"name": "bare"}"#, "PyPI").unwrap().is_empty());
+    }
+
+    #[test]
+    fn pypi_dynamic_requires_dist_is_unscannable_not_clean() {
+        let meta = r#"{"name": "demo", "requires_dist": [], "dynamic": ["Requires-Dist", "Requires-Python"]}"#;
+        let why = extract_dependencies(meta, "PyPI").unwrap_err();
+        assert!(why.contains("Requires-Dist dynamic"), "{why}");
+        let other = r#"{"name": "demo", "requires_dist": ["idna==3.4"], "dynamic": ["Description"]}"#;
+        assert_eq!(
+            extract_dependencies(other, "PyPI").unwrap(),
+            vec![("idna".to_string(), "3.4".to_string())]
+        );
     }
 
     #[test]
@@ -233,8 +366,8 @@ mod tests {
     #[test]
     fn test_extract_no_deps() {
         let meta = r#"{"name": "empty", "version": "1.0.0"}"#;
-        let deps = extract_dependencies(meta, "npm");
+        let deps = extract_dependencies(meta, "npm").unwrap();
         assert!(deps.is_empty());
-        assert!(extract_dependencies("module x\n\ngo 1.22\n", "Go").is_empty());
+        assert!(extract_dependencies("module x\n\ngo 1.22\n", "Go").unwrap().is_empty());
     }
 }

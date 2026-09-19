@@ -113,7 +113,8 @@ pub async fn read(
     let auth = auth.as_ref().map(|e| &e.0);
     let parsed = MavenPath::parse(&path)?;
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    let package = parsed.ga();
+    crate::registry::ensure_can_read(&state.authorize(), &repo, package.as_deref(), auth).await?;
     let cx = crate::registry::cx(&state, auth, &repo);
     match &parsed.target {
         Target::Metadata(dir) => {
@@ -155,21 +156,33 @@ pub async fn deposit(
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
     let parsed = MavenPath::parse(&path)?;
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
+    let package = parsed.ga();
+    crate::registry::ensure_can_write(&state.authorize(), &repo, package.as_deref(), &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
     let deposits = state.maven_deposits();
     let now = state.clock.now();
     let body = request.into_body();
     let outcome = match (&parsed.target, parsed.sum) {
         (Target::File(file), None) => {
-            let stream = body
-                .into_data_stream()
-                .map(|chunk| chunk.map_err(|e| e.to_string()));
+            let stream: deposit::Body = if file.is_pom() {
+                let bytes = axum::body::to_bytes(body, MAX_METADATA_BYTES)
+                    .await
+                    .map_err(|e| AppError::BadRequest(format!("failed to read body: {e}")))?;
+                let gav = &file.gav;
+                let described = super::pom::metadata_json(&bytes, &gav.group, &gav.artifact, &gav.version);
+                state.publish_gate().run(Format::Maven, &described).await?;
+                Box::pin(futures_util::stream::once(async move { Ok(bytes) }))
+            } else {
+                Box::pin(
+                    body.into_data_stream()
+                        .map(|chunk| chunk.map_err(|e| e.to_string())),
+                )
+            };
             let ga = file.gav.ga();
             let scopes = scopes_of(&file.gav);
             let package_path = file.gav.artifact_dir();
             let target = target(repo.id, file, &ga, &package_path, &auth.username, &scopes);
-            deposits.file(target, Box::pin(stream), now).await?
+            deposits.file(target, stream, now).await?
         }
         (Target::File(file), Some(algorithm)) => {
             let value = sum_of(body, algorithm).await?;

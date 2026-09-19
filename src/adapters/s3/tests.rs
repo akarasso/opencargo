@@ -88,6 +88,7 @@ async fn keys_live_under_the_prefix_and_list_as_logical_keys() {
         matches!(fx.storage.put(&long, Bytes::new()).await, Err(StorageError::InvalidPath(_))),
         "the prefix counts against the key budget"
     );
+    assert_eq!(fx.storage.key_budget().key, S3_MAX_KEY_BYTES - "inst/a/".len());
 }
 
 /// A body over one part is a multipart upload recorded in the ledger while

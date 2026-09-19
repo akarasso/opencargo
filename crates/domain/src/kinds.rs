@@ -78,6 +78,14 @@ impl Format {
         }
     }
 
+    /// Whether a publish of this format has one request the meter counts.
+    /// A Maven deploy is a file per request with none that completes it,
+    /// so a request count would not be an artifact count; an OCI push is
+    /// counted at its manifest put, the request that makes the image exist.
+    pub const fn metered_publish(self) -> bool {
+        !matches!(self, Format::Maven)
+    }
+
     pub const fn osv_ecosystem(self) -> Option<&'static str> {
         match self {
             Format::Npm => Some("npm"),

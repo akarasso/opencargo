@@ -22,6 +22,8 @@ pub struct CoreMetadata {
     pub requires_python: Option<String>,
     pub requires_dist: Vec<String>,
     pub license: Option<String>,
+    /// The fields a sdist leaves to build time (PEP 643), lower-cased.
+    pub dynamic: Vec<String>,
 }
 
 impl CoreMetadata {
@@ -60,6 +62,11 @@ impl CoreMetadata {
                 .map(|(_, v)| v.clone())
                 .collect(),
             license: one("license"),
+            dynamic: fields
+                .iter()
+                .filter(|(k, _)| k == "dynamic")
+                .map(|(_, v)| v.to_ascii_lowercase())
+                .collect(),
         })
     }
 
@@ -71,6 +78,7 @@ impl CoreMetadata {
             "requires_python": self.requires_python,
             "requires_dist": self.requires_dist,
             "license": self.license,
+            "dynamic": self.dynamic,
         })
     }
 }
@@ -150,6 +158,17 @@ mod tests {
         assert_eq!(m.requires_python.as_deref(), Some(">=3.8"));
         assert_eq!(m.requires_dist, ["requests (>=2)", "idna"]);
         assert_eq!(m.license.as_deref(), Some("MIT\ncontinued"));
+        assert!(m.dynamic.is_empty());
         assert!(CoreMetadata::parse("Name: x\n").is_none(), "no Version");
+    }
+
+    #[test]
+    fn dynamic_fields_reach_the_json_lower_cased() {
+        let m = CoreMetadata::parse(
+            "Metadata-Version: 2.2\nName: demo\nVersion: 1.0\nDynamic: Requires-Dist\nDynamic: Requires-Python\n\n",
+        )
+        .unwrap();
+        assert_eq!(m.dynamic, ["requires-dist", "requires-python"]);
+        assert_eq!(m.to_json()["dynamic"], serde_json::json!(["requires-dist", "requires-python"]));
     }
 }

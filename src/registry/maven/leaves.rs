@@ -10,6 +10,7 @@ use super::upstream::{sidecar_value, MavenArtifact, MavenUpstream};
 use crate::app::maven::deposit::Hashers;
 use crate::app::search;
 use crate::domain::{CacheRepo, Format, Outcome, Sighting};
+use crate::policy::{self, Source};
 use crate::ports::maven::SumAlgorithm;
 use crate::proxy::engine::Cached;
 use crate::proxy::{IntoPayload, Payload};
@@ -174,8 +175,26 @@ impl Leaf for FileLeaf {
         member: CacheRepo<'_>,
         up: &Upstream,
     ) -> Result<Outcome<Payload>, ResolveError> {
-        Ok(fetch_file(cx, member, up, &self.file).await?.into_payload())
+        let cached = fetch_file(cx, member, up, &self.file).await?;
+        if let Outcome::Found(c) = &cached {
+            if is_artifact(&self.file) {
+                let gav = &self.file.gav;
+                policy::record(cx, member, up, Format::Maven, &gav.ga(), Some(gav.version.clone()), || {
+                    Source::Maven {
+                        digest: c.entry.digest.clone(),
+                    }
+                });
+            }
+        }
+        Ok(cached.into_payload())
     }
+}
+
+/// The files that are the artifact, not a description or a signature of
+/// it: one policy row per served build, as the other formats record their
+/// tarball, crate, zip or package.
+fn is_artifact(file: &ArtifactFile) -> bool {
+    !matches!(file.extension.as_str(), "pom" | "module") && !file.extension.ends_with(".asc")
 }
 
 /// A file's checksum, from the member that serves the file: stored digests

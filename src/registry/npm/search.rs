@@ -35,7 +35,7 @@ pub async fn search(
 ) -> AppResult<Response> {
     let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, None, auth).await?;
 
     // A negative `size` would become `LIMIT -1` (unlimited) in SQLite.
     let size = query.size.unwrap_or(20).clamp(0, 250);

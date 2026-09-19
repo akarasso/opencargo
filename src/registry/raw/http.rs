@@ -83,9 +83,9 @@ pub async fn read(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let path = super::admit(&path)?.to_string();
+    let path = super::admit(&path, &state.raw_path_bound)?.to_string();
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&path), auth).await?;
     let cx = crate::registry::cx(&state, auth, &repo);
     let attachment = disposition(&path);
     let mut payload = first_hit(&cx, &repo, &FileLeaf { path }).await?;
@@ -108,10 +108,11 @@ pub async fn put(
         .get::<AuthUser>()
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    let path = super::admit(&path)?.to_string();
+    let path = super::admit(&path, &state.raw_path_bound)?.to_string();
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&path), &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
+    crate::registry::meter_publish(&state, &auth, Format::Raw, &repo_name)?;
     let content_type = content_type(request.headers());
     let declared = declared_sha256(request.headers())?;
     let stream = request
@@ -157,9 +158,9 @@ pub async fn delete(
     let auth = auth
         .map(|e| e.0)
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    let path = super::admit(&path)?.to_string();
+    let path = super::admit(&path, &state.raw_path_bound)?.to_string();
     let repo = open(&state, &repo_name).await?;
-    crate::registry::ensure_can_delete(&state.authorize(), &repo, &auth).await?;
+    crate::registry::ensure_can_delete(&state.authorize(), &repo, Some(&path), &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
     state
         .delete_raw_file()

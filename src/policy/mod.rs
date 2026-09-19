@@ -138,6 +138,11 @@ pub enum Source {
     Raw {
         digest: Option<String>,
     },
+    /// A Maven repository dates its artifact's last deploy, never one
+    /// version of it: nothing dates the file.
+    Maven {
+        digest: Option<String>,
+    },
     Oci {
         body: Cached,
         served: Option<Cached>,

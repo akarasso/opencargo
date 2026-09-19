@@ -74,7 +74,7 @@ async fn serve_manifest(
     let r = OciRef::parse(params)?;
     let reference = parse_reference(param(params, "reference")?)?;
     let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&r.name), auth).await?;
 
     let leaf = ManifestLeaf {
         name: r.name,
@@ -100,9 +100,12 @@ pub async fn put_manifest(
     let reference = parse_reference(param(&params, "reference")?)?;
 
     let repo = crate::registry::load_repo(state.repos.as_ref(), &r.repo).await?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth_user).await?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&r.name), &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
+    // The one request of a push that makes the image exist: the count is
+    // an image count, and the blobs before it are not counted.
+    crate::registry::meter_publish(&state, &auth_user, Format::Oci, &r.repo)?;
 
     let body = axum::body::to_bytes(request.into_body(), MAX_MANIFEST_BYTES)
         .await
@@ -221,6 +224,7 @@ pub async fn delete_manifest(
     crate::registry::ensure_action(
         &state.authorize(),
         &repo,
+        Some(&r.name),
         &auth_user,
         crate::domain::RepoAction::Delete,
     )

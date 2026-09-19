@@ -78,7 +78,6 @@ pub async fn upload(
     let repo = crate::registry::load_repo(state.repos.as_ref(), &repo_name).await?;
     crate::registry::ensure_format(&repo, Format::Pypi)?;
     crate::registry::ensure_hosted(&repo)?;
-    crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
 
     let content_type = request
         .headers()
@@ -91,6 +90,7 @@ pub async fn upload(
         .map_err(|e| bad(format!("failed to read body: {e}")))?;
     let form = form(&content_type, &body)?;
     let file = parse_filename(&form.filename)?;
+    crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&file.project), &auth).await?;
     if let Some(claimed) = &form.sha256 {
         let actual = format!("{:x}", Sha256::digest(&form.content));
         if !claimed.eq_ignore_ascii_case(&actual) {

@@ -6,6 +6,7 @@ use crate::domain::{
     compile_pattern, validate_oci_tag, validate_package_name, validate_version, DomainError,
     Format, FormatRules, Pattern,
 };
+use crate::storage::keys::KeyBudget;
 
 /// The common half of every format's routing canonicalization: ASCII case
 /// folded away. What each format adds to it is written in its own impl.
@@ -18,10 +19,38 @@ pub struct CargoRules;
 pub struct GoRules;
 pub struct OciRules;
 pub struct MavenRules;
-/// The largest raw path whose physical key always fits `MAX_KEY_BYTES`:
-/// `r/{32}/{path}/{64}/{last segment}~{generation}` frames it in 101 bytes,
-/// and a single-segment path is written twice, so `2n + 101 + 16 <= 1024`.
-pub const MAX_RAW_PATH: usize = 450;
+
+/// The bytes of a raw file's physical key that are not the path:
+/// `r/{incarnation}/{path}/{sha256}/{last segment}~{epoch}-{nonce}`, with
+/// the incarnation, the epoch and the nonce each 32 hex, is
+/// `2 + 32 + 1 + 1 + 64 + 1 + 1 + 32 + 1 + 32`.
+const RAW_KEY_FRAME: usize = 167;
+
+/// What the key's last segment carries besides the path's: the generation
+/// `~{epoch}-{nonce}`, `1 + 32 + 1 + 32`.
+const RAW_SEGMENT_FRAME: usize = 66;
+
+/// The longest raw path a store keys, and the longest segment of one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RawPathBound {
+    pub path: usize,
+    pub segment: usize,
+}
+
+/// A single-segment path is its own last segment, so it is written twice
+/// and `2n + RAW_KEY_FRAME <= key`; the last segment is one name with the
+/// generation appended, so `s + RAW_SEGMENT_FRAME <= segment`.
+pub const fn raw_path_bound(budget: KeyBudget) -> RawPathBound {
+    RawPathBound {
+        path: budget.key.saturating_sub(RAW_KEY_FRAME) / 2,
+        segment: budget.segment.saturating_sub(RAW_SEGMENT_FRAME),
+    }
+}
+
+/// The ceiling on any store: a backend with a prefix of its own, or with
+/// file names for segments, leaves less, and the raw routes hold to what
+/// theirs leaves at boot.
+pub const MAX_RAW_PATH: usize = raw_path_bound(KeyBudget::UNSEGMENTED).path;
 
 pub struct RawRules;
 
@@ -251,12 +280,6 @@ impl FormatRules for RawRules {
 
     fn validate(&self, path: &str) -> Result<(), DomainError> {
         let invalid = || DomainError::InvalidName(format!("invalid raw path: '{path}'"));
-        // The physical key is `r/{incarnation}/{path}/{sha256}/{last segment}`
-        // plus a generation suffix: 101 bytes of frame, and the path counted
-        // twice when it has one segment. A bound the storage port would refuse
-        // later is not a bound, so this one is the largest that always fits
-        // MAX_KEY_BYTES, and the refusal names the path rather than a key the
-        // caller never wrote.
         if path.is_empty() || path.len() > MAX_RAW_PATH || path.starts_with('_') {
             return Err(invalid());
         }
@@ -400,11 +423,55 @@ mod tests {
         for bad in ["", "/a", "a/", "a//b", "a/../b", "a/./b", "..", "_drafts/x", "a/b\\c"] {
             assert!(r.validate(bad).is_err(), "{bad}");
         }
-        assert!(r.validate(&"a".repeat(MAX_RAW_PATH)).is_ok());
-        assert!(r.validate(&"a".repeat(MAX_RAW_PATH + 1)).is_err());
         assert!(r.validate_version("").is_ok());
         assert!(r.validate_version("1.0.0").is_err());
         assert_eq!(r.normalize_version("1.0.0"), "");
+    }
+
+    /// The two frames are read off the layout functions, not remembered:
+    /// the key of a path at a bound fits the store, one byte more does not.
+    #[test]
+    fn the_raw_path_bound_is_the_largest_whose_key_fits_the_store() {
+        use crate::domain::layout;
+        use crate::storage::keys::{self, MAX_KEY_BYTES};
+        let hex32 = "f".repeat(32);
+        let sha = "e".repeat(64);
+        let key = |path: &str| {
+            let logical = layout::hosted_key(
+                &layout::incarnation_prefix(&hex32),
+                path,
+                &sha,
+                layout::file_name(path),
+            );
+            layout::physical_key(&logical, &layout::generation(&hex32, &hex32))
+        };
+        let r = rules_of(Format::Raw).unwrap();
+
+        let single = "a".repeat(MAX_RAW_PATH);
+        assert_eq!(key(&single).len(), 2 * MAX_RAW_PATH + RAW_KEY_FRAME);
+        assert!(r.validate(&single).is_ok());
+        assert!(keys::validate(&key(&single), MAX_KEY_BYTES).is_ok());
+        let past = "a".repeat(MAX_RAW_PATH + 1);
+        assert!(r.validate(&past).is_err());
+        assert!(keys::validate(&key(&past), MAX_KEY_BYTES).is_err());
+
+        let multi = format!("d/{}", "a".repeat(MAX_RAW_PATH - 2));
+        assert!(r.validate(&multi).is_ok());
+        assert!(keys::validate(&key(&multi), MAX_KEY_BYTES).is_ok());
+        assert!(r.validate(&format!("d/{}", "a".repeat(MAX_RAW_PATH - 1))).is_err());
+        assert_eq!(MAX_RAW_PATH, 428);
+
+        let names = KeyBudget { key: MAX_KEY_BYTES, segment: 255 };
+        let bound = raw_path_bound(names);
+        assert_eq!(bound, RawPathBound { path: 428, segment: 189 });
+        let name = "a".repeat(bound.segment);
+        assert_eq!(layout::file_name(&key(&name)).len(), names.segment);
+        assert!(keys::validate_segments(&key(&name), names.segment).is_ok());
+        assert!(keys::validate_segments(&key(&format!("{name}a")), names.segment).is_err());
+
+        let prefixed = KeyBudget { key: MAX_KEY_BYTES - "inst/a/".len(), segment: MAX_KEY_BYTES - "inst/a/".len() };
+        assert_eq!(raw_path_bound(prefixed).path, 425, "an S3 prefix and its slash, halved");
+        assert_eq!(raw_path_bound(KeyBudget { key: RAW_KEY_FRAME, segment: 0 }), RawPathBound { path: 0, segment: 0 });
     }
 
     #[test]

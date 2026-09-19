@@ -9,7 +9,9 @@ use serde_json::Value;
 use sha2::Digest;
 
 use common::pypi::{basic, sdist, sdist_name, upload, wheel, wheel_name};
-use common::{hosted, spawn_server, SpawnOpts, TestServer, STATIC_TOKEN};
+use common::{
+    add_scoped_token, create_user, hosted, repo_scope, spawn_server, SpawnOpts, TestServer, STATIC_TOKEN,
+};
 use opencargo::config::{RepositoryFormat, Visibility};
 
 const JSON_V1: &str = "application/vnd.pypi.simple.v1+json";
@@ -198,6 +200,29 @@ async fn pypi_routes_challenge_with_basic_and_others_do_not() {
         let challenge = resp.headers().get("www-authenticate").map(|v| v.to_str().unwrap().to_string());
         assert!(!challenge.unwrap_or_default().starts_with("Basic"), "{path} gains no Basic challenge");
     }
+}
+
+/// A yank hides a release without destroying it and unyank restores it, so
+/// both are the write rung; removing the release is the delete rung.
+#[tokio::test]
+async fn yank_is_the_write_rung_and_deletion_is_not() {
+    let s = server().await;
+    let client = Client::new();
+    create_user(&client, &s.base_url, STATIC_TOKEN, "ci", "publisher").await;
+    let writer = add_scoped_token(&client, &s.base_url, "ci", "writer", repo_scope("py", &["read", "write"])).await;
+    let auth = basic("__token__", &writer);
+    let uploaded = upload(&client, &s.base_url, "py", &auth, &sdist_name("demo", "1.0"), &sdist("demo", "1.0")).await;
+    assert_eq!(uploaded.status(), StatusCode::OK, "{}", uploaded.text().await.unwrap());
+
+    let release = format!("{}/py/pypi/demo/1.0", s.base_url);
+    let yanked = client.post(format!("{release}/yank")).header("Authorization", &auth).send().await.unwrap();
+    assert_eq!(yanked.status(), StatusCode::OK);
+    let unyanked = client.delete(format!("{release}/yank")).header("Authorization", &auth).send().await.unwrap();
+    assert_eq!(unyanked.status(), StatusCode::OK);
+
+    let refused = client.delete(&release).header("Authorization", &auth).send().await.unwrap();
+    assert_eq!(refused.status(), StatusCode::FORBIDDEN);
+    assert_eq!(refused.json::<Value>().await.unwrap()["code"], "insufficient_scope");
 }
 
 #[tokio::test]

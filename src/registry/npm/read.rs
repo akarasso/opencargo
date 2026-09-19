@@ -45,7 +45,7 @@ pub async fn get_package(
 
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&package_name), auth).await?;
 
     let abbreviated = headers
         .get(header::ACCEPT)
@@ -72,7 +72,7 @@ pub async fn download_tarball(
 
     let repo = crate::registry::load_repo(state.repos.as_ref(), repo_name).await?;
     let auth = auth.as_ref().map(|e| &e.0);
-    crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
+    crate::registry::ensure_can_read(&state.authorize(), &repo, Some(&package_name), auth).await?;
 
     let leaf = TarballLeaf {
         name: package_name,
