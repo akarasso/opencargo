@@ -97,6 +97,10 @@ export interface SearchResult {
   name: string;
   latest_version: string;
   description: string;
+  /** 'hosted': a package this server holds; 'cached': one a proxy member served. */
+  source: 'hosted' | 'cached';
+  repository: string;
+  last_seen: string | null;
 }
 
 export interface SearchResponse {

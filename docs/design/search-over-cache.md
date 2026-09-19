@@ -34,7 +34,10 @@ own surface, and it is additive to the index.
 **D2. A package is indexed, its versions are not.** One row per
 (repository, package name): the name, a description when the format's document
 carries one, and the version last seen as that package's newest. Cached
-*versions* are not rows.
+*versions* are not rows. Six formats write a sighting -- npm, Cargo, Go, PyPI,
+Maven, NuGet -- each from the document it already parses; only npm and NuGet
+carry a description, and a document that names one version because the client
+asked for it (a Go file, a Maven artifact) is not a claim about the newest.
 
 - A proxy's version list is upstream state, not this server's inventory; the
   moment it is copied it is wrong, and nothing reads it. Version lookups already
@@ -100,11 +103,11 @@ model with a different lifecycle. Two ports, one vocabulary.
 
 ## 3. Who writes, who reads
 
-- **Writes**: one use case, `app::search::seen`, called from each format's proxy
+- **Writes**: one use case, `app::search::remember`, called from each format's proxy
   metadata leaf with a `Sighting` that leaf built. The use case owns the rule
   (D3, D4); the leaf owns the document. `Cx` carries the port and the clock, so
   no leaf reaches for `AppState` (4.2's `cx.state` row stays 0).
-- **Reads**: `app::search::find` merges the two indexes for `/api/v1/search` —
+- **Reads**: `app::search::Find` merges the two indexes for `/api/v1/search` —
   hosted rows first, then cached rows whose name no hosted row already
   answered — and `SearchLeaf::proxy` answers a member's npm search from the
   cached index scoped to that member. Merging is the use case's rule, not the
@@ -136,7 +139,7 @@ model with a different lifecycle. Two ports, one vocabulary.
 | 4 | a private proxy repository's cached rows are invisible to an anonymous search and visible to an admin | same |
 | 5 | a second fetch of the same package leaves one row, with the newer `last_seen` | same |
 | 6 | a cache purge drops the rows; the package is findable again after a refetch | same |
-| 7 | Cargo, PyPI and Go sightings: an index/page/list fetch indexes the name | same |
+| 7 | Cargo and Go sightings: an index and a version list index the name | same |
 | 8 | the index write failing leaves the fetch a 200 | adapter/use-case unit test |
 | 9 | the adapter and the fake agree on `remember`/`search`/`forget_repo` | `tests/common/contract.rs` |
 
@@ -151,3 +154,14 @@ model with a different lifecycle. Two ports, one vocabulary.
 - OCI: `search` has no place in the distribution protocol and the UI lists
   images from the hosted rows; a cached image is reachable by its reference,
   which is what a client has when it pulls.
+
+## 7. As implemented
+
+- `Cached` carries `exchanged`: only the engine knows whether an answer cost a
+  fill, a revalidation or nothing, and D3 is a rule about that. A stale body
+  served because the upstream failed is not an exchange -- nothing was learned.
+- The port takes the repository as the `i64` the other stores take, not a
+  newtype; introducing one is a change to every port, not to this one.
+- The read side is `app::search::Find`, the write side `app::search::remember`,
+  and the purge side `app::search::forget`, which `purge_repository` feeds with
+  the proxy members it emptied.

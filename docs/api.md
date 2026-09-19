@@ -27,7 +27,8 @@ Through a proxy or a group, metadata and `dist-tags` come from the cached
 packument (`proxy.default_ttl`, revalidated with `If-None-Match`), tarballs
 are cached forever (a tarball over 100 MiB is refused with `502`) and their
 URLs point at the repository the client asked for; `search` covers hosted
-members only, nested groups included: proxied packages are not searchable.
+members and the packages a proxy member has already served, nested groups
+included -- a package this registry has never fetched is not in the index.
 `PUT`/`DELETE dist-tags` and publish are `400` on a proxy or a group. An unknown package is `404` and remembered for
 `proxy.negative_cache_ttl`; an unreachable upstream is `502`, or the stale
 cached copy with `Warning: 110`.
@@ -378,6 +379,11 @@ GET    /api/v1/packages?q=&repo=&page=
 GET    /api/v1/packages/{name}
 GET    /api/v1/search?q=
 ```
+
+A search result carries `source`: `hosted` for a package this server holds,
+`cached` for one a proxy member served, with the `repository` that answers for
+it and `last_seen`. A hosted package wins a name a proxy also serves, and a
+cached row has no package page: it is fetched through its repository.
 
 ## WebSocket events
 
