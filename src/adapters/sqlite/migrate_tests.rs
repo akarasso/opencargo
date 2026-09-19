@@ -574,8 +574,8 @@ async fn migration_019_is_order_independent_of_025_and_idempotent() {
 /// 025: it creates two tables of its own and reads none, so the order cannot
 /// show (A1 C2).
 #[tokio::test]
-async fn migration_026_is_order_independent_of_025_and_idempotent() {
-    let (_alone_tmp, alone) = apply_in(&["026", "026"]).await;
+async fn the_routing_migration_is_order_independent_of_025_and_idempotent() {
+    let (_alone_tmp, alone) = apply_in(&["031", "031"]).await;
     assert!(objects(&alone).await.contains(&"table routing_rules".to_string()));
     assert_eq!(
         count(&alone, "SELECT version FROM routing_snapshot_version WHERE id = 1").await,
@@ -583,10 +583,10 @@ async fn migration_026_is_order_independent_of_025_and_idempotent() {
         "a second apply never restarts the counter"
     );
     let ran = run_all(&alone).await.unwrap();
-    assert!(outcomes(&ran, Outcome::Adopted).contains(&"026"), "its sentinel is there");
+    assert!(outcomes(&ran, Outcome::Adopted).contains(&"031"), "its sentinel is there");
 
-    let (_a_tmp, before) = apply_in(&["025", "026"]).await;
-    let (_b_tmp, after) = apply_in(&["026", "025"]).await;
+    let (_a_tmp, before) = apply_in(&["025", "031"]).await;
+    let (_b_tmp, after) = apply_in(&["031", "025"]).await;
     assert_eq!(objects(&before).await, objects(&after).await);
 }
 
@@ -720,12 +720,13 @@ async fn migration_024_refuses_a_repository_named_maven_and_changes_nothing() {
     assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
 }
 
-/// A repository already named `raw` would be shadowed by the mount: 026
-/// refuses with a message naming it, and changes nothing.
+/// A repository already named `raw` would be shadowed by the mount: the raw
+/// migration refuses with a message naming it, and changes nothing. What is
+/// pinned is the refusal, never the id it happens to carry.
 #[tokio::test]
-async fn migration_026_refuses_a_repository_named_raw_and_changes_nothing() {
+async fn the_raw_migration_refuses_a_repository_named_raw_and_changes_nothing() {
     let (_tmp, pool) = pool().await;
-    run(&pool, &without("026")).await.unwrap();
+    run(&pool, &without("032")).await.unwrap();
     insert_repository(&pool, "raw", "hosted", "npm").await.unwrap();
     let ddl = repositories_ddl(&pool).await;
 
@@ -736,22 +737,23 @@ async fn migration_026_refuses_a_repository_named_raw_and_changes_nothing() {
         count(&pool, "SELECT COUNT(*) FROM sqlite_master WHERE name LIKE 'raw%'").await,
         0
     );
-    assert!(!applied(&pool).await.unwrap().iter().any(|id| id == "026"));
+    assert!(!applied(&pool).await.unwrap().iter().any(|id| id == "032"));
     assert_eq!(foreign_keys_on_every_connection(&pool).await, vec![1; 5]);
 }
 
-/// 026 alone on a database that predates 018 and 025, and again after them:
+/// The raw migration alone on a database that predates 018 and 025, and again
+/// after them:
 /// the format is admitted, the table lands once, and a second run is a
 /// no-op.
 #[tokio::test]
-async fn migration_026_runs_alone_on_a_legacy_database_and_before_025() {
+async fn the_raw_migration_runs_alone_on_a_legacy_database_and_before_025() {
     let (_tmp, pool) = pool().await;
     let pre_018: Vec<Migration> = MIGRATIONS.iter().filter(|m| m.id < "018").copied().collect();
     run(&pool, &pre_018).await.unwrap();
     insert_repository(&pool, "npm-hosted", "hosted", "npm").await.unwrap();
 
-    let ran = run(&pool, &only("026")).await.unwrap();
-    assert_eq!(ran, vec![("026", Outcome::Applied)]);
+    let ran = run(&pool, &only("032")).await.unwrap();
+    assert_eq!(ran, vec![("032", Outcome::Applied)]);
     assert!(admits(&pool).await.contains("raw"));
     insert_repository(&pool, "files", "hosted", "raw").await.unwrap();
 
@@ -1073,7 +1075,7 @@ async fn a_fully_migrated_database_admits_every_format_together() {
     }
     assert_eq!(
         admits(&pool).await,
-        set(["npm", "cargo", "oci", "go", "pypi", "maven", "nuget", "mcp"])
+        set(["npm", "cargo", "oci", "go", "pypi", "maven", "nuget", "mcp", "raw"])
     );
     assert!(insert_repository(&pool, "deb", "hosted", "deb").await.is_err());
 }
@@ -1082,7 +1084,7 @@ async fn a_fully_migrated_database_admits_every_format_together() {
 /// back as `inherit`, and a grant that could write can still delete now that
 /// the routes ask for the verb.
 #[tokio::test]
-async fn migration_026_makes_every_token_inherit_and_keeps_the_delete_rung() {
+async fn the_scopes_migration_makes_every_token_inherit_and_keeps_the_delete_rung() {
     let (_tmp, pool) = pool().await;
     legacy_migrate(&pool).await;
     insert_repository(&pool, "npm-hosted", "hosted", "npm").await.unwrap();
@@ -1097,7 +1099,7 @@ async fn migration_026_makes_every_token_inherit_and_keeps_the_delete_rung() {
     .await
     .unwrap();
 
-    sqlx::raw_sql(file_of("026")).execute(&pool).await.unwrap();
+    sqlx::raw_sql(file_of("030")).execute(&pool).await.unwrap();
 
     let scope: String = sqlx::query_scalar("SELECT scope FROM api_tokens WHERE id = 't1'")
         .fetch_one(&pool)
@@ -1126,5 +1128,5 @@ async fn migration_026_makes_every_token_inherit_and_keeps_the_delete_rung() {
     assert!(crate::domain::TokenScope::parse(&old_binary).unwrap().is_inherit());
 
     let ran = run_all(&pool).await.unwrap();
-    assert!(outcomes(&ran, Outcome::Adopted).contains(&"026"), "its sentinel is there");
+    assert!(outcomes(&ran, Outcome::Adopted).contains(&"030"), "its sentinel is there");
 }

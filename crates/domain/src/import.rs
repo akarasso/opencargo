@@ -204,9 +204,8 @@ impl SourceFormat {
             SourceFormat::Pypi => Some(Format::Pypi),
             SourceFormat::Maven => Some(Format::Maven),
             SourceFormat::Nuget => Some(Format::Nuget),
-            SourceFormat::Raw | SourceFormat::RubyGems | SourceFormat::Helm | SourceFormat::Other => {
-                None
-            }
+            SourceFormat::Raw => Some(Format::Raw),
+            SourceFormat::RubyGems | SourceFormat::Helm | SourceFormat::Other => None,
         }
     }
 }
@@ -364,7 +363,8 @@ mod tests {
                 "{format:?} is served but no source format maps onto it"
             );
         }
-        assert_eq!(SourceFormat::Raw.target(), None);
+        // A source repository of loose files now has somewhere to land.
+        assert_eq!(SourceFormat::Raw.target(), Some(Format::Raw));
     }
 
     #[test]
