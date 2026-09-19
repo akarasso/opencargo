@@ -10,6 +10,7 @@ import PackageDetail from './pages/PackageDetail.tsx';
 import Search from './pages/Search.tsx';
 import OciImages from './pages/OciImages.tsx';
 import GoModules from './pages/GoModules.tsx';
+import RawFiles from './pages/RawFiles.tsx';
 import Login from './pages/Login.tsx';
 import MyAccess from './pages/MyAccess.tsx';
 import SsoAccount from './pages/SsoAccount.tsx';
@@ -74,6 +75,7 @@ render(
           <Route path="/search" component={Search} />
           <Route path="/oci" component={OciImages} />
           <Route path="/go" component={GoModules} />
+          <Route path="/raw" component={RawFiles} />
           <Route path="/account/access" component={MyAccess} />
           <Route path="/account/sso" component={SsoAccount} />
           <Route path="/login/sso/link" component={SsoLink} />

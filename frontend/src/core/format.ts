@@ -58,3 +58,18 @@ export function formatNumber(n: number | null | undefined): string {
 export function initials(name: string | null | undefined): string {
   return (name || '?').slice(0, 2).toUpperCase();
 }
+
+const UNITS = ['B', 'KB', 'MB', 'GB', 'TB'];
+
+/** 1536 → "1.5 KB"; steps of 1024, at most one decimal. */
+export function formatBytes(n: number | null | undefined): string {
+  if (n == null || n < 0) return '—';
+  let value = n;
+  let unit = 0;
+  while (value >= 1024 && unit < UNITS.length - 1) {
+    value /= 1024;
+    unit += 1;
+  }
+  const rounded = unit === 0 ? value : Math.round(value * 10) / 10;
+  return `${rounded} ${UNITS[unit]}`;
+}

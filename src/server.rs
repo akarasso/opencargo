@@ -1216,6 +1216,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
         .route("/api/v1/system/storage", get(crate::api::storage::storage_status))
         .route("/api/v1/maven/{repo}/decide", post(crate::api::maven::decide))
+        .route("/api/v1/raw/{repo}/files", get(crate::api::raw::list_files))
         .route(
             "/api/v1/policy/report",
             get(crate::api::policy::report).delete(crate::api::policy::erase),

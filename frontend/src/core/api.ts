@@ -17,6 +17,7 @@ import type {
   PolicyQuery,
   PolicyReport,
   PolicyRules,
+  RawFilesResponse,
   RepositoriesResponse,
   RepositoryDetail,
   SearchResponse,
@@ -289,4 +290,17 @@ export function promotePackage(
   to: string,
 ): Promise<{ ok: boolean }> {
   return http.post(`/api/v1/promote/${name}/${enc(version)}`, { from, to });
+}
+
+// --- Raw files -----------------------------------------------------------------
+
+export function fetchRawFiles(params: {
+  repo: string;
+  prefix: string;
+  page: number;
+}): Promise<RawFilesResponse> {
+  const search = new URLSearchParams();
+  if (params.prefix) search.set('prefix', params.prefix);
+  search.set('page', String(params.page));
+  return http.get(`/api/v1/raw/${params.repo}/files?${search.toString()}`);
 }

@@ -322,6 +322,7 @@ function RepositoriesInner() {
                 <option value="go">go</option>
                 <option value="pypi">pypi</option>
                 <option value="maven">maven</option>
+                <option value="raw">raw</option>
                 <option value="nuget">nuget</option>
               </select>
             </div>
