@@ -389,6 +389,8 @@ export function deleteRoutingRule(name: string): Promise<{ deleted: string; stil
 /** The dry run: the same verdict the resolver reaches, on the same snapshot. */
 export function explainRoute(repository: string, name: string): Promise<Explanation> {
   return http.post('/api/v1/routing-rules/explain', { repository, name });
+}
+
 // --- Raw files -----------------------------------------------------------------
 
 export function fetchRawFiles(params: {

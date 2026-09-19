@@ -16,7 +16,6 @@ use std::collections::HashMap;
 
 use crate::app::authorize::Authorize;
 use crate::auth::middleware::AuthUser;
-use crate::auth::permissions::check_repo_permission;
 use crate::auth::publish_limit::Admission;
 use crate::domain::{Format, RepoAction, RepoKind, Repository, UrlRepo};
 use crate::error::{AppError, AppResult};

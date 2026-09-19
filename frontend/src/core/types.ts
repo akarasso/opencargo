@@ -34,8 +34,7 @@ export interface RecentVersion {
 }
 
 export type RepoType = 'hosted' | 'proxy' | 'group';
-export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go' | 'pypi' | 'maven' | 'nuget' | 'mcp';
-export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go' | 'pypi' | 'maven' | 'nuget' | 'raw';
+export type RepoFormat = 'npm' | 'cargo' | 'oci' | 'go' | 'pypi' | 'maven' | 'nuget' | 'mcp' | 'raw';
 export type RepoVisibility = 'public' | 'private';
 
 export interface Repository {
@@ -470,6 +469,8 @@ export interface Explanation {
   ident_key: string;
   snapshot_version: number;
   members: ExplainedMember[];
+}
+
 // --- Raw files -----------------------------------------------------------------
 
 /** One path of a raw repository, as `GET /api/v1/raw/{repo}/files` lists it. */

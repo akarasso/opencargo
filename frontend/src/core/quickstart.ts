@@ -129,6 +129,22 @@ const clients: Record<RepoFormat, Client> = {
       { label: '3 · Restore', command: 'dotnet restore' },
     ],
   },
+  raw: {
+    label: 'curl',
+    example: 'raw-private',
+    connect: (repo, at) => `${at.base}/raw/${repo}/<path>`,
+    steps: (repo, at) => [
+      {
+        label: '1 · Store a file at a path',
+        command: `curl -u you:$TOKEN -T ./tool.tar.gz ${at.base}/raw/${repo}/dist/tool.tar.gz`,
+      },
+      { label: '2 · Read it back', command: `curl -O ${at.base}/raw/${repo}/dist/tool.tar.gz` },
+      {
+        label: '3 · List what a prefix holds',
+        command: `curl -u you:$TOKEN "${at.base}/api/v1/raw/${repo}/files?prefix=dist"`,
+      },
+    ],
+  },
   mcp: {
     label: 'mcp',
     example: 'mcp-mirror',

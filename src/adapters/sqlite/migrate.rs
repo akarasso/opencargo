@@ -180,7 +180,11 @@ pub const MIGRATIONS: &[Migration] = &[
         Sentinel::Column { table: "api_tokens", column: "scope" }
     ),
     sql_migration!("031", "031_routing.sql", Sentinel::Object("idx_routing_rules_format")),
-    sql_migration!("032", "032_raw.sql", Sentinel::Object("idx_raw_files_key")),
+    Migration {
+        id: "032",
+        sentinel: Sentinel::Object("idx_raw_files_key"),
+        step: Step::Rust(raw),
+    },
 ];
 
 /// 020: the `nuget` format, through the shared rebuild; no table of its own.
