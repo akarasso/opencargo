@@ -313,7 +313,7 @@ fn walk<'a, L: Leaf + 'a>(
         let member = CacheRepo(repo);
         let kind = repo.kind()?;
         if kind != RepoKind::Group {
-            let verdict = gate.admits(cx, repo).await?;
+            let verdict = gate.admits(cx.repos, repo).await?;
             if !verdict.admitted() {
                 // A refusal is a skip, never a failure: the walk goes on with
                 // the members a rule allows, and it removes no `Degraded` a
@@ -473,7 +473,7 @@ fn view_of<'a>(
 ) -> Pin<Box<dyn Future<Output = Result<(), ResolveError>> + Send + 'a>> {
     Box::pin(async move {
         if repo.kind()? != RepoKind::Group {
-            if gate.admits(cx, repo).await?.admitted() {
+            if gate.admits(cx.repos, repo).await?.admitted() {
                 out.push(repo.clone());
             }
             return Ok(());

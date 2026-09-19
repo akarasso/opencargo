@@ -8,6 +8,7 @@ pub mod permissions;
 pub mod policy;
 pub mod promote;
 pub mod repositories;
+pub mod routing;
 pub mod storage;
 pub mod tokens;
 pub mod users;

@@ -38,3 +38,17 @@ name = "npm-private"
 type = "hosted"
 format = "npm"
 visibility = "private"
+
+# The rules below are written into an EMPTY rule table, once. Afterwards the
+# API owns them: a rule deleted through it does not come back, and a pattern
+# hardened here is not applied -- the startup log names the difference.
+[routing]
+refresh_secs = 30
+max_snapshot_age_secs = 300
+
+[[routing.rules]]
+name = "acme-internal"
+format = "npm"
+patterns = ["@acme/*"]
+effect = "allow_members"
+targets = ["npm-private"]

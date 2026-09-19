@@ -8,7 +8,7 @@ use chrono::DateTime;
 use super::*;
 use crate::domain::{Effect, RepoSpec, Visibility};
 use crate::ports::routing::StoredRule;
-use crate::registry::resolve::{collect, first_hit, view, Collected, Leaf, Upstream};
+use crate::registry::resolve::{collect, first_hit, view, Collected, Cx, Leaf, Upstream};
 use crate::testing::fakes::FakeDb;
 use crate::testing::resolver::Resolver;
 use crate::domain::{CacheRepo, Outcome};

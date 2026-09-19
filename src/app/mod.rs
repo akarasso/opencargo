@@ -58,6 +58,7 @@ pub mod reconcile;
 pub mod releases;
 pub mod repo_spec;
 pub mod repositories;
+pub mod routing;
 pub mod scan;
 pub mod storage_ops;
 pub mod sso;

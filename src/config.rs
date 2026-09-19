@@ -47,6 +47,25 @@ pub struct RoutingConfig {
     /// than serving the state from before a rule this node may not have seen.
     /// Several refresh periods, so a single failed read is not an outage.
     pub max_snapshot_age_secs: u64,
+    /// Rules to write **into an empty table**, once. The file seeds a
+    /// deployment; it never owns it afterwards, so a rule deleted here does
+    /// not come back and a rule hardened here has no effect. A drift between
+    /// the two is named in a startup note rather than applied.
+    pub rules: Vec<RoutingRuleConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RoutingRuleConfig {
+    pub name: String,
+    pub format: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub except: Vec<String>,
+    pub effect: String,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub confirm_catch_all: bool,
 }
 
 impl Default for RoutingConfig {
@@ -54,6 +73,7 @@ impl Default for RoutingConfig {
         Self {
             refresh_secs: 30,
             max_snapshot_age_secs: 300,
+            rules: Vec::new(),
         }
     }
 }

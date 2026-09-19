@@ -11,8 +11,9 @@ use std::time::{Duration, Instant};
 use crate::domain::{
     DomainError, Format, MemberRef, RepoKind, Repository, RouteSet, RoutingRule,
 };
+use crate::ports::repositories::RepositoryStore;
 use crate::ports::routing::{RoutingRuleStore, StoredRule};
-use crate::registry::resolve::{Cx, ResolveError, Subject};
+use crate::registry::resolve::{ResolveError, Subject};
 use crate::registry::rules::rules_of;
 
 /// Compile what the store holds into what the walk decides against. An
@@ -214,7 +215,11 @@ impl Gate {
     /// member's incarnation, read only when a rule has something to say about
     /// the subject, and never a read that depends on the name itself (I3,
     /// I13).
-    pub async fn admits(&self, cx: &Cx<'_>, member: &Repository) -> Result<Verdict, ResolveError> {
+    pub async fn admits(
+        &self,
+        repos: &dyn RepositoryStore,
+        member: &Repository,
+    ) -> Result<Verdict, ResolveError> {
         if self.idle() {
             return Ok(Verdict::Admitted);
         }
@@ -233,7 +238,7 @@ impl Gate {
         if !concerned {
             return Ok(Verdict::Admitted);
         }
-        let incarnation = cx.repos.incarnation(member.id).await?.unwrap_or_default();
+        let incarnation = repos.incarnation(member.id).await?.unwrap_or_default();
         let at = MemberRef { kind, incarnation: &incarnation };
         Ok(match (&self.keys, &self.term) {
             (Some(keys), _) => match set
