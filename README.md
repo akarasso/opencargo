@@ -595,6 +595,8 @@ group whose proxy member fronts another instance; locally they print
   shutdown and upgrades, backups and the restore drill.
 - [docs/write-amplification.md](docs/write-amplification.md): what a publish
   writes beyond what it keeps, measured, and what the database does about it.
+- [docs/performance.md](docs/performance.md): what one process costs per
+  workload, how it was measured, and what was not.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).

@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget test-e2e-import clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget test-e2e-import clean frontend release docker deploy undeploy logs publish lint fmt bench bench-smoke
 
 # Load .env if it exists
 -include .env
@@ -61,10 +61,16 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 		--test mcp_test --test mcp_sync_test --test mcp_probe_test --test mcp_policy_test --test mcp_client_test --test mcp_admin_test \
 		--test import_test --test import_managers_test --test import_oci_test \
 		--test instance_lease_test --test storage_cli_test --test shutdown_test --test backup_test \
-		--test write_amplification_test
+		--test write_amplification_test --test bench_smoke_test
 
 test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
 	scripts/test-s3.sh
+
+bench: release ## Mesures de consommation, tous les scénarios (BENCH_ARGS pour les options)
+	scripts/bench.sh $(BENCH_ARGS)
+
+bench-smoke: ## Le scénario minimal du harnais de mesure (sans réseau ni Docker)
+	scripts/bench.sh --smoke
 
 test-load: ## Tests de charge : writer policy (5 000 evenements a 500/s, ~16 s), memo NuGet
 	cargo test --lib burst_over_cold_rate_drops_nothing -- --ignored
