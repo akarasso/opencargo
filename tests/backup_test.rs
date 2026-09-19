@@ -101,7 +101,10 @@ async fn seed(server: &TestServer) -> Vec<(String, Vec<u8>)> {
     ]
 }
 
-fn wipe(server: &TestServer) {
+/// A lost machine: the database files gone and the store empty, whichever
+/// backend holds the objects.
+async fn wipe(server: &TestServer) {
+    common::clear_storage(server).await;
     for suffix in ["", "-wal", "-shm"] {
         let mut name = db_path(server).into_os_string();
         name.push(suffix);
@@ -131,7 +134,7 @@ async fn backup_then_restore_serves_every_format_byte_for_byte() {
     server::check_backup(&snapshot.dir).await.unwrap();
 
     server.stop().await;
-    wipe(&server);
+    wipe(&server).await;
     let report = restore(&config, &snapshot.dir, false).await.unwrap();
     assert_eq!(report.objects, snapshot.manifest.storage_keys);
     assert!(!marker_path(&db_path(&server)).exists());
@@ -325,7 +328,7 @@ async fn restoring_a_database_only_snapshot_onto_an_empty_tree_is_refused() {
     let snapshot = server::run_backup(&config, args(&server.tmp.path().join("b"), false)).await.unwrap();
     assert!(!snapshot.manifest.storage);
     server.stop().await;
-    wipe(&server);
+    wipe(&server).await;
     let err = restore(&config, &snapshot.dir, false).await.unwrap_err().to_string();
     assert!(err.contains("storage: false"), "{err}");
     let report = restore(&config, &snapshot.dir, true).await.unwrap();

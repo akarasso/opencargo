@@ -249,6 +249,26 @@ pub async fn storage_of(server: &TestServer) -> std::sync::Arc<dyn opencargo::st
     server::storage_for(&config, stores.multipart()).expect("failed to build the server's store")
 }
 
+/// Every object of the server's store, deleted. On S3 the bytes are not
+/// under `tmp`, so removing the storage directory empties nothing.
+pub async fn clear_storage(server: &TestServer) {
+    use futures_util::TryStreamExt;
+    let mut config = test_config(&server.tmp, "http://127.0.0.1:0", SpawnOpts::default());
+    config.storage = server.storage.clone();
+    let stores = server::open_stores(&server.tmp.path().join("opencargo.db"))
+        .await
+        .expect("failed to open the server database");
+    let storage = server::storage_for(&config, stores.multipart()).expect("failed to build the server's store");
+    let keys: Vec<String> = storage
+        .list("")
+        .map_ok(|meta| meta.key)
+        .try_collect()
+        .await
+        .expect("failed to list the server's store");
+    storage.delete_batch(&keys).await.expect("failed to empty the server's store");
+    stores.close().await;
+}
+
 /// The config `server` runs with, its store included.
 pub fn config_of(server: &TestServer) -> Config {
     let mut config = test_config(&server.tmp, &server.base_url, SpawnOpts::default());
