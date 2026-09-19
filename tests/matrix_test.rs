@@ -208,3 +208,80 @@ async fn the_download_count_is_exactly_the_formats_that_declare_the_signal() {
         dashboard["total_downloads"]
     );
 }
+
+/// `scannable`: a format that says a scan can read its document publishes one
+/// dependency, and the advisory against it comes back. This is the column the
+/// Maven arm failed silently for months, reading npm's document and answering
+/// clean.
+#[tokio::test]
+async fn every_scannable_format_has_its_dependency_read() {
+    let osv = common::fake_osv::start().await;
+    for format in Format::ALL {
+        let (Some(dep), Some(ecosystem)) = (publish::dependency(format), format.osv_ecosystem())
+        else {
+            continue;
+        };
+        osv.affect(ecosystem, dep.name, dep.resolved, &["GHSA-matrix"]);
+    }
+    osv.record(serde_json::json!({
+        "id": "GHSA-matrix",
+        "summary": "the advisory every ecosystem points at",
+        "severity": [{"type": "CVSS_V3", "score": "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H"}],
+    }));
+
+    let s = spawn_server(SpawnOpts {
+        repositories: publish::repositories(),
+        vuln: opencargo::config::VulnScanConfig {
+            enabled: true,
+            osv_base_url: osv.base_url.clone(),
+            ..Default::default()
+        },
+        ..Default::default()
+    })
+    .await;
+    let client = reqwest::Client::new();
+
+    for format in Format::ALL {
+        if !format.coverage().scannable.yes() {
+            continue;
+        }
+        let (subject, published) =
+            publish::publish_with_dependency(&client, &s.base_url, format, 1).await;
+        assert!(
+            published.status().is_success(),
+            "{format:?} publish failed: {:?}",
+            published.text().await
+        );
+
+        let found = scanned(
+            &client,
+            &s.base_url,
+            &publish::stored_name(format, 1),
+            &subject.version,
+        )
+        .await;
+        assert!(
+            found.contains("GHSA-matrix"),
+            "{format:?} declares itself scannable and its dependency was not read: {found}"
+        );
+    }
+}
+
+/// The scan runs after the publish is answered, so the read is retried.
+async fn scanned(client: &reqwest::Client, base_url: &str, name: &str, version: &str) -> String {
+    let mut last = String::new();
+    for _ in 0..40 {
+        let response = client
+            .get(format!("{base_url}/api/v1/vulns/{name}/{version}"))
+            .bearer_auth(STATIC_TOKEN)
+            .send()
+            .await
+            .unwrap();
+        last = format!("{} {}", response.status(), response.text().await.unwrap());
+        if last.contains("GHSA-matrix") {
+            return last;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    last
+}

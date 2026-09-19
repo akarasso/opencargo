@@ -199,15 +199,18 @@ pub async fn publish_named(
 pub fn subject(format: Format, n: usize) -> Subject {
     let version = match format {
         Format::Go => "v1.0.0".to_string(),
+        // 1.0.0 canonicalises to 1 under PEP 440, which is not what a
+        // caller would then ask for by name.
+        Format::Pypi => "1.2.3".to_string(),
         Format::Oci => format!("v{n}"),
         _ => "1.0.0".to_string(),
     };
     let name = match format {
         Format::Npm => format!("pkg-{n}"),
         Format::Cargo => format!("krate-{n}"),
-        Format::Go => format!("example.com/mod{n}"),
-        Format::Pypi => format!("widget{n}"),
-        Format::Nuget => format!("Widget{n}"),
+        Format::Go => format!("mod{n}.example.com"),
+        Format::Pypi => format!("wheel{n}"),
+        Format::Nuget => format!("Nupkg{n}"),
         Format::Maven => format!("lib{n}"),
         Format::Oci => "app".to_string(),
         Format::Mcp => format!("io.github.acme/srv{n}"),
@@ -219,16 +222,29 @@ pub fn subject(format: Format, n: usize) -> Subject {
 /// The dependency a `publish_with_dependency` declares, in the format's own
 /// grammar. Exhaustive: a format claiming to be scannable has to say how its
 /// document names what it depends on.
-pub fn dependency(format: Format) -> Option<(&'static str, &'static str)> {
-    match format {
-        Format::Npm => Some(("lodash", "4.17.20")),
-        Format::Cargo => Some(("serde", "1.0.100")),
-        Format::Go => Some(("example.com/dep", "v1.2.3")),
-        Format::Pypi => Some(("idna", "3.4")),
-        Format::Maven => Some(("org.example:dep", "2.0.0")),
-        Format::Nuget => Some(("Newtonsoft.Json", "12.0.1")),
-        Format::Oci | Format::Mcp | Format::Raw => None,
-    }
+pub struct Dependency {
+    pub name: &'static str,
+    /// What the published document writes, in the format's own grammar.
+    pub declared: &'static str,
+    /// What an extraction that understood that grammar must come out with.
+    pub resolved: &'static str,
+}
+
+pub fn dependency(format: Format) -> Option<Dependency> {
+    let (name, declared, resolved) = match format {
+        Format::Npm => ("lodash", "^4.17.20", "4.17.20"),
+        Format::Cargo => ("serde", "^1.0.100", "1.0.100"),
+        Format::Go => ("example.com/dep", "v1.2.3", "v1.2.3"),
+        Format::Pypi => ("idna", ">=3.4", "3.4"),
+        Format::Maven => ("org.example:dep", "[2.0.0,3.0.0)", "2.0.0"),
+        Format::Nuget => ("Newtonsoft.Json", "[12.0.1, )", "12.0.1"),
+        Format::Oci | Format::Mcp | Format::Raw => return None,
+    };
+    Some(Dependency {
+        name,
+        declared,
+        resolved,
+    })
 }
 
 /// The same publish, with one dependency declared, for the formats whose row
@@ -239,7 +255,12 @@ pub async fn publish_with_dependency(
     format: Format,
     n: usize,
 ) -> (Subject, Response) {
-    let Some((dep, dep_version)) = dependency(format) else {
+    let Some(Dependency {
+        name: dep,
+        declared,
+        ..
+    }) = dependency(format)
+    else {
         return publish_named(client, base_url, format, n).await;
     };
     let repo = repo_of(format);
@@ -247,13 +268,12 @@ pub async fn publish_with_dependency(
     let response = match format {
         Format::Npm => {
             let manifest = format!(
-                r#"{{"name":"{}","version":"{}","dependencies":{{"{dep}":"^{dep_version}"}}}}"#,
+                r#"{{"name":"{}","version":"{}","dependencies":{{"{dep}":"{declared}"}}}}"#,
                 s.name, s.version
             );
             let tarball = build_tarball(&manifest);
             let mut body = build_npm_publish_body(&s.name, &s.version, "matrix", &tarball);
-            body["versions"][&s.version]["dependencies"] =
-                json!({ dep: format!("^{dep_version}") });
+            body["versions"][&s.version]["dependencies"] = json!({ dep: declared });
             client
                 .put(format!("{base_url}/{repo}/{}", s.name))
                 .bearer_auth(STATIC_TOKEN)
@@ -268,7 +288,7 @@ pub async fn publish_with_dependency(
                 "vers": s.version,
                 "deps": [{
                     "name": dep,
-                    "version_req": format!("^{dep_version}"),
+                    "version_req": declared,
                     "kind": "normal",
                 }],
             })
@@ -282,7 +302,7 @@ pub async fn publish_with_dependency(
                 .unwrap()
         }
         Format::Go => {
-            let zip = go_zip_requiring(&s.name, &s.version, dep, dep_version);
+            let zip = go_zip_requiring(&s.name, &s.version, dep, declared);
             client
                 .put(format!("{base_url}/{repo}/{}/@v/{}", s.name, s.version))
                 .bearer_auth(STATIC_TOKEN)
@@ -293,7 +313,7 @@ pub async fn publish_with_dependency(
                 .unwrap()
         }
         Format::Pypi => {
-            let requires = format!("{dep}>={dep_version}");
+            let requires = format!("{dep}{declared}");
             pypi::upload(
                 client,
                 base_url,
@@ -305,7 +325,7 @@ pub async fn publish_with_dependency(
             .await
         }
         Format::Nuget => {
-            let deps = format!(r#"<dependency id="{dep}" version="[{dep_version}, )" />"#);
+            let deps = format!(r#"<dependency id="{dep}" version="{declared}" />"#);
             client
                 .put(format!("{base_url}/{repo}/v3/package"))
                 .header("X-NuGet-ApiKey", STATIC_TOKEN)
@@ -344,7 +364,7 @@ pub async fn publish_with_dependency(
                 "<project><groupId>org.example</groupId><artifactId>{}</artifactId>\
                  <version>{}</version><dependencies><dependency>\
                  <groupId>{group}</groupId><artifactId>{artifact}</artifactId>\
-                 <version>{dep_version}</version></dependency></dependencies></project>",
+                 <version>{declared}</version></dependency></dependencies></project>",
                 s.name, s.version
             );
             put(
@@ -383,6 +403,17 @@ fn go_zip_requiring(module: &str, version: &str, dep: &str, dep_version: &str) -
 
 /// The request a client makes to obtain what `publish` created. Exhaustive
 /// too, so a format cannot answer a download column without a download.
+/// The name the version is stored under, which is not always the one the
+/// path carries: a Maven package is its `groupId:artifactId` coordinate.
+pub fn stored_name(format: Format, n: usize) -> String {
+    let s = subject(format, n);
+    match format {
+        Format::Maven => format!("org.example:{}", s.name),
+        Format::Nuget => s.name.to_ascii_lowercase(),
+        _ => s.name,
+    }
+}
+
 pub async fn fetch(client: &Client, base_url: &str, format: Format, n: usize) -> Response {
     let repo = repo_of(format);
     let s = subject(format, n);
