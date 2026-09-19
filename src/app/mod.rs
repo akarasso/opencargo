@@ -21,7 +21,9 @@
 //! `SetPermission` is `permissions`, with its withdrawal; `CreateWebhook` is
 //! `webhooks`; `ScanVersion` is `scan`; `Authenticate` is `authenticate`,
 //! behind the auth middleware, npm login, the token endpoint and the
-//! password change. `events` and `audit` are not use
+//! password change; `search` is the one read that is a use case rather than a
+//! leaf, because merging the hosted index with what the proxy served is a
+//! rule and not a rendering. `events` and `audit` are not use
 //! cases but the two tails every one of them ends with: which audience an
 //! event has, and what the trail records.
 //!
@@ -63,6 +65,7 @@ pub mod releases;
 pub mod repo_spec;
 pub mod repositories;
 pub mod scan;
+pub mod search;
 pub mod storage_ops;
 pub mod sso;
 pub mod sweep_storage;

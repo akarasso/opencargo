@@ -57,7 +57,7 @@ use crate::ports::policy::PolicyStore;
 use crate::ports::proxy_cache::ProxyCacheStore;
 use crate::ports::pypi::PypiFileStore;
 use crate::ports::repositories::RepositoryStore;
-use crate::ports::search::SearchIndex;
+use crate::ports::search::{CachedPackageIndex, SearchIndex};
 use crate::ports::tokens::{NewToken, TokenStore};
 use crate::ports::users::{NewUser, UserPatch, UserStore};
 use crate::ports::webhooks::{NewWebhook, WebhookStore};
@@ -107,6 +107,7 @@ pub struct AppState {
     pub repos: Arc<dyn RepositoryStore>,
     pub packages: Arc<dyn PackageStore>,
     pub search: Arc<dyn SearchIndex>,
+    pub cached: Arc<dyn CachedPackageIndex>,
     pub nuget_feed: Arc<dyn crate::ports::nuget::NugetFeedRead>,
     /// NuGet's registration memo, per server: its keys are repository ids.
     pub nuget_documents: Arc<crate::registry::nuget::merged::Documents>,
@@ -827,6 +828,7 @@ pub async fn build_state(
         repos,
         packages: stores.packages(),
         search: stores.search(),
+        cached: stores.cached_packages(),
         nuget_feed: stores.nuget_feed(),
         nuget_documents: Arc::new(crate::registry::nuget::merged::documents()),
         oci: stores.oci(),
