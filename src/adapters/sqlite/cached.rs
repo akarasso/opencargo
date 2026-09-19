@@ -1,6 +1,6 @@
 //! `CachedPackageIndex` over `cached_packages` and its FTS5 table.
 //!
-//! Like `packages_fts`, the index is maintained by `026`'s triggers, so the
+//! Like `packages_fts`, the index is maintained by `027`'s triggers, so the
 //! only statements here are over the base table.
 
 use async_trait::async_trait;

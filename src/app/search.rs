@@ -69,6 +69,11 @@ impl Find {
     ) -> Result<Vec<Hit>, StoreError> {
         let found = self.hosted.search(scope, Some(query), limit).await?;
         let cached = self.cached.search(scope, Some(query), limit).await?;
+        // The panel searches on every keystroke, and most of those match
+        // nothing: two more port calls to name nothing is two too many.
+        if found.is_empty() && cached.is_empty() {
+            return Ok(Vec::new());
+        }
         let latest = self
             .dashboard
             .latest_versions(&found.iter().map(|pkg| pkg.id).collect::<Vec<_>>())
