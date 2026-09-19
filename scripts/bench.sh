@@ -182,7 +182,9 @@ record_fail() {
 # record_skip <name> <reason>
 record_skip() {
   RECORD_SEQ=$((RECORD_SEQ + 1))
-  local f=$RUN_DIR/scenarios/$(printf '%02d' "$RECORD_SEQ")-$1.kv
+  local seq f
+  seq=$(printf '%02d' "$RECORD_SEQ")
+  f=$RUN_DIR/scenarios/$seq-$1.kv
   printf 'name=%s\nstatus=skipped\nskip_reason=%s\n' "$1" "$2" >"$f"
   echo "bench: skipping $1 -- $2" >&2
 }
