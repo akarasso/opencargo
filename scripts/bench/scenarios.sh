@@ -367,8 +367,9 @@ scenario_s3() {
 
   storage_pair fs
   storage_pair s3
+  # The name stays set on purpose: the exit trap sweeps it again, and a
+  # removal that failed here would otherwise leave a container behind.
   docker rm -f "$MINIO_NAME" >/dev/null 2>&1 || true
-  MINIO_NAME=
 }
 
 # ---------------------------------------------------------------------------
