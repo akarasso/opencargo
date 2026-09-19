@@ -98,7 +98,11 @@ the enterprise ones.
 - **Promotion**: move a version from `dev` to `prod` without re-uploading or
   changing lockfiles; full audit trail.
 - **Permissions**: roles plus a per-user × per-repository matrix, editable in
-  the UI, enforced server-side and on the event stream.
+  the UI, enforced server-side and on the event stream. API tokens can be
+  **scoped** to repositories, packages and actions; a scope only removes, is
+  frozen at issue and reaches no administrative route. Configuration tokens
+  (`auth.static_tokens`) are operations keys and carry no scope — to scope a
+  CI, give it an account and a token. See [docs/api.md](docs/api.md).
 - **Dependency graph**: dependencies extracted at publish time; "who depends on
   this?" and impact analysis before you delete a version.
 - **Vulnerability scanning** through [OSV.dev](https://osv.dev) on every

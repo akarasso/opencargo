@@ -61,8 +61,21 @@ struct WsIdentity {
     level: Audience,
     username: String,
     role: String,
+    /// The credential narrows its bearer, so the stream is capped the same
+    /// way the API is: whatever role stands behind it, a scoped credential
+    /// does not hear the administrative feed.
+    scoped: bool,
     /// Raw bearer token (empty for anonymous) — kept for re-validation.
     token: Option<String>,
+}
+
+/// The audience a credential reaches: the role, capped by its own scope.
+fn level_of(role: &str, scoped: bool) -> Audience {
+    if role == "admin" && !scoped {
+        Audience::Admin
+    } else {
+        Audience::Authenticated
+    }
 }
 
 async fn client_loop(mut socket: WebSocket, state: AppState) {
@@ -156,11 +169,7 @@ async fn client_loop(mut socket: WebSocket, state: AppState) {
                                 Some((CLOSE_FORBIDDEN, "password change required"))
                             }
                             Ok(Some(user)) => {
-                                let fresh_level = if user.role == "admin" {
-                                    Audience::Admin
-                                } else {
-                                    Audience::Authenticated
-                                };
+                                let fresh_level = level_of(&user.role, identity.scoped);
                                 if fresh_level != identity.level {
                                     Some((CLOSE_UNAUTHORIZED, "access level changed — reconnect"))
                                 } else {
@@ -220,15 +229,12 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<WsIden
                 None
             }
             Ok(Some(user)) => {
-                let level = if user.role == "admin" {
-                    Audience::Admin
-                } else {
-                    Audience::Authenticated
-                };
+                let scoped = !user.scope.is_inherit();
                 Some(WsIdentity {
-                    level,
+                    level: level_of(&user.role, scoped),
                     username: user.username,
                     role: user.role,
+                    scoped,
                     token: Some(t),
                 })
             }
@@ -247,6 +253,7 @@ async fn authenticate(socket: &mut WebSocket, state: &AppState) -> Option<WsIden
         None => {
             if state.auth.anonymous_read {
                 Some(WsIdentity {
+                    scoped: false,
                     level: Audience::Public,
                     username: "anonymous".to_string(),
                     role: "anonymous".to_string(),
