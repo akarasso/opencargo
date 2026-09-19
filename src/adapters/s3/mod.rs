@@ -443,6 +443,11 @@ impl StorageBackend for S3Storage {
         }
     }
 
+    fn key_budget(&self) -> keys::KeyBudget {
+        let key = self.inner.key_budget();
+        keys::KeyBudget { key, segment: key }
+    }
+
     fn upload_plan(&self) -> UploadPlan {
         UploadPlan {
             max_object_bytes: SINGLE_COPY_BYTES,

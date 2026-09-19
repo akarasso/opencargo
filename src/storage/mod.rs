@@ -180,6 +180,13 @@ pub trait StorageBackend: Send + Sync {
 
     fn upload_plan(&self) -> UploadPlan;
 
+    /// What a trait call may name here: a backend with a prefix of its own
+    /// leaves less than `MAX_KEY_BYTES` for the key, and one whose segments
+    /// are file names bounds each of them.
+    fn key_budget(&self) -> keys::KeyBudget {
+        keys::KeyBudget::UNSEGMENTED
+    }
+
     async fn self_check(&self) -> CheckReport;
 
     fn identity(&self) -> StoreIdentity;

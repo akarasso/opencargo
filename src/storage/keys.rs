@@ -10,8 +10,32 @@ pub const BACKEND: &str = "_backend";
 /// Longest key a backend with no prefix of its own accepts.
 pub const MAX_KEY_BYTES: usize = 1024;
 
+/// What a backend can key: the whole key, and any one segment of it. A
+/// backend that bounds no segment reports the key's own budget for it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct KeyBudget {
+    pub key: usize,
+    pub segment: usize,
+}
+
+impl KeyBudget {
+    pub const UNSEGMENTED: KeyBudget = KeyBudget {
+        key: MAX_KEY_BYTES,
+        segment: MAX_KEY_BYTES,
+    };
+}
+
 fn invalid(why: &str) -> StorageError {
     StorageError::InvalidPath(why.to_string())
+}
+
+/// For a backend whose segments are names of something: no segment of
+/// `key` over `max` bytes.
+pub fn validate_segments(key: &str, max: usize) -> Result<(), StorageError> {
+    if key.split('/').any(|s| s.len() > max) {
+        return Err(invalid("storage key segment too long"));
+    }
+    Ok(())
 }
 
 /// A key a trait call may name. `budget` is what the backend leaves once its
@@ -92,6 +116,11 @@ mod tests {
         }
         assert!(validate("abcd", 3).is_err(), "the backend's budget counts");
         assert!(validate_prefix("", 3).is_ok());
+        assert!(validate_segments("ab/abc/ab", 3).is_ok());
+        assert!(matches!(
+            validate_segments("ab/abcd/ab", 3),
+            Err(StorageError::InvalidPath(_))
+        ));
     }
 
     #[test]

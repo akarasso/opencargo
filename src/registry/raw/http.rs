@@ -83,7 +83,7 @@ pub async fn read(
     auth: Option<axum::Extension<AuthUser>>,
 ) -> AppResult<Response> {
     let auth = auth.as_ref().map(|e| &e.0);
-    let path = super::admit(&path)?.to_string();
+    let path = super::admit(&path, &state.raw_path_bound)?.to_string();
     let repo = open(&state, &repo_name).await?;
     crate::registry::ensure_can_read(&state.authorize(), &repo, auth).await?;
     let cx = crate::registry::cx(&state, auth, &repo);
@@ -108,7 +108,7 @@ pub async fn put(
         .get::<AuthUser>()
         .cloned()
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    let path = super::admit(&path)?.to_string();
+    let path = super::admit(&path, &state.raw_path_bound)?.to_string();
     let repo = open(&state, &repo_name).await?;
     crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
@@ -157,7 +157,7 @@ pub async fn delete(
     let auth = auth
         .map(|e| e.0)
         .ok_or_else(|| AppError::Unauthorized("authentication required".to_string()))?;
-    let path = super::admit(&path)?.to_string();
+    let path = super::admit(&path, &state.raw_path_bound)?.to_string();
     let repo = open(&state, &repo_name).await?;
     crate::registry::ensure_can_delete(&state.authorize(), &repo, &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
