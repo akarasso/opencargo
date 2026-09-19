@@ -91,6 +91,7 @@ impl Inner {
 
     fn path(&self, key: &str) -> Result<Path, StorageError> {
         keys::validate(key, self.key_budget())?;
+        keys::validate_segments(key, keys::MAX_NAME_BYTES)?;
         self.raw_path(key)
     }
 
