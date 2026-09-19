@@ -136,3 +136,53 @@ async fn an_unmetered_format_publishes_past_the_fallback() {
         }
     }
 }
+
+/// `reclaim_referenced`: every byte a publish leaves behind is claimed by a
+/// committed row. A format missing from the union is not a cosmetic gap --
+/// the sweeper deletes live artifacts, and nothing fails until a client asks
+/// for one.
+#[tokio::test]
+async fn every_published_byte_is_claimed_by_the_reference_union() {
+    use futures_util::TryStreamExt;
+
+    let s = server().await;
+    let client = reqwest::Client::new();
+    for format in Format::ALL {
+        let published = publish::publish(&client, &s.base_url, format, 1).await;
+        assert!(published.status().is_success(), "{format:?} publish failed");
+        assert!(
+            format.coverage().reclaim_referenced.yes(),
+            "{format:?} declares its keys unreferenced, which the sweeper reads as garbage"
+        );
+    }
+
+    use opencargo::ports::referenced::Referenced;
+    let stores = opencargo::server::open_stores(&s.tmp.path().join("opencargo.db")).await.unwrap();
+    let referenced: Vec<Referenced> = stores
+        .referenced()
+        .referenced(std::time::Duration::from_secs(0), chrono::Utc::now())
+        .try_collect()
+        .await
+        .unwrap();
+
+    let claims = |key: &str| {
+        referenced.iter().any(|r| {
+            r.key == key || (r.prefix && key.starts_with(&format!("{}/", r.key)))
+        })
+    };
+    let stored = common::stored_keys(&s).await;
+    assert!(
+        stored.len() >= Format::ALL.len(),
+        "{} keys for {} publishes: the check would be vacuous",
+        stored.len(),
+        Format::ALL.len()
+    );
+    let orphans: Vec<String> = stored
+        .into_iter()
+        .filter(|key| !claims(key))
+        .collect();
+    assert!(
+        orphans.is_empty(),
+        "the sweeper would delete these live bytes: {orphans:#?}"
+    );
+}
