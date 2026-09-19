@@ -1,4 +1,4 @@
-use crate::domain::{DomainError, FormatRules};
+use crate::domain::{compile_pattern, DomainError, FormatRules, Pattern};
 
 use super::version::NuGetVersion;
 
@@ -29,6 +29,20 @@ fn is_valid_id(id: &str) -> bool {
 pub struct NugetRules;
 
 impl FormatRules for NugetRules {
+    /// NuGet ids are served case-insensitively, so a case class is one row and
+    /// the two keys coincide.
+    fn ident_key(&self, name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
+
+    fn match_key(&self, name: &str) -> String {
+        name.to_ascii_lowercase()
+    }
+
+    fn canonical_pattern(&self, pattern: &str) -> Result<Pattern, DomainError> {
+        compile_pattern(pattern, str::to_ascii_lowercase)
+    }
+
     fn validate(&self, name: &str) -> Result<(), DomainError> {
         if is_valid_id(name) {
             Ok(())

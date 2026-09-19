@@ -14,6 +14,7 @@ pub mod policy;
 pub mod proxy;
 pub mod repository;
 pub mod resolve;
+pub mod routing;
 pub mod user;
 pub mod vulns;
 pub mod webhook;
@@ -36,6 +37,9 @@ pub use proxy::{
 };
 pub use repository::{DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version};
 pub use resolve::{CacheRepo, Miss, Outcome, UrlRepo, Visit, Walk, MAX_GROUP_DEPTH};
+pub use routing::{
+    compile_pattern, Decision, Effect, MemberRef, Pattern, RefusalSet, RouteSet, RoutingRule,
+};
 pub use user::{ApiToken, User};
 pub use vulns::{ScanResult, Severity, VulnDetail};
 pub use webhook::{Subscription, Webhook};

@@ -1,7 +1,7 @@
 //! Project names (PEP 508, PEP 503) and distribution filenames (wheel,
 //! PEP 625 sdist), recomposed from their canonical parts before any key.
 
-use crate::domain::{DomainError, FormatRules};
+use crate::domain::{compile_pattern, DomainError, FormatRules, Pattern};
 
 use super::version::Pep440;
 
@@ -41,6 +41,20 @@ pub fn normalize(name: &str) -> String {
 }
 
 impl FormatRules for PypiRules {
+    /// PEP 503 is already the store's identity: one normalized name, one row,
+    /// so nothing is left for `match_key` to coarsen.
+    fn ident_key(&self, name: &str) -> String {
+        normalize(name)
+    }
+
+    fn match_key(&self, name: &str) -> String {
+        normalize(name)
+    }
+
+    fn canonical_pattern(&self, pattern: &str) -> Result<Pattern, DomainError> {
+        compile_pattern(pattern, normalize)
+    }
+
     fn validate(&self, name: &str) -> Result<(), DomainError> {
         if is_valid_name(name) {
             Ok(())
