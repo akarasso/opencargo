@@ -250,14 +250,19 @@ async fn oci_blobs_stream_without_spooling_whole_image() {
     assert_eq!(blob(&dst.base_url, "dst/app", d).await, (StatusCode::OK, layer));
 }
 
+/// One image copied, one chosen request of it broken. The layer is sized in
+/// MiB and the chunk asked for is 1MiB because the sink raises its chunk to
+/// the target's `OCI-Chunk-Min-Length`, which is 1MiB on S3 and nothing on a
+/// filesystem: a smaller one splits the layer on one backend and not on the
+/// other, so a rule counting PATCHes would fire on a different byte.
 async fn faulted(rule: Rule) -> (TestServer, Tap, common::import::Run, Vec<u8>) {
     let src = registry(&["src"]).await;
     let dst = registry(&["dst"]).await;
-    let layer = noise(4096, 10);
+    let layer = noise(2 * 1024 * 1024 + 17, 10);
     image(&src.base_url, "src/app", "t", &layer, "amd64").await;
     let tap = Tap::start(&dst.base_url, vec![rule]).await;
     let run = importer()
-        .run(&[args(&format!("{}/", src.base_url), &tap.url, "src/app"), vec!["--flatten-names", "--oci-chunk", "1KiB"]].concat())
+        .run(&[args(&format!("{}/", src.base_url), &tap.url, "src/app"), vec!["--flatten-names", "--oci-chunk", "1MiB"]].concat())
         .await;
     (dst, tap, run, layer)
 }
