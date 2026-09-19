@@ -167,10 +167,12 @@ check_domain_deps() {
   fi
 }
 
-# A suite that needs a client or the internet declares it in Cargo.toml, and a
-# suite that declares one is named for it. Both directions, because a hand-kept
-# list in the Makefile is what drifted: 31 binaries out of 82 sat outside the
-# quick gate, 16 of them for no reason at all.
+# A suite that drives a real client declares it in Cargo.toml, and a suite that
+# declares it is named for it. Both directions, because a hand-kept list in the
+# Makefile is what drifted: 31 binaries out of 82 sat outside the quick gate,
+# 16 of them for no reason at all. A suite that only *contains* a network test
+# is not gated: OPENCARGO_NETWORK_TESTS skips that one test, and gating the
+# binary would have hidden the fifteen around it that use a fake.
 check_test_gates() {
   local file name gated want n=0
   for file in tests/*_test.rs; do
@@ -178,12 +180,11 @@ check_test_gates() {
     gated=$(awk -v n="$name" '$0 == "name = \"" n "\"" {found=1; next} found && /required-features/ {print; exit} found && /^\[\[/ {exit}' Cargo.toml)
     want=""
     case "$name" in *_e2e_test) want="e2e" ;; esac
-    grep -q 'OPENCARGO_NETWORK_TESTS' "$file" && want="network"
     if [ -n "$want" ] && ! printf '%s' "$gated" | grep -q "\"$want\""; then
       printf 'FAIL %-14s %s needs %s and does not declare required-features = ["%s"] in Cargo.toml\n' test-gates "$name" "$want" "$want"
       fail=1
     elif [ -z "$want" ] && [ -n "$gated" ]; then
-      printf 'FAIL %-14s %s declares required-features but drives no client and no network\n' test-gates "$name"
+      printf 'FAIL %-14s %s declares required-features but drives no real client\n' test-gates "$name"
       fail=1
     fi
     [ -n "$want" ] && n=$((n + 1))

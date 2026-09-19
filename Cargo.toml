@@ -144,7 +144,6 @@ opt-level = "z"
 
 [features]
 e2e = []
-network = []
 
 [[test]]
 name = "cargo_e2e_test"
@@ -194,10 +193,3 @@ required-features = ["e2e"]
 name = "sso_dex_e2e_test"
 required-features = ["e2e"]
 
-[[test]]
-name = "proxy_test"
-required-features = ["network"]
-
-[[test]]
-name = "vuln_test"
-required-features = ["network"]

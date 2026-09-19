@@ -66,7 +66,7 @@ test-load: ## Tests de charge : writer policy (5 000 evenements a 500/s, ~16 s),
 	cargo test --test nuget_group_test the_registration_memo
 
 test-network: ## Tests contre npmjs.org / osv.dev (OPENCARGO_NETWORK_TESTS=1)
-	OPENCARGO_NETWORK_TESTS=1 cargo test --features network --test proxy_test --test vuln_test
+	OPENCARGO_NETWORK_TESTS=1 cargo test --test proxy_test --test vuln_test
 
 test-docker: ## Tests Docker/OCI (HTTP, sans client docker)
 	cargo test --test oci_test --test oci_nested_test --test oci_proxy_test --test oci_basic_auth_test
