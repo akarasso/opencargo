@@ -1,7 +1,7 @@
 # opencargo — Makefile
 # Usage: make help
 
-.PHONY: help build dev test test-quick test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget clean frontend release docker deploy undeploy logs publish lint fmt
+.PHONY: help build dev test test-quick bench bench-smoke test-s3 test-load test-network test-docker test-e2e test-e2e-cargo test-e2e-go test-e2e-docker test-e2e-maven test-e2e-nuget clean frontend release docker deploy undeploy logs publish lint fmt
 
 # Load .env if it exists
 -include .env
@@ -61,6 +61,12 @@ test-quick: ## Tests rapides (sans réseau ni client externe)
 
 test-s3: ## Toute la suite sur S3 (MinIO en conteneur)
 	scripts/test-s3.sh
+
+bench: release ## Mesures de consommation, tous les scénarios (BENCH_ARGS pour les options)
+	scripts/bench.sh $(BENCH_ARGS)
+
+bench-smoke: ## Le scénario minimal du harnais de mesure (sans réseau ni Docker)
+	scripts/bench.sh --smoke
 
 test-load: ## Tests de charge : writer policy (5 000 evenements a 500/s, ~16 s), memo NuGet
 	cargo test --lib burst_over_cold_rate_drops_nothing -- --ignored
