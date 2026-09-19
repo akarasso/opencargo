@@ -40,6 +40,21 @@ fn before(now: DateTime<Utc>, age: Duration) -> DateTime<Utc> {
 }
 
 /// The pins, the blob rows, then the manifest row, its links and its tag.
+/// What a repository holds of this format: every OCI row whose key to the
+/// repository does not cascade, so the emptiness probe answers before the
+/// delete trips it.
+pub(crate) async fn rows(tx: &mut Tx, repository: i64) -> Result<i64, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT (SELECT COUNT(*) FROM oci_manifests WHERE repository_id = ?1)
+              + (SELECT COUNT(*) FROM oci_blobs WHERE repository_id = ?1)
+              + (SELECT COUNT(*) FROM oci_tags WHERE repository_id = ?1)
+              + (SELECT COUNT(*) FROM oci_uploads WHERE repository_id = ?1)",
+    )
+    .bind(repository)
+    .fetch_one(&mut **tx)
+    .await
+}
+
 async fn write_manifest(tx: &mut Tx, m: &NewManifest<'_>, now: DateTime<Utc>) -> Step<()> {
     let mut pins: Vec<PinToken> = vec![m.pin.clone()];
     pins.extend(m.blobs.iter().map(|(_, pin)| pin.clone()));

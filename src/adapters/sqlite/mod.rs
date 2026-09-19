@@ -162,10 +162,11 @@ pub(crate) fn corrupt_row(err: DomainError) -> StoreError {
 /// The driver's failures in the store's vocabulary, for every store here.
 /// `Unavailable` is the one that must not collapse into `Other`: SQLite has a
 /// single writer, so a busy database is a retry (503), never an internal
-/// error (500).
+/// error (500). A constraint the schema declares is a refusal (409), not a
+/// failure to answer.
 pub(crate) fn store_error(err: sqlx::Error) -> StoreError {
     if let sqlx::Error::Database(ref db) = err {
-        if db.is_unique_violation() {
+        if db.is_unique_violation() || db.is_foreign_key_violation() {
             return StoreError::Conflict;
         }
         // SQLITE_BUSY and SQLITE_BUSY_SNAPSHOT, as extended result codes.

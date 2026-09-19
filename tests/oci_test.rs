@@ -258,6 +258,58 @@ async fn deleting_a_blob_asks_for_the_delete_rung() {
     assert_eq!(removed.status(), StatusCode::ACCEPTED);
 }
 
+/// The emptiness probe knows every format's rows: a repository holding an
+/// image answers 409, as one holding packages or files does, never the 500
+/// of the foreign key the delete would otherwise trip.
+#[tokio::test]
+async fn a_repository_holding_images_cannot_be_deleted_until_they_are() {
+    let (base_url, _handle, _tmp) = setup().await;
+    let client = reqwest::Client::new();
+    let config_data = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}";
+    let layer_data = b"layer bytes";
+    let config_digest = push_blob(&client, &base_url, "oci-private/app", config_data).await;
+    let layer_digest = push_blob(&client, &base_url, "oci-private/app", layer_data).await;
+    let manifest = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config_data.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": layer_digest, "size": layer_data.len()}],
+    }))
+    .unwrap();
+    let pushed = client
+        .put(format!("{base_url}/v2/oci-private/app/manifests/v1"))
+        .bearer_auth(STATIC_TOKEN)
+        .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+        .body(manifest)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(pushed.status(), StatusCode::CREATED);
+
+    let held = client
+        .delete(format!("{base_url}/api/v1/repositories/oci-private"))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(held.status(), StatusCode::CONFLICT, "{:?}", held.text().await);
+
+    let removed = client
+        .delete(format!("{base_url}/v2/oci-private/app/manifests/v1"))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), StatusCode::ACCEPTED);
+    let gone = client
+        .delete(format!("{base_url}/api/v1/repositories/oci-private"))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    assert!(gone.status().is_success(), "{}: {:?}", gone.status(), gone.text().await);
+}
+
 #[tokio::test]
 async fn test_oci_version_check() {
     let (base_url, _handle, _tmp) = setup().await;

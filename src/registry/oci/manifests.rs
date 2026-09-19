@@ -103,6 +103,9 @@ pub async fn put_manifest(
     crate::registry::ensure_can_write(&state.authorize(), &repo, Some(&r.name), &auth_user).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_format(&repo, Format::Oci)?;
+    // The one request of a push that makes the image exist: the count is
+    // an image count, and the blobs before it are not counted.
+    crate::registry::meter_publish(&state, &auth_user, Format::Oci, &r.repo)?;
 
     let body = axum::body::to_bytes(request.into_body(), MAX_MANIFEST_BYTES)
         .await

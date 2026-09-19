@@ -73,10 +73,14 @@ carrying `Retry-After` and the limit it hit:
 ```
 
 Out of the box that is thirty npm publishes and thirty PyPI uploads a minute
-per account, and nothing else. Cargo, Go and NuGet publishes are metered only
-once you configure them; OCI pushes and Maven deploys are never metered here,
-since both are several requests per artifact and a request count would not be
-an artifact count.
+per account, and nothing else. Cargo, Go, NuGet, MCP (a `server.json` or a
+skill archive) and raw publishes are metered only once you configure them. An
+OCI push is several requests: its blob uploads are not counted, its manifest
+put -- the one request that makes the image exist -- is, so the count is an
+image count and a multi-platform image counts each platform's manifest and its
+index. A Maven deploy is a file per request with none that completes it, so it
+is never metered here, and a `[limits.publish.format]` entry for `maven` is
+refused at startup rather than accepted as a setting that does nothing.
 
 One limit applies to a publish -- the most specific one configured:
 
@@ -102,8 +106,10 @@ npm-ci = { max = 2000, per = "1h" }
 
 A limit is finite by construction: `0`, and a window over 24h, are refused at
 startup with every other problem in the config. Raise a limit rather than
-lift it -- there is no value that turns the meter off, because the meter is
-what keeps a stolen token from flooding the store.
+lift it -- there is no value that turns the meter off, because on the formats
+it counts the meter is what keeps a stolen token from flooding the store. What
+it does not count, and what a stolen token can still fill the store with: OCI
+blobs uploaded ahead of any manifest, and Maven files.
 
 ## Backups
 

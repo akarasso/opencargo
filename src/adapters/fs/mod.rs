@@ -20,6 +20,9 @@ use crate::storage::{
 
 const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const LEGACY_PART: &str = ".part-";
+/// A segment is a file name, and `NAME_MAX` is 255 on every file system
+/// this runs on; the kernel's ENAMETOOLONG would otherwise be a fault.
+const MAX_NAME_BYTES: usize = 255;
 
 pub struct FilesystemStorage {
     base_path: PathBuf,
@@ -95,11 +98,13 @@ impl FilesystemStorage {
     /// the base and pointing outside is refused for existing and new files.
     fn safe_path(&self, key: &str) -> Result<PathBuf, StorageError> {
         keys::validate(key, MAX_KEY_BYTES)?;
+        keys::validate_segments(key, MAX_NAME_BYTES)?;
         self.contained(key)
     }
 
     fn safe_prefix(&self, prefix: &str) -> Result<PathBuf, StorageError> {
         keys::validate_prefix(prefix, MAX_KEY_BYTES)?;
+        keys::validate_segments(prefix, MAX_NAME_BYTES)?;
         if prefix.is_empty() {
             return Ok(self.base_path.clone());
         }
@@ -508,6 +513,13 @@ impl StorageBackend for FilesystemStorage {
         }
         fs::read(&health).await.map_err(|e| fault("probe", e))?;
         Ok(())
+    }
+
+    fn key_budget(&self) -> keys::KeyBudget {
+        keys::KeyBudget {
+            key: MAX_KEY_BYTES,
+            segment: MAX_NAME_BYTES,
+        }
     }
 
     fn upload_plan(&self) -> UploadPlan {

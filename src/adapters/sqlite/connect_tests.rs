@@ -37,3 +37,27 @@ async fn the_pool_opens_on_a_bounded_write_ahead_log() {
     );
     assert_eq!(pragma(&pool, "foreign_keys").await, 1);
 }
+
+/// A constraint the schema declares is a refusal the caller can act on, not
+/// the store's failure to answer: it reaches the client as a 409, never as
+/// the 500 an unmapped driver error becomes.
+#[tokio::test]
+async fn a_foreign_key_failure_is_a_conflict() {
+    let tmp = tempfile::TempDir::new().unwrap();
+    let pool = connect(&format!("sqlite:{}?mode=rwc", tmp.path().join("fk.db").display()))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TABLE child (parent INTEGER NOT NULL REFERENCES parent(id))")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let err = sqlx::query("INSERT INTO child (parent) VALUES (1)")
+        .execute(&pool)
+        .await
+        .expect_err("no parent row exists");
+    assert!(matches!(store_error(err), StoreError::Conflict));
+}

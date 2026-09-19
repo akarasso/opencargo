@@ -55,6 +55,10 @@ pub async fn publish(
     let auth = caller(&request)?;
     let repo = mcp_repo(&state, &repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
+    // Before the body: the repository rung and the meter, so a stolen token
+    // spends nothing. The name-aware rung is below, once parsing knows it.
+    crate::registry::ensure_can_write(&state.authorize(), &repo, None, &auth).await?;
+    crate::registry::meter_publish(&state, &auth, Format::Mcp, &repo_name)?;
     let mut record = json_body(request, MAX_RECORD_BYTES).await?;
     if let Some(meta) = record.get_mut("_meta").and_then(Value::as_object_mut) {
         meta.remove(super::schema::MIRROR_META);

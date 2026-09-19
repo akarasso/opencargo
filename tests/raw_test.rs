@@ -8,10 +8,11 @@ use serde_json::json;
 use sha2::Digest as _;
 
 use common::{
-    basic_auth_header, hosted, named_token, seed_error, spawn_server, SpawnOpts, TestServer,
-    STATIC_TOKEN,
+    basic_auth_header, hosted, named_token, seed_error, spawn_server, storage_of, SpawnOpts,
+    TestServer, STATIC_TOKEN,
 };
 use opencargo::config::{RepositoryFormat, Visibility};
+use opencargo::registry::rules::{raw_path_bound, MAX_RAW_PATH};
 
 const PATH: &str = "dist/linux-amd64/tool-1.2.3.tar.gz";
 
@@ -335,6 +336,51 @@ async fn a_hosted_write_route_refuses_a_proxy_and_a_repository_of_another_format
         .await
         .unwrap();
     assert_eq!(into_proxy.status(), StatusCode::BAD_REQUEST);
+}
+
+/// `total` bytes of path in segments of at most `segment`, never ending on
+/// a slash.
+fn path_of(total: usize, segment: usize) -> String {
+    let mut out = String::new();
+    let mut left = total;
+    while left > 0 {
+        if !out.is_empty() {
+            out.push('/');
+            left -= 1;
+        }
+        let mut take = segment.min(left);
+        if left - take == 1 {
+            take -= 1;
+        }
+        out.push_str(&"m".repeat(take));
+        left -= take;
+    }
+    out
+}
+
+/// Both bounds are the store's, asked of the store the server runs on: a
+/// path at either is stored, so neither is a round number under it, and
+/// one byte past is refused as a path before the body is read, never as a
+/// storage key the client did not write and never as a fault.
+#[tokio::test]
+async fn a_path_at_the_bound_is_stored_and_one_byte_past_is_refused_as_a_path() {
+    let s = server(Visibility::Public).await;
+    let bound = raw_path_bound(storage_of(&s).await.key_budget());
+    assert!(bound.path <= MAX_RAW_PATH && bound.segment >= 1);
+    let single = "s".repeat(bound.segment.min(bound.path));
+    let multi = path_of(bound.path, bound.segment);
+    for path in [&single, &multi] {
+        let stored = put(&s, path, b"payload").await;
+        assert_eq!(stored.status(), StatusCode::CREATED, "{} bytes", path.len());
+        assert_eq!(get(&s, path).await.status(), StatusCode::OK);
+    }
+    for path in [format!("{single}s"), path_of(bound.path + 1, bound.segment)] {
+        let refused = put(&s, &path, b"payload").await;
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST, "{} bytes", path.len());
+        let body = refused.text().await.unwrap();
+        assert!(body.contains("raw path"), "the refusal names the path: {body}");
+        assert!(!body.contains("storage key"), "{body}");
+    }
 }
 
 #[tokio::test]

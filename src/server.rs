@@ -101,6 +101,8 @@ pub struct AppState {
     pub registry_tokens: Arc<dyn RegistryTokenSigner>,
     /// Every metered publish is counted here, against the configured limits.
     pub publish_meter: Arc<PublishMeter>,
+    /// The longest raw path the store this server runs on can key.
+    pub raw_path_bound: crate::registry::rules::RawPathBound,
     pub token_rate_limiter: Arc<RateLimiter>,
     pub webhook_dispatcher: Arc<WebhookDispatcher>,
     pub webhooks: Arc<dyn WebhookStore>,
@@ -876,6 +878,7 @@ pub async fn build_state(
     );
     report_ready(config, &policy_notes);
 
+    let raw_path_bound = crate::registry::rules::raw_path_bound(storage.key_budget());
     let state = AppState {
         storage_backend,
         storage_ready: Arc::new(StorageReadiness::new(storage.clone())),
@@ -888,6 +891,7 @@ pub async fn build_state(
         metrics_handle,
         registry_tokens,
         publish_meter: Arc::new(PublishMeter::new(publish_limits)),
+        raw_path_bound,
         token_rate_limiter: Arc::new(RateLimiter::new(10, 60)),
         webhook_dispatcher,
         webhooks,
