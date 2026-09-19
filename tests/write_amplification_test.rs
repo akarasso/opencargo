@@ -54,16 +54,16 @@ async fn publish(base_url: &str, name: &str, version: &str) {
     assert!(response.status().is_success(), "publish {version} refused");
 }
 
-/// The pin a placement takes and spends, the version row and its indexes are
-/// what a publish must dirty; a b-tree added to either side shows up here as
-/// frames.
+/// The pin a placement takes and spends, the version row and its unique index
+/// are what a publish must dirty; a b-tree added to either side shows up here
+/// as frames.
 ///
 /// Counted over twenty publishes into a package that already exists, so the
 /// row is the steady-state one and not the one that also creates a package.
-/// The ceiling is the measured cost (8.3) plus the margin a page split needs,
-/// against 12.4 for the pin table's four b-trees before 027.
+/// The ceiling is the measured cost (7.4) plus the margin a page split needs,
+/// against 12.4 before 027 and 028.
 #[tokio::test]
-async fn a_publish_dirties_at_most_nine_database_pages() {
+async fn a_publish_dirties_at_most_eight_database_pages() {
     let server = spawn_server(SpawnOpts {
         repositories: vec![hosted(
             "crates-hosted",
@@ -86,7 +86,7 @@ async fn a_publish_dirties_at_most_nine_database_pages() {
     let dirtied = wal_frames(&db_dir).saturating_sub(before);
 
     assert!(
-        dirtied <= 9 * PUBLISHES,
+        dirtied <= 8 * PUBLISHES,
         "{dirtied} pages for {PUBLISHES} publishes, {} each",
         dirtied as f64 / PUBLISHES as f64
     );

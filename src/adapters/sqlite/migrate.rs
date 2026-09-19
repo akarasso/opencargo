@@ -168,6 +168,7 @@ pub const MIGRATIONS: &[Migration] = &[
         "027_pins_by_expiry.sql",
         Sentinel::Object("idx_reclaim_pins_physical")
     ),
+    sql_migration!("028", "028_redundant_indexes.sql", Sentinel::Unprovable),
 ];
 
 /// 020: the `nuget` format, through the shared rebuild; no table of its own.
