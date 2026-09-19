@@ -16,7 +16,7 @@ use crate::app::scan::ScanVersion;
 use crate::config::VulnScanConfig;
 use crate::domain::{DomainEvent, Format, PackageRelease, ScanResult};
 use crate::error::{AppError, AppResult};
-use crate::ports::vulns::{VulnFeed, VulnStore};
+use crate::ports::vulns::{ScanError, VulnFeed, VulnStore};
 use crate::telemetry::webhooks::WebhookDispatcher;
 
 /// The scan that ran before the first write, if any; persisted by
@@ -50,6 +50,10 @@ impl PublishGate {
                 "publish blocked: critical vulnerabilities found in dependencies".to_string(),
             )),
             Ok(result) => Ok(PreScan(Some(result))),
+            Err(ScanError::Unscannable(why)) => {
+                warn!(%why, "dependencies unknown; publishing unscanned");
+                Ok(PreScan(None))
+            }
             Err(e) if self.config.fail_closed => Err(AppError::ServiceUnavailable(format!(
                 "vulnerability scan unavailable: {e}"
             ))),
@@ -144,8 +148,12 @@ impl PublishTail {
                 let meta_json = done.metadata_json.to_string();
                 let eco = ecosystem.to_string();
                 tokio::spawn(async move {
-                    if let Err(e) = scan.run(version_id, &meta_json, &eco, Utc::now()).await {
-                        warn!(error = %e, "Background vulnerability scan failed");
+                    match scan.run(version_id, &meta_json, &eco, Utc::now()).await {
+                        Ok(_) => {}
+                        Err(ScanError::Unscannable(why)) => {
+                            warn!(version_id, %why, "version not scanned: no scan row will say it was")
+                        }
+                        Err(e) => warn!(error = %e, "Background vulnerability scan failed"),
                     }
                 });
             }

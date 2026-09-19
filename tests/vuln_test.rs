@@ -11,6 +11,7 @@ use reqwest::StatusCode;
 use serde_json::{json, Value};
 
 use common::fake_osv::{self, cvss_record, labelled_record, FakeOsv};
+use common::pypi::{basic, core_metadata_with, sdist_name, sdist_with, upload, wheel_name, wheel_with};
 use common::{
     build_cargo_publish_body, build_crate_data, build_npm_publish_body, build_tarball, hosted,
     spawn_server, SpawnOpts, TestServer, STATIC_TOKEN,
@@ -21,6 +22,7 @@ const NPM_REPO: &str = "test-npm";
 const GO_REPO: &str = "test-go";
 const CARGO_REPO: &str = "test-cargo";
 const MAVEN_REPO: &str = "test-maven";
+const PYPI_REPO: &str = "test-pypi";
 const PKG: &str = "@test/vuln-pkg";
 const VERSION: &str = "1.0.0";
 const DEP: &str = "lodash";
@@ -66,6 +68,7 @@ async fn spawn_lab(osv: FakeOsv, vuln: VulnScanConfig) -> Lab {
             hosted(GO_REPO, RepositoryFormat::Go, Visibility::Public),
             hosted(CARGO_REPO, RepositoryFormat::Cargo, Visibility::Public),
             hosted(MAVEN_REPO, RepositoryFormat::Maven, Visibility::Public),
+            hosted(PYPI_REPO, RepositoryFormat::Pypi, Visibility::Public),
         ],
         vuln,
         ..Default::default()
@@ -579,6 +582,59 @@ async fn maven_pom_is_gated_before_its_unit_is_revealed() {
         lab.status_at(&format!("/maven/{MAVEN_REPO}/org/example/lib/1.1/lib-1.1.jar"))
             .await,
         StatusCode::OK
+    );
+}
+
+/// A wheel's `Requires-Dist` is what the scan reads; a sdist that leaves
+/// `Requires-Dist` to build time is not scanned and no row says it was,
+/// and a rescan of it says why.
+#[tokio::test]
+async fn pypi_requires_dist_is_scanned_and_a_dynamic_sdist_is_not() {
+    let lab = lab(scan(false, false)).await;
+    lab.osv.affect("PyPI", DEP, DEP_VERSION, &["GHSA-py"]);
+    lab.osv.record(cvss_record("GHSA-py", "CVSS_V3", V3_MEDIUM));
+    let auth = basic("__token__", STATIC_TOKEN);
+    let wheel = wheel_with("vuln-py", "1.0", None, &[&format!("{DEP} (>={DEP_VERSION})"), "idna"]);
+    let resp = upload(&lab.client, &lab.server.base_url, PYPI_REPO, &auth, &wheel_name("vuln-py", "1.0"), &wheel).await;
+    assert_eq!(resp.status(), StatusCode::OK, "{}", resp.text().await.unwrap());
+
+    let mut row = None;
+    for _ in 0..100 {
+        if lab.count("SELECT COUNT(*) FROM vulnerability_scans").await == 1 {
+            row = Some(lab.scan_row().await);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let (status, results) = row.expect("the pypi scan never landed");
+    assert_eq!(status, "warning");
+    let results: Value = serde_json::from_str(&results).expect("scan results json");
+    assert_eq!(results["total_deps"], 1, "idna pins no version: {results}");
+    assert_eq!(only_detail(&results)["vuln_id"], "GHSA-py");
+    assert_eq!(only_detail(&results)["dependency"], DEP);
+
+    let mut pkg_info = core_metadata_with("dyn-py", "2.1", None, &[]);
+    pkg_info = pkg_info.replacen("Metadata-Version: 2.1\n", "Metadata-Version: 2.2\nDynamic: Requires-Dist\n", 1);
+    let sdist = sdist_with("dyn-py", "2.1", &pkg_info);
+    let resp = upload(&lab.client, &lab.server.base_url, PYPI_REPO, &auth, &sdist_name("dyn-py", "2.1"), &sdist).await;
+    assert_eq!(resp.status(), StatusCode::OK, "{}", resp.text().await.unwrap());
+    let rescan = lab
+        .client
+        .post(format!("{}/api/v1/vulns/dyn-py/2.1/rescan", lab.server.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .expect("rescan request failed");
+    assert_eq!(rescan.status(), StatusCode::BAD_REQUEST);
+    let body: Value = rescan.json().await.expect("error json");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("Requires-Dist dynamic"),
+        "the refusal names the reason: {body}"
+    );
+    assert_eq!(
+        lab.count("SELECT COUNT(*) FROM vulnerability_scans").await,
+        1,
+        "the dynamic sdist has no scan row, clean or otherwise"
     );
 }
 

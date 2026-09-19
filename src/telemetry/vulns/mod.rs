@@ -71,7 +71,7 @@ impl VulnFeed for VulnScanner {
         let Some(osv) = &self.osv else {
             return Ok(ScanResult::clean());
         };
-        let deps = deps::extract_dependencies(metadata_json, ecosystem);
+        let deps = deps::extract_dependencies(metadata_json, ecosystem).map_err(ScanError::Unscannable)?;
         if deps.is_empty() {
             return Ok(ScanResult::clean());
         }
