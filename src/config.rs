@@ -199,9 +199,9 @@ impl PublishLimitsConfig {
                 problems.push(format!("[limits.publish.format] {name:?} is not a format"));
                 continue;
             };
-            if !format.metered_publish() {
+            if let Some(why) = format.coverage().metered_publish.why() {
                 problems.push(format!(
-                    "[limits.publish.format] {name} is not metered: a deploy is a file per request, with none that completes it"
+                    "[limits.publish.format] {name} is not metered: {why}"
                 ));
                 continue;
             }
@@ -1144,17 +1144,23 @@ mod tests {
         }
     }
 
-    /// A setting that would do nothing is refused rather than accepted: a
-    /// Maven deploy is a file per request, so no request of it is metered.
+    /// A setting that would do nothing is refused rather than accepted, and
+    /// the refusal quotes the cell rather than restating it: the sentence
+    /// about Maven was the only one, and the tenth format would have read it.
     #[test]
     fn an_entry_for_a_format_that_is_not_metered_is_refused_at_load() {
-        let config: Config = toml::from_str("[limits.publish.format]\nmaven = 10\n").unwrap();
-        let problems = config.limits.publish.resolve().expect_err("maven is not metered");
-        assert!(problems[0].contains("maven") && problems[0].contains("not metered"), "{problems:?}");
-        assert!(config.validate().is_err());
-        for metered in ["npm", "cargo", "go", "pypi", "nuget", "oci", "mcp", "raw"] {
-            let config: Config = toml::from_str(&format!("[limits.publish.format]\n{metered} = 10\n")).unwrap();
-            config.validate().unwrap_or_else(|e| panic!("{metered}: {e}"));
+        for format in crate::domain::Format::ALL {
+            let name = format.as_str();
+            let config: Config =
+                toml::from_str(&format!("[limits.publish.format]\n{name} = 10\n")).unwrap();
+            match format.coverage().metered_publish.why() {
+                None => config.validate().unwrap_or_else(|e| panic!("{name}: {e}")),
+                Some(why) => {
+                    let problems = config.limits.publish.resolve().expect_err("{name} is not metered");
+                    assert!(problems[0].contains(name) && problems[0].contains(why), "{problems:?}");
+                    assert!(config.validate().is_err(), "{name}");
+                }
+            }
         }
     }
 

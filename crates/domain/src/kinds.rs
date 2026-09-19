@@ -199,7 +199,6 @@ impl Format {
     /// does not compile until every column has an answer.
     pub const fn coverage(self) -> Coverage {
         const NO_DOC: &str = "no package document: nothing declares dependencies";
-        const SESSION: &str = "a push is a session, not one request that completes it";
         match self {
             Format::Npm | Format::Cargo | Format::Nuget => Coverage {
                 metered_publish: Cell::Yes,
@@ -235,7 +234,9 @@ impl Format {
                 prerelease: Cell::Yes,
             },
             Format::Maven => Coverage {
-                metered_publish: Cell::No(SESSION),
+                metered_publish: Cell::No(
+                    "a deploy is a file per request, with none that completes it",
+                ),
                 publish_gate: Cell::Yes,
                 policy_record: Cell::Yes,
                 scannable: Cell::Yes,

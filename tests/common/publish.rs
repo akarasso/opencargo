@@ -1,0 +1,262 @@
+//! One publish per format.
+//!
+//! A column of the coverage matrix is a claim about every format, so a test
+//! that checks one must be able to publish into any of them. `publish` is
+//! exhaustive on `Format`: a tenth format does not compile until it says how
+//! it is published, and the matrix tests then run against it for free.
+//!
+//! No step asserts. A format whose publish is several requests returns the
+//! first one that is not a success, so a refusal is reported rather than
+//! panicked on, which is what a metered test reads.
+
+use reqwest::{Client, Response, StatusCode};
+use serde_json::json;
+use sha1::Digest as _;
+
+use opencargo::config::{RepositoryConfig, RepositoryFormat, Visibility};
+use opencargo::domain::Format;
+
+use super::{
+    build_cargo_publish_body, build_go_module_zip, build_npm_publish_body, build_tarball, hosted,
+    mcp, nuget, pypi, sha256_digest, STATIC_TOKEN,
+};
+
+/// The repository a matrix test publishes into, one per format.
+pub fn repo_of(format: Format) -> String {
+    format!("{}-repo", format.as_str())
+}
+
+/// One public hosted repository per format, in `Format::ALL` order.
+pub fn repositories() -> Vec<RepositoryConfig> {
+    Format::ALL
+        .into_iter()
+        .map(|format| {
+            hosted(
+                &repo_of(format),
+                RepositoryFormat::from(format),
+                Visibility::Public,
+            )
+        })
+        .collect()
+}
+
+/// What `publish` created, for the assertions that need to name it again.
+#[derive(Debug, Clone)]
+pub struct Subject {
+    pub name: String,
+    pub version: String,
+}
+
+pub async fn publish(client: &Client, base_url: &str, format: Format, n: usize) -> Response {
+    publish_named(client, base_url, format, n).await.1
+}
+
+pub async fn publish_named(
+    client: &Client,
+    base_url: &str,
+    format: Format,
+    n: usize,
+) -> (Subject, Response) {
+    let repo = repo_of(format);
+    let subject = subject(format, n);
+    let response = match format {
+        Format::Npm => {
+            let tarball = build_tarball(&format!(
+                r#"{{"name":"{}","version":"{}"}}"#,
+                subject.name, subject.version
+            ));
+            client
+                .put(format!("{base_url}/{repo}/{}", subject.name))
+                .bearer_auth(STATIC_TOKEN)
+                .json(&build_npm_publish_body(
+                    &subject.name,
+                    &subject.version,
+                    "matrix",
+                    &tarball,
+                ))
+                .send()
+                .await
+                .unwrap()
+        }
+        Format::Cargo => {
+            let meta = json!({"name": subject.name, "vers": subject.version}).to_string();
+            client
+                .put(format!("{base_url}/{repo}/api/v1/crates/new"))
+                .bearer_auth(STATIC_TOKEN)
+                .body(build_cargo_publish_body(&meta, b"crate bytes"))
+                .send()
+                .await
+                .unwrap()
+        }
+        Format::Go => client
+            .put(format!(
+                "{base_url}/{repo}/{}/@v/{}",
+                subject.name, subject.version
+            ))
+            .bearer_auth(STATIC_TOKEN)
+            .header("content-type", "application/zip")
+            .body(build_go_module_zip(&subject.name, &subject.version))
+            .send()
+            .await
+            .unwrap(),
+        Format::Pypi => {
+            pypi::upload(
+                client,
+                base_url,
+                &repo,
+                &pypi::basic("__token__", STATIC_TOKEN),
+                &pypi::wheel_name(&subject.name, &subject.version),
+                &pypi::wheel(&subject.name, &subject.version, None),
+            )
+            .await
+        }
+        Format::Nuget => client
+            .put(format!("{base_url}/{repo}/v3/package"))
+            .header("X-NuGet-ApiKey", STATIC_TOKEN)
+            .multipart(nuget::form(nuget::nupkg(&subject.name, &subject.version, &[])))
+            .send()
+            .await
+            .unwrap(),
+        Format::Maven => {
+            let dir = format!("org/example/{}", subject.name);
+            let jar = b"jar bytes".to_vec();
+            let put = |path: String, body: Vec<u8>| {
+                client
+                    .put(format!("{base_url}/maven/{repo}/{path}"))
+                    .bearer_auth(STATIC_TOKEN)
+                    .body(body)
+                    .send()
+            };
+            let jar_path = format!("{dir}/{}/{}-{}.jar", subject.version, subject.name, subject.version);
+            let deployed = put(jar_path.clone(), jar.clone()).await.unwrap();
+            if let Some(refused) = refusal(deployed) {
+                return (subject, refused);
+            }
+            let sha = format!("{:x}", sha1::Sha1::digest(&jar));
+            let checksum = put(format!("{jar_path}.sha1"), sha.into_bytes()).await.unwrap();
+            if let Some(refused) = refusal(checksum) {
+                return (subject, refused);
+            }
+            let pom = format!(
+                "<project><groupId>org.example</groupId><artifactId>{}</artifactId>\
+                 <version>{}</version></project>",
+                subject.name, subject.version
+            );
+            put(
+                format!("{dir}/{}/{}-{}.pom", subject.version, subject.name, subject.version),
+                pom.into_bytes(),
+            )
+            .await
+            .unwrap()
+        }
+        Format::Oci => {
+            let image = format!("{repo}/{}", subject.name);
+            let config = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}".to_vec();
+            let layer = b"layer bytes".to_vec();
+            let mut digests = Vec::new();
+            for blob in [&config, &layer] {
+                match blob_of(client, base_url, &image, blob).await {
+                    Ok(digest) => digests.push(digest),
+                    Err(refused) => return (subject, refused),
+                }
+            }
+            let manifest = serde_json::to_vec(&json!({
+                "schemaVersion": 2,
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "config": {
+                    "mediaType": "application/vnd.oci.image.config.v1+json",
+                    "digest": digests[0],
+                    "size": config.len(),
+                },
+                "layers": [{
+                    "mediaType": "application/vnd.oci.image.layer.v1.tar+gzip",
+                    "digest": digests[1],
+                    "size": layer.len(),
+                }],
+            }))
+            .unwrap();
+            client
+                .put(format!(
+                    "{base_url}/v2/{image}/manifests/{}",
+                    subject.version
+                ))
+                .bearer_auth(STATIC_TOKEN)
+                .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                .body(manifest)
+                .send()
+                .await
+                .unwrap()
+        }
+        Format::Mcp => client
+            .post(format!("{base_url}/{repo}/v0.1/publish"))
+            .bearer_auth(STATIC_TOKEN)
+            .json(&mcp::record(&subject.name, &subject.version))
+            .send()
+            .await
+            .unwrap(),
+        Format::Raw => client
+            .put(format!("{base_url}/raw/{repo}/{}", subject.name))
+            .bearer_auth(STATIC_TOKEN)
+            .body("raw bytes")
+            .send()
+            .await
+            .unwrap(),
+    };
+    (subject, response)
+}
+
+/// What each format calls the thing a publish creates. Names are the ones the
+/// format admits, not one shape bent to fit nine grammars.
+pub fn subject(format: Format, n: usize) -> Subject {
+    let version = match format {
+        Format::Go => "v1.0.0".to_string(),
+        Format::Oci => format!("v{n}"),
+        _ => "1.0.0".to_string(),
+    };
+    let name = match format {
+        Format::Npm => format!("pkg-{n}"),
+        Format::Cargo => format!("krate-{n}"),
+        Format::Go => format!("example.com/mod{n}"),
+        Format::Pypi => format!("widget{n}"),
+        Format::Nuget => format!("Widget{n}"),
+        Format::Maven => format!("lib{n}"),
+        Format::Oci => "app".to_string(),
+        Format::Mcp => format!("io.github.acme/srv{n}"),
+        Format::Raw => format!("dist/file-{n}.bin"),
+    };
+    Subject { name, version }
+}
+
+fn refusal(response: Response) -> Option<Response> {
+    (!response.status().is_success()).then_some(response)
+}
+
+async fn blob_of(
+    client: &Client,
+    base_url: &str,
+    image: &str,
+    blob: &[u8],
+) -> Result<String, Response> {
+    let start = client
+        .post(format!("{base_url}/v2/{image}/blobs/uploads/"))
+        .bearer_auth(STATIC_TOKEN)
+        .send()
+        .await
+        .unwrap();
+    if start.status() != StatusCode::ACCEPTED {
+        return Err(start);
+    }
+    let location = start.headers()["location"].to_str().unwrap().to_string();
+    let digest = sha256_digest(blob);
+    let done = client
+        .put(format!("{base_url}{location}?digest={digest}"))
+        .bearer_auth(STATIC_TOKEN)
+        .body(blob.to_vec())
+        .send()
+        .await
+        .unwrap();
+    if !done.status().is_success() {
+        return Err(done);
+    }
+    Ok(digest)
+}
