@@ -166,7 +166,7 @@ measure_stop() {
   # The database is the three WAL files together, or a publish still in the
   # write-ahead log reads as a database that never grew.
   kv "db_bytes=$(stat -c %s "$SCN_DIR"/data/db/opencargo.db* 2>/dev/null | awk '{ s += $1 } END { print s + 0 }')"
-  kv "storage_bytes=$(du -sb "$SCN_DIR/data/storage" 2>/dev/null | cut -f1 || echo 0)"
+  kv "storage_bytes=$(storage_size)"
   kv "log_bytes=$(stat -c %s "$SCN_DIR/server.log" 2>/dev/null || echo 0)"
   [[ -n ${1:-} ]] && kv "notes=$1"
   return 0

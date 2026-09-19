@@ -54,8 +54,12 @@ http_summary() {
   '
 }
 
-# metrics_requests <base_url> -- total HTTP requests the server has answered
-metrics_requests() {
+# metrics_counts <base_url> -- "<requests> <4xx-and-5xx>" the server has counted.
+# /metrics goes through the same middleware, so a reading counts itself: two
+# readings around a workload are one request more than the workload sent.
+metrics_counts() {
   curl -fsS --max-time 10 "$1/metrics" 2>/dev/null |
-    awk '/^opencargo_http_requests_total/ { s += $NF } END { printf "%d", s + 0 }'
+    awk '
+      /^opencargo_http_requests_total/ { t += $NF; if (/status="[45]/) f += $NF }
+      END { printf "%d %d", t + 0, f + 0 }'
 }

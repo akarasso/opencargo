@@ -19,6 +19,16 @@ scenarios_cleanup() {
   return 0
 }
 
+# What the artifacts weigh, wherever they landed: on S3 nothing is written
+# under storage_path, so measuring it there would report an empty store.
+storage_size() {
+  if [[ ${SCN_STORAGE:-fs} == s3 && -n $MINIO_NAME ]]; then
+    docker exec "$MINIO_NAME" du -sb "/data/$BENCH_S3_BUCKET" 2>/dev/null | cut -f1
+  else
+    du -sb "$SCN_DIR/data/storage" 2>/dev/null | cut -f1
+  fi
+}
+
 need() {
   command -v "$1" >/dev/null && return 0
   record_skip "$2" "$1 is not installed"
@@ -60,8 +70,8 @@ scenario_npm_install() {
     rm -rf "$project/node_modules" "$project/pnpm-lock.yaml" \
       "$SCN_DIR/pnpm-$pass" "$SCN_DIR/cache-$pass"
     mkdir -p "$SCN_DIR/pnpm-$pass" "$SCN_DIR/cache-$pass"
-    local before after
-    before=$(metrics_requests "$BASE")
+    local before after before_err after_err
+    read -r before before_err <<<"$(metrics_counts "$BASE")"
     measure_start "npm-install-$pass"
     env HOME="$SCN_DIR" XDG_CACHE_HOME="$SCN_DIR/cache-$pass" XDG_DATA_HOME="$SCN_DIR/cache-$pass" \
       XDG_STATE_HOME="$SCN_DIR/cache-$pass" \
@@ -69,8 +79,8 @@ scenario_npm_install() {
       --store-dir "$SCN_DIR/pnpm-$pass" --ignore-scripts --no-frozen-lockfile \
       --reporter=silent >>"$SCN_DIR/pnpm.log" 2>&1 || record_fail "pnpm install failed, see pnpm.log"
     measure_load_done
-    after=$(metrics_requests "$BASE")
-    kv "requests=$((after - before))" "errors=0"
+    read -r after after_err <<<"$(metrics_counts "$BASE")"
+    kv "requests=$((after - before - 1))" "errors=$((after_err - before_err))"
     kv "packages=$(find "$project/node_modules/.pnpm" -maxdepth 1 -mindepth 1 -type d 2>/dev/null | wc -l)"
     measure_stop "pnpm $(pnpm --version) against the npm proxy; the client store is wiped between the two passes, so only the server cache is warm"
   done
@@ -100,8 +110,8 @@ TOML
   local pass
   for pass in cold warm; do
     rm -rf "$SCN_DIR/cargo-home-$pass" "$project/Cargo.lock"
-    local before after
-    before=$(metrics_requests "$BASE")
+    local before after before_err after_err
+    read -r before before_err <<<"$(metrics_counts "$BASE")"
     measure_start "cargo-fetch-$pass"
     # From inside the project: cargo reads .cargo/config.toml from the working
     # directory, so --manifest-path alone would leave source replacement off
@@ -109,8 +119,8 @@ TOML
     (cd "$project" && exec env CARGO_HOME="$SCN_DIR/cargo-home-$pass" cargo fetch) \
       >>"$SCN_DIR/cargo.log" 2>&1 || record_fail "cargo fetch failed, see cargo.log"
     measure_load_done
-    after=$(metrics_requests "$BASE")
-    kv "requests=$((after - before))" "errors=0"
+    read -r after after_err <<<"$(metrics_counts "$BASE")"
+    kv "requests=$((after - before - 1))" "errors=$((after_err - before_err))"
     kv "crates=$(find "$SCN_DIR/cargo-home-$pass/registry/cache" -name '*.crate' 2>/dev/null | wc -l)"
     measure_stop "cargo fetch through source replacement; CARGO_HOME is wiped between the two passes"
   done
@@ -126,17 +136,17 @@ scenario_oci_pull() {
   local pass
   for pass in cold warm; do
     docker rmi -f "$ref" >/dev/null 2>&1 || true
-    local before after
-    before=$(metrics_requests "$BASE")
+    local before after before_err after_err
+    read -r before before_err <<<"$(metrics_counts "$BASE")"
     measure_start "oci-pull-$pass"
     if ! docker pull -q "$ref" >>"$SCN_DIR/docker.log" 2>&1; then
-      measure_stop "docker pull failed, see docker.log"
-      kv "status=failed"
+      record_fail "docker pull failed, see docker.log"
+      measure_stop
       return 0
     fi
     measure_load_done
-    after=$(metrics_requests "$BASE")
-    kv "requests=$((after - before))" "errors=0"
+    read -r after after_err <<<"$(metrics_counts "$BASE")"
+    kv "requests=$((after - before - 1))" "errors=$((after_err - before_err))"
     kv "image_bytes=$(docker image inspect "$ref" --format '{{.Size}}' 2>/dev/null || echo 0)"
     measure_stop "docker pull of $BENCH_OCI_IMAGE through the OCI proxy; the local image is removed before each pass, so both passes really transfer the layers"
   done
@@ -223,9 +233,12 @@ oci_push_run() {
     out=$(cat "$SCN_DIR/fx-oci/$i.kv")
     t0=$(sampler_now)
     for pair in "layer:layer_digest" "config:config_digest"; do
+      # Guarded like the PUT below: one refused session is this push's error,
+      # not the end of the record and of every push already measured.
       loc=$(curl -fsS -X POST -H "Authorization: Bearer $BENCH_TOKEN" \
         -D - -o /dev/null "$BASE/v2/$image/blobs/uploads/" |
-        awk 'tolower($1) == "location:" { print $2 }' | tr -d '\r')
+        awk 'tolower($1) == "location:" { print $2 }' | tr -d '\r') || loc=
+      [[ -n $loc ]] || { code=500; break; }
       [[ $loc == http* ]] || loc=$BASE$loc
       [[ $loc == *\?* ]] && loc="$loc&" || loc="$loc?"
       curl -fsS -X PUT -H "Authorization: Bearer $BENCH_TOKEN" \
@@ -233,10 +246,12 @@ oci_push_run() {
         --data-binary "@$(kvget "$out" "${pair%%:*}")" \
         -o /dev/null "${loc}digest=$(kvget "$out" "${pair##*:}")" || code=500
     done
-    curl -fsS -X PUT -H "Authorization: Bearer $BENCH_TOKEN" \
-      -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' \
-      --data-binary "@$(kvget "$out" manifest)" \
-      -o /dev/null "$BASE/v2/$image/manifests/1.0.0" || code=500
+    if [[ $code == 201 ]]; then
+      curl -fsS -X PUT -H "Authorization: Bearer $BENCH_TOKEN" \
+        -H 'Content-Type: application/vnd.oci.image.manifest.v1+json' \
+        --data-binary "@$(kvget "$out" manifest)" \
+        -o /dev/null "$BASE/v2/$image/manifests/1.0.0" || code=500
+    fi
     awk -v t0="$t0" -v t1="$(sampler_now)" -v c="$code" \
       'BEGIN { printf "%.6f\t%d\t0\n", t1 - t0, c }' >>"$tsv"
   done
@@ -376,6 +391,7 @@ scenario_growth() {
   measure_load_done
   http_summary "$SCN_DIR/growth.tsv" >>"$RECORD_KV"
   kv "throughput_rps=$(awk -v n="$BENCH_VERSIONS" -v ms="$RECORD_WALL" 'BEGIN { printf "%.0f", n / (ms / 1000) }')"
-  kv "packages=$((BENCH_VERSIONS / per))" "versions=$BENCH_VERSIONS"
-  measure_stop "$BENCH_VERSIONS crate versions over $((BENCH_VERSIONS / per)) crates, 1 KiB of payload each, published at concurrency 8; db_bytes and storage_bytes are what they cost"
+  local crates=$(((BENCH_VERSIONS + per - 1) / per))
+  kv "packages=$crates" "versions=$BENCH_VERSIONS"
+  measure_stop "$BENCH_VERSIONS crate versions over $crates crates, 1 KiB of payload each, published at concurrency 8; db_bytes and storage_bytes are what they cost"
 }
