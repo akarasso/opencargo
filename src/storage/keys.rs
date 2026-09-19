@@ -12,6 +12,11 @@ pub const MAX_KEY_BYTES: usize = 1024;
 
 /// What a backend can key: the whole key, and any one segment of it. A
 /// backend that bounds no segment reports the key's own budget for it.
+/// What a path component may weigh where an object is stored as a file:
+/// `NAME_MAX` on every filesystem this runs on, and on the filesystem of an
+/// object server that keeps its objects as files.
+pub const MAX_NAME_BYTES: usize = 255;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct KeyBudget {
     pub key: usize,

@@ -22,7 +22,7 @@ const WRITE_TIMEOUT: Duration = Duration::from_secs(60);
 const LEGACY_PART: &str = ".part-";
 /// A segment is a file name, and `NAME_MAX` is 255 on every file system
 /// this runs on; the kernel's ENAMETOOLONG would otherwise be a fault.
-const MAX_NAME_BYTES: usize = 255;
+use crate::storage::keys::MAX_NAME_BYTES;
 
 pub struct FilesystemStorage {
     base_path: PathBuf,
