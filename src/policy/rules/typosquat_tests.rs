@@ -350,3 +350,11 @@ fn pypi_names_compare_as_pep_503_spells_them() {
     assert_eq!(check(pypi, Format::Pypi, "reqeusts").0, Verdict::WouldBlock);
     assert_eq!(check(pypi, Format::Pypi, "Reqeusts").0, Verdict::WouldBlock, "normalized first");
 }
+
+#[test]
+fn has_lists_agrees_with_what_ships() {
+    for format in Format::ALL {
+        assert_eq!(has_lists(format), shipped(format).is_some(), "{format:?}");
+    }
+    assert!(!has_lists(Format::Maven));
+}

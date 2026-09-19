@@ -1,13 +1,22 @@
 mod common;
 
+use std::collections::HashMap;
+
 use reqwest::StatusCode;
 use sha1::Digest as _;
 
+use common::fake_osv::{self, cvss_record};
 use common::fake_upstream::maven::{self as fake, FakeMaven};
-use common::{expire_entries, group, hosted, proxy, spawn_server, SpawnOpts, TestServer, STATIC_TOKEN};
-use opencargo::config::{RepositoryFormat, Visibility};
+use common::{
+    expire_entries, group, hosted, policy_verdicts, proxy, sentinel, spawn_server, verdict_of, wait_for_policy_rows,
+    SpawnOpts, TestServer, STATIC_TOKEN,
+};
+use opencargo::config::{RepositoryFormat, Visibility, VulnScanConfig};
+use opencargo::policy::rules::PolicyConfig;
+use opencargo::telemetry::vulns::severity::Severity;
 
 const DIR: &str = "org/example/lib";
+const V3_CRITICAL: &str = "CVSS:3.1/AV:N/AC:L/PR:N/UI:N/S:U/C:H/I:H/A:H";
 
 fn sha1_hex(bytes: &[u8]) -> String {
     format!("{:x}", sha1::Sha1::digest(bytes))
@@ -75,6 +84,74 @@ async fn a_proxied_file_is_verified_cached_and_summed_on_the_served_body() {
     );
     assert_eq!(get(&s, "central", &path).await.status(), StatusCode::OK);
     assert_eq!(central.count(&path), 1, "an immutable file is fetched once");
+}
+
+/// The policy pipeline sees a proxied Maven artifact like any other format's:
+/// one row per served build under its `groupId:artifactId`, the OSV rule
+/// fires on the Maven ecosystem, and the three rules that cannot mean
+/// anything here say `not_applicable` instead of never appearing.
+#[tokio::test]
+async fn a_proxied_artifact_records_a_policy_row_on_which_osv_fires() {
+    let osv = fake_osv::start().await;
+    osv.affect("Maven", "org.example:lib", "1.0", &["GHSA-mvn"]);
+    osv.record(cvss_record("GHSA-mvn", "CVSS_V3", V3_CRITICAL));
+    let central = fake::start().await;
+    let jar = b"central jar".to_vec();
+    let path = format!("{DIR}/1.0/lib-1.0.jar");
+    central.put(&path, jar.clone());
+    central.put(&format!("{DIR}/1.0/lib-1.0.pom"), "<project/>");
+    central.put(&format!("{DIR}/1.1/lib-1.1.jar"), b"sentinel".to_vec());
+    let s = spawn_server(SpawnOpts {
+        repositories: vec![proxy("central", RepositoryFormat::Maven, &central.base_url)],
+        vuln: VulnScanConfig {
+            enabled: true,
+            osv_base_url: osv.base_url.clone(),
+            ..Default::default()
+        },
+        policy: HashMap::from([(
+            "central".to_string(),
+            PolicyConfig {
+                min_release_age: Some("48h".parse().unwrap()),
+                osv_severity: Some(Severity::High),
+                install_scripts: true,
+                typosquat: true,
+                ..Default::default()
+            },
+        )]),
+        ..Default::default()
+    })
+    .await;
+
+    assert_eq!(get(&s, "central", &format!("{DIR}/1.0/lib-1.0.pom")).await.status(), StatusCode::OK);
+    assert_eq!(get(&s, "central", &path).await.status(), StatusCode::OK);
+    let rows = wait_for_policy_rows(&s, 1).await;
+    let row = &rows[0];
+    assert_eq!(
+        (row.format.as_str(), row.name.as_str(), row.version.as_deref()),
+        ("maven", "org.example:lib", Some("1.0"))
+    );
+    assert_eq!(row.member_repo, "central");
+    assert_eq!(
+        row.digest.as_deref(),
+        Some(format!("{:x}", sha2::Sha256::digest(&jar)).as_str())
+    );
+    assert_eq!(row.date_source, "none");
+    let verdicts = policy_verdicts(&s).await;
+    assert_eq!(
+        verdict_of(&verdicts, row.id, "osv_severity"),
+        ("would_block", "GHSA-mvn critical >= high")
+    );
+    assert!(row.would_block);
+    for (rule, reason) in [
+        ("min_release_age", "maven: upstream carries no per-version publication date"),
+        ("install_scripts", "maven: install scripts are an npm and NuGet notion"),
+        ("typosquat", "maven: no name list"),
+    ] {
+        assert_eq!(verdict_of(&verdicts, row.id, rule), ("not_applicable", reason), "{rule}");
+    }
+
+    let rows = sentinel(&s, &format!("{}/maven/central/{DIR}/1.1/lib-1.1.jar", s.base_url), 2).await;
+    assert_eq!(rows[1].version.as_deref(), Some("1.1"), "the POM served first recorded nothing");
 }
 
 #[tokio::test]

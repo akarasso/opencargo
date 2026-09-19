@@ -98,6 +98,11 @@ impl Lists {
     }
 }
 
+/// Whether a name list ships for `format`, without parsing one.
+pub fn has_lists(format: Format) -> bool {
+    matches!(format, Format::Npm | Format::Cargo | Format::Go | Format::Pypi)
+}
+
 pub fn shipped(format: Format) -> Option<&'static Lists> {
     static NPM: OnceLock<Lists> = OnceLock::new();
     static CRATES: OnceLock<Lists> = OnceLock::new();

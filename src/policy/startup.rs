@@ -1,10 +1,12 @@
 use crate::config::Config;
 use crate::domain::{Format, RepoKind};
 
+use super::rules::{install_scripts, min_release_age, typosquat, PolicyConfig};
+
 /// What `build_state` says about `[policy.*]` before serving: `recording`
 /// names the members whose downloads are recorded, `unknown` the keys
-/// naming no configured repository, `inapplicable` the OCI members with a
-/// rule that can only answer `not_applicable` there.
+/// naming no configured repository, `inapplicable` the members with a
+/// rule that can only answer `not_applicable` on their format.
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct StartupNotes {
     pub recording: Vec<String>,
@@ -33,28 +35,30 @@ pub fn startup_notes(config: &Config) -> Result<StartupNotes, String> {
             continue;
         }
         notes.recording.push(key.clone());
-        if matches!(repo.format, Format::Oci | Format::Mcp) {
-            if cfg.typosquat {
-                notes.inapplicable.push((key.clone(), "typosquat"));
-            }
-            if cfg.osv_severity.is_some() {
-                notes.inapplicable.push((key.clone(), "osv_severity"));
-            }
-        }
-        if repo.format != Format::Mcp {
-            for (on, rule) in [
-                (cfg.mcp_allowlist, "mcp_allowlist"),
-                (cfg.mcp_injection, "mcp_injection"),
-                (cfg.mcp_transport, "mcp_transport"),
-                (cfg.mcp_drift, "mcp_drift"),
-            ] {
-                if on {
-                    notes.inapplicable.push((key.clone(), rule));
-                }
-            }
+        for rule in inapplicable(repo.format, cfg) {
+            notes.inapplicable.push((key.clone(), rule));
         }
     }
     Ok(notes)
+}
+
+/// The enabled rules that can only answer `not_applicable` on `format`,
+/// from what each rule says it can evaluate.
+pub fn inapplicable(format: Format, cfg: &PolicyConfig) -> Vec<&'static str> {
+    let mcp = format == Format::Mcp;
+    [
+        (cfg.typosquat && !typosquat::has_lists(format), "typosquat"),
+        (cfg.osv_severity.is_some() && format.osv_ecosystem().is_none(), "osv_severity"),
+        (cfg.min_release_age.is_some() && min_release_age::undated(format), "min_release_age"),
+        (cfg.install_scripts && !install_scripts::applies(format), "install_scripts"),
+        (cfg.mcp_allowlist && !mcp, "mcp_allowlist"),
+        (cfg.mcp_injection && !mcp, "mcp_injection"),
+        (cfg.mcp_transport && !mcp, "mcp_transport"),
+        (cfg.mcp_drift && !mcp, "mcp_drift"),
+    ]
+    .into_iter()
+    .filter_map(|(on, rule)| on.then_some(rule))
+    .collect()
 }
 
 #[cfg(test)]
@@ -116,6 +120,48 @@ install_scripts = true
         );
         let empty: Config = toml::from_str(&format!("{REPOS}\n[policy.npm-proxy]\n")).unwrap();
         assert_eq!(startup_notes(&empty).unwrap(), StartupNotes::default());
+    }
+
+    /// Maven: the ecosystem is scanned, nothing else can fire, and the
+    /// operator hears it before the first row instead of never.
+    #[test]
+    fn maven_rules_that_cannot_fire_are_named_at_startup() {
+        let config: Config = toml::from_str(&format!(
+            r#"{REPOS}
+[[repositories]]
+name = "maven-proxy"
+type = "proxy"
+format = "maven"
+upstream = "https://repo1.maven.org/maven2"
+
+[policy.maven-proxy]
+min_release_age = "48h"
+osv_severity = "high"
+install_scripts = true
+typosquat = true
+"#
+        ))
+        .unwrap();
+        let notes = startup_notes(&config).unwrap();
+        assert_eq!(notes.recording, vec!["maven-proxy"]);
+        assert_eq!(
+            notes.inapplicable,
+            vec![
+                ("maven-proxy".to_string(), "typosquat"),
+                ("maven-proxy".to_string(), "min_release_age"),
+                ("maven-proxy".to_string(), "install_scripts")
+            ]
+        );
+        let all_on = PolicyConfig {
+            min_release_age: Some("1h".parse().unwrap()),
+            osv_severity: Some(crate::domain::Severity::High),
+            install_scripts: true,
+            typosquat: true,
+            ..Default::default()
+        };
+        assert!(inapplicable(Format::Npm, &all_on).is_empty());
+        assert_eq!(inapplicable(Format::Nuget, &all_on), ["typosquat"]);
+        assert_eq!(inapplicable(Format::Raw, &all_on), ["typosquat", "osv_severity", "install_scripts"]);
     }
 
     #[test]

@@ -3,8 +3,15 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 
 use super::{PolicyConfig, Rule};
-use crate::domain::{RuleVerdict, Verdict};
+use crate::domain::{Format, RuleVerdict, Verdict};
 use crate::policy::{Age, Resolution};
+
+/// The formats whose upstream protocol carries no per-version publication
+/// date: the rule can only ever answer `not_applicable` there, and the
+/// startup check says so.
+pub fn undated(format: Format) -> bool {
+    matches!(format, Format::Maven)
+}
 
 pub struct MinReleaseAge;
 
@@ -24,6 +31,13 @@ impl Rule for MinReleaseAge {
         now: DateTime<Utc>,
     ) -> Option<RuleVerdict> {
         let min = cfg.min_release_age?;
+        if undated(r.format) {
+            return Some(RuleVerdict::new(
+                self.name(),
+                Verdict::NotApplicable,
+                format!("{}: upstream carries no per-version publication date", r.format.as_str()),
+            ));
+        }
         let verdict = match r.published_at {
             None => RuleVerdict::new(
                 self.name(),
@@ -130,6 +144,19 @@ mod tests {
         let v = run(&cfg("1s"), &resolution(Some(at), "fetch"));
         assert_eq!(v.verdict, Verdict::WouldBlock);
         assert!(v.reason.contains("future"), "{}", v.reason);
+    }
+
+    #[test]
+    fn maven_is_not_applicable_even_when_dated() {
+        let mut r = resolution(Some(Utc::now() - chrono::Duration::hours(2)), "none");
+        r.format = Format::Maven;
+        let v = run(&cfg("48h"), &r);
+        assert_eq!(v.verdict, Verdict::NotApplicable);
+        assert_eq!(v.reason, "maven: upstream carries no per-version publication date");
+        assert!(undated(Format::Maven));
+        for format in [Format::Npm, Format::Cargo, Format::Go, Format::Pypi, Format::Nuget, Format::Oci, Format::Raw] {
+            assert!(!undated(format), "{format:?}");
+        }
     }
 
     #[test]

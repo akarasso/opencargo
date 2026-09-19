@@ -20,6 +20,7 @@ use opencargo::config::{Config, RepositoryFormat, Visibility, VulnScanConfig};
 const NPM_REPO: &str = "test-npm";
 const GO_REPO: &str = "test-go";
 const CARGO_REPO: &str = "test-cargo";
+const MAVEN_REPO: &str = "test-maven";
 const PKG: &str = "@test/vuln-pkg";
 const VERSION: &str = "1.0.0";
 const DEP: &str = "lodash";
@@ -64,6 +65,7 @@ async fn spawn_lab(osv: FakeOsv, vuln: VulnScanConfig) -> Lab {
             hosted(NPM_REPO, RepositoryFormat::Npm, Visibility::Public),
             hosted(GO_REPO, RepositoryFormat::Go, Visibility::Public),
             hosted(CARGO_REPO, RepositoryFormat::Cargo, Visibility::Public),
+            hosted(MAVEN_REPO, RepositoryFormat::Maven, Visibility::Public),
         ],
         vuln,
         ..Default::default()
@@ -207,6 +209,16 @@ impl Lab {
             .expect("count query failed");
         pool.close().await;
         n
+    }
+
+    async fn deploy(&self, path: &str, body: &str) -> reqwest::Response {
+        self.client
+            .put(format!("{}/maven/{MAVEN_REPO}/{path}", self.server.base_url))
+            .bearer_auth(STATIC_TOKEN)
+            .body(body.to_string())
+            .send()
+            .await
+            .expect("maven deploy request failed")
     }
 
     async fn status_at(&self, path: &str) -> StatusCode {
@@ -513,6 +525,62 @@ async fn osv_down_fail_closed_is_503() {
 // ---------------------------------------------------------------------------
 // Go
 // ---------------------------------------------------------------------------
+
+/// Maven deploys file by file and the POM is what reveals a unit, so the
+/// gate runs on the POM before its first write: a refused POM leaves the
+/// jar deposited before it invisible and no version row behind.
+#[tokio::test]
+async fn maven_pom_is_gated_before_its_unit_is_revealed() {
+    let lab = lab(scan(true, false)).await;
+    lab.osv
+        .affect("Maven", "org.lodash:lodash", DEP_VERSION, &["GHSA-mvn"]);
+    lab.osv
+        .record(cvss_record("GHSA-mvn", "CVSS_V3", V3_CRITICAL));
+    let pom = |version: &str, dep: &str| {
+        format!(
+            "<project><groupId>org.example</groupId><artifactId>lib</artifactId><version>{version}</version>\
+             <dependencies><dependency><groupId>org.lodash</groupId><artifactId>lodash</artifactId>\
+             <version>{dep}</version></dependency></dependencies></project>"
+        )
+    };
+
+    let jar = lab.deploy("org/example/lib/1.0/lib-1.0.jar", "jar bytes").await;
+    assert_eq!(jar.status(), StatusCode::CREATED);
+    let refused = lab
+        .deploy("org/example/lib/1.0/lib-1.0.pom", &pom("1.0", DEP_VERSION))
+        .await;
+    assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+    let body: Value = refused.json().await.expect("error json");
+    assert!(
+        body["error"].as_str().unwrap_or("").contains("critical"),
+        "the refusal names the reason: {body}"
+    );
+    for file in ["lib-1.0.jar", "lib-1.0.pom"] {
+        assert_eq!(
+            lab.status_at(&format!("/maven/{MAVEN_REPO}/org/example/lib/1.0/{file}"))
+                .await,
+            StatusCode::NOT_FOUND,
+            "{file}: the unit was never revealed"
+        );
+    }
+    assert_eq!(lab.count("SELECT COUNT(*) FROM versions").await, 0);
+    assert_eq!(
+        lab.count("SELECT COUNT(*) FROM vulnerability_scans").await,
+        0
+    );
+
+    let jar = lab.deploy("org/example/lib/1.1/lib-1.1.jar", "jar bytes").await;
+    assert_eq!(jar.status(), StatusCode::CREATED);
+    let clean = lab
+        .deploy("org/example/lib/1.1/lib-1.1.pom", &pom("1.1", "4.17.21"))
+        .await;
+    assert_eq!(clean.status(), StatusCode::CREATED, "a clean POM reveals its unit");
+    assert_eq!(
+        lab.status_at(&format!("/maven/{MAVEN_REPO}/org/example/lib/1.1/lib-1.1.jar"))
+            .await,
+        StatusCode::OK
+    );
+}
 
 #[tokio::test]
 async fn go_require_block_is_scanned() {
