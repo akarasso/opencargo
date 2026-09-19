@@ -277,11 +277,31 @@ POST   /api/v1/webhooks/{id}/test
 
 GET    /api/v1/system/audit?page=1&size=50
 
+GET    /api/v1/routing-rules                       {rules[], snapshot_version}
+POST   /api/v1/routing-rules                       {name, format, patterns[], except[], effect, targets[]}
+GET    /api/v1/routing-rules/{name}
+PUT    /api/v1/routing-rules/{name}
+DELETE /api/v1/routing-rules/{name}                -> {deleted, still_refused_by[]}
+POST   /api/v1/routing-rules/explain               {repository, name, candidate?}
+
 GET    /api/v1/policy/report?since=24h&repo=&rule=&page=1&size=50   Policy report (admin)
 DELETE /api/v1/policy/report?user=alice | ?user_id=17            Erase one user's rows -> {deleted}
 GET    /api/v1/policy/rules                                       Effective rules of every proxy
 GET    /api/v1/me/policy?since=&repo=&rule=&page=&size=           The caller's own rows
 ```
+
+Routing rules: which members of a group may answer for a name, admin only.
+`effect` is `allow_members` (the hosted repositories in `targets`),
+`allow_hosted` (any hosted repository of the format, present and future) or
+`deny`. A rule applies to every repository of its format: a request carrying a
+scope field is refused, not ignored. `patterns` are compared on a coarsened key
+(case folded, plus the format's own equivalences), `except` on exact store
+identity and never as a glob. `explain` answers the members the resolver would
+consult, each `admitted` or `refused_by` naming **every** rule that refuses,
+with `match_key`, `ident_key` and `snapshot_version`; `candidate` tries a rule
+that is not stored. A refusal is never visible to a registry client: the group
+answers its usual 404 and no header, body or status names a rule. See
+[routing.md](routing.md).
 
 Policy report: a proxy repository with at least one rule enabled in
 `[policy.<repo>]` records every artifact it serves (actor, artifact, time)

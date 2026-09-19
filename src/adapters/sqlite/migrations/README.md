@@ -49,6 +49,7 @@ checksum in the same commit.
 | 028 | 028_redundant_indexes.sql | write amplification (the two indexes a unique constraint already carries) | 4ca3c60c8bc8168054c89d86b5f06e02cbfdb19901ded4f7a05d2943cd4f5c13 |
 | 029 | 029_cached_packages.sql | search-over-cache.md (port 24: what the proxy has served) | aed68ab685f6da77542314245529a8e4e5d8ca2c6d153d73021057a62f4c57b3 |
 | 030 | 030_token_scopes.sql | scopes (api_tokens.scope) | 359b691e29795d97e768c3c469d5e93b777b07673ebf380631aa8721199e39e9 |
+| 031 | 031_routing.sql | routing.v2 (group routing rules and their version) | c5c7017ee5820ba5e2539384a14d3fd03305f5669ea3b880f43dcd2c67330e95 |
 
 A `Step::Rust` migration has no file and so no checksum: `020` is the
 `repositories` CHECK widened by `migrate::widen_format_check`, the one helper

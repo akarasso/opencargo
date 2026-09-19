@@ -179,6 +179,7 @@ pub const MIGRATIONS: &[Migration] = &[
         "030_token_scopes.sql",
         Sentinel::Column { table: "api_tokens", column: "scope" }
     ),
+    sql_migration!("031", "031_routing.sql", Sentinel::Object("idx_routing_rules_format")),
 ];
 
 /// 020: the `nuget` format, through the shared rebuild; no table of its own.

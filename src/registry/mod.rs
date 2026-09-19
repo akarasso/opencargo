@@ -8,6 +8,7 @@ pub mod nuget;
 pub mod oci;
 pub mod pypi;
 pub mod resolve;
+pub mod routing;
 pub mod rules;
 
 use std::collections::HashMap;
@@ -52,6 +53,8 @@ pub fn cx<'a>(state: &'a AppState, auth: Option<&'a AuthUser>, repo: &'a Reposit
         creds: state.upstream_auth.as_ref(),
         auth,
         anonymous_read: state.auth.anonymous_read,
+        routing: state.routing.as_ref(),
+        refusals: state.refusals.as_ref(),
         url: UrlRepo(&repo.name),
         base_url: &state.base_url,
     }

@@ -36,6 +36,7 @@ use crate::ports::pypi::PypiFileStore;
 use crate::ports::reclaim::ReclaimStore;
 use crate::ports::referenced::ReferencedKeys;
 use crate::ports::repositories::RepositoryStore;
+use crate::ports::routing::RoutingRuleStore;
 use crate::ports::search::{CachedPackageIndex, SearchIndex};
 use crate::ports::tokens::TokenStore;
 use crate::ports::users::UserStore;
@@ -64,6 +65,7 @@ pub mod pypi;
 pub mod reclaim;
 pub mod rebuild;
 pub mod repositories;
+pub mod routing;
 pub mod rows;
 pub mod search;
 pub mod tokens;
@@ -306,6 +308,10 @@ impl SqliteStores {
 
     pub fn repositories(&self) -> Arc<dyn RepositoryStore> {
         Arc::new(repositories::SqliteRepositoryStore::new(self.pool.clone()))
+    }
+
+    pub fn routing(&self) -> Arc<dyn RoutingRuleStore> {
+        Arc::new(routing::SqliteRoutingRuleStore::new(self.pool.clone()))
     }
 
     pub fn packages(&self) -> Arc<dyn PackageStore> {

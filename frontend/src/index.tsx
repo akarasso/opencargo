@@ -23,6 +23,7 @@ import PackageManagement from './pages/admin/PackageManagement.tsx';
 import AuditLog from './pages/admin/AuditLog.tsx';
 import PolicyReport from './pages/admin/PolicyReport.tsx';
 import McpGovernance from './pages/admin/McpGovernance.tsx';
+import Routing from './pages/admin/Routing.tsx';
 import System from './pages/admin/System.tsx';
 import PasswordChange from './pages/admin/PasswordChange.tsx';
 import Webhooks from './pages/admin/Webhooks.tsx';
@@ -86,6 +87,7 @@ render(
           <Route path="/admin/audit" component={AuditLog} />
           <Route path="/admin/policy" component={PolicyReport} />
           <Route path="/admin/mcp" component={McpGovernance} />
+          <Route path="/admin/routing" component={Routing} />
           <Route path="/admin/system" component={System} />
           <Route path="/admin/password" component={PasswordChange} />
           <Route path="/admin/webhooks" component={Webhooks} />

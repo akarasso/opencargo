@@ -113,6 +113,12 @@ pub struct AppState {
     pub nuget_feed: Arc<dyn crate::ports::nuget::NugetFeedRead>,
     /// NuGet's registration memo, per server: its keys are repository ids.
     pub nuget_documents: Arc<crate::registry::nuget::merged::Documents>,
+    /// The compiled routing rules every member enumeration decides against.
+    pub routing: Arc<crate::registry::routing::RoutingRegistry>,
+    pub routing_rules: Arc<dyn crate::ports::routing::RoutingRuleStore>,
+    /// Where a refused member goes: one audit line per first sighting, then
+    /// counters.
+    pub refusals: Arc<dyn crate::registry::routing::RefusalRecorder>,
     pub oci: Arc<dyn OciStore>,
     pub pypi: Arc<dyn PypiFileStore>,
     /// Bounds the archives inspected at once; inspection is CPU on a blocking thread.
@@ -814,6 +820,34 @@ pub async fn build_state(
     let vuln_scanner: Arc<dyn VulnFeed> = Arc::new(VulnScanner::new(&config.vuln_scan)?);
 
     let events = event_bus();
+    let routing_rules = stores.routing();
+    let routing = Arc::new(
+        crate::registry::routing::RoutingRegistry::load(
+            routing_rules.clone(),
+            config.routing.max_snapshot_age(),
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("routing rules: {e}"))?,
+    );
+    seed_routing_rules(
+        &crate::app::routing::RoutingRules::new(
+            routing_rules.clone(),
+            repos.clone(),
+            routing.clone(),
+            stores.audit(),
+            events.clone(),
+        ),
+        &config.routing.rules,
+    )
+    .await?;
+
+    let refusals: Arc<dyn crate::registry::routing::RefusalRecorder> =
+        Arc::new(crate::app::refusals::RefusalLog::new(
+            stores.audit(),
+            events.clone(),
+            config.routing.refusal_window(),
+        ));
+
     let policy_store = stores.policy();
     let policy = PolicyEngine::new(
         policy_store.clone(),
@@ -848,6 +882,9 @@ pub async fn build_state(
         cached: stores.cached_packages(),
         nuget_feed: stores.nuget_feed(),
         nuget_documents: Arc::new(crate::registry::nuget::merged::documents()),
+        routing,
+        routing_rules,
+        refusals,
         oci: stores.oci(),
         pypi: stores.pypi(),
         archive_permits: Arc::new(tokio::sync::Semaphore::new(ARCHIVE_PERMITS)),
@@ -1370,6 +1407,65 @@ pub async fn start_sso_probe(sso: Arc<crate::app::sso::Sso>, every: std::time::D
     }
 }
 
+/// Write the configured rules into an empty table, and say when the file and
+/// the table disagree — the one case where the file's silence would otherwise
+/// look like an applied change (D11).
+async fn seed_routing_rules(
+    rules: &crate::app::routing::RoutingRules,
+    configured: &[crate::config::RoutingRuleConfig],
+) -> anyhow::Result<()> {
+    if configured.is_empty() {
+        return Ok(());
+    }
+    let drafts: Vec<crate::app::routing::RuleDraft<'_>> = configured
+        .iter()
+        .map(|r| {
+            Ok(crate::app::routing::RuleDraft {
+                name: &r.name,
+                format: r.format.parse()?,
+                patterns: &r.patterns,
+                except: &r.except,
+                effect: &r.effect,
+                targets: &r.targets,
+                confirm_catch_all: r.confirm_catch_all,
+            })
+        })
+        .collect::<Result<Vec<_>, crate::domain::DomainError>>()
+        .map_err(|e| anyhow::anyhow!("routing.rules: {e}"))?;
+    let seeded = rules
+        .seed(&drafts, Utc::now())
+        .await
+        .map_err(|e| anyhow::anyhow!("routing.rules: {e}"))?;
+    if seeded.written > 0 {
+        tracing::info!(rules = seeded.written, "seeded the routing rules from the configuration");
+    }
+    if !seeded.drifted.is_empty() {
+        warn!(
+            rules = ?seeded.drifted,
+            "routing.rules in the configuration differ from the stored rules and are NOT applied:              the file seeds an empty table only; change them through the API"
+        );
+    }
+    Ok(())
+}
+
+/// Re-read the routing rules on a timer. A failure keeps the last valid
+/// snapshot and lets its age run: past `routing.max_snapshot_age` the node
+/// closes the surface the rules protect rather than serve the state from
+/// before a rule it may not have seen.
+pub async fn start_routing_refresh(
+    routing: Arc<crate::registry::routing::RoutingRegistry>,
+    every: std::time::Duration,
+) {
+    let mut tick = tokio::time::interval(every.max(std::time::Duration::from_secs(1)));
+    tick.tick().await;
+    loop {
+        tick.tick().await;
+        if let Err(e) = routing.refresh().await {
+            warn!(error = %e, "failed to refresh the routing rules");
+        }
+    }
+}
+
 /// The password mode and the reauthentication bounds, refused at startup
 /// when they do not parse.
 pub fn gate_policy(sso: &crate::config::SsoConfig) -> anyhow::Result<crate::domain::identity::GatePolicy> {
@@ -1726,6 +1822,20 @@ pub fn build_router(state: AppState) -> Router {
         .route(
             "/api/v1/webhooks/{id}/test",
             post(crate::api::webhooks::test_webhook),
+        )
+        .route(
+            "/api/v1/routing-rules",
+            get(crate::api::routing::list_rules).post(crate::api::routing::create_rule),
+        )
+        .route(
+            "/api/v1/routing-rules/{name}",
+            get(crate::api::routing::get_rule)
+                .put(crate::api::routing::update_rule)
+                .delete(crate::api::routing::delete_rule),
+        )
+        .route(
+            "/api/v1/routing-rules/explain",
+            post(crate::api::routing::explain_route),
         )
         .route("/api/v1/system/audit", get(crate::api::audit::list_audit))
         .route("/api/v1/system/storage", get(crate::api::storage::storage_status))

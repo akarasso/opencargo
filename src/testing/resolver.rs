@@ -18,6 +18,7 @@ use crate::domain::UrlRepo;
 use crate::policy::{Pending, ResolutionRecorder};
 use crate::proxy::{ProxyEngine, Timeouts, TtlConfig, UpstreamCreds};
 use crate::registry::resolve::Cx;
+use crate::registry::routing::{NoRefusals, RoutingRegistry};
 use crate::storage::{
     CheckReport, ObjectList, ObjectMeta, ObjectWriter, ReadStream, StorageBackend, StorageError,
     StoreIdentity, UploadPlan,
@@ -64,6 +65,9 @@ pub struct Resolver {
     pub creds: HashMap<String, UpstreamCreds>,
     pub policy: Recorder,
     pub base_url: String,
+    /// The rules a test scripts; empty unless it says otherwise.
+    pub routing: RoutingRegistry,
+    refusals: NoRefusals,
     repos: Arc<dyn crate::ports::repositories::RepositoryStore>,
     perms: Arc<dyn crate::ports::permissions::PermissionStore>,
     packages: Arc<dyn crate::ports::packages::PackageStore>,
@@ -99,6 +103,8 @@ impl Resolver {
             creds: HashMap::new(),
             policy,
             base_url: "http://localhost:8080".to_string(),
+            routing: RoutingRegistry::default(),
+            refusals: NoRefusals,
             repos: db.repositories(),
             perms: db.perms(),
             packages: db.packages(),
@@ -127,6 +133,8 @@ impl Resolver {
             creds: &self.creds,
             auth,
             anonymous_read: true,
+            routing: &self.routing,
+            refusals: &self.refusals,
             url: UrlRepo(url),
             base_url: &self.base_url,
         }

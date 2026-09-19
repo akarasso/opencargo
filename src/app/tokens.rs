@@ -317,7 +317,7 @@ mod tests {
         TokenScope::Limited {
             grants: vec![crate::domain::Grant {
                 selector: crate::domain::Selector::Repo {
-                    repo: crate::domain::Pattern::parse(pattern).unwrap(),
+                    repo: crate::domain::ScopePattern::parse(pattern).unwrap(),
                 },
                 actions: actions.to_vec(),
                 incarnations: Vec::new(),

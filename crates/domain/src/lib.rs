@@ -19,6 +19,7 @@ pub mod proxy;
 pub mod repository;
 pub mod resolve;
 pub mod scope;
+pub mod routing;
 pub mod user;
 pub mod vulns;
 pub mod webhook;
@@ -44,9 +45,14 @@ pub use proxy::{
 };
 pub use repository::{DistTag, Package, Pending, RepoConfig, RepoSpec, Repository, Version};
 pub use resolve::{CacheRepo, Miss, Outcome, UrlRepo, Visit, Walk, MAX_GROUP_DEPTH};
+pub use routing::{
+    compile_pattern, Decision as RouteDecision, Effect as RouteEffect, MemberRef, Pattern,
+    RefusalSet, RouteSet, RoutingRule,
+};
 pub use scope::{
     narrow, narrowed_source, normalize_account, normalize_repo_name, AdminDomain, Grant,
-    Incarnation, Pattern, ScopeAction, ScopeError, Selector, Subject, TokenScope, MAX_GRANTS,
+    Incarnation, Pattern as ScopePattern, ScopeAction, ScopeError, Selector, Subject, TokenScope,
+    MAX_GRANTS,
 };
 pub use user::{ApiToken, User};
 pub use vulns::{ScanResult, Severity, VulnDetail};

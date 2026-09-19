@@ -27,6 +27,10 @@ fn scripted(repo: &Repository) -> Result<Outcome<String>, ResolveError> {
 impl Leaf for Script {
     type Out = String;
 
+    fn subject(&self) -> Subject<'_> {
+        Subject::of("a-name")
+    }
+
     async fn hosted(
         &self,
         _cx: &Cx<'_>,

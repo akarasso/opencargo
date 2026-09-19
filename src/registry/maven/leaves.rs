@@ -13,7 +13,7 @@ use crate::domain::{CacheRepo, Format, Outcome, Sighting};
 use crate::ports::maven::SumAlgorithm;
 use crate::proxy::engine::Cached;
 use crate::proxy::{IntoPayload, Payload};
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 /// A `maven-metadata.xml` as one member serves it.
 #[derive(Debug, Clone)]
@@ -53,6 +53,14 @@ pub struct MetadataLeaf {
 #[async_trait::async_trait]
 impl Leaf for MetadataLeaf {
     type Out = Member;
+
+    /// A group-level directory listing has no one coordinate: it enumerates.
+    fn subject(&self) -> Subject<'_> {
+        match super::path::MetadataLevel::of(&self.dir) {
+            Some(level) => Subject::built(level.ga()),
+            None => Subject::listing(),
+        }
+    }
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Member>, ResolveError> {
         Ok(match hosted::metadata(cx.maven, cx.packages, member.0.id, &self.dir).await? {
@@ -146,6 +154,10 @@ pub struct FileLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for FileLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::built(self.file.gav.ga())
+    }
     type Out = Payload;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Payload>, ResolveError> {
@@ -176,6 +188,10 @@ pub struct SumLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for SumLeaf {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::built(self.file.gav.ga())
+    }
     type Out = String;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<String>, ResolveError> {

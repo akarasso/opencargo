@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::future::Future;
 use std::pin::Pin;
 
@@ -19,6 +20,7 @@ use crate::ports::repositories::RepositoryStore;
 use crate::ports::search::{CachedPackageIndex, SearchIndex};
 use crate::proxy::auth::{default_token_realms, UpstreamAuth, UpstreamCredsSource};
 use crate::proxy::ProxyEngine;
+use crate::registry::routing::{Gate, RefusalRecorder, Refused, RoutingRegistry, Verdict as RouteVerdict};
 use crate::storage::StorageError;
 
 /// How resolving a name refuses, in the resolver's own vocabulary.
@@ -115,6 +117,13 @@ pub struct Cx<'a> {
     /// The deployment's answer for a public repository, which the walk needs
     /// to judge a member the same way the entry was judged.
     pub anonymous_read: bool,
+    /// The routing rules this node knows. Every site that enumerates members
+    /// opens a gate on it; a site that does not is the one way this control
+    /// could be walked around.
+    pub routing: &'a RoutingRegistry,
+    /// Where a refused member goes; the walk knows the fact and nothing else
+    /// about it.
+    pub refusals: &'a dyn RefusalRecorder,
     pub url: UrlRepo<'a>,
     pub base_url: &'a str,
 }
@@ -163,9 +172,66 @@ impl Upstream {
     }
 }
 
+/// What a leaf is asking for, as routing compares it.
+///
+/// Two variants and no `Option`, deliberately: with an `Option` a leaf added
+/// later that forgot to say what it is would read as an enumeration, and an
+/// enumeration is the one shape a rule cannot filter by name. Here a new leaf
+/// does not compile until it has said.
+///
+/// The subject lives on the leaf and not on [`Cx`] because the leaf is the
+/// only thing that knows it, and because several leaves of different subjects
+/// share one `Cx` — a dist-tag read delegates to a packument read without
+/// rebuilding a context.
+#[derive(Debug)]
+pub enum Subject<'a> {
+    /// One name, unescaped, in the spelling the client asked for.
+    Named(Cow<'a, str>),
+    /// A search, a simple index, a catalogue: a set of names, not one. The
+    /// term, when the client gave one, is what D7 decides on before any
+    /// upstream call.
+    Enumeration { term: Option<&'a str> },
+}
+
+impl<'a> Subject<'a> {
+    pub fn of(name: &'a str) -> Self {
+        Subject::Named(Cow::Borrowed(name))
+    }
+
+    /// For the leaves whose subject is recomposed: a Maven `groupId:artifactId`
+    /// out of a path, a Go module out of its escaped form.
+    pub fn built(name: String) -> Self {
+        Subject::Named(Cow::Owned(name))
+    }
+
+    /// An enumeration the client narrowed with a search term.
+    pub fn searching(term: &'a str) -> Self {
+        Subject::Enumeration { term: Some(term) }
+    }
+
+    /// An enumeration with nothing to narrow it: every member is asked, and
+    /// the merge is what filters.
+    pub fn listing() -> Self {
+        Subject::Enumeration { term: None }
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        match self {
+            Subject::Named(name) => Some(name),
+            Subject::Enumeration { .. } => None,
+        }
+    }
+}
+
 #[async_trait::async_trait]
 pub trait Leaf: Send + Sync {
     type Out: Send;
+
+    /// What this leaf asks for. No default body: an enumeration is a
+    /// decision, and a leaf that could forget to state one would silently
+    /// skip every routing rule.
+    fn subject(&self) -> Subject<'_>;
+
     async fn hosted(
         &self,
         cx: &Cx<'_>,
@@ -191,8 +257,9 @@ pub async fn first_hit<L: Leaf>(
     repo: &Repository,
     leaf: &L,
 ) -> Result<L::Out, ResolveError> {
+    let gate = gate_for(cx, repo, leaf)?;
     let mut w = Walk::new(repo, true);
-    walk(cx, repo, leaf, 0, &mut w).await?;
+    walk(cx, repo, leaf, &gate, 0, &mut w).await?;
     let miss = w.miss();
     let (hits, _) = w.finish();
     hits.into_iter().next().ok_or_else(|| missed(cx.url, miss))
@@ -205,8 +272,9 @@ pub async fn collect<L: Leaf>(
     repo: &Repository,
     leaf: &L,
 ) -> Result<Collected<L::Out>, ResolveError> {
+    let gate = gate_for(cx, repo, leaf)?;
     let mut w = Walk::new(repo, false);
-    walk(cx, repo, leaf, 0, &mut w).await?;
+    walk(cx, repo, leaf, &gate, 0, &mut w).await?;
     if !w.found() {
         if let degraded @ Miss::Degraded(_) = w.miss() {
             return Err(missed(cx.url, degraded));
@@ -214,6 +282,14 @@ pub async fn collect<L: Leaf>(
     }
     let (hits, degraded) = w.finish();
     Ok(Collected { hits, degraded })
+}
+
+/// The routing gate for what this leaf asks of this repository. The format is
+/// the addressed repository's: a group's members all share it, and a proxy
+/// addressed directly is one member of one.
+fn gate_for<L: Leaf>(cx: &Cx<'_>, repo: &Repository, leaf: &L) -> Result<Gate, ResolveError> {
+    let subject = leaf.subject();
+    Ok(Gate::open(cx.routing.snapshot(), repo.fmt()?, &subject)?)
 }
 
 /// The walk says why there was no hit; only the application knows which name
@@ -249,12 +325,25 @@ fn walk<'a, L: Leaf + 'a>(
     cx: &'a Cx<'a>,
     repo: &'a Repository,
     leaf: &'a L,
+    gate: &'a Gate,
     depth: u32,
     w: &'a mut Walk<L::Out>,
 ) -> Pin<Box<dyn Future<Output = Result<(), ResolveError>> + Send + 'a>> {
     Box::pin(async move {
         let member = CacheRepo(repo);
-        match repo.kind()? {
+        let kind = repo.kind()?;
+        if kind != RepoKind::Group {
+            let verdict = gate.admits(cx.repos, repo).await?;
+            if !verdict.admitted() {
+                // A refusal is a skip, never a failure: the walk goes on with
+                // the members a rule allows, and it removes no `Degraded` a
+                // member before it produced (D8).
+                refused(cx, gate, repo, &verdict);
+                w.record(Visit::Nothing);
+                return Ok(());
+            }
+        }
+        match kind {
             RepoKind::Hosted => {
                 let answer = leaf.hosted(cx, member).await;
                 w.record(visit(&repo.name, answer)?);
@@ -266,16 +355,48 @@ fn walk<'a, L: Leaf + 'a>(
                 };
                 w.record(visit(&repo.name, answer)?);
             }
-            RepoKind::Group => walk_members(cx, repo, leaf, depth, w).await?,
+            RepoKind::Group => walk_members(cx, repo, leaf, gate, depth, w).await?,
         }
         Ok(())
     })
+}
+
+/// What a refusal leaves behind. The client is told nothing (I6); an operator
+/// gets a line, and the application gets the fact.
+fn refused(cx: &Cx<'_>, gate: &Gate, member: &Repository, verdict: &RouteVerdict) {
+    if matches!(verdict, RouteVerdict::Stale) {
+        warn!(
+            member = %member.name,
+            "routing snapshot older than routing.max_snapshot_age; refusing a proxy member"
+        );
+    }
+    if !cx.refusals.records() {
+        return;
+    }
+    let Some((_, ident_key)) = gate.keys() else {
+        return;
+    };
+    cx.refusals.refused(Refused {
+        format: gate.format(),
+        addressed: cx.url.0,
+        member: &member.name,
+        ident_key,
+        rules: verdict.rules(),
+        stale: matches!(verdict, RouteVerdict::Stale),
+        user_id: cx.auth.and_then(|a| a.user_id),
+        actor_kind: match cx.auth {
+            None => "anonymous",
+            Some(a) if a.user_id.is_none() => "token",
+            Some(_) => "user",
+        },
+    });
 }
 
 async fn walk_members<'a, L: Leaf + 'a>(
     cx: &'a Cx<'a>,
     group: &Repository,
     leaf: &'a L,
+    gate: &'a Gate,
     depth: u32,
     w: &'a mut Walk<L::Out>,
 ) -> Result<(), ResolveError> {
@@ -309,7 +430,7 @@ async fn walk_members<'a, L: Leaf + 'a>(
         if !w.first_visit(member.id) {
             continue;
         }
-        walk(cx, &member, leaf, depth + 1, w).await?;
+        walk(cx, &member, leaf, gate, depth + 1, w).await?;
     }
     Ok(())
 }
@@ -360,23 +481,36 @@ pub async fn probe_access(cx: &Cx<'_>, repo: &Repository) -> Result<(), ResolveE
 /// caller, in walk order: the caller's permission view of `repo`, which a
 /// memo of merged answers keys by. Reads the configuration and the grants,
 /// never an upstream or a package store.
-pub async fn view(cx: &Cx<'_>, repo: &Repository) -> Result<Vec<Repository>, ResolveError> {
+///
+/// It takes the subject and filters by it exactly as the walk does. Without
+/// that, four things diverge — the view, the walk, the memo key and
+/// `explain` — and a member the walk refuses still has its stamp read here
+/// (D6bis, I3).
+pub async fn view(
+    cx: &Cx<'_>,
+    repo: &Repository,
+    subject: &Subject<'_>,
+) -> Result<Vec<Repository>, ResolveError> {
+    let gate = Gate::open(cx.routing.snapshot(), repo.fmt()?, subject)?;
     let mut seen = std::collections::HashSet::from([repo.id]);
     let mut out = Vec::new();
-    view_of(cx, repo, 0, &mut seen, &mut out).await?;
+    view_of(cx, repo, &gate, 0, &mut seen, &mut out).await?;
     Ok(out)
 }
 
 fn view_of<'a>(
     cx: &'a Cx<'a>,
     repo: &'a Repository,
+    gate: &'a Gate,
     depth: u32,
     seen: &'a mut std::collections::HashSet<i64>,
     out: &'a mut Vec<Repository>,
 ) -> Pin<Box<dyn Future<Output = Result<(), ResolveError>> + Send + 'a>> {
     Box::pin(async move {
         if repo.kind()? != RepoKind::Group {
-            out.push(repo.clone());
+            if gate.admits(cx.repos, repo).await?.admitted() {
+                out.push(repo.clone());
+            }
             return Ok(());
         }
         if depth >= MAX_GROUP_DEPTH {
@@ -390,7 +524,7 @@ fn view_of<'a>(
             if !readable(cx, &member).await? || member.fmt()? != format || !seen.insert(member.id) {
                 continue;
             }
-            view_of(cx, &member, depth + 1, seen, out).await?;
+            view_of(cx, &member, gate, depth + 1, seen, out).await?;
         }
         Ok(())
     })

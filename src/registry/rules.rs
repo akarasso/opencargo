@@ -3,8 +3,15 @@
 //! published, and only cargo folds the case of a name.
 
 use crate::domain::{
-    validate_oci_tag, validate_package_name, validate_version, DomainError, Format, FormatRules,
+    compile_pattern, validate_oci_tag, validate_package_name, validate_version, DomainError,
+    Format, FormatRules, Pattern,
 };
+
+/// The common half of every format's routing canonicalization: ASCII case
+/// folded away. What each format adds to it is written in its own impl.
+fn ascii_fold(name: &str) -> String {
+    name.to_ascii_lowercase()
+}
 
 pub struct NpmRules;
 pub struct CargoRules;
@@ -13,6 +20,22 @@ pub struct OciRules;
 pub struct MavenRules;
 
 impl FormatRules for NpmRules {
+    /// The npm store serves a name byte for byte (`NameMatch::Exact`), so
+    /// identity is the spelling itself.
+    fn ident_key(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    /// ASCII case only: npmjs refuses two names differing in case alone, so
+    /// folding it cannot merge two packages that both exist upstream.
+    fn match_key(&self, name: &str) -> String {
+        ascii_fold(name)
+    }
+
+    fn canonical_pattern(&self, pattern: &str) -> Result<Pattern, DomainError> {
+        compile_pattern(pattern, ascii_fold)
+    }
+
     fn validate(&self, name: &str) -> Result<(), DomainError> {
         validate_package_name("npm", name)
     }
@@ -35,6 +58,21 @@ impl FormatRules for NpmRules {
 }
 
 impl FormatRules for CargoRules {
+    /// The cargo store matches case-insensitively, so a case class is one row.
+    fn ident_key(&self, name: &str) -> String {
+        ascii_fold(name)
+    }
+
+    /// Plus `_` folded to `-`: crates.io refuses the pair `a_b`/`a-b`, so the
+    /// extra fold cannot close a name that really exists upstream.
+    fn match_key(&self, name: &str) -> String {
+        ascii_fold(name).replace('_', "-")
+    }
+
+    fn canonical_pattern(&self, pattern: &str) -> Result<Pattern, DomainError> {
+        compile_pattern(pattern, |p| ascii_fold(p).replace('_', "-"))
+    }
+
     fn validate(&self, name: &str) -> Result<(), DomainError> {
         validate_package_name("cargo", name)
     }
@@ -57,6 +95,20 @@ impl FormatRules for CargoRules {
 }
 
 impl FormatRules for GoRules {
+    /// Routing sees the module path already unescaped, and the Go store holds
+    /// `github.com/acme/tool` and `github.com/Acme/tool` as two rows.
+    fn ident_key(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn match_key(&self, name: &str) -> String {
+        ascii_fold(name)
+    }
+
+    fn canonical_pattern(&self, pattern: &str) -> Result<Pattern, DomainError> {
+        compile_pattern(pattern, ascii_fold)
+    }
+
     fn validate(&self, name: &str) -> Result<(), DomainError> {
         validate_package_name("go", name)
     }
@@ -80,6 +132,20 @@ impl FormatRules for GoRules {
 
 /// An OCI "version" is a tag.
 impl FormatRules for OciRules {
+    /// The only spelling that reaches an OCI route is already lowercase, so
+    /// the two keys coincide and neither coarsens anything.
+    fn ident_key(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn match_key(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn canonical_pattern(&self, pattern: &str) -> Result<Pattern, DomainError> {
+        compile_pattern(pattern, str::to_string)
+    }
+
     fn validate(&self, name: &str) -> Result<(), DomainError> {
         validate_package_name("oci", name)
     }
@@ -104,6 +170,18 @@ impl FormatRules for OciRules {
 /// A name is `groupId:artifactId`, both case-sensitive; a version is one
 /// path segment, compared as published.
 impl FormatRules for MavenRules {
+    fn ident_key(&self, name: &str) -> String {
+        name.to_string()
+    }
+
+    fn match_key(&self, name: &str) -> String {
+        ascii_fold(name)
+    }
+
+    fn canonical_pattern(&self, pattern: &str) -> Result<Pattern, DomainError> {
+        compile_pattern(pattern, ascii_fold)
+    }
+
     fn validate(&self, name: &str) -> Result<(), DomainError> {
         let invalid = || DomainError::InvalidName(format!("invalid maven coordinates: '{name}'"));
         let (group, artifact) = name.split_once(':').ok_or_else(invalid)?;
@@ -246,5 +324,100 @@ mod tests {
         for format in Format::ALL {
             assert!(rules_of(format).is_ok(), "{format:?}");
         }
+    }
+
+    /// Every spelling that reaches the read path of its format: the space the
+    /// relation below has to hold over, not the narrower publish space.
+    fn read_spellings(format: Format) -> &'static [&'static str] {
+        match format {
+            Format::Npm => &[
+                "@acme/foo",
+                "@ACME/foo",
+                "@Acme/Foo",
+                "left-pad",
+                "JSONStream",
+                "jsonstream",
+                "weird~name!(1)*",
+            ],
+            Format::Cargo => &["acme_lib", "Acme_Lib", "acme-lib", "ACME-LIB", "serde"],
+            Format::Go => &[
+                "github.com/acme/tool",
+                "github.com/Acme/tool",
+                "github.com/ACME/TOOL",
+                "gopkg.in/yaml.v3",
+            ],
+            Format::Oci => &["acme/app", "acme/app-base", "library/nginx"],
+            Format::Maven => &["com.acme:lib", "com.Acme:lib", "COM.ACME:LIB", "org.x:y"],
+            Format::Pypi => &["acme-lib", "Acme.Lib", "ACME__LIB", "acme_lib", "requests"],
+            Format::Nuget => &["Acme.Lib", "acme.lib", "ACME.LIB", "Newtonsoft.Json"],
+            Format::Mcp => &["io.acme/server", "io.acme/other-server", "com.example/tool"],
+        }
+    }
+
+    /// I7: `ker(ident_key) ⊆ ker(match_key)`. Two spellings the store serves
+    /// as one row always share a pattern key, so coarsening can only ever
+    /// refuse more — never let a spelling through.
+    #[test]
+    fn the_match_key_coarsens_store_identity_in_every_format() {
+        for format in Format::ALL {
+            let r = rules_of(format).unwrap();
+            let names = read_spellings(format);
+            for a in names {
+                for b in names {
+                    if r.ident_key(a) == r.ident_key(b) {
+                        assert_eq!(
+                            r.match_key(a),
+                            r.match_key(b),
+                            "{format:?}: {a} and {b} are one row but two pattern keys"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The seam of D0quater: a pattern is canonicalized by the same function
+    /// as the key, so a star substituted with any admissible spelling still
+    /// matches.
+    #[test]
+    fn a_pattern_canonicalizes_like_the_key_it_is_compared_to() {
+        let cases: &[(Format, &str, &[&str], &[&str])] = &[
+            (Format::Npm, "@acme/*", &["@acme/foo", "@ACME/foo"], &["@acmex/foo"]),
+            (Format::Cargo, "acme_*", &["acme-lib", "Acme_Lib"], &["acmelib"]),
+            (
+                Format::Go,
+                "github.com/acme/*",
+                &["github.com/acme/tool", "github.com/Acme/tool"],
+                &["github.com/acmex/tool"],
+            ),
+            (Format::Oci, "acme/*", &["acme/app"], &["acmefoo/app"]),
+            (Format::Maven, "com.acme:*", &["com.acme:lib", "com.Acme:lib"], &["com.acmex:lib"]),
+            (Format::Pypi, "Acme_*", &["acme-lib", "ACME.LIB"], &["acmelib"]),
+            (Format::Nuget, "Acme.*", &["acme.lib", "ACME.LIB"], &["acmex.lib"]),
+        ];
+        for (format, pattern, inside, outside) in cases {
+            let r = rules_of(*format).unwrap();
+            let compiled = r.canonical_pattern(pattern).unwrap();
+            for name in *inside {
+                assert!(compiled.matches(&r.match_key(name)), "{format:?}: {name}");
+            }
+            for name in *outside {
+                assert!(!compiled.matches(&r.match_key(name)), "{format:?}: {name}");
+            }
+        }
+    }
+
+    /// D4's alphabet, on the one format whose read path admits `*` and `!` as
+    /// name characters: a key is compared literally, so no name escapes
+    /// through its own metacharacters.
+    #[test]
+    fn a_name_never_escapes_through_its_own_metacharacters() {
+        let r = rules_of(Format::Npm).unwrap();
+        let legacy = "weird~name!(1)*";
+        assert!(crate::domain::validate_npm_read_name(legacy).is_ok());
+        let compiled = r.canonical_pattern("weird*").unwrap();
+        assert!(compiled.matches(&r.match_key(legacy)), "filtered, not interpreted");
+        assert!(r.canonical_pattern("weird\\*name").is_err(), "no escape exists");
+        assert!(r.canonical_pattern("").is_err());
     }
 }

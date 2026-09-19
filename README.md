@@ -95,6 +95,10 @@ the enterprise ones.
   blobs) forever; a stale copy is served with `Warning: 110` when the
   upstream is down, and an unreachable upstream is a `502`, never a silent
   `404`.
+- **Routing rules** against dependency confusion: `@acme/*` is served by your
+  hosted repository or by nobody, whatever the spelling and whichever URL is
+  used; a refused member is never asked, and a client gets the same 404 the
+  group already answered. See [docs/routing.md](docs/routing.md).
 - **Promotion**: move a version from `dev` to `prod` without re-uploading or
   changing lockfiles; full audit trail.
 - **Permissions**: roles plus a per-user × per-repository matrix, editable in
@@ -398,6 +402,11 @@ fail_closed = false                # with block_on_critical: OSV down = 503, not
 osv_base_url = "https://api.osv.dev"
 max_concurrency = 8
 
+[routing]                          # group routing rules; see docs/routing.md
+refresh_secs = 30
+max_snapshot_age_secs = 300        # past it, the proxy members a rule speaks for are refused
+refusal_window_secs = 3600         # how long one refused (name, repo, member) stays deduplicated
+
 [policy.npm-proxy]                 # per proxy repository, all rules off by default
 min_release_age = "48h"            # Ns | Nm | Nh | Nd
 osv_severity = "high"              # low | medium | high | critical; needs vuln_scan.enabled
@@ -601,6 +610,8 @@ group whose proxy member fronts another instance; locally they print
   writes beyond what it keeps, measured, and what the database does about it.
 - [docs/performance.md](docs/performance.md): what one process costs per
   workload, how it was measured, and what was not.
+- [docs/routing.md](docs/routing.md): routing rules, the spellings they cover,
+  and what a refusal does and does not say.
 - [README.fr.md](README.fr.md): full French guide.
 - [SECURITY.md](SECURITY.md): reporting, scope, hardening checklist.
 - [CHANGELOG.md](CHANGELOG.md).

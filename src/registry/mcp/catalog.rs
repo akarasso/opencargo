@@ -19,7 +19,7 @@ use crate::domain::{Format, Repository};
 use crate::error::{AppError, AppResult};
 use crate::ports::mcp::{CatalogRow, PageQuery};
 use crate::registry::cx;
-use crate::registry::resolve::view;
+use crate::registry::resolve::{view, Subject};
 use crate::server::AppState;
 
 const DEFAULT_LIMIT: i64 = 30;
@@ -37,7 +37,7 @@ pub async fn open(state: &AppState, name: &str, auth: Option<&AuthUser>) -> AppR
 
 /// The members a read walks, in group order, and the gate over them.
 pub async fn scope(state: &AppState, repo: &Repository, auth: Option<&AuthUser>) -> AppResult<(Vec<Repository>, Gates)> {
-    let members = view(&cx(state, auth, repo), repo).await?;
+    let members = view(&cx(state, auth, repo), repo, &Subject::listing()).await?;
     let gates = Gates::load(state.repos.as_ref(), state.mcp.as_ref(), &state.mcp_settings, repo).await?;
     Ok((members, gates))
 }

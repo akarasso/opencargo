@@ -14,7 +14,7 @@ use crate::domain::{CacheRepo, Outcome};
 use crate::error::AppResult;
 use crate::ports::nuget::FeedQuery;
 use crate::registry::cx;
-use crate::registry::resolve::{collect, Collected, Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Collected, Cx, Leaf, ResolveError, Subject, Upstream, collect};
 use crate::server::AppState;
 
 use super::model::{self, Entry};
@@ -77,6 +77,15 @@ pub struct SearchLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for SearchLeaf {
+
+    /// The one enumeration in the tree that really leaves for an upstream:
+    /// the term decides before the call, never after it.
+    fn subject(&self) -> Subject<'_> {
+        match self.params.q.as_deref() {
+            Some(term) => Subject::searching(term),
+            None => Subject::listing(),
+        }
+    }
     type Out = Found;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Found>, ResolveError> {

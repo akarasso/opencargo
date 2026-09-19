@@ -8,7 +8,7 @@ use crate::policy::{self, Source};
 use crate::ports::packages::NameMatch;
 use crate::proxy::strategy::CacheKey;
 use crate::proxy::{IntoPayload, Payload};
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 use super::packument::{dist_tags_map, hosted_packument};
 use super::render::{self, Flavor};
@@ -55,6 +55,10 @@ impl PackumentLeaf {
 #[async_trait::async_trait]
 impl Leaf for PackumentLeaf {
     type Out = Payload;
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
 
     async fn hosted(
         &self,
@@ -139,6 +143,10 @@ pub struct TarballLeaf {
 impl Leaf for TarballLeaf {
     type Out = Payload;
 
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
+
     async fn hosted(
         &self,
         cx: &Cx<'_>,
@@ -197,6 +205,10 @@ pub struct DistTagsLeaf {
 impl Leaf for DistTagsLeaf {
     type Out = Value;
 
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.name)
+    }
+
     async fn hosted(
         &self,
         cx: &Cx<'_>,
@@ -250,6 +262,12 @@ pub struct SearchLeaf {
 
 #[async_trait::async_trait]
 impl Leaf for SearchLeaf {
+
+    /// A search enumerates: the term is what D7 decides on, and the merge
+    /// filters what comes back.
+    fn subject(&self) -> Subject<'_> {
+        Subject::searching(&self.text)
+    }
     type Out = Vec<Value>;
 
     async fn hosted(

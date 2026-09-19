@@ -11,7 +11,7 @@ use crate::domain::{CacheRepo, Format, Outcome, Sighting};
 use crate::policy::{self, Source};
 use crate::ports::pypi::{PypiFile, PypiFileStore};
 use crate::proxy::Payload;
-use crate::registry::resolve::{Cx, Leaf, ResolveError, Upstream};
+use crate::registry::resolve::{Cx, Leaf, ResolveError, Subject, Upstream};
 
 use super::memo::{PageKey, PageMemo};
 use super::names::parse_filename;
@@ -177,6 +177,10 @@ pub struct PageLeaf<'a> {
 
 #[async_trait::async_trait]
 impl Leaf for PageLeaf<'_> {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.project)
+    }
     type Out = Page;
 
     async fn hosted(&self, _cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Page>, ResolveError> {
@@ -227,6 +231,10 @@ pub struct FileLeaf<'a> {
 
 #[async_trait::async_trait]
 impl Leaf for FileLeaf<'_> {
+
+    fn subject(&self) -> Subject<'_> {
+        Subject::of(&self.project)
+    }
     type Out = Served;
 
     async fn hosted(&self, cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Served>, ResolveError> {
@@ -312,6 +320,12 @@ pub struct IndexLeaf<'a> {
 
 #[async_trait::async_trait]
 impl Leaf for IndexLeaf<'_> {
+
+    /// The simple index lists every project a member holds, with nothing
+    /// to narrow it: the merge is what filters.
+    fn subject(&self) -> Subject<'_> {
+        Subject::listing()
+    }
     type Out = Vec<String>;
 
     async fn hosted(&self, _cx: &Cx<'_>, member: CacheRepo<'_>) -> Result<Outcome<Vec<String>>, ResolveError> {

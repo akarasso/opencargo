@@ -29,6 +29,7 @@ pub mod pypi;
 pub mod reclaim;
 pub mod referenced;
 pub mod repositories;
+pub mod routing;
 pub mod search;
 pub mod secrets;
 pub mod signing;

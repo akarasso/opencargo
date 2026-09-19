@@ -34,6 +34,8 @@ pub struct Config {
     /// MCP governance per `mcp` repository name.
     #[serde(default)]
     pub mcp: HashMap<String, McpConfig>,
+    #[serde(default)]
+    pub routing: RoutingConfig,
 }
 
 // ---------------------------------------------------------------------------
@@ -120,6 +122,55 @@ impl Default for PublishLimitsConfig {
             per_window: None,
             format: HashMap::new(),
             repository: HashMap::new(),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Group routing rules
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default)]
+pub struct RoutingConfig {
+    /// How often a node re-reads the rules.
+    pub refresh_secs: u64,
+    /// How long a node serves a snapshot nothing has refreshed. Past it the
+    /// proxy members of every format a rule speaks for are refused, rather
+    /// than serving the state from before a rule this node may not have seen.
+    /// Several refresh periods, so a single failed read is not an outage.
+    pub max_snapshot_age_secs: u64,
+    /// How long one refused (name, repository, member) stays deduplicated
+    /// before it is worth an audit line again.
+    pub refusal_window_secs: u64,
+    /// Rules to write **into an empty table**, once. The file seeds a
+    /// deployment; it never owns it afterwards, so a rule deleted here does
+    /// not come back and a rule hardened here has no effect. A drift between
+    /// the two is named in a startup note rather than applied.
+    pub rules: Vec<RoutingRuleConfig>,
+}
+
+#[derive(Debug, Deserialize, Clone)]
+pub struct RoutingRuleConfig {
+    pub name: String,
+    pub format: String,
+    pub patterns: Vec<String>,
+    #[serde(default)]
+    pub except: Vec<String>,
+    pub effect: String,
+    #[serde(default)]
+    pub targets: Vec<String>,
+    #[serde(default)]
+    pub confirm_catch_all: bool,
+}
+
+impl Default for RoutingConfig {
+    fn default() -> Self {
+        Self {
+            refresh_secs: 30,
+            max_snapshot_age_secs: 300,
+            refusal_window_secs: 3600,
+            rules: Vec::new(),
         }
     }
 }
@@ -263,6 +314,20 @@ impl McpConfig {
             );
         }
         Ok(())
+    }
+}
+
+impl RoutingConfig {
+    pub fn refresh(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refresh_secs)
+    }
+
+    pub fn max_snapshot_age(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.max_snapshot_age_secs)
+    }
+
+    pub fn refusal_window(&self) -> std::time::Duration {
+        std::time::Duration::from_secs(self.refusal_window_secs)
     }
 }
 
