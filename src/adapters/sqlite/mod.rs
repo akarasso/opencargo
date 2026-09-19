@@ -97,6 +97,21 @@ pub(crate) fn read_ts(
     })
 }
 
+/// Pages of write-ahead log a commit may find before it checkpoints, 16 MiB
+/// at the 4 KiB page this schema uses.
+///
+/// A checkpoint copies each page the log holds **once**, whatever the window,
+/// so a publish rewriting the same hot leaf writes it to the log every time
+/// and to the database once per window: four times the default window is a
+/// quarter of the copies. It costs disk, not durability — every commit is
+/// still in the log, fsynced, before the client is answered.
+pub(crate) const WAL_AUTOCHECKPOINT_PAGES: &str = "4000";
+
+/// What the log file is truncated back to once a checkpoint has emptied it,
+/// four windows. The default is no limit, which leaves a burst's high-water
+/// mark on disk for the life of the installation.
+pub(crate) const WAL_SIZE_LIMIT_BYTES: &str = "67108864";
+
 /// Create a connection pool and enable WAL mode.
 pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
@@ -105,6 +120,8 @@ pub async fn connect(url: &str) -> anyhow::Result<SqlitePool> {
     let opts = SqliteConnectOptions::from_str(url)?
         .create_if_missing(true)
         .journal_mode(SqliteJournalMode::Wal)
+        .pragma("wal_autocheckpoint", WAL_AUTOCHECKPOINT_PAGES)
+        .pragma("journal_size_limit", WAL_SIZE_LIMIT_BYTES)
         // Wait for a busy writer instead of failing immediately: instant
         // SQLITE_BUSY errors under load used to surface as spurious 401s in
         // the auth middleware.
@@ -384,3 +401,7 @@ impl SqliteStores {
         Arc::new(dashboard::SqliteDashboardRead::new(self.pool.clone()))
     }
 }
+
+#[cfg(test)]
+#[path = "connect_tests.rs"]
+mod connect_tests;
