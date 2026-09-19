@@ -18,6 +18,7 @@ pub mod faults;
 pub mod import;
 pub mod nuget;
 pub mod upstream_tap;
+pub mod publish;
 
 use std::collections::HashMap;
 use std::ffi::OsStr;
