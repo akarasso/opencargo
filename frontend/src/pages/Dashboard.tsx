@@ -10,7 +10,7 @@ import { createLiveResource } from '../core/stores/live.ts';
 import { session } from '../core/stores/session.ts';
 import { onEvent, wsStatus } from '../core/ws.ts';
 import { timeAgo } from '../core/format.ts';
-import { connectLine, endpointOf, exampleRepo } from '../core/quickstart.ts';
+import { clientLabel, connectLine, endpointOf, exampleRepo } from '../core/quickstart.ts';
 import type { RepoFormat } from '../core/types.ts';
 
 interface ManifestRow {
@@ -99,7 +99,7 @@ export default function Dashboard() {
     return order.map((format) => {
       const owned = visible.find((r) => r.format === format);
       return {
-        format,
+        label: clientLabel(format),
         repo: owned?.name,
         line: connectLine(format, owned?.name ?? exampleRepo(format), at),
       };
@@ -289,13 +289,13 @@ export default function Dashboard() {
                   {(entry) => (
                     <div>
                       <div class="row" style={{ 'justify-content': 'space-between' }}>
-                        <div class="side-label">{entry.format}</div>
+                        <div class="side-label">{entry.label}</div>
                         <Show when={!entry.repo}>
                           <span class="dim small">example</span>
                         </Show>
                       </div>
                       <div class="code-line">
-                        <code class="truncate">{entry.line}</code>
+                        <code class="grow truncate">{entry.line}</code>
                         <CopyButton text={entry.line} label="" />
                       </div>
                     </div>

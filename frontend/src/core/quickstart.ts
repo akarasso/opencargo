@@ -1,7 +1,3 @@
-// ---------------------------------------------------------------------------
-// How a client is pointed at a repository, per format (pure functions).
-// ---------------------------------------------------------------------------
-
 import type { RepoFormat } from './types.ts';
 
 export interface QuickstartStep {
@@ -13,13 +9,20 @@ export interface QuickstartStep {
 export interface Endpoint {
   base: string;
   host: string;
+  scheme: string;
 }
 
 export function endpointOf(location: { protocol: string; host: string }): Endpoint {
-  return { base: `${location.protocol}//${location.host}`, host: location.host };
+  return {
+    base: `${location.protocol}//${location.host}`,
+    host: location.host,
+    scheme: location.protocol,
+  };
 }
 
 interface Client {
+  /** What a user calls the toolchain, which is not always the format's name. */
+  label: string;
   /** Repository name used when none exists yet. */
   example: string;
   /** The one line that connects a client to this repository. */
@@ -29,6 +32,7 @@ interface Client {
 
 const clients: Record<RepoFormat, Client> = {
   npm: {
+    label: 'npm / pnpm',
     example: 'npm-all',
     connect: (repo, at) => `registry=${at.base}/${repo}/`,
     steps: (repo, at) => [
@@ -39,6 +43,7 @@ const clients: Record<RepoFormat, Client> = {
     ],
   },
   cargo: {
+    label: 'cargo',
     example: 'cargo-all',
     connect: (repo, at) => `index = "sparse+${at.base}/${repo}/index/"`,
     steps: (repo, at) => [
@@ -52,6 +57,7 @@ const clients: Record<RepoFormat, Client> = {
     ],
   },
   oci: {
+    label: 'docker',
     example: 'oci-private',
     connect: (repo, at) => `${at.host}/${repo}/image:tag`,
     steps: (repo, at) => [
@@ -61,6 +67,7 @@ const clients: Record<RepoFormat, Client> = {
     ],
   },
   go: {
+    label: 'go',
     example: 'go-all',
     connect: (repo, at) => `GOPROXY=${at.base}/${repo},direct`,
     steps: (repo, at) => [
@@ -71,6 +78,7 @@ const clients: Record<RepoFormat, Client> = {
     ],
   },
   pypi: {
+    label: 'pip / twine',
     example: 'pypi-all',
     connect: (repo, at) => `--index-url ${at.base}/${repo}/simple/`,
     steps: (repo, at) => [
@@ -80,7 +88,7 @@ const clients: Record<RepoFormat, Client> = {
       },
       {
         label: '2 · Install (the Basic user is the literal __token__)',
-        command: `pip install --index-url "https://__token__:$TOKEN@${at.host}/${repo}/simple/" demo`,
+        command: `pip install --index-url "${at.scheme}//__token__:$TOKEN@${at.host}/${repo}/simple/" demo`,
       },
       {
         label: '3 · Publish',
@@ -89,6 +97,7 @@ const clients: Record<RepoFormat, Client> = {
     ],
   },
   maven: {
+    label: 'maven / gradle',
     example: 'maven-all',
     connect: (repo, at) => `${at.base}/maven/${repo}/`,
     steps: (repo, at) => [
@@ -108,6 +117,7 @@ const clients: Record<RepoFormat, Client> = {
     ],
   },
   nuget: {
+    label: 'dotnet',
     example: 'nuget-all',
     connect: (repo, at) => `${at.base}/${repo}/v3/index.json`,
     steps: (repo, at) => [
@@ -120,6 +130,7 @@ const clients: Record<RepoFormat, Client> = {
     ],
   },
   mcp: {
+    label: 'mcp',
     example: 'mcp-mirror',
     connect: (repo, at) => `${at.base}/${repo}/v0.1/servers`,
     steps: (repo, at) => [
@@ -138,6 +149,10 @@ const clients: Record<RepoFormat, Client> = {
 
 export function exampleRepo(format: RepoFormat): string {
   return clients[format].example;
+}
+
+export function clientLabel(format: RepoFormat): string {
+  return clients[format].label;
 }
 
 /** The single line that connects a client, for a compact list. */

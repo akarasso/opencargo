@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { RepoFormat } from './types.ts';
-import { connectLine, endpointOf, exampleRepo, quickstart } from './quickstart.ts';
+import { clientLabel, connectLine, endpointOf, exampleRepo, quickstart } from './quickstart.ts';
 
 const at = endpointOf({ protocol: 'https:', host: 'registry.example.com' });
 
@@ -11,7 +11,7 @@ const formats: RepoFormat[] = ['npm', 'cargo', 'oci', 'go', 'pypi', 'maven', 'nu
 describe('quickstart', () => {
   it('covers every repository format', () => {
     for (const format of formats) {
-      expect(connectLine(format, 'r', at)).toContain('r');
+      expect(connectLine(format, 'team-repo', at)).toContain('team-repo');
       expect(quickstart(format, 'r', at).length).toBeGreaterThan(0);
       expect(exampleRepo(format)).not.toBe('');
     }
@@ -53,5 +53,21 @@ describe('quickstart', () => {
   it('keeps an endpoint plain HTTP when that is how the server answers', () => {
     const local = endpointOf({ protocol: 'http:', host: 'localhost:6789' });
     expect(connectLine('npm', 'npm-all', local)).toBe('registry=http://localhost:6789/npm-all/');
+    // No step may spell a scheme of its own: PyPI's credential URL is the one
+    // that is tempting to hardcode as https.
+    for (const format of formats) {
+      for (const step of quickstart(format, 'r', local)) {
+        expect(step.command).not.toContain('https://localhost:6789');
+        expect(step.command).not.toContain('https://r');
+      }
+    }
+    const pip = quickstart('pypi', 'pypi-all', local).map((s) => s.command).join('\n');
+    expect(pip).toContain('http://__token__:$TOKEN@localhost:6789/pypi-all/simple/');
+  });
+
+  it('gives every format a label a user would recognise', () => {
+    expect(clientLabel('oci')).toBe('docker');
+    expect(clientLabel('npm')).toBe('npm / pnpm');
+    for (const format of formats) expect(clientLabel(format)).not.toBe('');
   });
 });
