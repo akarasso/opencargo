@@ -5,8 +5,9 @@ NuGet and raw files, in one binary.**
 
 Host your private packages, proxy and cache the public registries, promote
 releases from dev to prod, one binary for the whole team. No JVM, no Postgres,
-no telemetry. SQLite inside: 16 MiB of RAM at rest and 17 MiB on disk —
-[measured](docs/performance.md), not estimated.
+no telemetry. SQLite inside: 19 MiB of RAM at rest, and 44 MiB at the peak of a
+warm `npm install` of 109 packages — [measured](docs/performance.md), not
+estimated.
 
 [![CI](https://github.com/akarasso/opencargo/actions/workflows/ci.yml/badge.svg)](https://github.com/akarasso/opencargo/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)

@@ -98,56 +98,68 @@ The real clients are exercised elsewhere, by `make test-e2e`.
 
 ## Results
 
-One run, `scripts/bench.sh --with-image`, at commit `aa69c3e` (the only file
-the tree carried uncommitted was this page). AMD Ryzen 5 9600X, 12 threads,
+One run, `make bench`, at commit `ccfa134`. AMD Ryzen 5 9600X, 12 threads,
 30 GiB RAM, Linux 7.0.0-31, work directory on ext4, rustc 1.93.0, Docker
-29.6.2, pnpm 10.25.0. Load average 0.20 at the start and 1.48 at the end: the
+29.6.2, pnpm 10.25.0. Load average 2.24 at the start and 2.43 at the end: the
 machine was otherwise idle. Settings: 15 s settle, concurrency 50, 1 000 reads,
 50 publishes per format, 10 000 versions, 16 KiB payloads, the shipped
 `RUST_LOG`.
 
-> **These rows predate two fixes that land in the same release** — the npm
-> proxy's packument rendering and the publish path's write amplification — so
-> `npm-install-warm`'s peak and every `written` column are the *before* of a
-> problem that was measured and fixed, not what this build costs. They are
-> re-measured on the merged tree before any of them is quoted anywhere else;
-> until that run replaces this table, read it as history.
+Two figures moved against the previous run of this page, and in opposite
+directions:
+
+| | before | now |
+|---|---|---|
+| `npm-install-warm`, peak RSS | 142.3 MiB | **44.4 MiB** |
+| `growth-10000-versions`, written | 630.8 MiB | **419.2 MiB** |
+| `idle`, RSS | 16.2 MiB | **19.4 MiB** |
+
+The first two are the two fixes that shipped in the same release, reproduced
+here independently of the branches that made them: the packument path no longer
+builds a tree over the whole document, and the publish path checkpoints on a
+wider window with two redundant indexes gone.
+
+The third is the cost of what else shipped: routing keeps a rule snapshot in
+memory, search keeps an index of what the proxy has served, and tokens carry a
+scope. **An idle server is three megabytes heavier than it was**, and that is
+the honest half of the same release.
 
 | scenario | storage | wall (s) | peak RSS (MiB) | steady RSS (MiB) | CPU avg % | CPU peak % | CPU (s) | written (MiB) | db (KiB) | storage (MiB) | reqs | err | p50 (ms) | p95 (ms) |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
-| idle | fs | 0 | 16.2 | 16.2 | 0.0 | 0.0 | 0.000 | 0 | 1991 | 0 | n/a | n/a | n/a | n/a |
-| npm-install-cold | fs | 1.2 | 91.3 | 91.3 | 2.0 | 89.3 | 0.330 | 21 | 4881 | 14.7 | 210 | 0 | n/a | n/a |
-| npm-install-warm | fs | 1.12 | 142.3 | 142.3 | 1.0 | 69.2 | 0.170 | 4.3 | 4929 | 14.7 | 210 | 0 | n/a | n/a |
-| cargo-fetch-cold | fs | 2.89 | 24.9 | 24.9 | 1.4 | 19.9 | 0.260 | 24.4 | 4611 | 19.2 | 118 | 0 | n/a | n/a |
-| cargo-fetch-warm | fs | 1.64 | 26.9 | 26.9 | 0.8 | 29.8 | 0.130 | 3.6 | 4631 | 19.2 | 118 | 0 | n/a | n/a |
-| oci-pull-cold | fs | 3.47 | 20.8 | 20.8 | 3.4 | 128.9 | 0.640 | 124.8 | 2313 | 124.4 | 16 | 0 | n/a | n/a |
-| oci-pull-warm | fs | 1.53 | 22.1 | 22.1 | 1.3 | 109.0 | 0.210 | 0.3 | 2502 | 124.4 | 16 | 0 | n/a | n/a |
-| publish-npm | fs | 0.16 | 17.3 | 17.3 | 0.1 | 19.9 | 0.020 | 3.9 | 4612 | 0.5 | 30 | 0 | 4.64 | 9.29 |
-| publish-cargo | fs | 0.26 | 17.8 | 17.8 | 0.3 | 19.8 | 0.040 | 5.5 | 4599 | 0.8 | 50 | 0 | 4.82 | 7.56 |
-| publish-pypi | fs | 0.19 | 17.9 | 17.9 | 0.2 | 19.9 | 0.030 | 4.1 | 4620 | 0.5 | 30 | 0 | 5.92 | 8.88 |
-| publish-maven | fs | 0.85 | 18.2 | 18.2 | 0.8 | 29.8 | 0.130 | 15.7 | 4708 | 0.8 | 150 | 0 | 5.52 | 11.74 |
-| publish-nuget | fs | 0.25 | 18.1 | 18.1 | 0.2 | 19.9 | 0.030 | 5.6 | 4656 | 0.8 | 50 | 0 | 4.62 | 7.23 |
-| publish-oci | fs | 2.71 | 20.4 | 20.4 | 1.1 | 9.9 | 0.190 | 18.2 | 4692 | 0.8 | 50 | 0 | 53.11 | 56.18 |
-| warm-reads-c50 | fs | 2.54 | 86.8 | 86.8 | 13.8 | 129.0 | 2.410 | 12.4 | 4579 | 2.8 | 1000 | 0 | 102.95 | 110.56 |
-| fs-publish | fs | 0.26 | 17.6 | 17.6 | 0.1 | 9.9 | 0.010 | 3.9 | 4612 | 0.5 | 30 | 0 | 7.97 | 13.10 |
-| fs-read | fs | 2.61 | 20.7 | 20.7 | 1.3 | 19.9 | 0.220 | 7.9 | 4616 | 0.5 | 1000 | 0 | 102.94 | 135.31 |
-| s3-publish | s3 | 0.28 | 18.1 | 18.1 | 0.2 | 9.9 | 0.030 | 3.3 | 4612 | 0.9 | 30 | 0 | 8.95 | 12.97 |
-| s3-read | s3 | 2.34 | 21.9 | 21.9 | 1.5 | 19.9 | 0.260 | 7.9 | 4616 | 0.9 | 1000 | 0 | 101.96 | 136.44 |
-| growth-10000-versions | fs | 72.06 | 40.7 | 40.7 | 24.5 | 59.6 | 21.370 | 630.8 | 12644 | 12.3 | 10000 | 0 | 27.85 | 35.87 |
+| idle | fs | 0 | 19.4 | 19.4 | 0.0 | 0.0 | 0.000 | 0 | 2732 | 0 | n/a | n/a | n/a | n/a |
+| npm-install-cold | fs | 1.93 | 42.9 | 42.9 | 2.5 | 69.3 | 0.420 | 32.5 | 12738 | 20.5 | 210 | 0 | n/a | n/a |
+| npm-install-warm | fs | 1.37 | 44.4 | 44.4 | 0.7 | 19.8 | 0.110 | 8.1 | 18100 | 20.5 | 210 | 0 | n/a | n/a |
+| cargo-fetch-cold | fs | 2.85 | 29.3 | 29.3 | 1.9 | 29.7 | 0.330 | 25.5 | 7785 | 19.2 | 118 | 0 | n/a | n/a |
+| cargo-fetch-warm | fs | 1.69 | 31.7 | 31.7 | 1.0 | 29.6 | 0.160 | 3.4 | 10320 | 19.2 | 118 | 0 | n/a | n/a |
+| oci-pull-cold | fs | 3.6 | 23.5 | 23.5 | 3.9 | 108.7 | 0.730 | 124.8 | 3058 | 124.4 | 16 | 0 | n/a | n/a |
+| oci-pull-warm | fs | 1.6 | 24.6 | 24.6 | 1.3 | 148.5 | 0.220 | 0.3 | 3255 | 124.4 | 16 | 0 | n/a | n/a |
+| publish-npm | fs | 0.17 | 20.9 | 20.8 | 0.3 | 29.7 | 0.040 | 2.6 | 4587 | 0.5 | 30 | 0 | 4.79 | 7.98 |
+| publish-cargo | fs | 0.3 | 21.6 | 21.6 | 0.3 | 19.8 | 0.050 | 4 | 5419 | 0.8 | 50 | 0 | 5.30 | 8.00 |
+| publish-pypi | fs | 0.3 | 21.1 | 21 | 0.3 | 19.8 | 0.050 | 3 | 4844 | 0.5 | 30 | 0 | 9.96 | 11.96 |
+| publish-maven | fs | 1.56 | 21.7 | 21.7 | 1.2 | 29.6 | 0.200 | 12.1 | 12135 | 0.8 | 150 | 0 | 11.85 | 17.06 |
+| publish-nuget | fs | 0.42 | 20.9 | 20.9 | 0.5 | 29.7 | 0.070 | 4.1 | 5492 | 0.8 | 50 | 0 | 7.97 | 9.02 |
+| publish-oci | fs | 2.95 | 23.9 | 23.9 | 1.5 | 19.8 | 0.260 | 15 | 13289 | 0.8 | 50 | 0 | 58.09 | 61.12 |
+| warm-reads-c50 | fs | 4.82 | 29.1 | 29.1 | 4.6 | 39.6 | 0.910 | 24.6 | 16834 | 5.6 | 1000 | 0 | 214.93 | 237.90 |
+| fs-publish | fs | 0.25 | 21 | 21 | 0.3 | 29.6 | 0.050 | 2.6 | 4587 | 0.5 | 30 | 0 | 7.98 | 8.68 |
+| fs-read | fs | 2.64 | 24.6 | 24.6 | 1.7 | 19.8 | 0.300 | 7.9 | 8618 | 0.5 | 1000 | 0 | 110.95 | 137.87 |
+| s3-publish | s3 | 0.28 | 21.4 | 21.4 | 0.2 | 9.9 | 0.030 | 2.1 | 4587 | 0.9 | 30 | 0 | 8.94 | 9.94 |
+| s3-read | s3 | 2.74 | 25 | 25 | 2.0 | 29.7 | 0.350 | 7.9 | 8618 | 0.9 | 1000 | 0 | 111.96 | 157.06 |
+| growth-10000-versions | fs | 79.14 | 44.5 | 44.5 | 30.3 | 69.2 | 28.530 | 419.2 | 23057 | 12.3 | 10000 | 0 | 30.91 | 40.16 |
 
 Throughput, where the harness drove the requests itself:
 
 | scenario | requests/s | downloaded (MiB) |
 |---|---|---|
-| warm-reads-c50 | 393 | 279.1 |
-| fs-read | 383 | 15.9 |
-| s3-read | 427 | 15.9 |
-| growth-10000-versions | 139 | 0.7 |
+| warm-reads-c50 | 208 | 279.1 |
+| fs-read | 379 | 15.9 |
+| s3-read | 365 | 15.9 |
+| growth-10000-versions | 126 | 0.7 |
 
-Artifacts of this commit: the release binary is 18 122 488 bytes (17.3 MiB,
-`lto`, `opt-level = "z"`, stripped); the container image built from the same
-tree is 12 044 970 bytes (11.5 MiB, Alpine and a musl build, so smaller than
-the glibc binary above).
+Artifacts: the binary this run measured is the workspace's own glibc release
+build, 19.9 MiB. The **published** binary is the musl one CI builds with `lto`
+and `opt-level = "z"`, stripped — a different artifact, and the figure to quote
+for a download size. The two are never interchangeable, and this page says which
+one each number came from.
 
 What the workloads were: the npm tree resolves to 109 packages over 210
 requests; the Cargo tree to 59 crates over 118; the pulled image is
@@ -157,36 +169,39 @@ crates.
 
 ### Reading it
 
-- **An idle server costs 16 MiB and no CPU.** Boot touches 32 MiB before
-  settling back; the database of a fresh server with ten repositories is
-  2.0 MiB, and the artifact store is empty.
-- **Serving is cheap, proxying npm is not.** Every publish path sits between
-  4.6 and 5.9 ms at p50 and never moves RSS past 19 MiB. The npm proxy is the
-  outlier: peak RSS reaches 91 MiB on the cold install and 142 MiB on the warm
-  one, and it stays there for the whole settle window — the steady figure
-  equals the peak in every row, so what a burst takes it keeps. Cargo and OCI
-  do not do this: a 124 MiB image pull peaks at 21 MiB of RSS, and a Cargo
-  fetch of 59 crates at 27 MiB.
+- **An idle server costs 19 MiB and no CPU**, three more than the previous
+  release: routing holds a rule snapshot, search an index of what the proxy has
+  served, and a token carries a scope. The database of a fresh server with ten
+  repositories is 2.7 MiB, and the artifact store is empty.
+- **Serving is cheap, and proxying npm no longer is the outlier it was.**
+  Every publish path sits between 4.8 and 11.9 ms at p50 and never moves RSS
+  past 24 MiB. The npm proxy used to peak at 142 MiB on a warm install and keep
+  it for the whole settle window; it now peaks at 44 MiB, within a few MiB of
+  the cold pass, because a packument is rendered a version at a time and served
+  from its cached rendering instead of being parsed into a tree. A 124 MiB image
+  pull peaks at 25 MiB, a Cargo fetch of 59 crates at 32.
 - **A warm cache is worth the most where the bytes are biggest.** The warm
   docker pull writes 0.3 MiB instead of 124.8 and takes 1.5 s instead of 3.5;
   warm `cargo fetch` writes 3.6 MiB instead of 24.4. Warm npm install is barely
   faster in wall time (1.12 s against 1.20) because pnpm's own linking, not the
   registry, is what that second is spent on.
-- **Fifty concurrent readers are served at 393 requests a second**, 109 MiB/s
-  off disk, for 2.4 CPU seconds and a 129% CPU peak — one core and a bit. The
-  p50 of 103 ms is a queue of fifty, not a slow request: the same warm reads
-  driven one at a time (`--concurrency 1 --reads 100`, a separate run minutes
-  later on the same machine) answer at a p50 of 4.2 ms and a p95 of 8.9 ms,
-  216 a second.
+- **Fifty concurrent readers are served at 208 requests a second**, 58 MiB/s
+  off disk, for 0.9 CPU seconds. The p50 of 215 ms is a queue of fifty, not a
+  slow request. This run is slower than the previous one (393 a second) and the
+  reason is not in the code: the machine carried a load average of 2.2 rather
+  than 0.2, and this scenario is the only one in the table that competes for
+  CPU. Read it as a floor, not as a regression.
 - **S3 was not slower than the filesystem here**, on MinIO over loopback:
-  427 reads a second against 383, and a publish 1 ms dearer. It does cost
+  365 reads a second against 379, and a publish 1 ms dearer. It does cost
   space: the same thirty packages weigh 0.9 MiB in the bucket against 0.5 MiB
   on disk, MinIO keeping its own metadata beside each object.
-- **10 000 versions cost 12.6 MiB of database and 12.3 MiB of artifacts** —
-  about 1.3 KiB of database per version, for 1 KiB payloads. They took 72 s at
-  139 publishes a second, and wrote 631 MiB to do it: fifty times the bytes
-  that were kept. The write-ahead log and the index rewrites are the difference,
-  along with 2.5 MiB of request logging at the shipped `RUST_LOG`.
+- **10 000 versions cost 22.5 MiB of database and 12.3 MiB of artifacts.**
+  They took 79 s at 126 publishes a second, and wrote 419 MiB to do it: thirty-
+  four times the bytes that were kept, against fifty-one in the previous
+  release. The write-ahead log and the index rewrites are still the difference;
+  what changed is a 16 MiB checkpoint window instead of 4, truncated afterwards,
+  and two indexes a unique constraint already carried, dropped. See
+  [write-amplification.md](write-amplification.md).
 
 ### What this run does not say
 
@@ -196,8 +211,8 @@ crates.
   nothing here says what they add.
 - The OCI push p50 of 53 ms is a five-request session plus the client process
   starts, and is not comparable to the single-request publish rows.
-- npm and PyPI publish rows are thirty deep, not fifty: the server allows
-  thirty publishes a minute per user, hard-coded, and a deeper row would have
+- npm and PyPI publish rows are thirty deep, not fifty: the shipped
+  `[limits.publish]` allows thirty publishes a minute per user, and a deeper row would have
   measured the limiter.
 - `written (MiB)` is what the process sent to the block layer, logging
   included; `log_bytes` in `results.json` says how much was the log.
