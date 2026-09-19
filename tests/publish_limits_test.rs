@@ -4,16 +4,19 @@ use reqwest::{Response, StatusCode};
 use serde_json::{json, Value};
 
 use common::{
-    build_cargo_publish_body, build_npm_publish_body, build_tarball, hosted, limits, pypi,
-    spawn_server, SpawnOpts, STATIC_TOKEN,
+    build_cargo_publish_body, build_npm_publish_body, build_tarball, hosted, limits, push_blob,
+    pypi, spawn_server, SpawnOpts, STATIC_TOKEN,
 };
 use opencargo::config::{RepositoryFormat, Visibility};
 
-const REPOS: [(&str, RepositoryFormat); 4] = [
+const REPOS: [(&str, RepositoryFormat); 7] = [
     ("npm-private", RepositoryFormat::Npm),
     ("npm-ci", RepositoryFormat::Npm),
     ("pypi-private", RepositoryFormat::Pypi),
     ("crates", RepositoryFormat::Cargo),
+    ("files", RepositoryFormat::Raw),
+    ("servers", RepositoryFormat::Mcp),
+    ("images", RepositoryFormat::Oci),
 ];
 
 async fn server(section: &str) -> common::TestServer {
@@ -173,6 +176,76 @@ async fn a_pypi_upload_is_metered_by_its_own_entry() {
     )
     .await;
     refusal(&refused);
+}
+
+#[tokio::test]
+async fn a_raw_put_is_metered_by_its_own_entry() {
+    let server = server("[limits.publish.format]\nraw = 1\n").await;
+    let client = reqwest::Client::new();
+    let put = |path: &str| {
+        client
+            .put(format!("{}/raw/files/{path}", server.base_url))
+            .bearer_auth(STATIC_TOKEN)
+            .body("bytes")
+            .send()
+    };
+    assert_eq!(put("dist/a.bin").await.unwrap().status(), StatusCode::CREATED);
+    refusal(&put("dist/b.bin").await.unwrap());
+}
+
+/// The two ways into an mcp repository spend one allowance: the meter runs
+/// before a body is read, so the skill route is refused on the count alone.
+#[tokio::test]
+async fn an_mcp_publish_and_a_skill_upload_share_the_mcp_meter() {
+    let server = server("[limits.publish.format]\nmcp = 1\n").await;
+    let client = reqwest::Client::new();
+    let published = client
+        .post(format!("{}/servers/v0.1/publish", server.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .json(&common::mcp::record("io.github.acme/billing", "1.0.0"))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(published.status(), StatusCode::CREATED, "{:?}", published.text().await);
+    let skill = client
+        .put(format!("{}/servers/skills/deploy/1.0.0/skill.zip", server.base_url))
+        .bearer_auth(STATIC_TOKEN)
+        .body(vec![0u8; 16])
+        .send()
+        .await
+        .unwrap();
+    refusal(&skill);
+}
+
+/// A push is a session of blob uploads closed by one manifest put, the
+/// request that makes the image exist: that one is counted, the blobs are
+/// not, so a count is an image count.
+#[tokio::test]
+async fn an_oci_push_is_metered_at_its_manifest_put() {
+    let server = server("[limits.publish.format]\noci = 1\n").await;
+    let client = reqwest::Client::new();
+    let config = b"{\"architecture\":\"amd64\",\"os\":\"linux\"}";
+    let layer = b"layer bytes";
+    let config_digest = push_blob(&client, &server.base_url, "images/app", config).await;
+    let layer_digest = push_blob(&client, &server.base_url, "images/app", layer).await;
+    let manifest = serde_json::to_vec(&json!({
+        "schemaVersion": 2,
+        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+        "config": {"mediaType": "application/vnd.oci.image.config.v1+json", "digest": config_digest, "size": config.len()},
+        "layers": [{"mediaType": "application/vnd.oci.image.layer.v1.tar+gzip", "digest": layer_digest, "size": layer.len()}],
+    }))
+    .unwrap();
+    let put = |tag: &str| {
+        client
+            .put(format!("{}/v2/images/app/manifests/{tag}", server.base_url))
+            .bearer_auth(STATIC_TOKEN)
+            .header("content-type", "application/vnd.oci.image.manifest.v1+json")
+            .body(manifest.clone())
+            .send()
+    };
+    assert_eq!(put("v1").await.unwrap().status(), StatusCode::CREATED);
+    refusal(&put("v2").await.unwrap());
+    push_blob(&client, &server.base_url, "images/app", b"another layer").await;
 }
 
 #[tokio::test]

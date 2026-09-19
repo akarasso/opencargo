@@ -112,6 +112,7 @@ pub async fn put(
     let repo = open(&state, &repo_name).await?;
     crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
     crate::registry::ensure_hosted(&repo)?;
+    crate::registry::meter_publish(&state, &auth, Format::Raw, &repo_name)?;
     let content_type = content_type(request.headers());
     let declared = declared_sha256(request.headers())?;
     let stream = request

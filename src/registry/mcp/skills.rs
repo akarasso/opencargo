@@ -220,6 +220,7 @@ pub async fn upload(
     validate_name(&name)?;
     McpRules.validate_version(&version)?;
     let repo = hosted_mcp(&state, &repo_name, &auth).await?;
+    crate::registry::meter_publish(&state, &auth, Format::Mcp, &repo_name)?;
     let bytes = axum::body::to_bytes(request.into_body(), MAX_ARCHIVE_BYTES)
         .await
         .map_err(|e| AppError::BadRequest(format!("skill archive over {MAX_ARCHIVE_BYTES} bytes or unreadable: {e}")))?;

@@ -56,6 +56,7 @@ pub async fn publish(
     let repo = mcp_repo(&state, &repo_name).await?;
     crate::registry::ensure_hosted(&repo)?;
     crate::registry::ensure_can_write(&state.authorize(), &repo, &auth).await?;
+    crate::registry::meter_publish(&state, &auth, Format::Mcp, &repo_name)?;
     let mut record = json_body(request, MAX_RECORD_BYTES).await?;
     if let Some(meta) = record.get_mut("_meta").and_then(Value::as_object_mut) {
         meta.remove(super::schema::MIRROR_META);
