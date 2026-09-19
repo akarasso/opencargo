@@ -7,7 +7,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 
-use crate::domain::ApiToken;
+use crate::domain::{ApiToken, TokenScope};
 use crate::error::StoreError;
 
 /// A token to record. The raw value never reaches the store — only its hash,
@@ -19,6 +19,9 @@ pub struct NewToken<'a> {
     pub prefix: &'a str,
     pub token_hash: &'a str,
     pub expires_at: Option<DateTime<Utc>>,
+    /// Chosen once, at issue: there is no method to change it, so changing a
+    /// scope means revoking the credential and issuing another.
+    pub scope: &'a TokenScope,
 }
 
 #[async_trait]

@@ -9,7 +9,7 @@ use serde_json::json;
 
 use crate::api::{actor, require_admin_or_self, require_auth};
 use crate::app::tokens::{IssueToken, RevokeToken};
-use crate::domain::User;
+use crate::domain::{TokenScope, User};
 use crate::error::{AppError, AppResult};
 use crate::server::AppState;
 use crate::wire::wire_ts;
@@ -92,6 +92,7 @@ pub async fn create_token(
         &username,
         &body.name,
         body.expires_in_days,
+        &TokenScope::Inherit,
         &actor(&caller),
         state.clock.now(),
     )

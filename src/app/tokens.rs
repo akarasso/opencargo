@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration, Utc};
 use crate::app::audit::{self, Actor};
 use crate::app::users::load_account;
 use crate::auth::tokens as credentials;
-use crate::domain::ApiToken;
+use crate::domain::{ApiToken, TokenScope};
 use crate::error::{AppError, AppResult};
 use crate::ports::audit::AuditStore;
 use crate::ports::events::Events;
@@ -33,6 +33,7 @@ pub struct Issued {
     /// The only copy: nothing stores it.
     pub token: String,
     pub expires_at: Option<DateTime<Utc>>,
+    pub scope: TokenScope,
 }
 
 pub struct IssueToken {
@@ -65,6 +66,7 @@ impl IssueToken {
         username: &str,
         name: &str,
         expires_in_days: Option<i64>,
+        scope: &TokenScope,
         by: &Actor<'_>,
         now: DateTime<Utc>,
     ) -> AppResult<Issued> {
@@ -84,6 +86,7 @@ impl IssueToken {
                     prefix: &prefix,
                     token_hash: &token_hash,
                     expires_at,
+                    scope,
                 },
                 now,
             )
@@ -104,6 +107,7 @@ impl IssueToken {
             prefix,
             token,
             expires_at,
+            scope: scope.clone(),
         })
     }
 }
@@ -218,7 +222,7 @@ mod tests {
             db.audit(),
             crate::server::event_bus(),
         )
-        .run(username, "ci", days, &by(), Utc::now())
+        .run(username, "ci", days, &TokenScope::Inherit, &by(), Utc::now())
         .await
         .unwrap()
     }

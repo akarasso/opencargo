@@ -7,12 +7,12 @@ use chrono::{DateTime, Utc};
 use sqlx::SqlitePool;
 
 use super::{bind_ts, corrupt_row, read_ts, store_error};
-use crate::domain::{ApiToken, DomainError};
+use crate::domain::{ApiToken, DomainError, TokenScope};
 use crate::error::StoreError;
 use crate::ports::tokens::{NewToken, TokenStore};
 
 const COLUMNS: &str =
-    "id, user_id, name, prefix, token_hash, expires_at, last_used_at, created_at";
+    "id, user_id, name, prefix, token_hash, expires_at, last_used_at, created_at, scope";
 
 #[derive(sqlx::FromRow)]
 struct TokenRow {
@@ -24,6 +24,7 @@ struct TokenRow {
     expires_at: Option<String>,
     last_used_at: Option<String>,
     created_at: String,
+    scope: String,
 }
 
 impl TryFrom<TokenRow> for ApiToken {
@@ -34,6 +35,11 @@ impl TryFrom<TokenRow> for ApiToken {
             Some(stored) => read_ts(&row.id, column, stored).map(Some),
             None => Ok(None),
         };
+        let scope = TokenScope::parse(&row.scope).map_err(|e| DomainError::CorruptColumn {
+            repo: row.id.clone(),
+            column: "scope",
+            value: e.to_string(),
+        })?;
         Ok(ApiToken {
             created_at: read_ts(&row.id, "created_at", &row.created_at)?,
             expires_at: optional("expires_at", &row.expires_at)?,
@@ -43,6 +49,7 @@ impl TryFrom<TokenRow> for ApiToken {
             name: row.name,
             prefix: row.prefix,
             token_hash: row.token_hash,
+            scope,
         })
     }
 }
@@ -56,9 +63,11 @@ fn insert<'q>(
     now: DateTime<Utc>,
 ) -> sqlx::query::QueryAs<'q, sqlx::Sqlite, TokenRow, sqlx::sqlite::SqliteArguments<'q>> {
     sqlx::query_as(
-        "INSERT INTO api_tokens (id, user_id, name, prefix, token_hash, expires_at, created_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         RETURNING id, user_id, name, prefix, token_hash, expires_at, last_used_at, created_at",
+        "INSERT INTO api_tokens
+             (id, user_id, name, prefix, token_hash, expires_at, created_at, scope)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+         RETURNING id, user_id, name, prefix, token_hash, expires_at, last_used_at,
+             created_at, scope",
     )
     .bind(token.id)
     .bind(token.user_id)
@@ -67,6 +76,7 @@ fn insert<'q>(
     .bind(token.token_hash)
     .bind(token.expires_at.map(bind_ts))
     .bind(bind_ts(now))
+    .bind(token.scope.to_json())
 }
 
 pub(super) async fn insert_in(

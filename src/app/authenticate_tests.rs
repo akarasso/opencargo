@@ -1,4 +1,5 @@
 use super::*;
+use crate::domain::TokenScope;
 use crate::ports::tokens::NewToken;
 use crate::ports::users::NewUser;
 use crate::registry::oci::token::TokenSigner;
@@ -64,6 +65,7 @@ async fn token_of(db: &FakeDb, user: &User, id: &str) -> String {
                 prefix: &raw[..16],
                 token_hash: &hash,
                 expires_at: None,
+                scope: &TokenScope::Inherit,
             },
             Utc::now(),
         )

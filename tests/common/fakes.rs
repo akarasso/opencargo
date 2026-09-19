@@ -1344,6 +1344,7 @@ impl TokenStore for Tokens {
                 expires_at: token.expires_at,
                 last_used_at: None,
                 created_at: now,
+                scope: token.scope.clone(),
             };
             state.tokens.push(stored.clone());
             Ok(stored)
@@ -3821,6 +3822,7 @@ impl IdentityStore for Identities {
                 expires_at: token.expires_at,
                 last_used_at: None,
                 created_at: now,
+                scope: token.scope.clone(),
             });
             state
                 .sso

@@ -102,11 +102,15 @@ pub fn effective_rights(role: &str, grant: Option<Rights>) -> (Rights, RightsSou
     }
 }
 
+/// A publisher deletes what a publisher publishes: the ladder never asked
+/// for `delete` before, so a publisher who could remove a manifest through
+/// the write rung keeps that power now that the routes ask for the verb.
 fn role_default(role: &str) -> Rights {
     match role {
         "publisher" => Rights {
             read: true,
             write: true,
+            delete: true,
             ..Rights::NONE
         },
         "reader" => Rights {
@@ -184,6 +188,7 @@ mod tests {
                 Rights {
                     read: true,
                     write: true,
+                    delete: true,
                     ..Rights::NONE
                 },
                 RightsSource::Role

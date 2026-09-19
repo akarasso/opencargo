@@ -1544,6 +1544,7 @@ async fn issue_login_token(
                 prefix: &raw_token[..16],
                 token_hash: &token_hash,
                 expires_at: Some(now + chrono::Duration::days(30)),
+                scope: &crate::domain::TokenScope::Inherit,
             },
             now,
         )

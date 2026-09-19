@@ -156,6 +156,11 @@ pub const MIGRATIONS: &[Migration] = &[
         "025_reclaim.sql",
         Sentinel::Object("idx_reclaim_candidates_enqueued")
     ),
+    sql_migration!(
+        "026",
+        "026_token_scopes.sql",
+        Sentinel::Column { table: "api_tokens", column: "scope" }
+    ),
 ];
 
 /// 020: the `nuget` format, through the shared rebuild; no table of its own.
