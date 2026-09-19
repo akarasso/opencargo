@@ -1,9 +1,4 @@
-//! The coverage matrix, checked against the server rather than read.
-//!
-//! `Format::coverage` is a declaration; these tests are what stops it from
-//! becoming a comfortable fiction. Each one takes a column, loops
-//! `Format::ALL`, and holds the declared cell against what the running
-//! server does with a real publish.
+//! `Format::coverage` held against a running server, one test per column.
 
 mod common;
 
@@ -20,9 +15,6 @@ async fn server() -> common::TestServer {
     .await
 }
 
-/// Nine formats, nine publishes, one server: the loop the eight defects of
-/// wave nine walked past, because every list that had to learn `raw` and
-/// `mcp` was written out by hand.
 #[tokio::test]
 async fn every_format_publishes_into_its_own_repository() {
     let s = server().await;
@@ -38,9 +30,7 @@ async fn every_format_publishes_into_its_own_repository() {
     }
 }
 
-/// `emptiness_probe`: deleting a repository that holds something is a 409,
-/// never a 204 that leaves rows behind. The probe is five hand-written counts
-/// over five tables; this is what tells a format it was left out of them.
+/// The probe is five hand-written counts over five tables.
 #[tokio::test]
 async fn a_repository_holding_a_publish_refuses_to_be_deleted() {
     let s = server().await;
@@ -68,9 +58,6 @@ async fn a_repository_holding_a_publish_refuses_to_be_deleted() {
     }
 }
 
-/// `metered_publish`: a format whose row says `Yes` is refused by its own
-/// entry at the limit. The section is built from the matrix, so a tenth
-/// format is metered here the day it declares it.
 #[tokio::test]
 async fn the_meter_refuses_every_format_that_declares_one() {
     let metered: Vec<Format> = Format::ALL
@@ -106,10 +93,7 @@ async fn the_meter_refuses_every_format_that_declares_one() {
     }
 }
 
-/// The other half: a format that declares it cannot be metered publishes as
-/// often as it likes, even under the fallback that meters everything else.
-/// That asking for a limit on it is refused at load, with the reason its cell
-/// carries, is settled where the section is parsed (`config::tests`).
+/// That a limit on such a format is refused at load is settled in `config::tests`.
 #[tokio::test]
 async fn an_unmetered_format_publishes_past_the_fallback() {
     let unmetered: Vec<Format> = Format::ALL
@@ -137,10 +121,8 @@ async fn an_unmetered_format_publishes_past_the_fallback() {
     }
 }
 
-/// `reclaim_referenced`: every byte a publish leaves behind is claimed by a
-/// committed row. A format missing from the union is not a cosmetic gap --
-/// the sweeper deletes live artifacts, and nothing fails until a client asks
-/// for one.
+/// A format missing from the union has its live artifacts swept, and nothing
+/// fails until a client asks for one.
 #[tokio::test]
 async fn every_published_byte_is_claimed_by_the_reference_union() {
     use futures_util::TryStreamExt;

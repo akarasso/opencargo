@@ -78,10 +78,6 @@ impl Format {
         }
     }
 
-    /// Whether a publish of this format has one request the meter counts.
-    /// A Maven deploy is a file per request with none that completes it,
-    /// so a request count would not be an artifact count; an OCI push is
-    /// counted at its manifest put, the request that makes the image exist.
     pub const fn metered_publish(self) -> bool {
         self.coverage().metered_publish.yes()
     }
@@ -146,13 +142,7 @@ impl FromStr for Visibility {
     }
 }
 
-/// What a format answers for one of the lists that enumerate formats.
-///
-/// A list nobody holds is how eight defects reached `main` at once: a format
-/// arrives, a dozen lists must learn it, and the ones that are a `Vec` rather
-/// than a `match` stay silent. Every such list is a column here, every format
-/// a row, and `No` carries the reason so an absence is a decision on the
-/// record rather than an oversight.
+/// A `No` carries its reason so an absence is a decision, not an oversight.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Cell {
     Yes,
@@ -172,8 +162,6 @@ impl Cell {
     }
 }
 
-/// One row of the matrix. Adding a column here makes every format answer it;
-/// adding a format makes `Format::coverage` fail to compile until it does.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Coverage {
     /// A publish has one request the meter counts.
@@ -195,8 +183,8 @@ pub struct Coverage {
 }
 
 impl Format {
-    /// The matrix, one row per format. Exhaustive on purpose: a tenth format
-    /// does not compile until every column has an answer.
+    /// Exhaustive on purpose: a tenth format does not compile until every
+    /// column has an answer.
     pub const fn coverage(self) -> Coverage {
         const NO_DOC: &str = "no package document: nothing declares dependencies";
         match self {
@@ -349,9 +337,7 @@ mod tests {
 mod coverage_tests {
     use super::*;
 
-    /// Every cell of every row is stated. The compiler already refuses a
-    /// missing row; this refuses a row that answers `No` with nothing to say,
-    /// because "no" without a reason is the oversight the matrix exists to end.
+    /// The compiler refuses a missing row; this refuses a silent `No`.
     #[test]
     fn every_absence_carries_its_reason() {
         for format in Format::ALL {
@@ -376,10 +362,7 @@ mod coverage_tests {
         }
     }
 
-    /// The column a format declares and the ecosystem it names must agree: a
-    /// format that says it is scannable has somewhere to send the scan, and
-    /// one that names an ecosystem is scanned. PyPI held both halves apart —
-    /// it named `PyPI` and read no dependency — and answered clean forever.
+    /// PyPI named an ecosystem, read no dependency, and answered clean forever.
     #[test]
     fn scannable_and_its_ecosystem_are_one_statement() {
         for format in Format::ALL {

@@ -1144,9 +1144,7 @@ mod tests {
         }
     }
 
-    /// A setting that would do nothing is refused rather than accepted, and
-    /// the refusal quotes the cell rather than restating it: the sentence
-    /// about Maven was the only one, and the tenth format would have read it.
+    /// A setting that would do nothing is refused rather than accepted.
     #[test]
     fn an_entry_for_a_format_that_is_not_metered_is_refused_at_load() {
         for format in crate::domain::Format::ALL {

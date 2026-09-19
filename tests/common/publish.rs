@@ -1,13 +1,7 @@
-//! One publish per format.
+//! One publish per format, exhaustive on `Format`.
 //!
-//! A column of the coverage matrix is a claim about every format, so a test
-//! that checks one must be able to publish into any of them. `publish` is
-//! exhaustive on `Format`: a tenth format does not compile until it says how
-//! it is published, and the matrix tests then run against it for free.
-//!
-//! No step asserts. A format whose publish is several requests returns the
-//! first one that is not a success, so a refusal is reported rather than
-//! panicked on, which is what a metered test reads.
+//! No step asserts: a publish made of several requests returns the first that
+//! is not a success, so a metered test reads the refusal instead of a panic.
 
 use reqwest::{Client, Response, StatusCode};
 use serde_json::json;
@@ -21,12 +15,10 @@ use super::{
     mcp, nuget, pypi, sha256_digest, STATIC_TOKEN,
 };
 
-/// The repository a matrix test publishes into, one per format.
 pub fn repo_of(format: Format) -> String {
     format!("{}-repo", format.as_str())
 }
 
-/// One public hosted repository per format, in `Format::ALL` order.
 pub fn repositories() -> Vec<RepositoryConfig> {
     Format::ALL
         .into_iter()
@@ -40,7 +32,6 @@ pub fn repositories() -> Vec<RepositoryConfig> {
         .collect()
 }
 
-/// What `publish` created, for the assertions that need to name it again.
 #[derive(Debug, Clone)]
 pub struct Subject {
     pub name: String,
@@ -205,8 +196,6 @@ pub async fn publish_named(
     (subject, response)
 }
 
-/// What each format calls the thing a publish creates. Names are the ones the
-/// format admits, not one shape bent to fit nine grammars.
 pub fn subject(format: Format, n: usize) -> Subject {
     let version = match format {
         Format::Go => "v1.0.0".to_string(),
