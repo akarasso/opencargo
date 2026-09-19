@@ -42,6 +42,17 @@ password = "admin"
 [auth.sso]
 password_mode = "enabled"
 
+[limits.publish]
+window = "1m"
+# per_window = 500
+
+[limits.publish.format]
+npm = 30
+pypi = 30
+
+# [limits.publish.repository]
+# npm-ci = { max = 2000, per = "1h" }
+
 [proxy]
 default_ttl = "24h"
 negative_cache_ttl = "1h"
